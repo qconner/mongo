@@ -91,7 +91,7 @@ public:
 
     void doCollection( const string coll , Query q, FILE* out , ProgressMeter *m ) {
         int queryOptions = QueryOption_SlaveOk | QueryOption_NoCursorTimeout;
-        if (startsWith(coll.c_str(), "local.oplog."))
+        if (startsWith(coll.c_str(), "local.oplog.") && q.obj.hasField("ts"))
             queryOptions |= QueryOption_OplogReplay;
         else if (mongoDumpGlobalParams.snapShotQuery) {
             q.snapshot();
@@ -103,7 +103,7 @@ public:
         // use low-latency "exhaust" mode if going over the network
         if (!_usingMongos && typeid(connBase) == typeid(DBClientConnection&)) {
             DBClientConnection& conn = static_cast<DBClientConnection&>(connBase);
-            boost::function<void(const BSONObj&)> castedWriter(writer); // needed for overload resolution
+            stdx::function<void(const BSONObj&)> castedWriter(writer); // needed for overload resolution
             conn.query( castedWriter, coll.c_str() , q , NULL, queryOptions | QueryOption_Exhaust);
         }
         else {

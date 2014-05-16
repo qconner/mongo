@@ -33,46 +33,9 @@
 #include <vector>
 
 #include "mongo/db/storage/extent_manager.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/structure/record_store_v1_base.h"
 
 namespace mongo {
-
-    class DummyRecoveryUnit : public RecoveryUnit {
-    public:
-        virtual bool commitIfNeeded(bool force = false);
-
-        virtual bool isCommitNeeded() const;
-
-        virtual void* writingPtr(void* data, size_t len);
-
-        virtual void createdFile(const std::string& filename, unsigned long long len);
-
-        virtual void syncDataAndTruncateJournal();
-    };
-
-    class DummyOperationContext : public OperationContext {
-    public:
-        DummyOperationContext();
-
-        virtual ~DummyOperationContext() { }
-
-        virtual RecoveryUnit* recoveryUnit() const {
-            return _recoveryUnit.get();
-        }
-
-        virtual ProgressMeter* setMessage(const char* msg,
-                                          const std::string& name ,
-                                          unsigned long long progressMeterTotal,
-                                          int secondsBetween);
-
-        virtual void checkForInterrupt(bool heedMutex = true) const;
-
-        virtual Status checkForInterruptNoAssert() const;
-
-    private:
-        boost::scoped_ptr<DummyRecoveryUnit> _recoveryUnit;
-    };
 
     class DummyRecordStoreV1MetaData : public RecordStoreV1MetaData {
     public:
@@ -84,8 +47,6 @@ namespace mongo {
 
         virtual const DiskLoc& capFirstNewRecord() const;
         virtual void setCapFirstNewRecord( OperationContext* txn, const DiskLoc& loc );
-
-        virtual bool capLooped() const;
 
         virtual long long dataSize() const;
         virtual long long numRecords() const;
@@ -201,11 +162,14 @@ namespace mongo {
      *
      * records must be sorted by extent/file. offsets within an extent can be in any order.
      *
-     * drecs must be grouped into size-buckets, but the ordering within the size buckets is up to
-     * you.
+     * In a simple RS, drecs must be grouped into size-buckets, but the ordering within the size
+     * buckets is up to you.
      *
-     * You are responsible for ensuring the records and drecs don't overlap (unless you are testing
-     * a corrupt initial state).
+     * In a capped collection, all drecs form a single list and must be grouped by extent, with each
+     * extent having at least one drec. capFirstNewRecord() and capExtent() *must* be correctly set
+     * on md before calling.
+     *
+     * You are responsible for ensuring the records and drecs don't overlap.
      *
      * ExtentManager and MetaData must both be empty.
      */
@@ -226,4 +190,5 @@ namespace mongo {
                          const LocAndSize* drecs,
                          const ExtentManager* em,
                          const DummyRecordStoreV1MetaData* md);
-}
+
+}  // namespace mongo

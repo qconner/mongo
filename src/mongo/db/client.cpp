@@ -49,7 +49,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/db.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/curop-inl.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/instance.h"
@@ -102,7 +102,6 @@ namespace mongo {
         _god(0),
         _lastOp(0)
     {
-        _hasWrittenThisOperation = false;
         _hasWrittenSinceCheckpoint = false;
         _connectionId = p ? p->connectionId() : 0;
         _curOp = new CurOp( this );
@@ -420,12 +419,6 @@ namespace mongo {
         time += w; // writers are greedy, so we can be mean tot hem
 
         time = min( time , 1000000 );
-
-        // if there has been a kill request for this op - we should yield to allow the op to stop
-        // This function returns empty string if we aren't interrupted
-        if ( *killCurrentOp.checkForInterruptNoAssert() ) {
-            return 100;
-        }
 
         return time;
     }

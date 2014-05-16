@@ -35,6 +35,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/interrupt_status_mongod.h"
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -290,7 +291,7 @@ namespace DocumentSourceTests {
         public:
             WriterClientScope() :
             _state( Initial ),
-            _dummyWriter( boost::bind( &WriterClientScope::runDummyWriter, this ) ) {
+            _dummyWriter( stdx::bind( &WriterClientScope::runDummyWriter, this ) ) {
                 _state.await( Ready );
             }
             ~WriterClientScope() {

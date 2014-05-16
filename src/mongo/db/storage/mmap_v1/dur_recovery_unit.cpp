@@ -32,7 +32,16 @@
 
 namespace mongo {
 
+    DurRecoveryUnit::DurRecoveryUnit() {
+        _hasWrittenSinceCheckpoint = false;
+    }
+
+    bool DurRecoveryUnit::awaitCommit() {
+        return getDur().awaitCommit();
+    }
+
     bool DurRecoveryUnit::commitIfNeeded(bool force) {
+        _hasWrittenSinceCheckpoint = false;
         return getDur().commitIfNeeded(force);
     }
 
@@ -41,6 +50,7 @@ namespace mongo {
     }
 
     void* DurRecoveryUnit::writingPtr(void* data, size_t len) {
+        _hasWrittenSinceCheckpoint = true;
         return getDur().writingPtr(data, len);
     }
 

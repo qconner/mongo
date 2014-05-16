@@ -226,7 +226,6 @@ add_option( "no-glibc-check" , "don't check for new versions of glibc" , 0 , Fal
 
 # experimental features
 add_option( "mm", "use main memory instead of memory mapped files" , 0 , True )
-add_option( "asio" , "Use Asynchronous IO (NOT READY YET)" , 0 , True )
 add_option( "ssl" , "Enable SSL" , 0 , True )
 
 # library choices
@@ -399,8 +398,6 @@ usev8 = (jsEngine != 'none')
 
 v8version = jsEngine[3:] if jsEngine.startswith('v8-') else 'none'
 v8suffix = '' if v8version == '3.12' else '-' + v8version
-
-asio = has_option( "asio" )
 
 usePCH = has_option( "usePCH" )
 
@@ -765,7 +762,7 @@ if nix:
         env["CXX"] = "distcc " + env["CXX"]
 
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
-    env.Append( CCFLAGS=["-fPIE",
+    env.Append( CCFLAGS=["-fPIC",
                          "-fno-strict-aliasing",
                          "-ggdb",
                          "-pthread",
@@ -781,7 +778,7 @@ if nix:
 
     env.Append( CPPDEFINES=["_FILE_OFFSET_BITS=64"] )
     env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
-    env.Append( LINKFLAGS=["-fPIE", "-pthread"] )
+    env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
