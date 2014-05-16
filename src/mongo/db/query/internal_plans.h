@@ -62,14 +62,18 @@ namespace mongo {
         /**
          * Return a collection scan.  Caller owns pointer.
          */
-        static Runner* collectionScan(const StringData& ns, // TODO: make this a Collection*
+        static Runner* collectionScan(const StringData& ns,
+                                      Collection* collection,
                                       const Direction direction = FORWARD,
                                       const DiskLoc startLoc = DiskLoc()) {
-            Collection* collection = cc().database()->getCollection(ns);
-            if (NULL == collection) { return new EOFRunner(NULL, ns.toString()); }
+            if (NULL == collection) {
+                return new EOFRunner(NULL, ns.toString());
+            }
+
+            dassert( ns == collection->ns().ns() );
 
             CollectionScanParams params;
-            params.ns = ns.toString();
+            params.collection = collection;
             params.start = startLoc;
 
             if (FORWARD == direction) {
@@ -107,7 +111,8 @@ namespace mongo {
             IndexScan* ix = new IndexScan(params, ws, NULL);
 
             if (IXSCAN_FETCH & options) {
-                return new InternalRunner(collection, new FetchStage(ws, ix, NULL), ws);
+                return new InternalRunner(
+                                collection, new FetchStage(ws, ix, NULL, collection), ws);
             }
             else {
                 return new InternalRunner(collection, ix, ws);

@@ -42,12 +42,7 @@ namespace mongo {
     DBHashCmd dbhashCmd;
 
 
-    void logOpForDbHash( const char* opstr,
-                         const char* ns,
-                         const BSONObj& obj,
-                         BSONObj* patt,
-                         const BSONObj* fullObj,
-                         bool forMigrateCleanup ) {
+    void logOpForDbHash(const char* ns) {
         dbhashCmd.wipeCacheForCollection( ns );
     }
 
@@ -66,7 +61,7 @@ namespace mongo {
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
     }
 
-    string DBHashCmd::hashCollection( const string& fullCollectionName, bool* fromCache ) {
+    string DBHashCmd::hashCollection( Database* db, const string& fullCollectionName, bool* fromCache ) {
 
         scoped_ptr<scoped_lock> cachedHashedLock;
 
@@ -80,7 +75,7 @@ namespace mongo {
         }
 
         *fromCache = false;
-        Collection* collection = cc().database()->getCollection( fullCollectionName );
+        Collection* collection = db->getCollection( fullCollectionName );
         if ( !collection )
             return "";
 
@@ -96,8 +91,9 @@ namespace mongo {
                                                     InternalPlanner::FORWARD,
                                                     InternalPlanner::IXSCAN_FETCH));
         }
-        else if ( collection->details()->isCapped() ) {
-            runner.reset(InternalPlanner::collectionScan(fullCollectionName));
+        else if ( collection->isCapped() ) {
+            runner.reset(InternalPlanner::collectionScan(fullCollectionName,
+                                                         collection));
         }
         else {
             log() << "can't find _id index for: " << fullCollectionName << endl;
@@ -129,7 +125,7 @@ namespace mongo {
         return hash;
     }
 
-    bool DBHashCmd::run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+    bool DBHashCmd::run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
         Timer timer;
 
         set<string> desiredCollections;
@@ -146,7 +142,10 @@ namespace mongo {
         }
 
         list<string> colls;
-        Database* db = cc().database();
+        const string ns = parseNs(dbname, cmdObj);
+
+        Client::ReadContext ctx(ns);
+        Database* db = ctx.ctx().db();
         if ( db )
             db->namespaceIndex().getNamespaces( colls );
         colls.sort();
@@ -176,7 +175,7 @@ namespace mongo {
                 continue;
 
             bool fromCache = false;
-            string hash = hashCollection( fullCollectionName, &fromCache );
+            string hash = hashCollection( db, fullCollectionName, &fromCache );
 
             bb.append( shortCollectionName, hash );
 

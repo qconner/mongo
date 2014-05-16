@@ -37,17 +37,19 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/rs.h"  // theReplSet
+#include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
 
     // used in replAuthenticate
     static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
-    void SyncSourceFeedback::associateMember(const BSONObj& id, const int memberId) {
+    void SyncSourceFeedback::associateMember(const BSONObj& id, Member* member) {
+        invariant(member);
         const OID rid = id["_id"].OID();
         boost::unique_lock<boost::mutex> lock(_mtx);
         _handshakeNeeded = true;
-        _members[rid] = theReplSet->getMutableMember(memberId);
+        _members[rid] = member;
         _cond.notify_all();
     }
 
@@ -64,83 +66,79 @@ namespace mongo {
         string myname = getHostName();
         {
             Client::WriteContext ctx("local");
+            OperationContextImpl txn;
             // local.me is an identifier for a server for getLastError w:2+
             if (!Helpers::getSingleton("local.me", _me) ||
                 !_me.hasField("host") ||
                 _me["host"].String() != myname) {
 
                 // clean out local.me
-                Helpers::emptyCollection("local.me");
+                Helpers::emptyCollection(&txn, "local.me");
 
                 // repopulate
                 BSONObjBuilder b;
                 b.appendOID("_id", 0, true);
                 b.append("host", myname);
                 _me = b.obj();
-                Helpers::putSingleton("local.me", _me);
+                Helpers::putSingleton(&txn, "local.me", _me);
             }
+            // _me is used outside of a read lock, so we must copy it out of the mmap
+            _me = _me.getOwned();
         }
     }
 
     bool SyncSourceFeedback::replHandshake() {
-        // handshake for us
-        BSONObjBuilder cmd;
-        cmd.append("replSetUpdatePosition", 1);
-        BSONObjBuilder sub (cmd.subobjStart("handshake"));
-        sub.appendAs(_me["_id"], "handshake");
-        sub.append("member", theReplSet->selfId());
-        sub.append("config", theReplSet->myConfig().asBson());
-        sub.doneFast();
-
-        LOG(1) << "detecting upstream updater";
-        BSONObj res;
-        try {
-            if (!_connection->runCommand("admin", cmd.obj(), res)) {
-                if (res["errmsg"].str().find("no such cmd") != std::string::npos) {
-                    LOG(1) << "upstream updater is not supported by the member from which we"
-                              " are syncing, using oplogreader-based updating instead";
-                    _supportsUpdater = false;
-                }
-                resetConnection();
-                return false;
-            }
-            else {
-                LOG(1) << "upstream updater is supported";
-                _supportsUpdater = true;
-            }
-        }
-        catch (const DBException& e) {
-            log() << "SyncSourceFeedback error sending handshake: " << e.what() << endl;
-            resetConnection();
-            return false;
-        }
-
-        // handshakes for those connected to us
+        // construct a vector of handshake obj for us as well as all chained members
+        std::vector<BSONObj> handshakeObjs;
         {
+            boost::unique_lock<boost::mutex> lock(_mtx);
+            // handshake obj for us
+            BSONObjBuilder cmd;
+            cmd.append("replSetUpdatePosition", 1);
+            BSONObjBuilder sub (cmd.subobjStart("handshake"));
+            sub.appendAs(_me["_id"], "handshake");
+            sub.append("member", theReplSet->selfId());
+            sub.append("config", theReplSet->myConfig().asBson());
+            sub.doneFast();
+            handshakeObjs.push_back(cmd.obj());
+
+            // handshake objs for all chained members
             for (OIDMemberMap::iterator itr = _members.begin();
                  itr != _members.end(); ++itr) {
-                BSONObjBuilder slaveCmd;
-                slaveCmd.append("replSetUpdatePosition", 1);
+                BSONObjBuilder cmd;
+                cmd.append("replSetUpdatePosition", 1);
                 // outer handshake indicates this is a handshake command
                 // inner is needed as part of the structure to be passed to gotHandshake
-                BSONObjBuilder slaveSub (slaveCmd.subobjStart("handshake"));
-                slaveSub.append("handshake", itr->first);
-                slaveSub.append("member", itr->second->id());
-                slaveSub.append("config", itr->second->config().asBson());
-                slaveSub.doneFast();
-                BSONObj slaveRes;
-                try {
-                    if (!_connection->runCommand("admin", slaveCmd.obj(), slaveRes)) {
-                        resetConnection();
-                        return false;
-                    }
-                }
-                catch (const DBException& e) {
-                    log() << "SyncSourceFeedback error sending chained handshakes: "
-                          << e.what() << endl;
-                    resetConnection();
+                BSONObjBuilder subCmd (cmd.subobjStart("handshake"));
+                subCmd.append("handshake", itr->first);
+                subCmd.append("member", itr->second->id());
+                subCmd.append("config", itr->second->config().asBson());
+                subCmd.doneFast();
+                handshakeObjs.push_back(cmd.obj());
+            }
+        }
+
+        LOG(1) << "handshaking upstream updater";
+        for (std::vector<BSONObj>::iterator it = handshakeObjs.begin();
+                it != handshakeObjs.end();
+                ++it) {
+            BSONObj res;
+            try {
+                if (!_connection->runCommand("admin", *it, res)) {
+                    massert(17447, "upstream updater is not supported by the member from which we"
+                            " are syncing, please update all nodes to 2.6 or later.",
+                            res["errmsg"].str().find("no such cmd") == std::string::npos);
+                    log() << "replSet error while handshaking the upstream updater: "
+                        << res["errmsg"].valuestrsafe();
+
+                    _resetConnection();
                     return false;
                 }
+            }
+            catch (const DBException& e) {
+                log() << "SyncSourceFeedback error sending handshake: " << e.what() << endl;
+                _resetConnection();
+                return false;
             }
         }
         return true;
@@ -150,36 +148,18 @@ namespace mongo {
         if (hasConnection()) {
             return true;
         }
+        log() << "replset setting syncSourceFeedback to " << hostName << rsLog;
         _connection.reset(new DBClientConnection(false, 0, OplogReader::tcp_timeout));
         string errmsg;
         if (!_connection->connect(hostName.c_str(), errmsg) ||
             (getGlobalAuthorizationManager()->isAuthEnabled() && !replAuthenticate())) {
-            resetConnection();
+            _resetConnection();
             log() << "repl: " << errmsg << endl;
             return false;
         }
 
-        if (!replHandshake()) {
-            if (!supportsUpdater()) {
-                return connectOplogReader(hostName);
-            }
-            return false;
-        }
-        return true;
-    }
-
-    bool SyncSourceFeedback::connect(const Member* target) {
-        boost::unique_lock<boost::mutex> lock(_mtx);
-        boost::unique_lock<boost::mutex> connlock(_connmtx);
-        resetConnection();
-        resetOplogReaderConnection();
-        _syncTarget = target;
-        if (_connect(target->fullName())) {
-            if (!supportsUpdater()) {
-                return true;
-            }
-        }
-        return false;
+        replHandshake();
+        return hasConnection();
     }
 
     void SyncSourceFeedback::forwardSlaveHandshake() {
@@ -187,25 +167,6 @@ namespace mongo {
         _handshakeNeeded = true;
         _cond.notify_all();
     }
-
-    void SyncSourceFeedback::percolate(const mongo::OID& rid, const OpTime& ot) {
-        // Update our own record of where this node is, and then register an upstream
-        // message about this.
-        // Note that we must keep the map up to date even if we are not actively reporting
-        // upstream via the new command, since our sync source might later change to a node
-        // that does support the command.
-        updateMap(rid, ot);
-        if (!supportsUpdater()) {
-            // this is only necessary if our sync source does not support
-            // the new syncSourceFeedback command
-            theReplSet->ghost->send(boost::bind(&GhostSync::percolate,
-                                                theReplSet->ghost,
-                                                rid,
-                                                ot));
-        }
-    }
-
-
 
     void SyncSourceFeedback::updateMap(const mongo::OID& rid, const OpTime& ot) {
         boost::unique_lock<boost::mutex> lock(_mtx);
@@ -229,6 +190,7 @@ namespace mongo {
         BSONArrayBuilder array (cmd.subarrayStart("optimes"));
         OID myID = _me["_id"].OID();
         {
+            boost::unique_lock<boost::mutex> lock(_mtx);
             for (map<mongo::OID, OpTime>::const_iterator itr = _slaveMap.begin();
                     itr != _slaveMap.end(); ++itr) {
                 BSONObjBuilder entry(array.subobjStart());
@@ -252,12 +214,12 @@ namespace mongo {
         }
         catch (const DBException& e) {
             log() << "SyncSourceFeedback error sending update: " << e.what() << endl;
-            resetConnection();
+            _resetConnection();
             return false;
         }
         if (!ok) {
             log() << "SyncSourceFeedback error sending update, response: " << res.toString() <<endl;
-            resetConnection();
+            _resetConnection();
             return false;
         }
         return true;
@@ -266,7 +228,13 @@ namespace mongo {
     void SyncSourceFeedback::run() {
         Client::initThread("SyncSourceFeedbackThread");
         bool sleepNeeded = false;
-        while (true) {
+        bool positionChanged = false;
+        bool handshakeNeeded = false;
+        while (!inShutdown()) {
+            if (!theReplSet) {
+                sleepsecs(5);
+                continue;
+            }
             if (sleepNeeded) {
                 sleepmillis(500);
                 sleepNeeded = false;
@@ -276,52 +244,46 @@ namespace mongo {
                 while (!_positionChanged && !_handshakeNeeded) {
                     _cond.wait(lock);
                 }
-                if (theReplSet->isPrimary()) {
-                    _positionChanged = false;
-                    _handshakeNeeded = false;
+                positionChanged = _positionChanged;
+                handshakeNeeded = _handshakeNeeded;
+                _positionChanged = false;
+                _handshakeNeeded = false;
+            }
+
+            MemberState state = theReplSet->state();
+            if (state.primary() || state.fatal() || state.startup()) {
+                continue;
+            }
+            const Member* target = replset::BackgroundSync::get()->getSyncTarget();
+            if (_syncTarget != target) {
+                _resetConnection();
+                _syncTarget = target;
+            }
+            if (!hasConnection()) {
+                // fix connection if need be
+                if (!target) {
+                    sleepNeeded = true;
                     continue;
                 }
-                const Member* target = replset::BackgroundSync::get()->getSyncTarget();
-                boost::unique_lock<boost::mutex> connlock(_connmtx);
-                if (_syncTarget != target) {
-                    resetConnection();
-                    _syncTarget = target;
+                if (!_connect(target->fullName())) {
+                    sleepNeeded = true;
+                    continue;
                 }
-                if (!hasConnection()) {
-                    // fix connection if need be
-                    if (!target) {
-                        sleepNeeded = true;
-                        continue;
-                    }
-                    if (!_connect(target->fullName())) {
-                        sleepNeeded = true;
-                        continue;
-                    }
-                    else if (!supportsUpdater()) {
-                        _handshakeNeeded = false;
-                        _positionChanged = false;
-                        continue;
-                    }
+            }
+            if (handshakeNeeded) {
+                if (!replHandshake()) {
+                    boost::unique_lock<boost::mutex> lock(_mtx);
+                    _handshakeNeeded = true;
+                    continue;
                 }
-                if (_handshakeNeeded) {
-                    if (!replHandshake()) {
-                        _handshakeNeeded = true;
-                        continue;
-                    }
-                    else {
-                        _handshakeNeeded = false;
-                    }
-                }
-                if (_positionChanged) {
-                    if (!updateUpstream()) {
-                        _positionChanged = true;
-                        continue;
-                    }
-                    else {
-                        _positionChanged = false;
-                    }
+            }
+            if (positionChanged) {
+                if (!updateUpstream()) {
+                    boost::unique_lock<boost::mutex> lock(_mtx);
+                    _positionChanged = true;
                 }
             }
         }
+        cc().shutdown();
     }
 }

@@ -31,7 +31,6 @@
 #include "mongo/db/ops/delete_executor.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/ops/delete_request.h"
@@ -41,7 +40,6 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -67,21 +65,21 @@ namespace mongo {
         }
 
         CanonicalQuery* cqRaw;
+        const WhereCallbackReal whereCallback(_request->getNamespaceString().db());
+
         Status status = CanonicalQuery::canonicalize(_request->getNamespaceString().ns(),
                                                      _request->getQuery(),
-                                                     &cqRaw);
+                                                     &cqRaw,
+                                                     whereCallback);
         if (status.isOK()) {
             _canonicalQuery.reset(cqRaw);
             _isQueryParsed = true;
         }
-        else if (status == ErrorCodes::NoClientContext) {
-            // _isQueryParsed is still false, but execute() will try again under the lock.
-            status = Status::OK();
-        }
+
         return status;
     }
 
-    long long DeleteExecutor::execute() {
+    long long DeleteExecutor::execute(OperationContext* txn, Database* db) {
         uassertStatusOK(prepare());
         uassert(17417,
                 mongoutils::str::stream() <<
@@ -101,12 +99,7 @@ namespace mongo {
             }
         }
 
-        massert(17418,
-                mongoutils::str::stream() <<
-                "dbname = " << currentClient.get()->database()->name() <<
-                "; ns = " << ns.ns(),
-                currentClient.get()->database()->name() == nsToDatabaseSubstring(ns.ns()));
-        Collection* collection = currentClient.get()->database()->getCollection(ns.ns());
+        Collection* collection = db->getCollection(ns.ns());
         if (NULL == collection) {
             return 0;
         }
@@ -120,11 +113,6 @@ namespace mongo {
                 !logop || isMasterNs(ns.ns().c_str()));
 
         long long nDeleted = 0;
-
-        const bool canYield = !_request->isGod() && (
-                _canonicalQuery.get() ?
-                !QueryPlannerCommon::hasNode(_canonicalQuery->root(), MatchExpression::ATOMIC) :
-                LiteParsedQuery::isQueryIsolated(_request->getQuery()));
 
         Runner* rawRunner;
         if (_canonicalQuery.get()) {
@@ -140,12 +128,7 @@ namespace mongo {
         }
 
         auto_ptr<Runner> runner(rawRunner);
-        auto_ptr<ScopedRunnerRegistration> safety;
-
-        if (canYield) {
-            safety.reset(new ScopedRunnerRegistration(runner.get()));
-            runner->setYieldPolicy(Runner::YIELD_AUTO);
-        }
+        ScopedRunnerRegistration safety(runner.get());
 
         DiskLoc rloc;
         Runner::RunnerState state;
@@ -163,18 +146,19 @@ namespace mongo {
             // TODO: do we want to buffer docs and delete them in a group rather than
             // saving/restoring state repeatedly?
             runner->saveState();
-            collection->deleteDocument(rloc, false, false, logop ? &toDelete : NULL );
+            collection->deleteDocument(txn, rloc, false, false, logop ? &toDelete : NULL );
             runner->restoreState();
 
             nDeleted++;
 
             if (logop) {
                 if ( toDelete.isEmpty() ) {
-                    problem() << "deleted object without id, not logging" << endl;
+                    problem() << "Deleted object without id in collection " << collection->ns()
+                              << ", not logging.";
                 }
                 else {
                     bool replJustOne = true;
-                    logOp("d", ns.ns().c_str(), toDelete, 0, &replJustOne);
+                    logOp(txn, "d", ns.ns().c_str(), toDelete, 0, &replJustOne);
                 }
             }
 
@@ -183,7 +167,7 @@ namespace mongo {
             }
 
             if (!_request->isGod()) {
-                getDur().commitIfNeeded();
+                txn->recoveryUnit()->commitIfNeeded();
             }
 
             if (debug && _request->isGod() && nDeleted == 100) {

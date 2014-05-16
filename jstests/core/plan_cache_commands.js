@@ -213,8 +213,14 @@ for (var i = 0; i < plans.length; i++) {
 //   always be zero, and in turn the score will always be the same.
 //   2) The plan hits EOF quickly. This means that it will be cached despite
 //   returning zero results.
+
+/* STAGE_MIGRATION
+// conversion from CachedPlanRunner->CachePlanStage breaks feedback
+// As part of 2.7 we plan to rework this (see SERVER-10488 for details)
+
 assert.eq(20, plans[0].feedback.nfeedback, 'incorrect nfeedback');
 assert.gt(plans[0].feedback.averageScore, 0, 'invalid average score');
+*/
 
 
 
@@ -386,6 +392,58 @@ assert.eq(1, getShapes().length, 'plan cache should not be empty after running c
 planCache.clear();
 assert.eq(0, getShapes().length, 'plan cache not empty after clearing');
 
+
+
+//
+// Cursor-style shell helpers
+//
+
+// Repopulate plan cache with 4 query shapes.
+assert.eq(n, t.find(queryB, projectionB).sort(sortB).itcount(), 'unexpected document count');
+assert.eq(n, t.find(queryB, projectionB).itcount(), 'unexpected document count');
+assert.eq(n, t.find(queryB).sort(sortB).itcount(), 'unexpected document count');
+assert.eq(n, t.find(queryB).itcount(), 'unexpected document count');
+assert.eq(4, getShapes().length, 'unexpected number of query shapes in plan cache');
+
+var cursor = t.find(queryB, projectionB).sort(sortB);
+var queryPlan = cursor.getQueryPlan();
+assert.eq(t.getName(), queryPlan.getName(), 'name of query plan should match collection');
+
+//
+// QueryPlan.help
+//
+queryPlan.help();
+
+//
+// shellPrint
+//
+
+print('query plan:');
+printjson(queryPlan);
+
+// Retrieve query plans.
+assert.eq(getPlans(queryB, sortB, projectionB), queryPlan.getPlans(),
+          'plans from cursor.getQueryPlan().getPlans() different from command result');
+
+// Retrieve query plans by passing DBQuery to PlanCache.getPlansByQuery().
+assert.eq(getPlans(queryB, sortB, projectionB), planCache.getPlansByQuery(cursor),
+          'plans from cursor.getQueryPlan().getPlans() different from command result');
+
+// It is an error to pass a sort or projection in addition to DBQuery.
+assert.throws(function() { planCache.getPlansByQuery(cursor, undefined, sortB); });
+assert.throws(function() { planCache.getPlansByQuery(cursor, projectionB, undefined) });
+
+// Clear query plans.
+queryPlan.clearPlans();
+assert.eq(3, getShapes().length,
+          'query shape not dropped after running cursor.getQueryPlan().clearPlans()');
+
+// Clear query plans by passing DBQuery to PlanCache.clearPlansByQuery().
+assert.eq(n, t.find(queryB, projectionB).sort(sortB).itcount(), 'unexpected document count');
+assert.eq(4, getShapes().length, 'query plans not added to cache');
+planCache.clearPlansByQuery(cursor);
+assert.eq(3, getShapes().length,
+          'query shape not dropped after running PlanCache.clearPlansByQuery(DBQuery)');
 
 
 //

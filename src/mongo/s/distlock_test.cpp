@@ -74,9 +74,8 @@ namespace mongo {
         virtual bool adminOnly() const {
             return true;
         }
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false;  }
+
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -98,13 +97,13 @@ namespace mongo {
                         current->unlock();
                     }
                 }
-                catch ( const LockException& ex ) {
+                catch ( const DBException& ex ) {
                     log() << "*** !Could not try distributed lock." << causedBy( ex ) << endl;
                 }
             }
         }
 
-        bool run(const string&, BSONObj& cmdObj, int, string& errmsg,
+        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
                  BSONObjBuilder& result, bool) {
             Timer t;
             DistributedLock lk(ConnectionString(cmdObj["host"].String(),
@@ -183,9 +182,7 @@ namespace mongo {
         virtual bool adminOnly() const {
             return true;
         }
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -299,7 +296,7 @@ namespace mongo {
                     }
 
                 }
-                catch( const LockException& ex ) {
+                catch( const DBException& ex ) {
                     log() << "*** !Could not try distributed lock." << causedBy( ex ) << endl;
                     break;
                 }
@@ -324,7 +321,7 @@ namespace mongo {
             return;
         }
 
-        bool run(const string&, BSONObj& cmdObj, int, string& errmsg,
+        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
                  BSONObjBuilder& result, bool) {
 
             Timer t;
@@ -458,15 +455,13 @@ namespace mongo {
         virtual bool adminOnly() const {
             return true;
         }
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
 
-        bool run(const string&, BSONObj& cmdObj, int, string& errmsg,
+        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
                  BSONObjBuilder& result, bool) {
 
             long long skew = (long long) number_field(cmdObj, "skew", 0);

@@ -32,7 +32,8 @@
 
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/extsort.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/db/index/btree_based_bulk_access_method.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/cstdint.h"
@@ -52,8 +53,8 @@ namespace ExtSortTests {
 
     static const char* const _ns = "unittests.extsort";
     DBDirectClient _client;
-    ExternalSortComparison* _arbitrarySort = BtreeBasedAccessMethod::getComparison(time(0)%2, BSONObj());
-    ExternalSortComparison* _aFirstSort = BtreeBasedAccessMethod::getComparison(0, BSON("a" << 1));
+    ExternalSortComparison* _arbitrarySort = BtreeBasedBulkAccessMethod::getComparison(time(0)%2, BSONObj());
+    ExternalSortComparison* _aFirstSort = BtreeBasedBulkAccessMethod::getComparison(0, BSON("a" << 1));
 
     /** Sort four values. */
     class SortFour {
@@ -310,6 +311,7 @@ namespace ExtSortTests {
             _client.createCollection( _ns );
             // Take a write lock.
             Client::WriteContext ctx( _ns );
+            OperationContextImpl txn;
             Collection* coll = ctx.ctx().db()->getCollection( _ns );
             // Do a write to ensure the implementation will interrupt sort() even after a write has
             // occurred.
@@ -317,10 +319,10 @@ namespace ExtSortTests {
             OID id;
             id.init();
             b.appendOID( "_id", &id );
-            coll->insertDocument( b.obj(), true );
+            coll->insertDocument( &txn, b.obj(), true );
             // Create a sorter with a max file size of only 10k, to trigger a file flush after a
             // relatively small number of inserts.
-            auto_ptr<ExternalSortComparison> cmp(BtreeBasedAccessMethod::getComparison(0,
+            auto_ptr<ExternalSortComparison> cmp(BtreeBasedBulkAccessMethod::getComparison(0,
                 BSON("a" << 1)));
             BSONObjExternalSorter sorter(cmp.get(), 10 * 1024 );
             // Register a request to kill the current operation.
@@ -358,6 +360,7 @@ namespace ExtSortTests {
             _client.createCollection( _ns );
             // Take a write lock.
             Client::WriteContext ctx( _ns );
+            OperationContextImpl txn;
             Collection* coll = ctx.ctx().db()->getCollection( _ns );
             // Do a write to ensure the implementation will interrupt sort() even after a write has
             // occurred.
@@ -365,7 +368,7 @@ namespace ExtSortTests {
             OID id;
             id.init();
             b.appendOID( "_id", &id );
-            coll->insertDocument( b.obj(), true );
+            coll->insertDocument( &txn, b.obj(), true );
             // Create a sorter.
             BSONObjExternalSorter sorter(_aFirstSort);
             // Add keys to the sorter.

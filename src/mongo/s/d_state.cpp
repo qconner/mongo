@@ -185,6 +185,8 @@ namespace mongo {
     }
 
     void ShardingState::donateChunk( const string& ns , const BSONObj& min , const BSONObj& max , ChunkVersion version ) {
+        
+        Lock::assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -211,7 +213,10 @@ namespace mongo {
     }
 
     void ShardingState::undoDonateChunk( const string& ns, CollectionMetadataPtr prevMetadata ) {
+        
+        Lock::assertWriteLocked( ns );        
         scoped_lock lk( _mutex );
+        
         log() << "ShardingState::undoDonateChunk acquired _mutex" << endl;
 
         CollectionMetadataMap::iterator it = _collMetadata.find( ns );
@@ -224,6 +229,8 @@ namespace mongo {
                                      const BSONObj& max,
                                      const OID& epoch,
                                      string* errMsg ) {
+        
+        Lock::assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -266,6 +273,8 @@ namespace mongo {
                                        const BSONObj& max,
                                        const OID& epoch,
                                        string* errMsg ) {
+        
+        Lock::assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -307,8 +316,9 @@ namespace mongo {
                                     const BSONObj& min,
                                     const BSONObj& max,
                                     const vector<BSONObj>& splitKeys,
-                                    ChunkVersion version )
-    {
+                                    ChunkVersion version ) {
+        
+        Lock::assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -331,6 +341,7 @@ namespace mongo {
                                      const BSONObj& maxKey,
                                      ChunkVersion mergedVersion ) {
 
+        Lock::assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -819,7 +830,7 @@ namespace mongo {
         if ( ! shardingState.hasVersion( ns ) )
             return false;
 
-        return ShardedConnectionInfo::get(false) > 0;
+        return ShardedConnectionInfo::get(false) != NULL;
     }
 
     class UnsetShardingCommand : public MongodShardCommand {
@@ -830,7 +841,7 @@ namespace mongo {
             help << "internal";
         }
 
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual bool slaveOk() const { return true; }
 
@@ -842,7 +853,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             ShardedConnectionInfo::reset();
             return true;
         }
@@ -858,7 +869,7 @@ namespace mongo {
         }
 
         virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -927,7 +938,7 @@ namespace mongo {
             return true;
         }
 
-        bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
 
             // Steps
             // 1. check basic config
@@ -971,7 +982,7 @@ namespace mongo {
             }
 
             // we can run on a slave up to here
-            if ( ! isMaster( "admin" ) ) {
+            if (!_isMaster()) {
                 result.append( "errmsg" , "not master" );
                 result.append( "note" , "from post init in setShardVersion" );
                 return false;
@@ -1028,10 +1039,7 @@ namespace mongo {
             }
 
             // step 4
-            
-            // this is because of a weird segfault I saw and I can't see why this should ever be set
-            massert( 13647 , str::stream() << "context should be empty here, is: " << cc().getContext()->ns() , cc().getContext() == 0 ); 
-        
+
             if ( oldVersion.isSet() && ! globalVersion.isSet() ) {
                 // this had been reset
                 info->setVersion( ns , ChunkVersion( 0, OID() ) );
@@ -1173,7 +1181,7 @@ namespace mongo {
             help << " example: { getShardVersion : 'alleyinsider.foo'  } ";
         }
 
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
@@ -1189,7 +1197,7 @@ namespace mongo {
             return parseNsFullyQualified(dbname, cmdObj);
         }
 
-        bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             string ns = cmdObj["getShardVersion"].valuestrsafe();
             if ( ns.size() == 0 ) {
                 errmsg = "need to specify full namespace";
@@ -1222,7 +1230,7 @@ namespace mongo {
     public:
         ShardingStateCmd() : MongodShardCommand( "shardingState" ) {}
 
-        virtual LockType locktype() const { return WRITE; } // TODO: figure out how to make this not need to lock
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -1232,7 +1240,10 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            Lock::DBWrite dbXLock(dbname);
+            Client::Context ctx(dbname);
+
             shardingState.appendInfo( result );
             return true;
         }

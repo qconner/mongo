@@ -47,7 +47,7 @@ namespace mongo {
     /**
      * IndexFilterCommand
      * Defines common attributes for all index filter related commands
-     * such as slaveOk and locktype.
+     * such as slaveOk.
      */
     class IndexFilterCommand : public Command {
     public:
@@ -63,15 +63,10 @@ namespace mongo {
          * implement plan cache command functionality.
          */
 
-        bool run(const std::string& dbname, BSONObj& cmdObj, int options,
+        bool run(OperationContext* txn, const std::string& dbname, BSONObj& cmdObj, int options,
                  std::string& errmsg, BSONObjBuilder& result, bool fromRepl);
 
-        /**
-         * It's fine to return NONE here because plan cache commands
-         * create explicit read context to access collection info cache.
-         * Refer to dbcommands.cpp on how locktype() is handled.
-         */
-        virtual LockType locktype() const;
+        virtual bool isWriteCommandForConfigServer() const;
 
         virtual bool slaveOk() const;
 

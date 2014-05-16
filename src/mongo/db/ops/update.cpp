@@ -35,25 +35,21 @@
 #include <cstring>  // for memcpy
 
 #include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/index_set.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_executor.h"
 #include "mongo/db/ops/update_lifecycle.h"
-#include "mongo/db/pagefault.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/db/query/runner_yield_policy.h"
-#include "mongo/db/queryutil.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/storage/record.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/platform/unordered_set.h"
 
@@ -389,68 +385,6 @@ namespace mongo {
             return Status::OK();
         }
 
-        Status recoverFromYield(const UpdateRequest& request,
-                                UpdateDriver* driver,
-                                Collection* collection) {
-
-            const NamespaceString& nsString(request.getNamespaceString());
-            // We yielded and recovered OK, and our cursor is still good. Details about
-            // our namespace may have changed while we were yielded, so we re-acquire
-            // them here. If we can't do so, escape the update loop. Otherwise, refresh
-            // the driver so that it knows about what is currently indexed.
-
-            if (request.shouldCallLogOp() && !isMasterNs(nsString.ns().c_str())) {
-                return Status(ErrorCodes::NotMaster, mongoutils::str::stream() <<
-                              "Demoted from primary while performing update on " << nsString.ns());
-            }
-
-            Collection* oldCollection = collection;
-            collection = cc().database()->getCollection(nsString.ns());
-
-            // We should not get a new pointer to the same collection...
-            if (oldCollection && (oldCollection != collection))
-                return Status(ErrorCodes::IllegalOperation,
-                              str::stream() << "Collection changed during the Update: ok?"
-                                            << " old: " << oldCollection->ok()
-                                            << " new:" << collection->ok());
-
-            if (!collection)
-                return Status(ErrorCodes::IllegalOperation,
-                              "Update aborted due to invalid state transitions after yield -- "
-                              "collection pointer NULL.");
-
-            if (!collection->ok())
-                return Status(ErrorCodes::IllegalOperation,
-                              "Update aborted due to invalid state transitions after yield -- "
-                              "collection not ok().");
-
-            IndexCatalog* idxCatalog = collection->getIndexCatalog();
-            if (!idxCatalog)
-                return Status(ErrorCodes::IllegalOperation,
-                              "Update aborted due to invalid state transitions after yield -- "
-                              "IndexCatalog pointer NULL.");
-
-            if (!idxCatalog->ok())
-                return Status(ErrorCodes::IllegalOperation,
-                              "Update aborted due to invalid state transitions after yield -- "
-                              "IndexCatalog not ok().");
-
-            if (request.getLifecycle()) {
-                UpdateLifecycle* lifecycle = request.getLifecycle();
-                lifecycle->setCollection(collection);
-
-                if (!lifecycle->canContinue()) {
-                    return Status(ErrorCodes::IllegalOperation,
-                                  "Update aborted due to invalid state transitions after yield.",
-                                  17270);
-                }
-
-                driver->refreshIndexKeys(lifecycle->getIndexKeys());
-            }
-
-            return Status::OK();
-        }
-
         Status ensureIdAndFirst(mb::Document& doc) {
             mb::Element idElem = mb::findFirstChildNamed(doc.root(), idFieldName);
 
@@ -482,13 +416,18 @@ namespace mongo {
         }
     } // namespace
 
-    UpdateResult update(const UpdateRequest& request, OpDebug* opDebug) {
+    UpdateResult update(OperationContext* txn,
+                        Database* db,
+                        const UpdateRequest& request,
+                        OpDebug* opDebug) {
 
         UpdateExecutor executor(&request, opDebug);
-        return executor.execute();
+        return executor.execute(txn, db);
     }
 
     UpdateResult update(
+            OperationContext* txn,
+            Database* db,
             const UpdateRequest& request,
             OpDebug* opDebug,
             UpdateDriver* driver,
@@ -499,8 +438,8 @@ namespace mongo {
         std::auto_ptr<CanonicalQuery> cqHolder(cq);
         const NamespaceString& nsString = request.getNamespaceString();
         UpdateLifecycle* lifecycle = request.getLifecycle();
-        const CurOp* curOp = cc().curop();
-        Collection* collection = cc().database()->getCollection(nsString.ns());
+
+        Collection* collection = db->getCollection(nsString.ns());
 
         validateUpdate(nsString.ns().c_str(), request.getUpdates(), request.getQuery());
 
@@ -526,15 +465,6 @@ namespace mongo {
 
         // Register Runner with ClientCursor
         const ScopedRunnerRegistration safety(runner.get());
-
-        // Use automatic yield policy
-        runner->setYieldPolicy(Runner::YIELD_AUTO);
-
-        // If the update was marked with '$isolated' (a.k.a '$atomic'), we are not allowed to
-        // yield while evaluating the update loop below.
-        const bool isolated =
-            (cq && QueryPlannerCommon::hasNode(cq->root(), MatchExpression::ATOMIC)) ||
-            LiteParsedQuery::isQueryIsolated(request.getQuery());
 
         //
         // We'll start assuming we have one or more documents for this update. (Otherwise,
@@ -576,41 +506,20 @@ namespace mongo {
         // Used during iteration of docs
         BSONObj oldObj;
 
-        // Keep track if we have done a write in isolation mode, which will indicate we can't yield
-        bool isolationModeWriteOccured = false;
-
         // Get first doc, and location
         Runner::RunnerState state = Runner::RUNNER_ADVANCED;
-
-        // Keep track of yield count so we can see if one happens on the getNext() calls below
-        int oldYieldCount = curOp->numYields();
 
         uassert(ErrorCodes::NotMaster,
                 mongoutils::str::stream() << "Not primary while updating " << nsString.ns(),
                 !request.shouldCallLogOp() || isMasterNs(nsString.ns().c_str()));
 
         while (true) {
-            // See if we have a write in isolation mode
-            isolationModeWriteOccured = isolated && (opDebug->nModified > 0);
-
-            // Change to manual yielding (no yielding) if we have written in isolation mode
-            if (isolationModeWriteOccured) {
-                runner->setYieldPolicy(Runner::YIELD_MANUAL);
-            }
-
-            // keep track of the yield count before calling getNext (which might yield).
-            oldYieldCount = curOp->numYields();
-
             // Get next doc, and location
             DiskLoc loc;
             state = runner->getNext(&oldObj, &loc);
-            const bool didYield = (oldYieldCount != curOp->numYields());
 
             if (state != Runner::RUNNER_ADVANCED) {
                 if (state == Runner::RUNNER_EOF) {
-                    if (didYield)
-                        uassertStatusOK(recoverFromYield(request, driver, collection));
-
                     // We have reached the logical end of the loop, so do yielding recovery
                     break;
                 }
@@ -620,10 +529,6 @@ namespace mongo {
                                                          << Runner::statestr(state)));
                 }
             }
-
-            // Refresh things after a yield.
-            if (didYield)
-                uassertStatusOK(recoverFromYield(request, driver, collection));
 
             // We fill this with the new locs of moved doc so we don't double-update.
             if (updatedLocs && updatedLocs->count(loc) > 0) {
@@ -721,22 +626,7 @@ namespace mongo {
                 // If a set of modifiers were all no-ops, we are still 'in place', but there is
                 // no work to do, in which case we want to consider the object unchanged.
                 if (!damages.empty() ) {
-
-                    // Broadcast the mutation so that query results stay correct.
-                    collection->cursorCache()->invalidateDocument(loc, INVALIDATION_MUTATION);
-
-                    collection->details()->paddingFits();
-
-                    // All updates were in place. Apply them via durability and writing pointer.
-                    mutablebson::DamageVector::const_iterator where = damages.begin();
-                    const mutablebson::DamageVector::const_iterator end = damages.end();
-                    for( ; where != end; ++where ) {
-                        const char* sourcePtr = source + where->sourceOffset;
-                        void* targetPtr = getDur().writingPtr(
-                            const_cast<char*>(oldObj.objdata()) + where->targetOffset,
-                            where->size);
-                        std::memcpy(targetPtr, sourcePtr, where->size);
-                    }
+                    collection->updateDocumentWithDamages( txn, loc, source, damages );
                     docWasModified = true;
                     opDebug->fastmod = true;
                 }
@@ -751,7 +641,8 @@ namespace mongo {
                         str::stream() << "Resulting document after update is larger than "
                                       << BSONObjMaxUserSize,
                         newObj.objsize() <= BSONObjMaxUserSize);
-                StatusWith<DiskLoc> res = collection->updateDocument(loc,
+                StatusWith<DiskLoc> res = collection->updateDocument(txn,
+                                                                     loc,
                                                                      newObj,
                                                                      true,
                                                                      opDebug);
@@ -777,8 +668,8 @@ namespace mongo {
             // Call logOp if requested.
             if (request.shouldCallLogOp() && !logObj.isEmpty()) {
                 BSONObj idQuery = driver->makeOplogEntryQuery(newObj, request.isMulti());
-                logOp("u", nsString.ns().c_str(), logObj , &idQuery,
-                      NULL, request.isFromMigration(), &newObj);
+                logOp(txn, "u", nsString.ns().c_str(), logObj , &idQuery,
+                      NULL, request.isFromMigration());
             }
 
             // Only record doc modifications if they wrote (exclude no-ops)
@@ -790,7 +681,7 @@ namespace mongo {
             }
 
             // Opportunity for journaling to write during the update.
-            getDur().commitIfNeeded();
+            txn->recoveryUnit()->commitIfNeeded();
         }
 
         // TODO: Can this be simplified?
@@ -874,9 +765,9 @@ namespace mongo {
 
         // Only create the collection if the doc will be inserted.
         if (!collection) {
-            collection = cc().database()->getCollection(request.getNamespaceString().ns());
+            collection = db->getCollection(request.getNamespaceString().ns());
             if (!collection) {
-                collection = cc().database()->createCollection(request.getNamespaceString().ns());
+                collection = db->createCollection(txn, request.getNamespaceString().ns());
             }
         }
 
@@ -886,12 +777,13 @@ namespace mongo {
                 str::stream() << "Document to upsert is larger than " << BSONObjMaxUserSize,
                 newObj.objsize() <= BSONObjMaxUserSize);
 
-        StatusWith<DiskLoc> newLoc = collection->insertDocument(newObj,
+        StatusWith<DiskLoc> newLoc = collection->insertDocument(txn,
+                                                                newObj,
                                                                 !request.isGod() /*enforceQuota*/);
         uassertStatusOK(newLoc.getStatus());
         if (request.shouldCallLogOp()) {
-            logOp("i", nsString.ns().c_str(), newObj,
-                   NULL, NULL, request.isFromMigration(), &newObj);
+            logOp(txn, "i", nsString.ns().c_str(), newObj,
+                   NULL, NULL, request.isFromMigration());
         }
 
         opDebug->nMatched = 1;

@@ -623,7 +623,11 @@ namespace mongo {
             if ( o.isEmpty() ) {
                 try {
                     LOG( logLvl ) << "inserting initial doc in " << LocksType::ConfigNS << " for lock " << _name << endl;
-                    conn->insert( LocksType::ConfigNS , BSON( LocksType::name(_name) << LocksType::state(0) << LocksType::who("") ) );
+                    conn->insert( LocksType::ConfigNS,
+                                  BSON( LocksType::name(_name)
+                                        << LocksType::state(0)
+                                        << LocksType::who("")
+                                        << LocksType::lockID(OID()) ));
                 }
                 catch ( UserException& e ) {
                     warning() << "could not insert initial doc for distributed lock " << _name << causedBy( e ) << endl;
@@ -964,11 +968,6 @@ namespace mongo {
             }
             else {
                 LOG( logLvl - 1 ) << "lock update lost, lock '" << lockName << "' not propagated." << endl;
-
-                // Register the lock for deletion, to speed up failover
-                // Not strictly necessary, but helpful
-                distLockPinger.addUnlockOID( lockDetails[LocksType::lockID()].OID() );
-
                 gotLock = false;
             }
         }

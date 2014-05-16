@@ -34,6 +34,7 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/client.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/write_concern.h"
@@ -51,6 +52,7 @@
 #include "mongo/s/type_lockpings.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/s/type_shard.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/stringutils.h"
 

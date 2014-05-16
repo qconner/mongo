@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -35,8 +36,6 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-    class NamespaceDetails;
 
     /**
      * OplogStart walks a collection backwards to find the first object in the collection that
@@ -61,7 +60,7 @@ namespace mongo {
     class OplogStart : public PlanStage {
     public:
         // Does not take ownership.
-        OplogStart(const string& ns, MatchExpression* filter, WorkingSet* ws);
+        OplogStart(const Collection* collection, MatchExpression* filter, WorkingSet* ws);
         virtual ~OplogStart();
 
         virtual StageState work(WorkingSetID* out);
@@ -79,9 +78,6 @@ namespace mongo {
         bool isExtentHopping() { return _extentHopping; }
         bool isBackwardsScanning() { return _backwardsScanning; }
     private:
-        // Copied verbatim.
-        static DiskLoc prevExtentFirstLoc(NamespaceDetails* nsd, const DiskLoc& rec);
-
         StageState workBackwardsScan(WorkingSetID* out);
 
         void switchToExtentHopping();
@@ -91,9 +87,9 @@ namespace mongo {
         // If we're backwards scanning we just punt to a collscan.
         scoped_ptr<CollectionScan> _cs;
 
-        // What's our current DiskLoc?  Set by both collscan and extent hopping.
-        // Only written by collscan, read and written by extent hopping.
-        DiskLoc _curloc;
+        // This is only used for the extent hopping scan.
+        typedef OwnedPointerVector<RecordIterator> SubIterators;
+        SubIterators _subIterators;
 
         // Have we done our heavy init yet?
         bool _needInit;
@@ -107,7 +103,7 @@ namespace mongo {
         // Our final state: done.
         bool _done;
 
-        NamespaceDetails* _nsd;
+        const Collection* _collection;
 
         // We only go backwards via a collscan for a few seconds.
         Timer _timer;
@@ -116,7 +112,7 @@ namespace mongo {
         WorkingSet* _workingSet;
 
         string _ns;
-        
+
         MatchExpression* _filter;
 
         static int _backwardsScanTime;

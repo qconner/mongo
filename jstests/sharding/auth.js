@@ -40,7 +40,13 @@ function getShardName(rsTest) {
     return config._id+"/"+members.join(",");
 }
 
-var s = new ShardingTest( "auth1", 0 , 0 , 1 , {rs: true, extraOptions : {"keyFile" : "jstests/libs/key1"}, noChunkSize : true});
+var s = new ShardingTest( "auth1", 0 , 0 , 1 ,
+  {
+    rs: true,
+    extraOptions : {"keyFile" : "jstests/libs/key1"},
+    noChunkSize : true,
+    enableBalancer:true
+  } );
 
 print("logging in first, if there was an unclean shutdown the user might already exist");
 login(adminUser);
@@ -58,8 +64,8 @@ else {
 }
 
 login(adminUser);
-s.getDB( "config" ).settings.update( { _id : "chunksize" }, {$set : {value : 1 }}, true );
-printjson(s.getDB("config").runCommand({getlasterror:1}));
+assert.writeOK(s.getDB( "config" ).settings.update({ _id: "chunksize" },
+                                                   { $set: { value : 1 }}, true ));
 printjson(s.getDB("config").settings.find().toArray());
 
 print("restart mongos");
@@ -139,9 +145,7 @@ login(testUser);
 assert.eq(s.getDB("test").foo.findOne(), null);
 
 print("insert try 2");
-s.getDB("test").foo.insert({x:1});
-result = s.getDB("test").getLastErrorObj();
-assert.eq(result.err, null);
+assert.writeOK(s.getDB("test").foo.insert({ x: 1 }));
 assert.eq( 1 , s.getDB( "test" ).foo.find().itcount() , tojson(result) );
 
 logout(testUser);
@@ -164,23 +168,26 @@ ReplSetTest.awaitRSClientHosts(s.s, d2.nodes, {ok: true });
 s.getDB("test").foo.remove({})
 
 var num = 100000;
+var bulk = s.getDB("test").foo.initializeUnorderedBulkOp();
 for (i=0; i<num; i++) {
-    s.getDB("test").foo.insert({_id:i, x:i, abc : "defg", date : new Date(), str : "all the talk on the market"});
+    bulk.insert({ _id: i, x: i, abc: "defg", date: new Date(), str: "all the talk on the market" });
 }
+assert.writeOK(bulk.execute());
 
-// Make sure all data gets sent through
-printjson( s.getDB("test").getLastError() )
-for (var i = 0; i < s._connections.length; i++) { // SERVER-4356
-    s._connections[i].getDB("test").getLastError();
-}
+var d1Chunks;
+var d2Chunks;
+var totalChunks;
+assert.soon(function() {
+                d1Chunks = s.getDB("config").chunks.count({shard : "d1"});
+                d2Chunks = s.getDB("config").chunks.count({shard : "d2"});
+                totalChunks = s.getDB("config").chunks.count({ns : "test.foo"});
 
-var d1Chunks = s.getDB("config").chunks.count({shard : "d1"});
-var d2Chunks = s.getDB("config").chunks.count({shard : "d2"});
-var totalChunks = s.getDB("config").chunks.count({ns : "test.foo"});
+                print("chunks: " + d1Chunks+" "+d2Chunks+" "+totalChunks);
 
-print("chunks: " + d1Chunks+" "+d2Chunks+" "+totalChunks);
-
-assert(d1Chunks > 0 && d2Chunks > 0 && d1Chunks+d2Chunks == totalChunks);
+                return d1Chunks > 0 && d2Chunks > 0 && d1Chunks+d2Chunks == totalChunks;
+            }, "Chunks failed to balance: " + d1Chunks+" "+d2Chunks+" "+totalChunks,
+            60000,
+            5000);
 
 //SERVER-3645
 //assert.eq(s.getDB("test").foo.count(), num+1);
@@ -202,7 +209,7 @@ if (numDocs != num) {
         lastDocNumber = docs[i].x;
         numDocsSeen++;
     }
-    assert.eq(numDocs, numDocsSeen, "More docs discovered on second find() even though getLastError was already called")
+    assert.eq(numDocs, numDocsSeen, "More docs discovered on second find()")
     assert.eq(num - numDocs, missingDocNumbers.length);
 
     load('jstests/libs/trace_missing_docs.js');
@@ -244,11 +251,11 @@ d2.waitForState( d2.getSecondaries(), d2.SECONDARY, 5 * 60 * 1000 )
 d1.getMaster().getDB(adminUser.db).createUser({user: adminUser.username,
                                                pwd: adminUser.password,
                                                roles: jsTest.adminUserRoles},
-                                              {w: 3, wtimeout: 30000});
+                                              {w: 3, wtimeout: 60000});
 d2.getMaster().getDB(adminUser.db).createUser({user: adminUser.username,
                                                pwd: adminUser.password,
                                                roles: jsTest.adminUserRoles},
-                                              {w: 3, wtimeout: 30000});
+                                              {w: 3, wtimeout: 60000});
 
 login(testUser);
 print( "testing map reduce" );
@@ -286,9 +293,7 @@ print( "   testing find that should work" );
 readOnlyDB.foo.findOne();
 
 print( "   testing write that should fail" );
-readOnlyDB.foo.insert( { eliot : 1 } );
-result = readOnlyDB.getLastError();
-assert( ! result.ok , tojson( result ) )
+assert.writeError(readOnlyDB.foo.insert({ eliot: 1 }));
 
 print( "   testing read command (should succeed)" );
 assert.commandWorked(readOnlyDB.runCommand({count : "foo"}));

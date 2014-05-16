@@ -493,6 +493,7 @@ var authCommandsLib = {
                         dbOwner: 1,
                         clusterMonitor: 1,
                         clusterAdmin: 1,
+                        backup: 1,
                         root: 1,
                         __system: 1
                     },
@@ -508,6 +509,7 @@ var authCommandsLib = {
                         dbAdminAnyDatabase: 1,
                         clusterMonitor: 1,
                         clusterAdmin: 1,
+                        backup: 1,
                         root: 1,
                         __system: 1
                     },
@@ -1247,15 +1249,6 @@ var authCommandsLib = {
             ]
         },
         {
-            testname: "getoptime",
-            command: {getoptime: 1},
-            skipSharded: true,
-            testcases: [
-                { runOnDb: firstDbName, roles: roles_all, privileges: [ ] },
-                { runOnDb: secondDbName, roles: roles_all, privileges: [ ] }
-            ]
-        },
-        {
             testname: "getShardMap",
             command: {getShardMap: "x"},
             testcases: [
@@ -1347,6 +1340,7 @@ var authCommandsLib = {
                 }
             ]
         },
+/*      temporarily removed see SERVER-13555 
         {
             testname: "indexStats",
             command: {indexStats: "x", index: "a_1"},
@@ -1373,6 +1367,7 @@ var authCommandsLib = {
                 }
             ]
         },
+*/
         {
             testname: "isMaster",
             command: {isMaster: 1},
@@ -1775,7 +1770,6 @@ var authCommandsLib = {
             command: {renameCollection: firstDbName + ".x", to: secondDbName + ".y"},
             setup: function (db) {
                 db.getSisterDB(firstDbName).x.save( {} );
-                db.getSisterDB(firstDbName).getLastError();
                 db.getSisterDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name});
                 db.getSisterDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name});
             },
@@ -2271,7 +2265,8 @@ var authCommandsLib = {
                 }
             ]
         },
-        {
+/*      temporarily removed see SERVER-13555 
+         {
             testname: "storageDetails",
             command: {storageDetails: "x", analyze: "diskStorage"},
             skipSharded: true,
@@ -2293,7 +2288,7 @@ var authCommandsLib = {
                     ]
                 }
             ]
-        },
+        }, */
         {
             testname: "text",
             command: {text: "x"},

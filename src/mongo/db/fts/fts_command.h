@@ -49,14 +49,14 @@ namespace mongo {
             bool slaveOk() const { return true; }
             bool slaveOverrideOk() const { return true; }
 
-            LockType locktype() const;
+            virtual bool isWriteCommandForConfigServer() const { return false; }
 
             void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out);
 
 
-            bool run(const string& dbname,
+            bool run(OperationContext* txn, const string& dbname,
                      BSONObj& cmdObj,
                      int options,
                      string& errmsg,

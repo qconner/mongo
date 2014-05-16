@@ -80,7 +80,7 @@ namespace mongo {
                 try {
                     loaded = dbConfig->load();
                 }
-                catch ( const DBException& ex ) {
+                catch ( const DBException& ) {
                     // Retry again, if the config server are now up, the previous call should have
                     // cleared all the bad connections in the pool and this should succeed.
                     loaded = dbConfig->load();
@@ -587,18 +587,6 @@ namespace mongo {
         }
 
         return false;
-    }
-
-    unsigned long long Grid::getNextOpTime() const {
-        ScopedDbConnection conn(configServer.getPrimary().getConnString(), 30);
-
-        BSONObj result;
-        massert( 10421,
-                 "getoptime failed",
-                 conn->simpleCommand( "admin" , &result , "getoptime" ) );
-        conn.done();
-
-        return result["optime"]._numberLong();
     }
 
     bool Grid::_isSpecialLocalDB( const string& dbName ) {

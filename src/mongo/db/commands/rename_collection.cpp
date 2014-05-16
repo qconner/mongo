@@ -39,7 +39,8 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/structure/collection_iterator.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
 
@@ -52,11 +53,7 @@ namespace mongo {
         virtual bool slaveOk() const {
             return false;
         }
-        virtual LockType locktype() const { return WRITE; }
-        virtual bool lockGlobally() const { return true; }
-        virtual bool logTheOp() {
-            return true; // can't log steps when doing fast rename within a db, so always log the op rather than individual steps comprising it.
-        }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
@@ -94,7 +91,19 @@ namespace mongo {
             IndexBuilder::restoreIndexes( indexesInProg );
         }
 
-        virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            Lock::GlobalWrite globalWriteLock;
+            bool ok = wrappedRun(txn, dbname, cmdObj, errmsg, result, fromRepl);
+            if (ok && !fromRepl)
+                logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
+            return ok;
+        }
+        virtual bool wrappedRun(OperationContext* txn,
+                                const string& dbname,
+                                BSONObj& cmdObj,
+                                string& errmsg,
+                                BSONObjBuilder& result,
+                                bool fromRepl) {
             string source = cmdObj.getStringField( name.c_str() );
             string target = cmdObj.getStringField( "to" );
 
@@ -162,12 +171,12 @@ namespace mongo {
                 }
 
                 {
-                    const NamespaceDetails *nsd = nsdetails( source );
+
                     indexesInProg = stopIndexBuilds( srcCtx.db(), cmdObj );
-                    capped = nsd->isCapped();
-                    if ( capped )
-                        for( DiskLoc i = nsd->firstExtent(); !i.isNull(); i = i.ext()->xnext )
-                            size += i.ext()->length;
+                    capped = sourceColl->isCapped();
+                    if ( capped ) {
+                        size = sourceColl->getRecordStore()->storageSize();
+                    }
                 }
             }
 
@@ -182,7 +191,7 @@ namespace mongo {
                         return false;
                     }
 
-                    Status s = cc().database()->dropCollection( target );
+                    Status s = ctx.db()->dropCollection( txn, target );
                     if ( !s.isOK() ) {
                         errmsg = s.toString();
                         restoreIndexBuildsOnSource( indexesInProg, source );
@@ -193,7 +202,7 @@ namespace mongo {
                 // If we are renaming in the same database, just
                 // rename the namespace and we're done.
                 if ( sourceDB == targetDB ) {
-                    Status s = ctx.db()->renameCollection( source, target,
+                    Status s = ctx.db()->renameCollection( txn, source, target,
                                                            cmdObj["stayTemp"].trueValue() );
                     if ( !s.isOK() ) {
                         errmsg = s.toString();
@@ -209,18 +218,18 @@ namespace mongo {
                 // Create the target collection.
                 Collection* targetColl = NULL;
                 if ( capped ) {
-                    BSONObjBuilder spec;
-                    spec.appendBool( "capped", true );
-                    spec.append( "size", double( size ) );
-                    spec.appendBool( "autoIndexId", false );
-                    userCreateNS( target.c_str(), spec.obj(), errmsg, false );
-                    targetColl = ctx.db()->getCollection( target );
+                    CollectionOptions options;
+                    options.capped = true;
+                    options.cappedSize = size;
+                    options.setNoIdIndex();
+
+                    targetColl = ctx.db()->createCollection( txn, target, options );
                 }
                 else {
                     CollectionOptions options;
                     options.setNoIdIndex();
                     // No logOp necessary because the entire renameCollection command is one logOp.
-                    targetColl = ctx.db()->createCollection( target, options );
+                    targetColl = ctx.db()->createCollection( txn, target, options );
                 }
                 if ( !targetColl ) {
                     errmsg = "Failed to create target collection.";
@@ -231,11 +240,12 @@ namespace mongo {
 
             // Copy over all the data from source collection to target collection.
             bool insertSuccessful = true;
-            boost::scoped_ptr<CollectionIterator> sourceIt;
+            boost::scoped_ptr<RecordIterator> sourceIt;
+            Collection* sourceColl = NULL;
 
             {
                 Client::Context srcCtx( source );
-                Collection* sourceColl = srcCtx.db()->getCollection( source );
+                sourceColl = srcCtx.db()->getCollection( source );
                 sourceIt.reset( sourceColl->getIterator( DiskLoc(), false, CollectionScanParams::FORWARD ) );
             }
 
@@ -244,7 +254,7 @@ namespace mongo {
                 BSONObj o;
                 {
                     Client::Context srcCtx( source );
-                    o = sourceIt->getNext().obj();
+                    o = sourceColl->docFor(sourceIt->getNext());
                 }
                 // Insert and check return status of insert.
                 {
@@ -252,7 +262,7 @@ namespace mongo {
                     if ( !targetColl )
                         targetColl = ctx.db()->getCollection( target );
                     // No logOp necessary because the entire renameCollection command is one logOp.
-                    Status s = targetColl->insertDocument( o, true ).getStatus();
+                    Status s = targetColl->insertDocument( txn, o, true ).getStatus();
                     if ( !s.isOK() ) {
                         insertSuccessful = false;
                         errmsg = s.toString();
@@ -264,7 +274,7 @@ namespace mongo {
             // If inserts were unsuccessful, drop the target collection and return false.
             if ( !insertSuccessful ) {
                 Client::Context ctx( target );
-                Status s = ctx.db()->dropCollection( target );
+                Status s = ctx.db()->dropCollection( txn, target );
                 if ( !s.isOK() )
                     errmsg = s.toString();
                 restoreIndexBuildsOnSource( indexesInProg, source );
@@ -276,7 +286,6 @@ namespace mongo {
             bool indexSuccessful = true;
             {
                 Client::Context srcCtx( source );
-                Collection* sourceColl = srcCtx.db()->getCollection( source );
                 IndexCatalog::IndexIterator sourceIndIt =
                     sourceColl->getIndexCatalog()->getIndexIterator( true );
 
@@ -308,7 +317,7 @@ namespace mongo {
 
                 for ( vector<BSONObj>::iterator it = copiedIndexes.begin();
                                                 it != copiedIndexes.end(); ++it ) {
-                    Status s = targetColl->getIndexCatalog()->createIndex( *it, true );
+                    Status s = targetColl->getIndexCatalog()->createIndex(txn, *it, true );
                     if ( !s.isOK() ) {
                         indexSuccessful = false;
                         errmsg = s.toString();
@@ -318,7 +327,7 @@ namespace mongo {
 
                 // If indexes were unsuccessful, drop the target collection and return false.
                 if ( !indexSuccessful ) {
-                    Status s = ctx.db()->dropCollection( target );
+                    Status s = ctx.db()->dropCollection( txn, target );
                     if ( !s.isOK() )
                         errmsg = s.toString();
                     restoreIndexBuildsOnSource( indexesInProg, source );
@@ -329,7 +338,7 @@ namespace mongo {
             // Drop the source collection.
             {
                 Client::Context srcCtx( source );
-                Status s = srcCtx.db()->dropCollection( source );
+                Status s = srcCtx.db()->dropCollection( txn, source );
                 if ( !s.isOK() ) {
                     errmsg = s.toString();
                     restoreIndexBuildsOnSource( indexesInProg, source );

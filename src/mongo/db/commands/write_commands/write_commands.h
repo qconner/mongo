@@ -61,11 +61,9 @@ namespace mongo {
         static void redactTooLongLog( mutablebson::Document* cmdObj, const StringData& fieldName );
 
     private:
-        virtual bool logTheOp();
-
         virtual bool slaveOk() const;
 
-        virtual LockType locktype() const;
+        virtual bool isWriteCommandForConfigServer() const;
 
         virtual Status checkAuthForCommand( ClientBasic* client,
                                             const std::string& dbname,
@@ -74,7 +72,9 @@ namespace mongo {
         virtual bool shouldAffectCommandCounter() const;
 
         // Write command entry point.
-        virtual bool run(const string& dbname,
+        virtual bool run(
+                 OperationContext* txn,
+                 const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,

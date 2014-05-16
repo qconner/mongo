@@ -48,7 +48,7 @@ namespace mongo {
         : _collection( collection ),
           _canonicalQuery(canonicalQuery),
           _solution(soln),
-          _exec(new PlanExecutor(ws, root)) { }
+          _exec(new PlanExecutor(ws, root, collection)) { }
 
     SingleSolutionRunner::~SingleSolutionRunner() { }
 
@@ -70,10 +70,6 @@ namespace mongo {
 
     bool SingleSolutionRunner::restoreState() {
         return _exec->restoreState();
-    }
-
-    void SingleSolutionRunner::setYieldPolicy(Runner::YieldPolicy policy) {
-        _exec->setYieldPolicy(policy);
     }
 
     void SingleSolutionRunner::invalidate(const DiskLoc& dl, InvalidationType type) {

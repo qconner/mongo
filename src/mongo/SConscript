@@ -12,17 +12,22 @@ Import("testEnv")
 Import("has_option")
 Import("get_option")
 Import("usev8")
+Import("v8suffix")
 Import("enforce_glibc")
 Import("darwin windows solaris linux nix")
 
 env.SConscript(['base/SConscript',
                 'db/auth/SConscript',
+                'db/commands/SConscript',
                 'db/exec/SConscript',
                 'db/fts/SConscript',
                 'db/index/SConscript',
                 'db/ops/SConscript',
                 'db/query/SConscript',
                 'db/sorter/SConscript',
+                'db/storage/SConscript',
+                'db/structure/SConscript',
+                'db/structure/btree/SConscript',
                 'db/SConscript',
                 'installer/msi/SConscript',
                 'logger/SConscript',
@@ -46,10 +51,10 @@ env.Library('foundation',
               'util/file.cpp',
               'util/log.cpp',
               'util/platform_init.cpp',
-              'util/signal_handlers.cpp',
               'util/text.cpp',
               'util/time_support.cpp',
               'util/timer.cpp',
+              "util/touch_pages.cpp",
               "util/util.cpp",
               "util/startup_test.cpp",
               ],
@@ -152,6 +157,7 @@ env.Library('expressions',
              'db/matcher/expression_tree.cpp',
              'db/matcher/expression_parser.cpp',
              'db/matcher/expression_parser_tree.cpp',
+             'db/matcher/expression_where_noop.cpp',
              'db/matcher/matchable.cpp',
              'db/matcher/match_details.cpp'],
             LIBDEPS=['bson',
@@ -169,10 +175,6 @@ env.Library('expressions_text',
             ['db/matcher/expression_text.cpp',
              'db/matcher/expression_parser_text.cpp'],
             LIBDEPS=['expressions','db/fts/base'] )
-
-env.Library('expressions_where',
-            ['db/matcher/expression_where.cpp'],
-            LIBDEPS=['expressions'] )
 
 env.CppUnitTest('expression_test',
                 ['db/matcher/expression_test.cpp',
@@ -221,6 +223,8 @@ env.Library( 'mongohasher', [ "db/hasher.cpp" ] )
 env.Library('synchronization', [ 'util/concurrency/synchronization.cpp' ])
 
 env.Library('auth_helpers', ['client/auth_helpers.cpp'])
+
+env.Library('global_optime', ['db/global_optime.cpp'])
 
 env.Library('spin_lock', ["util/concurrency/spin_lock.cpp"])
 env.CppUnitTest('spin_lock_test', ['util/concurrency/spin_lock_test.cpp'],
@@ -288,6 +292,7 @@ env.Library('version',
                 '$BUILD_DIR/mongo/base/base'
             ])
 commonFiles = [ "pch.cpp",
+                "db/namespace_string.cpp",
                 "db/structure/catalog/namespace.cpp",
                 "shell/mongo.cpp",
                 "util/intrusive_counter.cpp",
@@ -302,7 +307,6 @@ commonFiles = [ "pch.cpp",
                 "util/histogram.cpp",
                 "util/text_startuptest.cpp",
                 'util/signal_win32.cpp',
-                "util/stack_introspect.cpp",
                 "util/version_reporting.cpp",
                 ]
 
@@ -419,7 +423,6 @@ env.Library("coredb", [
         "db/commands/mr_common.cpp",
         "db/commands/rename_collection_common.cpp",
         "db/commands/server_status.cpp",
-        "db/commands/shutdown.cpp",
         "db/commands/parameters.cpp",
         "db/commands/user_management_commands.cpp",
         "db/commands/write_commands/write_commands_common.cpp",
@@ -454,20 +457,19 @@ env.Library("coredb", [
         "db/pipeline/field_path.cpp",
         "db/pipeline/value.cpp",
         "db/projection.cpp",
-        "db/queryutil.cpp",
         "db/stats/timer_stats.cpp",
         "s/shardconnection.cpp",
         ]
         + tcmallocServerStatus
         ,
                   LIBDEPS=['db/auth/serverauth',
+                           'db/commands/server_status_core',
                            'db/common',
                            'server_parameters',
                            'geoparser',
                            'geoquery',
                            'expressions',
                            'expressions_geo',
-                           'expressions_where',
                            'expressions_text',
                            'index_names',
                            'db/exec/working_set',
@@ -484,6 +486,7 @@ coreServerFiles = [ "db/client_basic.cpp",
                     "db/stats/counters.cpp",
                     "db/stats/service_stats.cpp",
                     "db/log_process_details.cpp",
+                    "db/conn_pool_options.cpp"
                     ]
 
 env.Library('ntservice', ['util/ntservice.cpp'],
@@ -505,10 +508,11 @@ env.CppUnitTest('bson_template_evaluator_test', ['scripting/bson_template_evalua
                 LIBDEPS=['bson_template_evaluator'])
 
 if usev8:
-    env.Library('scripting', scripting_common_files + ['scripting/engine_v8.cpp',
-                                                       'scripting/v8_db.cpp',
-                                                       'scripting/v8_utils.cpp',
-                                                       'scripting/v8_profiler.cpp'],
+    env.Library('scripting', scripting_common_files + ['scripting/engine_v8' + v8suffix + '.cpp',
+                                                       'scripting/v8' + v8suffix + '_db.cpp',
+                                                       'scripting/v8' + v8suffix + '_utils.cpp',
+                                                       'scripting/v8' + v8suffix +
+                                                       '_profiler.cpp'],
                  LIBDEPS=['bson_template_evaluator', '$BUILD_DIR/third_party/shim_v8'])
 else:
     env.Library('scripting', scripting_common_files + ['scripting/engine_none.cpp'],
@@ -532,29 +536,26 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/kill_current_op.cpp",
                     "db/interrupt_status_mongod.cpp",
                     "db/d_globals.cpp",
-                    "db/pagefault.cpp",
                     "util/compress.cpp",
                     "db/ttl.cpp",
                     "db/d_concurrency.cpp",
                     "db/lockstat.cpp",
                     "db/lockstate.cpp",
-                    "db/structure/btree/key.cpp",
-                    "db/structure/btree/btreebuilder.cpp",
                     "util/logfile.cpp",
                     "util/alignedbuilder.cpp",
                     "util/elapsed_tracker.cpp",
-                    "util/touch_pages.cpp",
                     "db/storage/durable_mapped_file.cpp",
-                    "db/dur.cpp",
-                    "db/durop.cpp",
-                    "db/dur_writetodatafiles.cpp",
-                    "db/dur_preplogbuffer.cpp",
-                    "db/dur_commitjob.cpp",
-                    "db/dur_recover.cpp",
-                    "db/dur_journal.cpp",
+                    "db/storage/mmap_v1/dur.cpp",
+                    "db/storage/mmap_v1/durop.cpp",
+                    "db/storage/mmap_v1/dur_writetodatafiles.cpp",
+                    "db/storage/mmap_v1/dur_preplogbuffer.cpp",
+                    "db/storage/mmap_v1/dur_commitjob.cpp",
+                    "db/storage/mmap_v1/dur_recover.cpp",
+                    "db/storage/mmap_v1/dur_journal.cpp",
+                    "db/storage/mmap_v1/dur_recovery_unit.cpp",
+                    "db/operation_context_impl.cpp",
+                    "db/storage/mmap_v1/mmap_v1_extent_manager.cpp",
                     "db/introspect.cpp",
-                    "db/structure/btree/btree.cpp",
-                    "db/structure/btree/btree_stats.cpp",
                     "db/clientcursor.cpp",
                     "db/tests.cpp",
                     "db/range_deleter_db_env.cpp",
@@ -563,20 +564,25 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/repl/rs.cpp",
                     "db/repl/consensus.cpp",
                     "db/repl/rs_initiate.cpp",
+                    "db/repl/repl_set_health_poll_task.cpp",
                     "db/repl/replset_commands.cpp",
                     "db/repl/manager.cpp",
                     "db/repl/health.cpp",
                     "db/repl/heartbeat.cpp",
+                    "db/repl/heartbeat_info.cpp",
+                    "db/repl/initial_sync.cpp",
                     "db/repl/rs_config.cpp",
                     "db/repl/rs_rollback.cpp",
                     "db/repl/rs_sync.cpp",
                     "db/repl/rs_initialsync.cpp",
                     "db/repl/bgsync.cpp",
+                    "db/repl/member.cpp",
                     "db/repl/master_slave.cpp",
                     "db/repl/sync.cpp",
+                    "db/repl/sync_tail.cpp",
                     "db/repl/sync_source_feedback.cpp",
                     "db/repl/oplogreader.cpp",
-                    "db/repl/replication_server_status.cpp",
+                    "db/repl/repl_settings.cpp",
                     "db/repl/repl_reads_ok.cpp",
                     "db/repl/resync.cpp",
                     "db/repl/oplog.cpp",
@@ -586,8 +592,8 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/index/2d_access_method.cpp",
                     "db/index/btree_access_method.cpp",
                     "db/index/btree_based_access_method.cpp",
+                    "db/index/btree_based_bulk_access_method.cpp",
                     "db/index/btree_index_cursor.cpp",
-                    "db/index/btree_interface.cpp",
                     "db/index/index_descriptor.cpp",
                     "db/index/fts_access_method.cpp",
                     "db/index/hash_access_method.cpp",
@@ -596,7 +602,6 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/cloner.cpp",
                     "db/structure/catalog/namespace_details.cpp",
                     "db/structure/catalog/namespace_index.cpp",
-                    "db/structure/catalog/cap.cpp",
                     "db/dbeval.cpp",
                     "db/dbhelpers.cpp",
                     "db/instance.cpp",
@@ -609,20 +614,15 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/structure/collection_compact.cpp",
                     "db/catalog/collection_cursor_cache.cpp",
                     "db/catalog/collection_info_cache.cpp",
-                    "db/structure/collection_iterator.cpp",
                     "db/catalog/database_holder.cpp",
                     "db/background.cpp",
                     "db/pdfile.cpp",
                     "db/repair_database.cpp",
                     "db/storage/data_file.cpp",
-                    "db/storage/extent.cpp",
-                    "db/storage/extent_manager.cpp",
                     "db/structure/catalog/index_details.cpp",
-                    "db/structure/record_store.cpp",
                     "db/extsort.cpp",
                     "db/index_builder.cpp",
                     "db/index_rebuilder.cpp",
-                    "db/storage/record.cpp",
                     "db/commands/geonear.cpp",
                     "db/geo/haystack.cpp",
                     "db/geo/s2common.cpp",
@@ -638,6 +638,7 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/startup_warnings.cpp",
                     "db/storage_options.cpp",
                     "db/ops/update_lifecycle_impl.cpp",
+                    "db/matcher/expression_where.cpp",
 
                     # most commands are only for mongod
                     "db/stats/top.cpp",
@@ -698,7 +699,12 @@ env.CppUnitTest('diskloc_test', 'db/diskloc_test.cpp', LIBDEPS=[])
 
 env.CppUnitTest('v8_deadline_monitor_test', 'scripting/v8_deadline_monitor_test.cpp', LIBDEPS=[])
 
-env.Library('stacktrace', 'util/stacktrace.cpp')
+env.Library('stacktrace',
+            'util/stacktrace_${OS_FAMILY}.cpp',
+            LIBDEPS=['bson',
+                     'stringutils',
+                     'version',
+                     '$BUILD_DIR/mongo/base/base'])
 
 serverOnlyFiles += mmapFiles
 
@@ -713,7 +719,7 @@ env.Library('coreshard', ['s/distlock.cpp',
                           's/shard.cpp',
                           's/shardkey.cpp'],
             LIBDEPS=['s/base',
-                     's/cluster_op_impl']);
+                     's/cluster_ops_impl']);
     
 mongosLibraryFiles = [
     "s/interrupt_status_mongos.cpp",
@@ -742,7 +748,7 @@ env.Library( "mongoscore",
              LIBDEPS=['db/auth/authmongos',
                       'db/fts/ftsmongos',
                       'db/query/lite_parsed_query',
-                      's/cluster_write_ops',
+                      's/cluster_ops',
                       's/cluster_write_op_conversion',
                       's/upgrade',
                      ] )
@@ -881,6 +887,7 @@ env.Library("serveronly", serverOnlyFiles,
                      "defaultversion",
                      "geoparser",
                      "geoquery",
+                     "global_optime",
                      "index_key_validate",
                      "index_set",
                      'range_deleter',
@@ -889,6 +896,10 @@ env.Library("serveronly", serverOnlyFiles,
                      "db/exec/working_set",
                      "db/exec/exec",
                      "db/query/query",
+                     'db/storage/extent',
+                     'db/structure/record_store',
+                     'db/structure/record_store_v1',
+                     'db/structure/btree/btree',
                      '$BUILD_DIR/third_party/shim_snappy'])
 
 
@@ -899,6 +910,7 @@ mongodAndMongosFiles = [
     "db/initialize_server_global_state.cpp",
     "db/server_extra_log_context.cpp",
     "db/dbwebserver.cpp",
+    "util/signal_handlers.cpp",
     ]
 env.Library("mongodandmongos", mongodAndMongosFiles,
             LIBDEPS=["message_server_port"])
@@ -1037,7 +1049,7 @@ env.Library('mocklib', [
 
 test = testEnv.Install(
     '#/',
-    testEnv.Program("test",
+    testEnv.Program("dbtest",
                     [ f for f in Glob("dbtests/*.cpp")
                       if not str(f).endswith('framework.cpp') and
                          not str(f).endswith('framework_options.cpp') and
@@ -1051,15 +1063,15 @@ test = testEnv.Install(
                        "testframework",
                        "gridfs",
                        "s/upgrade",
-                       "s/cluster_write_ops",
-                       "s/cluster_op_impl",
+                       "s/cluster_ops",
+                       "s/cluster_ops_impl",
                        "mocklib",
                        "db/exec/mock_stage",
                        "$BUILD_DIR/mongo/db/auth/authmocks",
                        "$BUILD_DIR/mongo/db/query/query"]))
 
 if len(testEnv.subst('$PROGSUFFIX')):
-    testEnv.Alias( "test", "#/${PROGPREFIX}test${PROGSUFFIX}" )
+    testEnv.Alias( "dbtest", "#/${PROGPREFIX}dbtest${PROGSUFFIX}" )
 
 env.Install( '#/', testEnv.Program( "perftest", [ "dbtests/perf/perftest.cpp" ], LIBDEPS=["serveronly", "coreserver", "coredb", "testframework" ] ) )
 

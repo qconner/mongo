@@ -32,7 +32,6 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/query/runner.h"
-#include "mongo/db/query/runner_yield_policy.h"
 
 namespace mongo {
 
@@ -52,7 +51,7 @@ namespace mongo {
      */
     class PlanExecutor {
     public:
-        PlanExecutor(WorkingSet* ws, PlanStage* rt);
+        PlanExecutor(WorkingSet* ws, PlanStage* rt, const Collection* collection);
         ~PlanExecutor();
 
         //
@@ -83,9 +82,6 @@ namespace mongo {
         //
 
         /** TODO document me */
-        void setYieldPolicy(Runner::YieldPolicy policy);
-
-        /** TODO document me */
         Runner::RunnerState getNext(BSONObj* objOut, DiskLoc* dlOut);
 
         /** TOOD document me */
@@ -99,9 +95,12 @@ namespace mongo {
         void kill();
 
     private:
+        // Collection over which this plan executor runs. Used to resolve record ids retrieved by
+        // the plan stages. The collection must not be destroyed while there are active plans.
+        const Collection* _collection;
+
         boost::scoped_ptr<WorkingSet> _workingSet;
         boost::scoped_ptr<PlanStage> _root;
-        boost::scoped_ptr<RunnerYieldPolicy> _yieldPolicy;
 
         // Did somebody drop an index we care about or the namespace we're looking at?  If so,
         // we'll be killed.

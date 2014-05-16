@@ -64,7 +64,7 @@ namespace mongo {
 
         verify(_nearFieldIndex < _params.indexKeyPattern.nFields());
 
-        // FLAT implies the distances are in radians.  Convert to meters.
+        // FLAT implies the input distances are in radians.  Convert to meters.
         if (FLAT == _params.nearQuery.centroid.crs) {
             _params.nearQuery.minDistance *= kRadiusOfEarthInMeters;
             _params.nearQuery.maxDistance *= kRadiusOfEarthInMeters;
@@ -80,19 +80,13 @@ namespace mongo {
         _outerRadiusInclusive = false;
 
         // Grab the IndexDescriptor.
-        Database* db = cc().database();
-        if (!db) {
+        if ( !_params.collection ) {
             _failed = true;
             return;
         }
 
-        Collection* collection = db->getCollection(_params.ns);
-        if (!collection) {
-            _failed = true;
-            return;
-        }
-
-        _descriptor = collection->getIndexCatalog()->findIndexByKeyPattern(_params.indexKeyPattern);
+        _descriptor =
+            _params.collection->getIndexCatalog()->findIndexByKeyPattern(_params.indexKeyPattern);
         if (NULL == _descriptor) {
             _failed = true;
             return;
@@ -281,7 +275,7 @@ namespace mongo {
         IndexScan* scan = new IndexScan(params, _ws, _keyGeoFilter.get());
 
         // Owns 'scan'.
-        _child.reset(new FetchStage(_ws, scan, _params.filter));
+        _child.reset(new FetchStage(_ws, scan, _params.filter, _params.collection));
         _seenInScan.clear();
     }
 
@@ -365,7 +359,14 @@ namespace mongo {
             (_outerRadiusInclusive ? minDistance <= _outerRadius : minDistance < _outerRadius)) {
             _results.push(Result(*out, minDistance));
             if (_params.addDistMeta) {
-                member->addComputed(new GeoDistanceComputedData(minDistance));
+                // FLAT implies the output distances are in radians.  Convert to meters.
+                if (FLAT == _params.nearQuery.centroid.crs) {
+                    member->addComputed(new GeoDistanceComputedData(minDistance
+                                                                    / kRadiusOfEarthInMeters));
+                }
+                else {
+                    member->addComputed(new GeoDistanceComputedData(minDistance));
+                }
             }
             if (_params.addPointMeta) {
                 member->addComputed(new GeoNearPointComputedData(minDistanceObj));
@@ -404,7 +405,7 @@ namespace mongo {
         if (it != _invalidationMap.end()) {
             WorkingSetMember* member = _ws->get(it->second);
             verify(member->hasLoc());
-            WorkingSetCommon::fetchAndInvalidateLoc(member);
+            WorkingSetCommon::fetchAndInvalidateLoc(member, _params.collection);
             verify(!member->hasLoc());
             // Don't keep it around in the invalidation map since there's no valid DiskLoc anymore.
             _invalidationMap.erase(it);

@@ -67,14 +67,12 @@ namespace mongo {
     class TwoDAccessMethod : public BtreeBasedAccessMethod {
     public:
         using BtreeBasedAccessMethod::_descriptor;
-        using BtreeBasedAccessMethod::_interface;
 
         TwoDAccessMethod(IndexCatalogEntry* btreeState);
         virtual ~TwoDAccessMethod() { }
 
     private:
         friend class TwoDIndexCursor;
-        friend class twod_internal::GeoPoint;
         friend class twod_internal::GeoAccumulator;
         friend class twod_internal::GeoBrowse;
         friend class twod_internal::GeoHopper;
@@ -94,7 +92,6 @@ namespace mongo {
 
         friend class twod_internal::TwoDGeoNearRunner;
 
-        BtreeInterface* getInterface() { return _interface; }
         const IndexDescriptor* getDescriptor() { return _descriptor; }
         TwoDIndexingParams& getParams() { return _params; }
 

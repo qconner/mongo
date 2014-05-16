@@ -441,8 +441,8 @@ namespace mongo {
             actions.addAction(ActionType::cursorInfo);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual LockType locktype() const { return NONE; }
-        bool run(const string&, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        bool run(OperationContext* txn, const string&, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             cursorCache.appendInfo( result );
             if ( jsobj["setTimeout"].isNumber() )
                 CursorCache::TIMEOUT = jsobj["setTimeout"].numberLong();

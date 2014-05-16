@@ -62,9 +62,11 @@ namespace mongo {
         return Status::OK();
     }
 
-    UpdateResult UpdateExecutor::execute() {
+    UpdateResult UpdateExecutor::execute(OperationContext* txn, Database* db) {
         uassertStatusOK(prepare());
-        return update(*_request,
+        return update(txn,
+                      db,
+                      *_request,
                       _opDebug,
                       &_driver,
                       _canonicalQuery.release());
@@ -83,17 +85,17 @@ namespace mongo {
         }
 
         CanonicalQuery* cqRaw;
+        const WhereCallbackReal whereCallback(_request->getNamespaceString().db());
+
         Status status = CanonicalQuery::canonicalize(_request->getNamespaceString().ns(),
                                                      _request->getQuery(),
-                                                     &cqRaw);
+                                                     &cqRaw,
+                                                     whereCallback);
         if (status.isOK()) {
             _canonicalQuery.reset(cqRaw);
             _isQueryParsed = true;
         }
-        else if (status == ErrorCodes::NoClientContext) {
-            // _isQueryParsed is still false, but execute() will try again under the lock.
-            return status = Status::OK();
-        }
+
         return status;
     }
 

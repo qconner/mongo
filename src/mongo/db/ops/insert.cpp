@@ -29,6 +29,7 @@
  */
 
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/global_optime.h"
 #include "mongo/db/structure/catalog/namespace.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -55,7 +56,6 @@ namespace mongo {
                     // we replace Timestamp(0,0) at the top level with a correct value
                     // in the fast pass, we just mark that we want to swap
                     hasTimestampToFix = true;
-                    break;
                 }
 
                 const char* fieldName = e.fieldName();
@@ -122,8 +122,7 @@ namespace mongo {
                 // no-op
             }
             else if ( e.type() == Timestamp && e.timestampValue() == 0 ) {
-                mutex::scoped_lock lk(OpTime::m);
-                b.append( e.fieldName(), OpTime::now(lk) );
+                b.append( e.fieldName(), getNextGlobalOptime() );
             }
             else {
                 b.append( e );

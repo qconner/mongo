@@ -43,19 +43,20 @@
 #include "mongo/db/ops/update_executor.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
-#include "mongo/db/pagefault.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/collection_metadata.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/write_ops/batched_upsert_detail.h"
 #include "mongo/s/write_ops/write_error_detail.h"
+#include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -88,10 +89,12 @@ namespace mongo {
 
     using mongoutils::str::stream;
 
-    WriteBatchExecutor::WriteBatchExecutor( const BSONObj& wc,
+    WriteBatchExecutor::WriteBatchExecutor( OperationContext* txn,
+                                            const BSONObj& wc,
                                             Client* client,
                                             OpCounters* opCounters,
                                             LastError* le ) :
+        _txn(txn),
         _defaultWriteConcern( wc ),
         _client( client ),
         _opCounters( opCounters ),
@@ -511,11 +514,13 @@ namespace mongo {
             currentOp->setQuery( currWrite.getUpdate()->getQuery() );
             currentOp->debug().query = currWrite.getUpdate()->getQuery();
             currentOp->debug().updateobj = currWrite.getUpdate()->getUpdateExpr();
+            // Note: debug().nMatched, nModified and nmoved are set internally in update
         }
         else {
             dassert( currWrite.getOpType() == BatchedCommandRequest::BatchType_Delete );
             currentOp->setQuery( currWrite.getDelete()->getQuery() );
             currentOp->debug().query = currWrite.getDelete()->getQuery();
+            currentOp->debug().ndeleted = 0;
         }
 
         return currentOp.release();
@@ -574,7 +579,10 @@ namespace mongo {
         }
     }
 
-    static void finishCurrentOp( Client* client, CurOp* currentOp, WriteErrorDetail* opError ) {
+    static void finishCurrentOp( OperationContext* txn,
+                                 Client* client,
+                                 CurOp* currentOp,
+                                 WriteErrorDetail* opError ) {
 
         currentOp->done();
         int executionTime = currentOp->debug().executionTime = currentOp->totalTimeMillis();
@@ -597,7 +605,7 @@ namespace mongo {
         }
 
         if ( currentOp->shouldDBProfile( executionTime ) ) {
-            profile( *client, currentOp->getOp(), *currentOp );
+            profile( txn, *client, currentOp->getOp(), *currentOp );
         }
     }
 
@@ -610,18 +618,23 @@ namespace mongo {
     // - error
     //
 
-    static void singleInsert( const BSONObj& docToInsert,
+    static void singleInsert( OperationContext* txn,
+                              const BSONObj& docToInsert,
                               Collection* collection,
                               WriteOpResult* result );
 
-    static void singleCreateIndex( const BSONObj& indexDesc,
+    static void singleCreateIndex( OperationContext* txn,
+                                   const BSONObj& indexDesc,
                                    Collection* collection,
                                    WriteOpResult* result );
 
-    static void multiUpdate( const BatchItemRef& updateItem,
+    static void multiUpdate( OperationContext* txn,
+                             const BatchItemRef& updateItem,
                              WriteOpResult* result );
 
-    static void multiRemove( const BatchItemRef& removeItem, WriteOpResult* result );
+    static void multiRemove( OperationContext* txn,
+                             const BatchItemRef& removeItem,
+                             WriteOpResult* result );
 
     //
     // WRITE EXECUTION
@@ -640,7 +653,8 @@ namespace mongo {
         /**
          * Constructs a new instance, for performing inserts described in "aRequest".
          */
-        explicit ExecInsertsState(const BatchedCommandRequest* aRequest);
+        explicit ExecInsertsState(OperationContext* txn,
+                                  const BatchedCommandRequest* aRequest);
 
         /**
          * Acquires the write lock and client context needed to perform the current write operation.
@@ -672,6 +686,8 @@ namespace mongo {
          * unless hasLock() is true.
          */
         Collection* getCollection() { return _collection; }
+
+        OperationContext* txn;
 
         // Request object describing the inserts.
         const BatchedCommandRequest* request;
@@ -792,24 +808,20 @@ namespace mongo {
         // particularly on operation interruption.  These kinds of errors necessarily prevent
         // further insertOne calls, and stop the batch.  As a result, the only expected source of
         // such exceptions are interruptions.
-        ExecInsertsState state(&request);
+        ExecInsertsState state(_txn, &request);
         normalizeInserts(request, &state.normalizedInserts);
+
+        ElapsedTracker elapsedTracker(128, 10); // 128 hits or 10 ms, matching RunnerYieldPolicy's
+
         for (state.currIndex = 0;
              state.currIndex < state.request->sizeWriteOps();
              ++state.currIndex) {
 
-            if (state.currIndex > 0) {
+            if (elapsedTracker.intervalHasElapsed()) {
                 // Consider yielding between inserts.
 
-                if (state.hasLock()) {
-                    int micros = ClientCursor::suggestYieldMicros();
-                    if (micros > 0) {
-                        state.unlock();
-                        killCurrentOp.checkForInterrupt();
-                        sleepmicros(micros);
-                    }
-                }
                 killCurrentOp.checkForInterrupt();
+                elapsedTracker.resetLastTime();
             }
 
             WriteErrorDetail* error = NULL;
@@ -832,7 +844,7 @@ namespace mongo {
         incOpStats( updateItem );
 
         WriteOpResult result;
-        multiUpdate( updateItem, &result );
+        multiUpdate( _txn, updateItem, &result );
 
         if ( !result.getStats().upsertedID.isEmpty() ) {
             *upsertedId = result.getStats().upsertedID;
@@ -840,7 +852,7 @@ namespace mongo {
 
         // END CURRENT OP
         incWriteStats( updateItem, result.getStats(), result.getError(), currentOp.get() );
-        finishCurrentOp( _client, currentOp.get(), result.getError() );
+        finishCurrentOp( _txn, _client, currentOp.get(), result.getError() );
 
         if ( result.getError() ) {
             result.getError()->setIndex( updateItem.getItemIndex() );
@@ -859,24 +871,11 @@ namespace mongo {
 
         WriteOpResult result;
 
-        // NOTE: Deletes will not fault outside the lock once any data has been written
-        PageFaultRetryableSection pageFaultSection;
-        while ( true ) {
-            try {
-                multiRemove( removeItem, &result );
-                break;
-            }
-            catch (PageFaultException& pfe) {
-                pfe.touch();
-                invariant(!result.getError());
-                continue;
-            }
-            fassertFailed(17429);
-        }
+        multiRemove( _txn, removeItem, &result );
 
         // END CURRENT OP
         incWriteStats( removeItem, result.getStats(), result.getError(), currentOp.get() );
-        finishCurrentOp( _client, currentOp.get(), result.getError() );
+        finishCurrentOp( _txn, _client, currentOp.get(), result.getError() );
 
         if ( result.getError() ) {
             result.getError()->setIndex( removeItem.getItemIndex() );
@@ -888,7 +887,9 @@ namespace mongo {
     // IN-DB-LOCK CORE OPERATIONS
     //
 
-    WriteBatchExecutor::ExecInsertsState::ExecInsertsState(const BatchedCommandRequest* aRequest) :
+    WriteBatchExecutor::ExecInsertsState::ExecInsertsState(OperationContext* txn,
+                                                           const BatchedCommandRequest* aRequest) :
+        txn(txn),
         request(aRequest),
         currIndex(0),
         _collection(NULL) {
@@ -919,11 +920,12 @@ namespace mongo {
         _collection = database->getCollection(request->getTargetingNS());
         if (!_collection) {
             // Implicitly create if it doesn't exist
-            _collection = database->createCollection(request->getTargetingNS());
+            _collection = database->createCollection(txn, request->getTargetingNS());
             if (!_collection) {
                 result->setError(
                         toWriteError(Status(ErrorCodes::InternalError,
-                                            "could not create collection " + request->getNS())));
+                                            "could not create collection " +
+                                            request->getTargetingNS())));
                 return false;
             }
         }
@@ -956,35 +958,21 @@ namespace mongo {
             state->request->getInsertRequest()->getDocumentsAt( state->currIndex ) :
             normalizedInsert.getValue();
 
-        cc().clearHasWrittenThisOperation();
-        PageFaultRetryableSection pageFaultSection;
-        while (true) {
-            try {
-                if (!state->lockAndCheck(result)) {
-                    break;
-                }
-
+        try {
+            if (state->lockAndCheck(result)) {
                 if (!state->request->isInsertIndexRequest()) {
-                    singleInsert(insertDoc, state->getCollection(), result);
+                    singleInsert(state->txn, insertDoc, state->getCollection(), result);
                 }
                 else {
-                    singleCreateIndex(insertDoc, state->getCollection(), result);
+                    singleCreateIndex(state->txn, insertDoc, state->getCollection(), result);
                 }
-                break;
             }
-            catch (const DBException& ex) {
-                Status status(ex.toStatus());
-                if (ErrorCodes::isInterruption(status.code()))
-                    throw;
-                result->setError(toWriteError(status));
-                break;
-            }
-            catch (PageFaultException& pfe) {
-                state->unlock();
-                pfe.touch();
-                continue;  // Try the operation again.
-            }
-            fassertFailed(17430);
+        }
+        catch (const DBException& ex) {
+            Status status(ex.toStatus());
+            if (ErrorCodes::isInterruption(status.code()))
+                throw;
+            result->setError(toWriteError(status));
         }
 
         // Errors release the write lock, as a matter of policy.
@@ -1014,7 +1002,7 @@ namespace mongo {
                       result.getStats(),
                       result.getError(),
                       currentOp.get());
-        finishCurrentOp(_client, currentOp.get(), result.getError());
+        finishCurrentOp(_txn, _client, currentOp.get(), result.getError());
 
         if (result.getError()) {
             *error = result.releaseError();
@@ -1027,7 +1015,8 @@ namespace mongo {
      *
      * Might fault or error, otherwise populates the result.
      */
-    static void singleInsert( const BSONObj& docToInsert,
+    static void singleInsert( OperationContext* txn,
+                              const BSONObj& docToInsert,
                               Collection* collection,
                               WriteOpResult* result ) {
 
@@ -1035,14 +1024,14 @@ namespace mongo {
 
         Lock::assertWriteLocked( insertNS );
 
-        StatusWith<DiskLoc> status = collection->insertDocument( docToInsert, true );
+        StatusWith<DiskLoc> status = collection->insertDocument( txn, docToInsert, true );
 
         if ( !status.isOK() ) {
             result->setError(toWriteError(status.getStatus()));
         }
         else {
-            logOp( "i", insertNS.c_str(), docToInsert );
-            getDur().commitIfNeeded();
+            logOp( txn, "i", insertNS.c_str(), docToInsert );
+            txn->recoveryUnit()->commitIfNeeded();
             result->getStats().n = 1;
         }
     }
@@ -1053,7 +1042,8 @@ namespace mongo {
      *
      * Might fault or error, otherwise populates the result.
      */
-    static void singleCreateIndex( const BSONObj& indexDesc,
+    static void singleCreateIndex( OperationContext* txn,
+                                   const BSONObj& indexDesc,
                                    Collection* collection,
                                    WriteOpResult* result ) {
 
@@ -1061,7 +1051,7 @@ namespace mongo {
 
         Lock::assertWriteLocked( indexNS );
 
-        Status status = collection->getIndexCatalog()->createIndex( indexDesc, true );
+        Status status = collection->getIndexCatalog()->createIndex(txn, indexDesc, true);
 
         if ( status.code() == ErrorCodes::IndexAlreadyExists ) {
             result->getStats().n = 0;
@@ -1070,12 +1060,13 @@ namespace mongo {
             result->setError(toWriteError(status));
         }
         else {
-            logOp( "i", indexNS.c_str(), indexDesc );
+            logOp( txn, "i", indexNS.c_str(), indexDesc );
             result->getStats().n = 1;
         }
     }
 
-    static void multiUpdate( const BatchItemRef& updateItem,
+    static void multiUpdate( OperationContext* txn,
+                             const BatchItemRef& updateItem,
                              WriteOpResult* result ) {
 
         const NamespaceString nsString(updateItem.getRequest()->getNS());
@@ -1107,7 +1098,7 @@ namespace mongo {
                              false /* don't check version */ );
 
         try {
-            UpdateResult res = executor.execute();
+            UpdateResult res = executor.execute(txn, ctx.db());
 
             const long long numDocsModified = res.numDocsModified;
             const long long numMatched = res.numMatched;
@@ -1135,7 +1126,8 @@ namespace mongo {
      *
      * Might fault or error, otherwise populates the result.
      */
-    static void multiRemove( const BatchItemRef& removeItem,
+    static void multiRemove( OperationContext* txn,
+                             const BatchItemRef& removeItem,
                              WriteOpResult* result ) {
 
         const NamespaceString nss( removeItem.getRequest()->getNS() );
@@ -1169,7 +1161,7 @@ namespace mongo {
                                       false /* don't check version */);
 
         try {
-            result->getStats().n = executor.execute();
+            result->getStats().n = executor.execute(txn, writeContext.db());
         }
         catch ( const DBException& ex ) {
             status = ex.toStatus();

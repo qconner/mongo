@@ -291,7 +291,11 @@ namespace mongo {
 
         set<Shard> shards;
         if ( _manager ) {
-            _manager->getShardsForQuery( shards, query );
+            try {
+                _manager->getShardsForQuery( shards, query );
+            } catch ( const DBException& ex ) {
+                return ex.toStatus();
+            }
         }
         else {
             shards.insert( *_primary );
@@ -307,7 +311,9 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status ChunkManagerTargeter::targetAll( vector<ShardEndpoint*>* endpoints ) const {
+
+
+    Status ChunkManagerTargeter::targetCollection( vector<ShardEndpoint*>* endpoints ) const {
 
         if ( !_primary && !_manager ) {
             return Status( ErrorCodes::NamespaceNotFound,
@@ -325,6 +331,28 @@ namespace mongo {
         }
 
         for ( set<Shard>::iterator it = shards.begin(); it != shards.end(); ++it ) {
+            endpoints->push_back( new ShardEndpoint( it->getName(),
+                                                     _manager ?
+                                                         _manager->getVersion( *it ) :
+                                                         ChunkVersion::UNSHARDED() ) );
+        }
+
+        return Status::OK();
+    }
+
+    Status ChunkManagerTargeter::targetAllShards( vector<ShardEndpoint*>* endpoints ) const {
+
+        if ( !_primary && !_manager ) {
+            return Status( ErrorCodes::NamespaceNotFound,
+                           str::stream() << "could not target every shard with versions for "
+                                         << getNS().ns()
+                                         << "; metadata not found" );
+        }
+
+        vector<Shard> shards;
+        Shard::getAllShards( shards );
+
+        for ( vector<Shard>::iterator it = shards.begin(); it != shards.end(); ++it ) {
             endpoints->push_back( new ShardEndpoint( it->getName(),
                                                      _manager ?
                                                          _manager->getVersion( *it ) :

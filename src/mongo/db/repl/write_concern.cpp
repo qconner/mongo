@@ -141,10 +141,14 @@ namespace mongo {
                 _slaves[ident] = last;
                 _dirty = true;
 
+                // update write concern tags if this node is primary
                 if (theReplSet && theReplSet->isPrimary()) {
-                    if (!theReplSet->ghost->updateSlave(ident.obj["_id"].OID(), last)) {
+                    const Member* mem = theReplSet->findById(ident.obj["config"]["_id"].Int());
+                    if (!mem) {
                         return false;
                     }
+                    ReplSetConfig::MemberCfg cfg = mem->config();
+                    cfg.updateGroups(last);
                 }
 
                 if ( ! _started ) {
@@ -295,8 +299,9 @@ namespace mongo {
 
             if (theReplSet && !theReplSet->isPrimary()) {
                 // pass along if we are not primary
-                LOG(2) << "percolating " << ot.toString() << " from " << entry << endl;
-                theReplSet->syncSourceFeedback.percolate(entry["_id"].OID(), ot);
+                LOG(2) << "received notification that " << entry << " has reached optime: "
+                       << ot.toStringPretty();
+                theReplSet->syncSourceFeedback.updateMap(entry["_id"].OID(), ot);
             }
         }
         return true;
@@ -329,8 +334,9 @@ namespace mongo {
             // we don't know the slave's port, so we make the replica set keep
             // a map of rids to slaves
             // pass along if we are not primary
-            LOG(2) << "getmore percolating " << lastOp.toString() << " from " << rid << endl;
-            theReplSet->syncSourceFeedback.percolate(rid["_id"].OID(), lastOp);
+            LOG(2) << "received notification via getmore that " << rid << " has reached optime: "
+                   << lastOp.toStringPretty();
+            theReplSet->syncSourceFeedback.updateMap(rid["_id"].OID(), lastOp);
         }
     }
 

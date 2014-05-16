@@ -33,8 +33,6 @@
 #include <string>
 #include <vector>
 
-#include <boost/filesystem/path.hpp>
-
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/diskloc.h"
@@ -42,7 +40,10 @@
 namespace mongo {
 
     class DataFile;
-    class NamespaceDetails;
+    class Record;
+    class OperationContext;
+
+    struct Extent;
 
     /**
      * ExtentManager basics
@@ -55,141 +56,108 @@ namespace mongo {
      *  - this structure is NOT stored on disk
      *  - this class is NOT thread safe, locking should be above (for now)
      *
-     * implementation:
-     *  - ExtentManager holds a list of DataFile
      */
     class ExtentManager {
         MONGO_DISALLOW_COPYING( ExtentManager );
 
     public:
-        /**
-         * @param freeListDetails this is a reference into the .ns file
-         *        while a bit odd, this is not a layer violation as extents
-         *        are a peer to the .ns file, without any layering
-         */
-        ExtentManager( const StringData& dbname, const StringData& path,
-                       bool directoryPerDB );
+        ExtentManager(){}
 
-        ~ExtentManager();
-
-        /**
-         * deletes all state and puts back to original state
-         */
-        void reset();
+        virtual ~ExtentManager(){}
 
         /**
          * opens all current files
          */
-        Status init();
+        virtual Status init(OperationContext* txn) = 0;
 
-        size_t numFiles() const;
-        long long fileSize() const;
+        virtual size_t numFiles() const = 0;
+        virtual long long fileSize() const = 0;
 
-        DataFile* getFile( int n, int sizeNeeded = 0, bool preallocateOnly = false );
+        virtual void flushFiles( bool sync ) = 0;
 
-        DataFile* addAFile( int sizeNeeded, bool preallocateNextFile );
-
-        void preallocateAFile() { getFile( numFiles() , 0, true ); }// XXX-ERH
-
-        void flushFiles( bool sync );
-
-        /* allocate a new Extent, does not check free list
-         * @param maxFileNoForQuota - 0 for unlimited
-        */
-        DiskLoc createExtent( int approxSize, int maxFileNoForQuota );
-
-        /**
-         * will return NULL if nothing suitable in free list
-         */
-        DiskLoc allocFromFreeList( int approxSize, bool capped );
-
-        /**
-         * @param details - this is for the collection we're adding space to
-         * @param quotaMax 0 == no limit
-         * TODO: this isn't quite in the right spot
-         *  really need the concept of a NamespaceStructure in the current paradigm
-         */
-        Extent* increaseStorageSize( const string& ns,
-                                     NamespaceDetails* details,
-                                     int size,
-                                     int quotaMax );
+        // must call Extent::reuse on the returned extent
+        virtual DiskLoc allocateExtent( OperationContext* txn,
+                                        bool capped,
+                                        int size,
+                                        int quotaMax ) = 0;
 
         /**
          * firstExt has to be == lastExt or a chain
          */
-        void freeExtents( DiskLoc firstExt, DiskLoc lastExt );
+        virtual void freeExtents( OperationContext* txn,
+                                  DiskLoc firstExt, DiskLoc lastExt ) = 0;
 
-        void printFreeList() const;
+        /**
+         * frees a single extent
+         * ignores all fields in the Extent except: magic, myLoc, length
+         */
+        virtual void freeExtent( OperationContext* txn, DiskLoc extent ) = 0;
 
-        void freeListStats( int* numExtents, int64_t* totalFreeSize ) const;
+        virtual void freeListStats( int* numExtents, int64_t* totalFreeSize ) const = 0;
 
         /**
          * @param loc - has to be for a specific Record
+         * Note(erh): this sadly cannot be removed.
+         * A Record DiskLoc has an offset from a file, while a RecordStore really wants an offset
+         * from an extent.  This intrinsically links an original record store to the original extent
+         * manager.
          */
-        Record* recordFor( const DiskLoc& loc ) const;
+        virtual Record* recordForV1( const DiskLoc& loc ) const = 0;
 
         /**
          * @param loc - has to be for a specific Record (not an Extent)
+         * Note(erh) see comment on recordFor
          */
-        Extent* extentFor( const DiskLoc& loc ) const;
+        virtual Extent* extentForV1( const DiskLoc& loc ) const = 0;
 
         /**
          * @param loc - has to be for a specific Record (not an Extent)
+         * Note(erh) see comment on recordFor
          */
-        DiskLoc extentLocFor( const DiskLoc& loc ) const;
+        virtual DiskLoc extentLocForV1( const DiskLoc& loc ) const = 0;
 
         /**
          * @param loc - has to be for a specific Extent
          */
-        Extent* getExtent( const DiskLoc& loc, bool doSanityCheck = true ) const;
+        virtual Extent* getExtent( const DiskLoc& loc, bool doSanityCheck = true ) const = 0;
 
-        Extent* getNextExtent( Extent* ) const;
-        Extent* getPrevExtent( Extent* ) const;
+        /**
+         * @return maximum size of an Extent
+         */
+        virtual int maxSize() const = 0;
 
-        // get(Next|Prev)Record follows the Record linked list
-        // these WILL cross Extent boundaries
-        // * @param loc - has to be the DiskLoc for a Record
+        /**
+         * @return minimum size of an Extent
+         */
+        virtual int minSize() const { return 0x1000; }
 
-        DiskLoc getNextRecord( const DiskLoc& loc ) const;
+        /**
+         * @param recordLen length of record we need
+         * @param lastExt size of last extent which is a factor in next extent size
+         */
+        virtual int followupSize( int recordLen, int lastExtentLen ) const;
 
-        DiskLoc getPrevRecord( const DiskLoc& loc ) const;
-
-        // does NOT traverse extent boundaries
-
-        DiskLoc getNextRecordInExtent( const DiskLoc& loc ) const;
-
-        DiskLoc getPrevRecordInExtent( const DiskLoc& loc ) const;
+        /** get a suggested size for the first extent in a namespace
+         *  @param recordLen length of record we need to insert
+         */
+        virtual int initialSize( int recordLen ) const;
 
         /**
          * quantizes extent size to >= min + page boundary
          */
-        static int quantizeExtentSize( int size );
+        virtual int quantizeExtentSize( int size ) const;
 
-    private:
-
-        DiskLoc _getFreeListStart() const;
-        DiskLoc _getFreeListEnd() const;
-        void _setFreeListStart( DiskLoc loc );
-        void _setFreeListEnd( DiskLoc loc );
-
-        const DataFile* _getOpenFile( int n ) const;
-
-        DiskLoc _createExtentInFile( int fileNo, DataFile* f,
-                                     int size, int maxFileNoForQuota );
-
-        boost::filesystem::path fileName( int n ) const;
-
-// -----
-
-        std::string _dbname; // i.e. "test"
-        std::string _path; // i.e. "/data/db"
-        bool _directoryPerDB;
-
-        // must be in the dbLock when touching this (and write locked when writing to of course)
-        // however during Database object construction we aren't, which is ok as it isn't yet visible
-        //   to others and we are in the dbholder lock then.
-        std::vector<DataFile*> _files;
-
+        // see cacheHint methods
+        enum HintType { Sequential, Random };
+        class CacheHint {
+        public:
+            virtual ~CacheHint(){}
+        };
+        /**
+         * Tell the system that for this extent, it will have this kind of disk access.
+         * Owner takes owernship of CacheHint
+         */
+        virtual CacheHint* cacheHint( const DiskLoc& extentLoc, const HintType& hint ) = 0;
     };
 
 }

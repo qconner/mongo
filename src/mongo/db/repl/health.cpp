@@ -35,16 +35,16 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/replset_commands.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/task.h"
-#include "mongo/util/concurrency/value.h"
 #include "mongo/util/goodies.h"
 #include "mongo/util/mongoutils/html.h"
 #include "mongo/util/ramlog.h"
-#include "mongo/util/startup_test.h"
 
 namespace mongo {
     /* decls for connections.h */
@@ -58,8 +58,7 @@ namespace mongo {
     using namespace bson;
 
     static RamLog * _rsLog = RamLog::get("rs");
-    Tee *rsLog = _rsLog;
-    extern bool replSetBlind; // for testing
+    Tee* rsLog = _rsLog;
 
     string ago(time_t t) {
         if( t == 0 ) return "";
@@ -79,52 +78,6 @@ namespace mongo {
             s << x / 3600.0 << " hrs";
         }
         return s.str();
-    }
-
-    void Member::summarizeMember(stringstream& s) const {
-        s << tr();
-        {
-            stringstream u;
-            u << "http://" << h().host() << ':' << (h().port() + 1000) << "/_replSet";
-            s << td( a(u.str(), "", fullName()) );
-        }
-        s << td( id() );
-        double h = hbinfo().health;
-        bool ok = h > 0;
-        s << td(red(str::stream() << h,h == 0));
-        s << td(ago(hbinfo().upSince));
-        bool never = false;
-        {
-            string h;
-            time_t hb = hbinfo().lastHeartbeat;
-            if( hb == 0 ) {
-                h = "never";
-                never = true;
-            }
-            else h = ago(hb) + " ago";
-            s << td(h);
-        }
-        s << td(config().votes);
-        s << td(config().priority);
-        {
-            string stateText = state().toString();
-            if( _config.hidden )
-                stateText += " (hidden)";
-            if( ok || stateText.empty() )
-                s << td(stateText); // text blank if we've never connected
-            else
-                s << td( grey(str::stream() << "(was " << state().toString() << ')', true) );
-        }
-        s << td( grey(hbinfo().lastHeartbeatMsg,!ok) );
-        stringstream q;
-        q << "/_replSetOplog?_id=" << id();
-        s << td( a(q.str(), "", never ? "?" : hbinfo().opTime.toString()) );
-        if( hbinfo().skew > INT_MIN ) {
-            s << td( grey(str::stream() << hbinfo().skew,!ok) );
-        }
-        else
-            s << td("");
-        s << _tr();
     }
 
     string ReplSetImpl::stateAsHtml(MemberState s) {
@@ -515,13 +468,4 @@ namespace mongo {
         if( replSetBlind )
             b.append("blind",true); // to avoid confusion if set...normally never set except for testing.
     }
-
-    static struct Test : public StartupTest {
-        void run() {
-            HealthOptions a,b;
-            verify( a == b );
-            verify( a.isDefault() );
-        }
-    } test;
-
 }

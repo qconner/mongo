@@ -30,7 +30,7 @@
 
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
+#include "mongo/db/repl/repl_settings.h"  // replSettings
 #include "mongo/db/repl/rs.h"
 #include "mongo/util/mongoutils/html.h"
 #include "mongo/util/mongoutils/str.h"
@@ -53,7 +53,8 @@ namespace {
             return startsWith( url , "/_replSet" );
         }
 
-        virtual void handle( const char *rq, const std::string& url, BSONObj params,
+        virtual void handle( OperationContext* txn,
+                             const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
 

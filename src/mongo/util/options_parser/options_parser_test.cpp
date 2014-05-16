@@ -964,6 +964,51 @@ namespace {
         ASSERT_EQUALS(str, "NotCommented");
     }
 
+    // Ensure switches in INI config files have the correct semantics.
+    //
+    // Switches have the following semantics:
+    // - Present on the command line -> set to true
+    // - Present in the config file -> set to value in config file
+    // - Present in the config file with no value (INI only) -> set to true
+    // - Not present -> not set to any value
+    TEST(INIConfigFile, Switches) {
+        OptionsParserTester parser;
+        moe::Environment environment;
+
+        moe::OptionSection testOpts;
+        testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+        testOpts.addOptionChaining("switch1", "switch1", moe::Switch, "switch1");
+        testOpts.addOptionChaining("switch2", "switch2", moe::Switch, "switch2");
+        testOpts.addOptionChaining("switch3", "switch3", moe::Switch, "switch3");
+        testOpts.addOptionChaining("switch4", "switch4", moe::Switch, "switch4");
+        testOpts.addOptionChaining("switch5", "switch5", moe::Switch, "switch5");
+
+        std::vector<std::string> argv;
+        argv.push_back("binaryname");
+        argv.push_back("--config");
+        argv.push_back("default.conf");
+        argv.push_back("--switch1");
+        std::map<std::string, std::string> env_map;
+
+        parser.setConfig("default.conf", "switch2=true\nswitch3=false\nswitch5=");
+
+        ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
+        bool switch1;
+        ASSERT_OK(environment.get(moe::Key("switch1"), &switch1));
+        ASSERT_TRUE(switch1);
+        bool switch2;
+        ASSERT_OK(environment.get(moe::Key("switch2"), &switch2));
+        ASSERT_TRUE(switch2);
+        bool switch3;
+        ASSERT_OK(environment.get(moe::Key("switch3"), &switch3));
+        ASSERT_FALSE(switch3);
+        bool switch4;
+        ASSERT_NOT_OK(environment.get(moe::Key("switch4"), &switch4));
+        bool switch5;
+        ASSERT_OK(environment.get(moe::Key("switch5"), &switch5));
+        ASSERT_TRUE(switch5);
+    }
+
     TEST(INIConfigFile, Monkeys) {
         OptionsParserTester parser;
         moe::Environment environment;
@@ -987,7 +1032,10 @@ namespace {
 
         ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
         moe::Value value;
-        ASSERT_NOT_OK(environment.get(moe::Key("this"), &value));
+        ASSERT_OK(environment.get(moe::Key("this"), &value));
+        bool thisValue;
+        ASSERT_OK(value.get(&thisValue));
+        ASSERT_FALSE(thisValue);
         ASSERT_NOT_OK(environment.get(moe::Key("that"), &value));
         ASSERT_NOT_OK(environment.get(moe::Key("another"), &value));
         ASSERT_OK(environment.get(moe::Key("other"), &value));
@@ -1527,12 +1575,8 @@ namespace {
         environment = moe::Environment();
         parser.setConfig("config.json", "{ switchVal : false }");
         ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
-
-        // A switch not being present results in it not getting added to the map for legacy reasons.
-        // The downside of this is that switches can't override a default value of "true" in a
-        // config file.  We should change this once we elminate the places in the code that depend
-        // on this behavior.
-        ASSERT_NOT_OK(environment.get(moe::Key("switchVal"), &value));
+        ASSERT_OK(environment.get(moe::Key("switchVal"), &switchVal));
+        ASSERT_FALSE(switchVal);
     }
 
     TEST(JSONConfigFile, Nested) {
@@ -3525,12 +3569,8 @@ namespace {
         environment = moe::Environment();
         parser.setConfig("config.json", "switchVal : false");
         ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
-
-        // A switch not being present results in it not getting added to the map for legacy reasons.
-        // The downside of this is that switches can't override a default value of "true" in a
-        // config file.  We should change this once we elminate the places in the code that depend
-        // on this behavior.
-        ASSERT_NOT_OK(environment.get(moe::Key("switchVal"), &value));
+        ASSERT_OK(environment.get(moe::Key("switchVal"), &switchVal));
+        ASSERT_FALSE(switchVal);
     }
 
     TEST(YAMLConfigFile, Nested) {

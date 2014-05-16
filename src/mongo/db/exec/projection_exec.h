@@ -31,6 +31,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -66,7 +67,10 @@ namespace mongo {
         typedef StringMap<MatchExpression*> Matchers;
         typedef StringMap<MetaProjection> MetaMap;
 
-        ProjectionExec(const BSONObj& spec, const MatchExpression* queryExpression);
+        ProjectionExec(const BSONObj& spec, 
+                       const MatchExpression* queryExpression,
+                       const MatchExpressionParser::WhereCallback& whereCallback =
+                                    MatchExpressionParser::WhereCallback());
         ~ProjectionExec();
 
         /**
@@ -76,7 +80,6 @@ namespace mongo {
 
         /**
          * Apply this projection to the object 'in'.
-         * 'this' must be a simple inclusion/exclusion projection.
          *
          * Upon success, 'out' is set to the new object and Status::OK() is returned.
          * Otherwise, returns an error Status and *out is not mutated.

@@ -37,6 +37,7 @@
 namespace mongo {
 
     class ExtentManager;
+    class OperationContext;
 
     /*  a datafile - i.e. the "dbname.<#>" files :
 
@@ -76,9 +77,9 @@ namespace mongo {
 
         bool uninitialized() const { return version == 0; }
 
-        void init(int fileno, int filelength, const char* filename);
+        void init(OperationContext* txn, int fileno, int filelength, const char* filename);
 
-        void checkUpgrade();
+        void checkUpgrade(OperationContext* txn);
 
         bool isEmpty() const {
             return uninitialized() || ( unusedLength == fileLength - HeaderSize - 16 );
@@ -89,17 +90,20 @@ namespace mongo {
 
     class DataFile {
         friend class BasicCursor;
-        friend class ExtentManager;
+        friend class MmapV1ExtentManager;
     public:
         DataFile(int fn) : _mb(0), fileNo(fn) { }
 
         /** @return true if found and opened. if uninitialized (prealloc only) does not open. */
-        Status openExisting( const char *filename );
+        Status openExisting( OperationContext* txn, const char *filename );
 
         /** creates if DNE */
-        void open(const char *filename, int requestedDataSize = 0, bool preallocateOnly = false);
+        void open(OperationContext* txn,
+                  const char *filename,
+                  int requestedDataSize = 0,
+                  bool preallocateOnly = false);
 
-        DiskLoc allocExtentArea( int size );
+        DiskLoc allocExtentArea( OperationContext* txn, int size );
 
         DataFileHeader* getHeader() { return header(); }
         const DataFileHeader* getHeader() const { return header(); }

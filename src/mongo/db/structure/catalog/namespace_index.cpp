@@ -32,8 +32,10 @@
 
 #include <boost/filesystem/operations.hpp>
 
+#include "mongo/db/d_concurrency.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/structure/catalog/namespace_details.h"
-
+#include "mongo/util/exit.h"
 
 namespace mongo {
 
@@ -45,36 +47,36 @@ namespace mongo {
     NamespaceDetails* NamespaceIndex::details(const Namespace& ns) {
         if ( !_ht.get() )
             return 0;
-        NamespaceDetails *d = _ht->get(ns);
-        if ( d && d->isCapped() )
-            d->cappedCheckMigrate();
-        return d;
+        return _ht->get(ns);
     }
 
-    void NamespaceIndex::add_ns(const StringData& ns, const DiskLoc& loc, bool capped) {
+    void NamespaceIndex::add_ns( OperationContext* txn,
+                                 const StringData& ns, const DiskLoc& loc, bool capped) {
         NamespaceDetails details( loc, capped );
-        add_ns( ns, &details );
+        add_ns( txn, ns, &details );
     }
 
-    void NamespaceIndex::add_ns( const StringData& ns, const NamespaceDetails* details ) {
+    void NamespaceIndex::add_ns( OperationContext* txn,
+                                 const StringData& ns, const NamespaceDetails* details ) {
         Namespace n(ns);
-        add_ns( n, details );
+        add_ns( txn, n, details );
     }
 
-    void NamespaceIndex::add_ns( const Namespace& ns, const NamespaceDetails* details ) {
+    void NamespaceIndex::add_ns( OperationContext* txn,
+                                 const Namespace& ns, const NamespaceDetails* details ) {
         string nsString = ns.toString();
         Lock::assertWriteLocked( nsString );
         massert( 17315, "no . in ns", nsString.find( '.' ) != string::npos );
-        init();
-        uassert( 10081, "too many namespaces/collections", _ht->put(ns, *details));
+        init( txn );
+        uassert( 10081, "too many namespaces/collections", _ht->put(txn, ns, *details));
     }
 
-    void NamespaceIndex::kill_ns(const StringData& ns) {
+    void NamespaceIndex::kill_ns( OperationContext* txn, const StringData& ns) {
         Lock::assertWriteLocked(ns);
         if ( !_ht.get() )
             return;
         Namespace n(ns);
-        _ht->kill(n);
+        _ht->kill(txn, n);
 
         if (ns.size() <= Namespace::MaxNsColletionLen) {
             // Larger namespace names don't have room for $extras so they can't exist. The code
@@ -83,7 +85,7 @@ namespace mongo {
             for( int i = 0; i<=1; i++ ) {
                 try {
                     Namespace extra(n.extraName(i));
-                    _ht->kill(extra);
+                    _ht->kill(txn, extra);
                 }
                 catch(DBException&) {
                     MONGO_DLOG(3) << "caught exception in kill_ns" << endl;
@@ -130,7 +132,7 @@ namespace mongo {
             MONGO_ASSERT_ON_EXCEPTION_WITH_MSG( boost::filesystem::create_directory( dir ), "create dir for db " );
     }
 
-    NOINLINE_DECL void NamespaceIndex::_init() {
+    NOINLINE_DECL void NamespaceIndex::_init( OperationContext* txn ) {
         verify( !_ht.get() );
 
         Lock::assertWriteLocked(_database);
@@ -167,7 +169,7 @@ namespace mongo {
             maybeMkdir();
             unsigned long long l = storageGlobalParams.lenForNewNsFiles;
             if ( _f.create(pathString, l, true) ) {
-                getDur().createdFile(pathString, l); // always a new file
+                txn->recoveryUnit()->createdFile(pathString, l); // always a new file
                 len = l;
                 verify(len == storageGlobalParams.lenForNewNsFiles);
                 p = _f.getView();
@@ -176,7 +178,7 @@ namespace mongo {
                     // we do this so the durability system isn't mad at us for
                     // only initiating file and not doing a write
                     // grep for 17388
-                    getDur().writingPtr( p, 5 ); // throw away
+                    txn->recoveryUnit()->writingPtr( p, 5 ); // throw away
                 }
             }
         }

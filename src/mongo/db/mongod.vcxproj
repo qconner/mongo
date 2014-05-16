@@ -4474,7 +4474,6 @@ cscript //Nologo "$(ProjectDir)..\shell\createCPPfromJavaScriptFiles.js" "$(Proj
     <ClInclude Include="index_update.h" />
     <ClInclude Include="initialize_server_global_state.h" />
     <ClInclude Include="intervalbtreecursor.h" />
-    <ClInclude Include="jsobjmanipulator.h" />
     <ClInclude Include="key.h" />
     <ClInclude Include="keypattern.h" />
     <ClInclude Include="kill_current_op.h" />
@@ -4587,7 +4586,6 @@ cscript //Nologo "$(ProjectDir)..\shell\createCPPfromJavaScriptFiles.js" "$(Proj
     <ClCompile Include="stats\counters.cpp" />
     <ClCompile Include="stats\snapshots.cpp" />
     <ClCompile Include="stats\top.cpp" />
-    <ClCompile Include="btree.cpp" />
     <ClCompile Include="btreecursor.cpp" />
     <ClCompile Include="repl\health.cpp" />
     <ClCompile Include="repl\rs.cpp" />
@@ -4890,7 +4888,6 @@ cscript //Nologo "$(ProjectDir)..\shell\createCPPfromJavaScriptFiles.js" "$(Proj
     <ClInclude Include="..\scripting\engine_v8.h" />
     <ClInclude Include="..\scripting\v8_db.h" />
     <ClInclude Include="..\scripting\v8_utils.h" />
-    <ClInclude Include="btree.h" />
     <ClInclude Include="repl\health.h" />
     <ClInclude Include="repl\rs.h" />
     <ClInclude Include="repl\rs_config.h" />

@@ -33,10 +33,10 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
-#include "mongo/db/query/multi_plan_runner.h"
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
@@ -44,7 +44,6 @@
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
 
@@ -56,9 +55,6 @@ namespace mongo {
 namespace PlanRankingTests {
 
     static const char* ns = "unittests.PlanRankingTests";
-
-    // The name of the "fetch always required" failpoint.
-    static const char* kFetchFpName = "fetchInMemoryFail";
 
     class PlanRankingTestBase {
     public:
@@ -105,47 +101,32 @@ namespace PlanRankingTests {
             ASSERT_GREATER_THAN_OR_EQUALS(solutions.size(), 1U);
 
             // Fill out the MPR.
-            _mpr.reset(new MultiPlanRunner(collection, cq));
-
+            _mps.reset(new MultiPlanStage(collection, cq));
+            WorkingSet* ws = new WorkingSet();
             // Put each solution from the planner into the MPR.
             for (size_t i = 0; i < solutions.size(); ++i) {
-                WorkingSet* ws;
                 PlanStage* root;
-                ASSERT(StageBuilder::build(*solutions[i], &root, &ws));
+                ASSERT(StageBuilder::build(collection, *solutions[i], ws, &root));
                 // Takes ownership of all arguments.
-                _mpr->addPlan(solutions[i], root, ws);
+                _mps->addPlan(solutions[i], root, ws);
             }
 
-            // And return a pointer to the best solution.  The MPR owns the pointer.
-            size_t bestPlan = numeric_limits<size_t>::max();
-            BSONObj unused;
-            ASSERT(_mpr->pickBestPlan(&bestPlan, &unused));
-            ASSERT_LESS_THAN(bestPlan, solutions.size());
-            // This is what sets a backup plan, should we test for it.
-            _mpr->cacheBestPlan();
-            return solutions[bestPlan];
+            _mps->pickBestPlan(); // This is what sets a backup plan, should we test for it.
+            ASSERT(_mps->bestPlanChosen());
+
+            size_t bestPlanIdx = _mps->bestPlanIdx();
+            ASSERT_LESS_THAN(bestPlanIdx, solutions.size());
+
+            // And return a pointer to the best solution.
+            return _mps->bestSolution();
         }
 
         /**
          * Was a backup plan picked during the ranking process?
          */
         bool hasBackupPlan() const {
-            ASSERT(NULL != _mpr.get());
-            return _mpr->hasBackupPlan();
-        }
-
-        void turnOnAlwaysFetch() {
-            FailPointRegistry* registry = getGlobalFailPointRegistry();
-            FailPoint* failPoint = registry->getFailPoint(kFetchFpName);
-            ASSERT(NULL != failPoint);
-            failPoint->setMode(FailPoint::alwaysOn);
-        }
-
-        void turnOffAlwaysFetch() {
-            FailPointRegistry* registry = getGlobalFailPointRegistry();
-            FailPoint* failPoint = registry->getFailPoint(kFetchFpName);
-            ASSERT(NULL != failPoint);
-            failPoint->setMode(FailPoint::off);
+            ASSERT(NULL != _mps.get());
+            return _mps->hasBackupPlan();
         }
 
     protected:
@@ -156,7 +137,7 @@ namespace PlanRankingTests {
 
     private:
         static DBDirectClient _client;
-        scoped_ptr<MultiPlanRunner> _mpr;
+        scoped_ptr<MultiPlanStage> _mps;
         // Holds the value of global "internalQueryForceIntersectionPlans" setParameter flag.
         // Restored at end of test invocation regardless of test result.
         bool _internalQueryForceIntersectionPlans;
@@ -463,9 +444,6 @@ namespace PlanRankingTests {
     class PlanRankingIxisectCovered : public PlanRankingTestBase {
     public:
         void run() {
-            // Simulate needing lots of FETCH's.
-            turnOnAlwaysFetch();
-
             // Neither 'a' nor 'b' is selective.
             for (int i = 0; i < N; ++i) {
                 insert(BSON("a" << 1 << "b" << 1));
@@ -492,8 +470,6 @@ namespace PlanRankingTests {
                     "{ixscan: {filter: null, pattern: {a:1}}},"
                     "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                 soln->root.get()));
-
-            turnOffAlwaysFetch();
         }
     };
 
@@ -506,9 +482,6 @@ namespace PlanRankingTests {
     class PlanRankingIxisectNonCovered : public PlanRankingTestBase {
     public:
         void run() {
-            // Simulate needing lots of FETCH's.
-            turnOnAlwaysFetch();
-
             // Neither 'a' nor 'b' is selective.
             for (int i = 0; i < N; ++i) {
                 insert(BSON("a" << 1 << "b" << 1));
@@ -535,8 +508,6 @@ namespace PlanRankingTests {
                         "{fetch: {node: {ixscan: {pattern: {b: 1}}}}}",
                         soln->root.get());
             ASSERT(bestIsScanOverA || bestIsScanOverB);
-
-            turnOffAlwaysFetch();
         }
     };
 
@@ -549,9 +520,6 @@ namespace PlanRankingTests {
     class PlanRankingNonCoveredIxisectFetchesLess : public PlanRankingTestBase {
     public:
         void run() {
-            // Simulate needing lots of FETCH's.
-            turnOnAlwaysFetch();
-
             // Set up data so that the following conditions hold:
             //  1) Documents matching {a: 1} are of high cardinality.
             //  2) Documents matching {b: 1} are of high cardinality.
@@ -587,8 +555,6 @@ namespace PlanRankingTests {
                     "{ixscan: {filter: null, pattern: {a:1}}},"
                     "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                 soln->root.get()));
-
-            turnOffAlwaysFetch();
         }
     };
 
@@ -599,9 +565,6 @@ namespace PlanRankingTests {
     class PlanRankingIxisectHitsEOFFirst : public PlanRankingTestBase {
     public:
         void run() {
-            // Simulate needing lots of FETCH's.
-            turnOnAlwaysFetch();
-
             // Set up the data so that for the query {a: 1, b: 1}, the
             // intersection is empty. The single index plans have to do
             // more fetching from disk in order to determine that the result
@@ -633,8 +596,6 @@ namespace PlanRankingTests {
                     "{ixscan: {filter: null, pattern: {a:1}}},"
                     "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                 soln->root.get()));
-
-            turnOffAlwaysFetch();
         }
     };
 
@@ -646,9 +607,6 @@ namespace PlanRankingTests {
     class PlanRankingChooseBetweenIxisectPlans : public PlanRankingTestBase {
     public:
         void run() {
-            // Simulate needing lots of FETCH's.
-            turnOnAlwaysFetch();
-
             // Set up the data so that for the query {a: 1, b: 1, c: 1}, the intersection
             // between 'b' and 'c' is small, and the other intersections are larger.
             for (int i = 0; i < 10; ++i) {
@@ -681,8 +639,6 @@ namespace PlanRankingTests {
                     "{ixscan: {filter: null, pattern: {b:1}}},"
                     "{ixscan: {filter: null, pattern: {c:1}}}]}}}}",
                 soln->root.get()));
-
-            turnOffAlwaysFetch();
         }
     };
 
@@ -750,6 +706,7 @@ namespace PlanRankingTests {
 
             // Use index on 'b'.
             QuerySolution* soln = pickBestPlan(cq);
+            std::cerr << "PlanRankingWorkPlansLongEnough: soln=" << soln->toString() << std::endl;
             ASSERT(QueryPlannerTestLib::solutionMatches(
                         "{fetch: {node: {ixscan: {pattern: {b: 1}}}}}",
                         soln->root.get()));
@@ -769,11 +726,12 @@ namespace PlanRankingTests {
             add<PlanRankingPreferImmediateEOF>();
             add<PlanRankingNoCollscan>();
             add<PlanRankingCollscan>();
-            add<PlanRankingIxisectCovered>();
-            add<PlanRankingIxisectNonCovered>();
-            add<PlanRankingNonCoveredIxisectFetchesLess>();
-            add<PlanRankingIxisectHitsEOFFirst>();
-            add<PlanRankingChooseBetweenIxisectPlans>();
+            // TODO: These don't work without counting FETCH and FETCH is now gone.
+            // add<PlanRankingIxisectCovered>();
+            // add<PlanRankingIxisectNonCovered>();
+            // add<PlanRankingNonCoveredIxisectFetchesLess>();
+            // add<PlanRankingIxisectHitsEOFFirst>();
+            // add<PlanRankingChooseBetweenIxisectPlans>();
             add<PlanRankingAvoidBlockingSort>();
             add<PlanRankingWorkPlansLongEnough>();
         }

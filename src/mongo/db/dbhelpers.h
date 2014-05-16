@@ -42,6 +42,7 @@ namespace mongo {
 
     class Collection;
     class Cursor;
+    class OperationContext;
 
     /**
      * db helpers are helper functions and classes that let us easily manipulate the local
@@ -63,11 +64,11 @@ namespace mongo {
 
            Note: does nothing if collection does not yet exist.
         */
-        static void ensureIndex(const char *ns, BSONObj keyPattern, bool unique, const char *name);
-
-        // same as other ensureIndex
-        static void ensureIndex(Collection* collection,
-                                BSONObj keyPattern, bool unique, const char *name);
+        static void ensureIndex(OperationContext* txn,
+                                Collection* collection,
+                                BSONObj keyPattern,
+                                bool unique,
+                                const char *name);
 
         /* fetch a single object from collection ns that matches query.
            set your db SavedContext first.
@@ -80,8 +81,12 @@ namespace mongo {
 
            @return true if object found
         */
-        static bool findOne(const StringData& ns, const BSONObj &query, BSONObj& result, bool requireIndex = false);
-        static DiskLoc findOne(const StringData& ns, const BSONObj &query, bool requireIndex);
+        static bool findOne(Collection* collection,
+                            const BSONObj &query,
+                            BSONObj& result, 
+                            bool requireIndex = false);
+
+        static DiskLoc findOne(Collection* collection, const BSONObj &query, bool requireIndex);
 
         /**
          * have to be locked already
@@ -92,8 +97,8 @@ namespace mongo {
          * @param foundIndex if passed in will be set to 1 if ns and index found
          * @return true if object found
          */
-        static bool findById(Client&, const char *ns, BSONObj query, BSONObj& result ,
-                             bool * nsFound = 0 , bool * indexFound = 0 );
+        static bool findById(Database* db, const char *ns, BSONObj query, BSONObj& result,
+                             bool* nsFound = 0, bool* indexFound = 0 );
 
         /* TODO: should this move into Collection?
          * uasserts if no _id index.
@@ -108,8 +113,8 @@ namespace mongo {
             @return true if object exists.
         */
         static bool getSingleton(const char *ns, BSONObj& result);
-        static void putSingleton(const char *ns, BSONObj obj);
-        static void putSingletonGod(const char *ns, BSONObj obj, bool logTheOp);
+        static void putSingleton(OperationContext* txn, const char *ns, BSONObj obj);
+        static void putSingletonGod(OperationContext* txn, const char *ns, BSONObj obj, bool logTheOp);
         static bool getFirst(const char *ns, BSONObj& result) { return getSingleton(ns, result); }
         static bool getLast(const char *ns, BSONObj& result); // get last object int he collection; e.g. {$natural : -1}
 
@@ -118,7 +123,10 @@ namespace mongo {
          * you do not have to have Context set
          * o has to have an _id field or will assert
          */
-        static void upsert( const string& ns , const BSONObj& o, bool fromMigrate = false );
+        static void upsert( OperationContext* txn,
+                            const string& ns,
+                            const BSONObj& o,
+                            bool fromMigrate = false );
 
         /** You do not need to set the database before calling.
             @return true if collection is empty.
@@ -154,7 +162,8 @@ namespace mongo {
          * Does oplog the individual document deletions.
          * // TODO: Refactor this mechanism, it is growing too large
          */
-        static long long removeRange( const KeyRange& range,
+        static long long removeRange( OperationContext* txn,
+                                      const KeyRange& range,
                                       bool maxInclusive = false,
                                       bool secondaryThrottle = false,
                                       RemoveSaver* callback = NULL,
@@ -192,7 +201,7 @@ namespace mongo {
          * You do not need to set the database before calling.
          * Does not oplog the operation.
          */
-        static void emptyCollection(const char *ns);
+        static void emptyCollection(OperationContext* txn, const char *ns);
 
         /**
          * for saving deleted bson objects to a flat file

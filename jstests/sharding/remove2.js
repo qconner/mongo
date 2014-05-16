@@ -78,7 +78,8 @@ var st = new ShardingTest( testName = "remove2",
                            { chunkSize : 1,
                              rs : true,
                              rs0 : { nodes : 2 },
-                             rs1 : { nodes : 2 }
+                             rs1 : { nodes : 2 },
+                             enableBalancer: true
                            });
 
 // Pending resolution of SERVER-8598, we need to wait for deletion after chunk migrations to avoid
@@ -110,11 +111,12 @@ var str = 'a';
 while( str.length < 1024 * 16 ) {
     str += str;
 }
-for( var i = 0; i < 300; i++ ){
-    coll.insert( { i : i % 10, str : str } );
-}
 
-coll.getDB().getLastError();
+var bulk = coll.initializeUnorderedBulkOp();
+for( var i = 0; i < 300; i++ ){
+    bulk.insert({ i: i % 10, str: str });
+}
+assert.writeOK(bulk.execute());
 
 assert.eq( 300, coll.find().itcount() );
 

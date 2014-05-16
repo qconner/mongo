@@ -32,6 +32,7 @@
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -64,6 +65,7 @@ namespace {
 }
 
     boost::shared_ptr<Runner> PipelineD::prepareCursorSource(
+            Collection* collection,
             const intrusive_ptr<Pipeline>& pPipeline,
             const intrusive_ptr<ExpressionContext>& pExpCtx) {
         // get the full "namespace" name
@@ -152,6 +154,9 @@ namespace {
                                    ;
         boost::shared_ptr<Runner> runner;
         bool sortInRunner = false;
+
+        const WhereCallbackReal whereCallback(pExpCtx->ns.db());
+
         if (sortStage) {
             CanonicalQuery* cq;
             Status status =
@@ -159,9 +164,10 @@ namespace {
                                              queryObj,
                                              sortObj,
                                              projectionForQuery,
-                                             &cq);
+                                             &cq,
+                                             whereCallback);
             Runner* rawRunner;
-            if (status.isOK() && getRunner(cq, &rawRunner, runnerOptions).isOK()) {
+            if (status.isOK() && getRunner(collection, cq, &rawRunner, runnerOptions).isOK()) {
                 // success: The Runner will handle sorting for us using an index.
                 runner.reset(rawRunner);
                 sortInRunner = true;
@@ -182,16 +188,16 @@ namespace {
                                              queryObj,
                                              noSort,
                                              projectionForQuery,
-                                             &cq));
+                                             &cq,
+                                             whereCallback));
 
             Runner* rawRunner;
-            uassertStatusOK(getRunner(cq, &rawRunner, runnerOptions));
+            uassertStatusOK(getRunner(collection, cq, &rawRunner, runnerOptions));
             runner.reset(rawRunner);
         }
 
 
         // DocumentSourceCursor expects a yielding Runner that has had its state saved.
-        runner->setYieldPolicy(Runner::YIELD_AUTO);
         runner->saveState();
 
         // Put the Runner into a DocumentSourceCursor and add it to the front of the pipeline.

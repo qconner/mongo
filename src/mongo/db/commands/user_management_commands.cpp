@@ -123,6 +123,7 @@ namespace mongo {
                                       const UserName& userName,
                                       unordered_set<RoleName>* roles) {
         User* user;
+        authzManager->invalidateUserByName(userName); // Need to make sure cache entry is up to date
         Status status = authzManager->acquireUser(userName, &user);
         if (!status.isOK()) {
             return status;
@@ -306,17 +307,11 @@ namespace mongo {
 
         CmdCreateUser() : Command("createUser") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Adds a user to the system" << endl;
@@ -346,7 +341,7 @@ namespace mongo {
             return checkAuthorizedToGrantRoles(authzSession, args.roles);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -472,17 +467,11 @@ namespace mongo {
 
         CmdUpdateUser() : Command("updateUser") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Used to update a user, for example to change its password" << endl;
@@ -538,7 +527,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -629,17 +618,11 @@ namespace mongo {
 
         CmdDropUser() : Command("dropUser") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops a single user." << endl;
@@ -668,7 +651,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -731,17 +714,11 @@ namespace mongo {
 
         CmdDropAllUsersFromDatabase() : Command("dropAllUsersFromDatabase") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops all users for a single database." << endl;
@@ -760,7 +737,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -812,17 +789,11 @@ namespace mongo {
 
         CmdGrantRolesToUser() : Command("grantRolesToUser") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Grants roles to a user." << endl;
@@ -848,7 +819,7 @@ namespace mongo {
             return checkAuthorizedToGrantRoles(authzSession, roles);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -916,17 +887,11 @@ namespace mongo {
 
         CmdRevokeRolesFromUser() : Command("revokeRolesFromUser") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Revokes roles from a user." << endl;
@@ -952,7 +917,7 @@ namespace mongo {
             return checkAuthorizedToRevokeRoles(authzSession, roles);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1018,10 +983,6 @@ namespace mongo {
     class CmdUsersInfo: public Command {
     public:
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
@@ -1030,9 +991,7 @@ namespace mongo {
             return true;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         CmdUsersInfo() : Command("usersInfo") {}
 
@@ -1074,7 +1033,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1177,17 +1136,11 @@ namespace mongo {
 
         CmdCreateRole() : Command("createRole") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Adds a role to the system" << endl;
@@ -1222,7 +1175,7 @@ namespace mongo {
             return checkAuthorizedToGrantPrivileges(authzSession, args.privileges);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1328,17 +1281,11 @@ namespace mongo {
 
         CmdUpdateRole() : Command("updateRole") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Used to update a role" << endl;
@@ -1374,7 +1321,7 @@ namespace mongo {
             return checkAuthorizedToGrantPrivileges(authzSession, args.privileges);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1464,17 +1411,11 @@ namespace mongo {
 
         CmdGrantPrivilegesToRole() : Command("grantPrivilegesToRole") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Grants privileges to a role" << endl;
@@ -1501,7 +1442,7 @@ namespace mongo {
             return checkAuthorizedToGrantPrivileges(authzSession, privileges);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1606,17 +1547,11 @@ namespace mongo {
 
         CmdRevokePrivilegesFromRole() : Command("revokePrivilegesFromRole") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Revokes privileges from a role" << endl;
@@ -1643,7 +1578,7 @@ namespace mongo {
             return checkAuthorizedToRevokePrivileges(authzSession, privileges);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1750,17 +1685,11 @@ namespace mongo {
 
         CmdGrantRolesToRole() : Command("grantRolesToRole") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Grants roles to another role." << endl;
@@ -1786,7 +1715,7 @@ namespace mongo {
             return checkAuthorizedToGrantRoles(authzSession, roles);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1875,17 +1804,11 @@ namespace mongo {
 
         CmdRevokeRolesFromRole() : Command("revokeRolesFromRole") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Revokes roles from another role." << endl;
@@ -1911,7 +1834,7 @@ namespace mongo {
             return checkAuthorizedToRevokeRoles(authzSession, roles);
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -1994,17 +1917,11 @@ namespace mongo {
 
         CmdDropRole() : Command("dropRole") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops a single role.  Before deleting the role completely it must remove it "
@@ -2036,7 +1953,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -2177,17 +2094,11 @@ namespace mongo {
 
         CmdDropAllRolesFromDatabase() : Command("dropAllRolesFromDatabase") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops all roles from the given database.  Before deleting the roles completely "
@@ -2210,7 +2121,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -2313,10 +2224,6 @@ namespace mongo {
     class CmdRolesInfo: public Command {
     public:
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
@@ -2325,9 +2232,7 @@ namespace mongo {
             return true;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         CmdRolesInfo() : Command("rolesInfo") {}
 
@@ -2371,7 +2276,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -2424,17 +2329,15 @@ namespace mongo {
     class CmdInvalidateUserCache: public Command {
     public:
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return true;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
+        virtual bool adminOnly() const {
+            return true;
         }
+
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         CmdInvalidateUserCache() : Command("invalidateUserCache") {}
 
@@ -2453,7 +2356,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -2466,6 +2369,51 @@ namespace mongo {
         }
 
     } cmdInvalidateUserCache;
+
+    class CmdGetCacheGeneration: public Command {
+    public:
+
+        virtual bool slaveOk() const {
+            return true;
+        }
+
+        virtual bool adminOnly() const {
+            return true;
+        }
+
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+
+        CmdGetCacheGeneration() : Command("_getUserCacheGeneration") {}
+
+        virtual void help(stringstream& ss) const {
+            ss << "internal" << endl;
+        }
+
+        virtual Status checkAuthForCommand(ClientBasic* client,
+                                           const std::string& dbname,
+                                           const BSONObj& cmdObj) {
+            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            if (!authzSession->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forClusterResource(), ActionType::internal)) {
+                return Status(ErrorCodes::Unauthorized, "Not authorized to get cache generation");
+            }
+            return Status::OK();
+        }
+
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int options,
+                 string& errmsg,
+                 BSONObjBuilder& result,
+                 bool fromRepl) {
+
+            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
+            result.append("cacheGeneration", authzManager->getCacheGeneration());
+            return true;
+        }
+
+    } CmdGetCacheGeneration;
 
     /**
      * This command is used only by mongorestore to handle restoring users/roles.  We do this so
@@ -2482,17 +2430,11 @@ namespace mongo {
 
         CmdMergeAuthzCollections() : Command("_mergeAuthzCollections") {}
 
-        virtual bool logTheOp() {
-            return false;
-        }
-
         virtual bool slaveOk() const {
             return false;
         }
 
-        virtual LockType locktype() const {
-            return NONE;
-        }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual bool adminOnly() const {
             return true;
@@ -2867,7 +2809,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -2930,7 +2872,7 @@ namespace mongo {
 
     bool CmdAuthSchemaUpgrade::slaveOk() const { return false; }
     bool CmdAuthSchemaUpgrade::adminOnly() const { return true; }
-    Command::LockType CmdAuthSchemaUpgrade::locktype() const { return NONE; }
+    bool CmdAuthSchemaUpgrade::isWriteCommandForConfigServer() const { return false; }
 
     void CmdAuthSchemaUpgrade::help(stringstream& ss) const {
         ss << "Upgrades the auth data storage schema";

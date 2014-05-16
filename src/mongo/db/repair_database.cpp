@@ -38,10 +38,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
-#include "mongo/db/cloner.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/structure/collection_iterator.h"
 #include "mongo/util/file.h"
 #include "mongo/util/file_allocator.h"
 
@@ -228,10 +225,12 @@ namespace mongo {
 
     class RepairFileDeleter {
     public:
-        RepairFileDeleter( const string& dbName,
+        RepairFileDeleter( OperationContext* txn,
+                           const string& dbName,
                            const string& pathString,
                            const Path& path )
-            : _dbName( dbName ),
+            : _txn(txn),
+              _dbName( dbName ),
               _pathString( pathString ),
               _path( path ),
               _success( false ) {
@@ -245,7 +244,7 @@ namespace mongo {
                   << "db: " << _dbName << " path: " << _pathString;
 
             try {
-                getDur().syncDataAndTruncateJournal();
+                _txn->recoveryUnit()->syncDataAndTruncateJournal();
                 MongoFile::flushAll(true); // need both in case journaling is disabled
                 {
                     Client::Context tempContext( _dbName, _pathString );
@@ -265,13 +264,15 @@ namespace mongo {
         }
 
     private:
+        OperationContext* _txn;
         string _dbName;
         string _pathString;
         Path _path;
         bool _success;
     };
 
-    Status repairDatabase( string dbName,
+    Status repairDatabase( OperationContext* txn,
+                           string dbName,
                            bool preserveClonedFilesOnFailure,
                            bool backupOriginalFiles ) {
         scoped_ptr<RepairFileDeleter> repairFileDeleter;
@@ -280,12 +281,9 @@ namespace mongo {
 
         log() << "repairDatabase " << dbName << endl;
 
-        invariant( cc().database()->name() == dbName );
-        invariant( cc().database()->path() == storageGlobalParams.dbpath );
-
         BackgroundOperation::assertNoBgOpInProgForDb(dbName);
 
-        getDur().syncDataAndTruncateJournal(); // Must be done before and after repair
+        txn->recoveryUnit()->syncDataAndTruncateJournal(); // Must be done before and after repair
 
         intmax_t totalSize = dbSize( dbName );
         intmax_t freeSize = File::freeSpace(storageGlobalParams.repairpath);
@@ -297,7 +295,7 @@ namespace mongo {
                            << " (bytes) because free disk space is: " << freeSize << " (bytes)" );
         }
 
-        killCurrentOp.checkForInterrupt();
+        txn->checkForInterrupt();
 
         Path reservedPath =
             uniqueReservedPath( ( preserveClonedFilesOnFailure || backupOriginalFiles ) ?
@@ -306,7 +304,8 @@ namespace mongo {
         string reservedPathString = reservedPath.string();
 
         if ( !preserveClonedFilesOnFailure )
-            repairFileDeleter.reset( new RepairFileDeleter( dbName,
+            repairFileDeleter.reset( new RepairFileDeleter( txn,
+                                                            dbName,
                                                             reservedPathString,
                                                             reservedPath ) );
 
@@ -328,7 +327,7 @@ namespace mongo {
                 Client::Context ctx( ns );
                 Collection* coll = originalDatabase->getCollection( ns );
                 if ( coll ) {
-                    scoped_ptr<CollectionIterator> it( coll->getIterator( DiskLoc(),
+                    scoped_ptr<RecordIterator> it( coll->getIterator( DiskLoc(),
                                                                           false,
                                                                           CollectionScanParams::FORWARD ) );
                     while ( !it->isEOF() ) {
@@ -368,16 +367,16 @@ namespace mongo {
                 Collection* tempCollection = NULL;
                 {
                     Client::Context tempContext( ns, tempDatabase );
-                    tempCollection = tempDatabase->createCollection( ns, options, true, false );
+                    tempCollection = tempDatabase->createCollection( txn, ns, options, true, false );
                 }
 
                 Client::Context readContext( ns, originalDatabase );
-                Collection* originalCollection = originalDatabase->getCollection( ns );
+                Collection* originalCollection = originalDatabase->getCollection( txn, ns );
                 invariant( originalCollection );
 
                 // data
 
-                MultiIndexBlock indexBlock( tempCollection );
+                MultiIndexBlock indexBlock(txn, tempCollection );
                 {
                     vector<BSONObj> indexes;
                     IndexCatalog::IndexIterator ii =
@@ -394,7 +393,7 @@ namespace mongo {
 
                 }
 
-                scoped_ptr<CollectionIterator> iterator( originalCollection->getIterator( DiskLoc(),
+                scoped_ptr<RecordIterator> iterator( originalCollection->getIterator( DiskLoc(),
                                                                                           false,
                                                                                           CollectionScanParams::FORWARD ) );
                 while ( !iterator->isEOF() ) {
@@ -404,12 +403,12 @@ namespace mongo {
                     BSONObj doc = originalCollection->docFor( loc );
 
                     Client::Context tempContext( ns, tempDatabase );
-                    StatusWith<DiskLoc> result = tempCollection->insertDocument( doc, indexBlock );
+                    StatusWith<DiskLoc> result = tempCollection->insertDocument( txn, doc, indexBlock );
                     if ( !result.isOK() )
                         return result.getStatus();
 
-                    getDur().commitIfNeeded();
-                    killCurrentOp.checkForInterrupt(false);
+                    txn->recoveryUnit()->commitIfNeeded();
+                    txn->checkForInterrupt(false);
                 }
 
                 {
@@ -421,30 +420,41 @@ namespace mongo {
 
             }
 
-            getDur().syncDataAndTruncateJournal();
+            txn->recoveryUnit()->syncDataAndTruncateJournal();
             MongoFile::flushAll(true); // need both in case journaling is disabled
 
-            killCurrentOp.checkForInterrupt(false);
+            txn->checkForInterrupt(false);
 
             Client::Context tempContext( dbName, reservedPathString );
             Database::closeDatabase( dbName, reservedPathString );
         }
 
+        // at this point if we abort, we don't want to delete new files
+        // as they might be the only copies
+
+        if ( repairFileDeleter.get() )
+            repairFileDeleter->success();
+
         Client::Context ctx( dbName );
         Database::closeDatabase(dbName, storageGlobalParams.dbpath);
-
 
         if ( backupOriginalFiles ) {
             _renameForBackup( dbName, reservedPath );
         }
         else {
-            _deleteDataFiles( dbName );
-            MONGO_ASSERT_ON_EXCEPTION(
-                    boost::filesystem::create_directory(Path(storageGlobalParams.dbpath) / dbName));
-        }
+            // first make new directory before deleting data
+            Path newDir = Path(storageGlobalParams.dbpath) / dbName;
+            MONGO_ASSERT_ON_EXCEPTION(boost::filesystem::create_directory(newDir));
 
-        if ( repairFileDeleter.get() )
-            repairFileDeleter->success();
+            // this deletes old files
+            _deleteDataFiles( dbName );
+
+            if ( !boost::filesystem::exists(newDir) ) {
+                // we deleted because of directoryperdb
+                // re-create
+                MONGO_ASSERT_ON_EXCEPTION(boost::filesystem::create_directory(newDir));
+            }
+        }
 
         _replaceWithRecovered( dbName, reservedPathString.c_str() );
 

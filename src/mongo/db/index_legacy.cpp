@@ -34,7 +34,6 @@
 #include "mongo/db/index/s2_access_method.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 
 namespace mongo {
 
@@ -78,18 +77,6 @@ namespace mongo {
             BSONObjBuilder b;
             b.appendNull("");
             return b.obj();
-        }
-    }
-
-    // static
-    void IndexLegacy::postBuildHook(Collection* collection, const BSONObj& keyPattern) {
-        // If it's an FTS index, we want to set the power of 2 flag.
-        string pluginName = collection->getIndexCatalog()->getAccessMethodName(keyPattern);
-        if (IndexNames::TEXT == pluginName) {
-            NamespaceDetails* nsd = collection->details();
-            if (nsd->setUserFlag(NamespaceDetails::Flag_UsePowerOf2Sizes)) {
-                nsd->syncUserFlags(collection->ns().ns());
-            }
         }
     }
 

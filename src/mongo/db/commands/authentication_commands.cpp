@@ -91,16 +91,15 @@ namespace mongo {
             _random(SecureRandom::create()) {
         }
 
-        virtual bool logTheOp() { return false; }
         virtual bool slaveOk() const {
             return true;
         }
         void help(stringstream& h) const { h << "internal"; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        bool run(const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             nonce64 n = getNextNonce();
             stringstream ss;
             ss << hex << n;
@@ -134,7 +133,7 @@ namespace mongo {
         }
     }
 
-    bool CmdAuthenticate::run(const string& dbname,
+    bool CmdAuthenticate::run(OperationContext* txn, const string& dbname,
                               BSONObj& cmdObj,
                               int,
                               string& errmsg,
@@ -303,14 +302,18 @@ namespace mongo {
         }
         else {
             std::string srvSubjectName = getSSLManager()->getServerSubjectName();
-            std::string srvClusterId = srvSubjectName.substr(srvSubjectName.find(",OU="));
-            std::string peerClusterId = subjectName.substr(subjectName.find(",OU="));
+            
+            size_t srvClusterIdPos = srvSubjectName.find(",OU=");
+            size_t peerClusterIdPos = subjectName.find(",OU=");
 
-            fassert(17002, !srvClusterId.empty() && srvClusterId != srvSubjectName);
+            std::string srvClusterId = srvClusterIdPos != std::string::npos ? 
+                srvSubjectName.substr(srvClusterIdPos) : "";
+            std::string peerClusterId = peerClusterIdPos != std::string::npos ? 
+                subjectName.substr(peerClusterIdPos) : "";
 
             // Handle internal cluster member auth, only applies to server-server connections
             int clusterAuthMode = serverGlobalParams.clusterAuthMode.load(); 
-            if (srvClusterId == peerClusterId) {
+            if (srvClusterId == peerClusterId && !srvClusterId.empty()) {
                 if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_undefined ||
                     clusterAuthMode == ServerGlobalParams::ClusterAuthMode_keyFile) {
                     return Status(ErrorCodes::AuthenticationFailed, "The provided certificate " 
@@ -339,9 +342,6 @@ namespace mongo {
 
     class CmdLogout : public Command {
     public:
-        virtual bool logTheOp() {
-            return false;
-        }
         virtual bool slaveOk() const {
             return true;
         }
@@ -349,9 +349,9 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         void help(stringstream& h) const { h << "de-authenticate"; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         CmdLogout() : Command("logout") {}
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,

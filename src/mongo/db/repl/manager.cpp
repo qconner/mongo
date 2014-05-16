@@ -29,18 +29,13 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/db/repl/manager.h"
 
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/rs.h"
 #include "mongo/db/client.h"
 
 namespace mongo {
-
-    enum {
-        NOPRIMARY = -2,
-        SELFPRIMARY = -1
-    };
 
     /* check members OTHER THAN US to see if they think they are primary */
     const Member * Manager::findOtherPrimary(bool& two) {
@@ -64,7 +59,7 @@ namespace mongo {
     }
 
     Manager::Manager(ReplSetImpl *_rs) :
-        task::Server("rsMgr"), rs(_rs), busyWithElectSelf(false), _primary(NOPRIMARY) {
+        task::Server("rsMgr"), rs(_rs), busyWithElectSelf(false) {
     }
 
     Manager::~Manager() {
@@ -205,9 +200,6 @@ namespace mongo {
     /** called as the health threads get new results */
     void Manager::msgCheckNewState() {
         {
-            theReplSet->assertValid();
-            rs->assertValid();
-
             RSBase::lock lk(rs);
 
             if( busyWithElectSelf ) return;

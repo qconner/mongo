@@ -33,10 +33,13 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 
+
 namespace mongo {
 
     class CanonicalQuery;
+    class Database;
     class DeleteRequest;
+    class OperationContext;
 
     /**
      * Implementation of the processing of a delete operation in a mongod.
@@ -89,7 +92,7 @@ namespace mongo {
          *
          * Returns the number of documents deleted.
          */
-        long long execute();
+        long long execute(OperationContext* txn, Database* db);
 
     private:
         /// Unowned pointer to the request object that this executor will process.

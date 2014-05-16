@@ -438,7 +438,7 @@ ReplSetTest.prototype.initiate = function( cfg , initCmd , timeout ) {
     var config  = cfg || this.getReplSetConfig();
     var cmd     = {};
     var cmdKey  = initCmd || 'replSetInitiate';
-    var timeout = timeout || 30000;
+    var timeout = timeout || 60000;
     cmd[cmdKey] = config;
     printjson(cmd);
 
@@ -493,7 +493,15 @@ ReplSetTest.prototype.awaitReplication = function(timeout) {
     print("ReplSetTest awaitReplication: starting: timestamp for primary, " +
           name + ", is " + tojson(this.latest));
 
-    var configVersion = this.liveNodes.master.getDB("local")['system.replset'].findOne().version;
+    // get the latest config version from master. if there is a problem, grab master and try again
+    var configVersion;
+    try {
+        configVersion = this.liveNodes.master.getDB("local")['system.replset'].findOne().version;
+    }
+    catch(e) {
+        this.getMaster();
+        configVersion = this.liveNodes.master.getDB("local")['system.replset'].findOne().version;
+    }
 
     var self = this;
     assert.soon( function() {
@@ -958,10 +966,11 @@ ReplSetTest.prototype.overflow = function( secondaries ){
     while (count != prevCount) {
       
       print("ReplSetTest overflow inserting 10000");
-      
+      var bulk = overflowColl.initializeUnorderedBulkOp();
       for (var i = 0; i < 10000; i++) {
-          overflowColl.insert({ overflow : "value" });
+          bulk.insert({ overflow : "value" });
       }
+      bulk.execute();
       prevCount = count;
       this.awaitReplication();
       

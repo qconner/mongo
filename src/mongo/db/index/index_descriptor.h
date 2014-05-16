@@ -32,9 +32,7 @@
 
 #include <string>
 
-#include "mongo/db/structure/catalog/index_details.h"  // For IndexDetails.
 #include "mongo/db/jsobj.h"
-#include "mongo/db/structure/catalog/namespace_details.h"  // For NamespaceDetails.
 #include "mongo/db/catalog/collection.h"
 
 #include "mongo/util/stacktrace.h"
@@ -67,13 +65,13 @@ namespace mongo {
               _keyPattern(infoObj.getObjectField("key").getOwned()),
               _indexName(infoObj.getStringField("name")),
               _parentNS(infoObj.getStringField("ns")),
-              _isIdIndex(IndexDetails::isIdIndexPattern( _keyPattern )),
+              _isIdIndex(isIdIndexPattern( _keyPattern )),
               _sparse(infoObj["sparse"].trueValue()),
               _dropDups(infoObj["dropDups"].trueValue()),
               _unique( _isIdIndex || infoObj["unique"].trueValue() ),
               _cachedEntry( NULL )
         {
-            _indexNamespace = _parentNS + ".$" + _indexName;
+            _indexNamespace = makeIndexNamespace( _parentNS, _indexName );
 
             _version = 0;
             BSONElement e = _infoObj["v"];
@@ -155,10 +153,28 @@ namespace mongo {
         // Return the info object.
         const BSONObj& infoObj() const { _checkOk(); return _infoObj; }
 
-        // this is the owner of this IndexDescriptor
-        IndexCatalog* getIndexCatalog() const { return _collection->getIndexCatalog(); }
+        // Both the collection and the catalog must outlive the IndexDescriptor
+        const Collection* getCollection() const { return _collection; }
+        const IndexCatalog* getIndexCatalog() const { return _collection->getIndexCatalog(); }
 
         bool areIndexOptionsEquivalent( const IndexDescriptor* other ) const;
+
+        static bool isIdIndexPattern( const BSONObj &pattern ) {
+            BSONObjIterator i(pattern);
+            BSONElement e = i.next();
+            //_id index must have form exactly {_id : 1} or {_id : -1}.
+            //Allows an index of form {_id : "hashed"} to exist but
+            //do not consider it to be the primary _id index
+            if(! ( strcmp(e.fieldName(), "_id") == 0
+                   && (e.numberInt() == 1 || e.numberInt() == -1)))
+                return false;
+             return i.next().eoo();
+        }
+
+        static string makeIndexNamespace( const StringData& ns,
+                                          const StringData& name ) {
+            return ns.toString() + ".$" + name.toString();
+        }
 
     private:
 

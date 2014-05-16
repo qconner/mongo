@@ -38,23 +38,19 @@ from itertools import izip
 import glob
 from optparse import OptionParser
 import os
-import parser
 import pprint
 import re
-import shutil
 import shlex
 import socket
 import stat
-from subprocess import (Popen,
-                        PIPE,
-                        STDOUT,
-                        call)
+from subprocess import (PIPE, Popen, STDOUT)
 import sys
 import time
 
 from pymongo import Connection
 from pymongo.errors import OperationFailure
 
+import cleanbb
 import utils
 
 try:
@@ -87,6 +83,8 @@ continue_on_failure = None
 file_of_commands_mode = False
 start_mongod = True
 temp_path = None
+clean_every_n_tests = 1
+clean_whole_dbroot = False
 
 tests = []
 winners = []
@@ -126,6 +124,16 @@ def buildlogger(cmd, is_global=False):
             return [utils.find_python(), 'buildscripts/buildlogger.py'] + cmd
     return cmd
 
+
+def clean_dbroot(dbroot="", nokill=False):
+    # Clean entire /data/db dir if --with-cleanbb, else clean specific database path.
+    if clean_whole_dbroot and not small_oplog:
+        dbroot = os.path.normpath(smoke_db_prefix + "/data/db")
+    if os.path.exists(dbroot):
+        print("clean_dbroot: %s" % dbroot)
+        cleanbb.cleanup(dbroot, nokill)
+
+
 class mongod(object):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -157,6 +165,8 @@ class mongod(object):
         sock.close()
         
     def is_mongod_up(self, port=mongod_port):
+        if not start_mongod:
+            return False
         try:
             self.check_mongo_port(int(port))
             return True
@@ -189,13 +199,10 @@ class mongod(object):
             srcport = mongod_port
             self.port += 1
             self.slave = True
-        if os.path.exists(dir_name):
-            if 'slave' in self.kwargs:
-                argv = [utils.find_python(), "buildscripts/cleanbb.py", '--nokill', dir_name]
-            else:
-                argv = [utils.find_python(), "buildscripts/cleanbb.py", dir_name]
-            call(argv)
+
+        clean_dbroot(dbroot=dir_name, nokill=self.slave)
         utils.ensureDir(dir_name)
+
         argv = [mongod_executable, "--port", str(self.port), "--dbpath", dir_name]
         # These parameters are alwas set for tests
         # SERVER-9137 Added httpinterface parameter to keep previous behavior
@@ -398,8 +405,8 @@ def skipTest(path):
     parentPath = os.path.dirname(path)
     parentDir = os.path.basename(parentPath)
     if small_oplog: # For tests running in parallel
-        if basename in ["cursor8.js", "indexh.js", "dropdb.js", 
-                        "connections_opened.js", "opcounters.js", "dbadmin.js"]:
+        if basename in ["cursor8.js", "indexh.js", "dropdb.js", "dropdb_race.js", 
+                        "connections_opened.js", "opcounters_write_cmd.js", "dbadmin.js"]:
             return True
     if use_ssl:
         # Skip tests using mongobridge since it does not support SSL
@@ -442,14 +449,11 @@ def skipTest(path):
 
     return False
 
-forceCommandsForSuite = ["aggregation", "replsets", "parallel", "core", "auth"]
-# look for jstests and one of the above suites separated by either posix or windows slashes
-forceCommandsRE = re.compile(r"jstests[/\\](%s)" % ('|'.join(forceCommandsForSuite)))
+legacyWriteRE = re.compile(r"jstests[/\\]multiVersion")
 def setShellWriteModeForTest(path, argv):
     swm = shell_write_mode
-    if swm == "legacy": # change when the default changes to "commands"
-        if use_write_commands or forceCommandsRE.search(path):
-            swm = "commands"
+    if legacyWriteRE.search(path):
+        swm = "legacy"
     argv += ["--writeMode", swm]
 
 def runTest(test, result):
@@ -493,7 +497,7 @@ def runTest(test, result):
         argv += [path]
     elif ext in ["", ".exe"]:
         # Blech.
-        if os.path.basename(path) in ["test", "test.exe", "perftest", "perftest.exe"]:
+        if os.path.basename(path) in ["dbtest", "dbtest.exe", "perftest", "perftest.exe"]:
             argv = [path]
             # default data directory for test and perftest is /tmp/unittest
             if smoke_db_prefix:
@@ -548,7 +552,7 @@ def runTest(test, result):
 
         argv = argv + [ '--eval', evalString]
 
-    if argv[0].endswith( 'test' ) or argv[0].endswith( 'test.exe' ):
+    if argv[0].endswith( 'dbtest' ) or argv[0].endswith( 'dbtest.exe' ):
         if no_preallocj :
             argv = argv + [ '--nopreallocj' ]
         if temp_path:
@@ -602,12 +606,12 @@ def runTest(test, result):
 
     result["exit_code"] = r
 
+
     is_mongod_still_up = test_mongod.is_mongod_up(mongod_port)
-    if not is_mongod_still_up:
+    if start_mongod and not is_mongod_still_up:
         print "mongod is not running after test"
         result["mongod_running_at_end"] = is_mongod_still_up;
-        if start_mongod:
-            raise TestServerFailure(path)
+        raise TestServerFailure(path)
 
     result["mongod_running_at_end"] = is_mongod_still_up;
 
@@ -672,8 +676,8 @@ def run_tests(tests):
             if small_oplog or small_oplog_rs:
                 master.wait_for_repl()
 
-            tests_run = 0
             for tests_run, test in enumerate(tests):
+                tests_run += 1    # enumerate from 1, python 2.5 compatible
                 test_result = { "start": time.time() }
 
                 (test_path, use_db) = test
@@ -708,8 +712,9 @@ def run_tests(tests):
                             check_and_report_replication_dbhashes()
 
                     elif use_db: # reach inside test and see if "usedb" is true
-                        if (tests_run+1) % 20 == 0:
-                            # restart mongo every 20 times, for our 32-bit machines
+                        if clean_every_n_tests and (tests_run % clean_every_n_tests) == 0:
+                            # Restart mongod periodically to clean accumulated test data
+                            # clean_dbroot() is invoked by mongod.start()
                             master.__exit__(None, None, None)
                             master = mongod(small_oplog_rs=small_oplog_rs,
                                             small_oplog=small_oplog,
@@ -820,8 +825,8 @@ suiteGlobalConfig = {"js": ("core/*.js", True),
                      "quota": ("quota/*.js", True),
                      "jsPerf": ("perf/*.js", True),
                      "disk": ("disk/*.js", True),
-                     "jsSlowNightly": ("slowNightly/*.js", True),
-                     "jsSlowWeekly": ("slowWeekly/*.js", False),
+                     "noPassthroughWithMongod": ("noPassthroughWithMongod/*.js", True),
+                     "noPassthrough": ("noPassthrough/*.js", False),
                      "parallel": ("parallel/*.js", True),
                      "clone": ("clone/*.js", False),
                      "repl": ("repl/*.js", False),
@@ -837,6 +842,8 @@ suiteGlobalConfig = {"js": ("core/*.js", True),
                      "sslSpecial": ("sslSpecial/*.js", True),
                      "jsCore": ("core/*.js", True),
                      "gle": ("gle/*.js", True),
+                     "slow1": ("slow1/*.js", True),
+                     "slow2": ("slow2/*.js", True),
                      }
 
 def get_module_suites():
@@ -898,24 +905,26 @@ def expand_suites(suites,expandUseDB=True):
     module_suites = get_module_suites()
     for suite in suites:
         if suite == 'all':
-            return expand_suites(['test', 
+            return expand_suites(['dbtest',
                                   'perf', 
-                                  'js', 
+                                  'jsCore', 
                                   'jsPerf', 
-                                  'jsSlowNightly', 
-                                  'jsSlowWeekly', 
+                                  'noPassthroughWithMongod', 
+                                  'noPassthrough', 
                                   'clone', 
                                   'parallel', 
                                   'repl', 
                                   'auth', 
                                   'sharding', 
+                                  'slow1',
+                                  'slow2',
                                   'tool'],
                                  expandUseDB=expandUseDB)
-        if suite == 'test':
+        if suite == 'dbtest' or suite == 'test':
             if os.sys.platform == "win32":
-                program = 'test.exe'
+                program = 'dbtest.exe'
             else:
-                program = 'test'
+                program = 'dbtest'
             (globstr, usedb) = (program, False)
         elif suite == 'perf':
             if os.sys.platform == "win32":
@@ -979,6 +988,9 @@ def set_globals(options, tests):
     global file_of_commands_mode
     global report_file, shell_write_mode, use_write_commands
     global temp_path
+    global clean_every_n_tests
+    global clean_whole_dbroot
+
     start_mongod = options.start_mongod
     if hasattr(options, 'use_ssl'):
         use_ssl = options.use_ssl
@@ -1010,6 +1022,9 @@ def set_globals(options, tests):
     auth = options.auth
     authMechanism = options.authMechanism
     keyFile = options.keyFile
+
+    clean_every_n_tests = options.clean_every_n_tests
+    clean_whole_dbroot = options.with_cleanbb
 
     if auth and not keyFile:
         # if only --auth was given to smoke.py, load the
@@ -1077,7 +1092,7 @@ def run_old_fails():
                 continue
 
             filename = os.path.basename(path)
-            if filename in ('test', 'test.exe') or filename.endswith('.js'):
+            if filename in ('dbtest', 'dbtest.exe') or filename.endswith('.js'):
                 set_globals(options, [filename])
                 oldWinners = len(winners)
                 run_tests([test])
@@ -1170,9 +1185,12 @@ def main():
     parser.add_option('--reset-old-fails', dest='reset_old_fails', default=False,
                       action="store_true",
                       help='Clear the failfile. Do this if all tests pass')
-    parser.add_option('--with-cleanbb', dest='with_cleanbb', default=False,
-                      action="store_true",
-                      help='Clear database files from previous smoke.py runs')
+    parser.add_option('--with-cleanbb', dest='with_cleanbb', action="store_true",
+                      default=False,
+                      help='Clear database files before first test')
+    parser.add_option('--clean-every', dest='clean_every_n_tests', type='int',
+                      default=20,
+                      help='Clear database files every N tests [default %default]')
     parser.add_option('--dont-start-mongod', dest='start_mongod', default=True,
                       action='store_false',
                       help='Do not start mongod before commencing test running')
@@ -1202,7 +1220,7 @@ def main():
     parser.add_option('--use-write-commands', dest='use_write_commands', default=False,
                       action='store_true',
                       help='Deprecated(use --shell-write-mode): Sets the shell to use write commands by default')
-    parser.add_option('--shell-write-mode', dest='shell_write_mode', default="legacy",
+    parser.add_option('--shell-write-mode', dest='shell_write_mode', default="commands",
                       help='Sets the shell to use a specific write mode: commands/compatibility/legacy (default:legacy)')
 
     global tests
@@ -1264,8 +1282,7 @@ def main():
         return
 
     if options.with_cleanbb:
-        dbroot = os.path.join(options.smoke_db_prefix, 'data', 'db')
-        call([utils.find_python(), "buildscripts/cleanbb.py", "--nokill", dbroot])
+        clean_dbroot(nokill=True)
 
     test_report["start"] = time.time()
     test_report["mongod_running_at_start"] = mongod().is_mongod_up(mongod_port)

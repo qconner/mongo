@@ -40,13 +40,10 @@ namespace mongo {
     public:
         static void disableAuthMechanism(std::string authMechanism);
 
-        virtual bool logTheOp() {
-            return false;
-        }
         virtual bool slaveOk() const {
             return true;
         }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void help(stringstream& ss) const { ss << "internal"; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -54,7 +51,7 @@ namespace mongo {
         virtual void redactForLogging(mutablebson::Document* cmdObj);
 
         CmdAuthenticate() : Command("authenticate") {}
-        bool run(const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,

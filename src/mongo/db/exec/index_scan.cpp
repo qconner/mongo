@@ -50,31 +50,31 @@ namespace mongo {
     IndexScan::IndexScan(const IndexScanParams& params, WorkingSet* workingSet,
                          const MatchExpression* filter)
         : _workingSet(workingSet),
-          _keyPattern(params.descriptor->keyPattern().getOwned()),
           _hitEnd(false),
           _filter(filter), 
-          _shouldDedup(params.descriptor->isMultikey()),
+          _shouldDedup(true),
           _yieldMovedCursor(false),
           _params(params),
-          _btreeCursor(NULL) {
-        // Do not access index descriptor after construction.
-        const IndexDescriptor* descriptor = params.descriptor;
-        _params.descriptor = NULL;
-        invariant(descriptor);
+          _btreeCursor(NULL) { }
 
-        _iam = descriptor->getIndexCatalog()->getIndex(descriptor);
+    void IndexScan::initIndexScan() {
+        // Perform the possibly heavy-duty initialization of the underlying index cursor.
+        _iam = _params.descriptor->getIndexCatalog()->getIndex(_params.descriptor);
+        _keyPattern = _params.descriptor->keyPattern().getOwned();
 
         if (_params.doNotDedup) {
             _shouldDedup = false;
         }
+        else {
+            _shouldDedup = _params.descriptor->isMultikey();
+        }
 
-        // Fetch what we need from index descriptor now because details in index
-        // catalog (such as multi-key) might change during/after execution.
-        _specificStats.indexName = descriptor->infoObj()["name"].String();
-        _specificStats.isMultiKey = descriptor->isMultikey();
-    }
+        // We can't always access the descriptor in the call to getStats() so we pull
+        // the status-only information we need out here.
+        _specificStats.indexName = _params.descriptor->infoObj()["name"].String();
+        _specificStats.isMultiKey = _params.descriptor->isMultikey();
 
-    void IndexScan::initIndexCursor() {
+        // Set up the index cursor.
         CursorOptions cursorOptions;
 
         if (1 == _params.direction) {
@@ -94,7 +94,7 @@ namespace mongo {
             // Start at one key, end at another.
             Status status = _indexCursor->seek(_params.bounds.startKey);
             if (!status.isOK()) {
-                warning() << "Seek failed: " << status.toString();
+                warning() << "IndexCursor seek failed: " << status.toString();
                 _hitEnd = true;
             }
             if (!isEOF()) {
@@ -128,8 +128,8 @@ namespace mongo {
         ++_commonStats.works;
 
         if (NULL == _indexCursor.get()) {
-            // First call to work().  Perform cursor init.
-            initIndexCursor();
+            // First call to work().  Perform possibly heavy init.
+            initIndexScan();
             checkEnd();
         }
         else if (_yieldMovedCursor) {
@@ -334,6 +334,8 @@ namespace mongo {
     }
 
     PlanStageStats* IndexScan::getStats() {
+        // WARNING: this could be called even if the collection was dropped.  Do not access any
+        // catalog information here.
         _commonStats.isEOF = isEOF();
 
         // These specific stats fields never change.

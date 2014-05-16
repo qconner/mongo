@@ -27,6 +27,7 @@
  */
 
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/fetch.h"
@@ -80,7 +81,7 @@ namespace QuerySingleSolutionRunner {
         SingleSolutionRunner* makeCollScanRunner(Client::Context& ctx,
                                                  BSONObj& filterObj) {
             CollectionScanParams csparams;
-            csparams.ns = ns();
+            csparams.collection = ctx.db()->getCollection( ns() );
             csparams.direction = CollectionScanParams::FORWARD;
             auto_ptr<WorkingSet> ws(new WorkingSet());
             // Parse the filter.
@@ -120,22 +121,25 @@ namespace QuerySingleSolutionRunner {
                                                   BSONObj& indexSpec, int start, int end) {
             // Build the index scan stage.
             IndexScanParams ixparams;
-            ixparams.descriptor = getIndex(indexSpec);
+            ixparams.descriptor = getIndex(context.db(), indexSpec);
             ixparams.bounds.isSimpleRange = true;
             ixparams.bounds.startKey = BSON("" << start);
             ixparams.bounds.endKey = BSON("" << end);
             ixparams.bounds.endKeyInclusive = true;
             ixparams.direction = 1;
+
+            const Collection* coll = context.db()->getCollection(ns());
+
             auto_ptr<WorkingSet> ws(new WorkingSet());
             IndexScan* ix = new IndexScan(ixparams, ws.get(), NULL);
-            auto_ptr<PlanStage> root(new FetchStage(ws.get(), ix, NULL));
+            auto_ptr<PlanStage> root(new FetchStage(ws.get(), ix, NULL, coll));
 
             CanonicalQuery* cq;
             verify(CanonicalQuery::canonicalize(ns(), BSONObj(), &cq).isOK());
             verify(NULL != cq);
 
             // Hand the plan off to the single solution runner.
-            return new SingleSolutionRunner(context.db()->getCollection(ns()),
+            return new SingleSolutionRunner(coll,
                                             cq, new QuerySolution(),
                                             root.release(), ws.release());
         }
@@ -163,8 +167,8 @@ namespace QuerySingleSolutionRunner {
         }
 
     private:
-        IndexDescriptor* getIndex(const BSONObj& obj) {
-            Collection* collection = cc().database()->getCollection( ns() );
+        IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
+            Collection* collection = db->getCollection( ns() );
             return collection->getIndexCatalog()->findIndexByKeyPattern(obj);
         }
 
@@ -186,10 +190,7 @@ namespace QuerySingleSolutionRunner {
 
             BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
             scoped_ptr<SingleSolutionRunner> ssr(makeCollScanRunner(ctx.ctx(),filterObj));
-
-            // Set up autoyielding.
             registerRunner(ssr.get());
-            ssr->setYieldPolicy(Runner::YIELD_AUTO);
 
             BSONObj objOut;
             ASSERT_EQUALS(Runner::RUNNER_ADVANCED, ssr->getNext(&objOut, NULL));
@@ -219,10 +220,7 @@ namespace QuerySingleSolutionRunner {
             addIndex(indexSpec);
 
             scoped_ptr<SingleSolutionRunner> ssr(makeIndexScanRunner(ctx.ctx(), indexSpec, 7, 10));
-
-            // Set up autoyielding.
             registerRunner(ssr.get());
-            ssr->setYieldPolicy(Runner::YIELD_AUTO);
 
             BSONObj objOut;
             ASSERT_EQUALS(Runner::RUNNER_ADVANCED, ssr->getNext(&objOut, NULL));

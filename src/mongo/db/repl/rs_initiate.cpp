@@ -39,9 +39,11 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/repl/health.h"
+#include "mongo/db/repl/heartbeat.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
+#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/repl_start.h"  // parseReplsetCmdLine
+#include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_config.h"
 #include "mongo/util/mmap.h"
@@ -163,7 +165,7 @@ namespace mongo {
 
     class CmdReplSetInitiate : public ReplSetCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         CmdReplSetInitiate() : ReplSetCommand("replSetInitiate") { }
         virtual void help(stringstream& h) const {
             h << "Initiate/christen a replica set.";
@@ -176,7 +178,7 @@ namespace mongo {
             actions.addAction(ActionType::replSetConfigure);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             log() << "replSet replSetInitiate admin command received from client" << rsLog;
 
             if( !replSet ) {

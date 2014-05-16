@@ -115,7 +115,7 @@ namespace mongo {
                 return Status(ErrorCodes::FailedToParse,
                               str::stream() << "'" << outerModElem.fieldName()
                                             << "' is empty. You must specify a field like so: "
-                                                    "{$mod: {<field>: ...}}");
+                                                    "{" << outerModElem.fieldName() << ": {<field>: ...}}");
             }
 
             BSONObjIterator innerIter(outerModElem.embeddedObject());
@@ -167,7 +167,9 @@ namespace mongo {
                                                          mutablebson::Document& doc) const {
         CanonicalQuery* rawCG;
         // We canonicalize the query to collapse $and/$or, and the first arg (ns) is not needed
-        Status s = CanonicalQuery::canonicalize("", query, &rawCG);
+        // Also, because this is for the upsert case, where we insert a new document if one was
+        // not found, the $where clause does not make sense, hence empty WhereCallback.
+        Status s = CanonicalQuery::canonicalize("", query, &rawCG, WhereCallbackNoop());
         if (!s.isOK())
             return s;
         scoped_ptr<CanonicalQuery> cq(rawCG);

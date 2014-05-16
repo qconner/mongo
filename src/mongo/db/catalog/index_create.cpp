@@ -34,20 +34,19 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
-#include "mongo/db/structure/btree/btreebuilder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/extsort.h"
-#include "mongo/db/structure/catalog/index_details.h"
 #include "mongo/db/kill_current_op.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/db/pdfile_private.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/runner_yield_policy.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/rs.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/structure/catalog/index_details.h"
+#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/progress_meter.h"
 
@@ -56,10 +55,11 @@ namespace mongo {
     /**
      * Add the provided (obj, dl) pair to the provided index.
      */
-    static void addKeysToIndex( Collection* collection,
-                                const IndexDescriptor* descriptor,
-                                IndexAccessMethod* accessMethod,
-                                const BSONObj& obj, const DiskLoc &recordLoc ) {
+    static void addKeysToIndex(OperationContext* txn,
+                               Collection* collection,
+                               const IndexDescriptor* descriptor,
+                               IndexAccessMethod* accessMethod,
+                               const BSONObj& obj, const DiskLoc &recordLoc ) {
 
         InsertDeleteOptions options;
         options.logIfError = false;
@@ -72,26 +72,26 @@ namespace mongo {
         }
 
         int64_t inserted;
-        Status ret = accessMethod->insert(obj, recordLoc, options, &inserted);
+        Status ret = accessMethod->insert(txn, obj, recordLoc, options, &inserted);
         uassertStatusOK( ret );
     }
 
-    unsigned long long addExistingToIndex( Collection* collection,
+    unsigned long long addExistingToIndex( OperationContext* txn,
+                                           Collection* collection,
                                            const IndexDescriptor* descriptor,
                                            IndexAccessMethod* accessMethod,
-                                           bool shouldYield ) {
+                                           bool canBeKilled ) {
 
         string ns = collection->ns().ns(); // our copy for sanity
 
         bool dupsAllowed = !descriptor->unique();
         bool dropDups = descriptor->dropDups();
 
-
         string curopMessage;
         {
             stringstream ss;
             ss << "Index Build";
-            if ( shouldYield )
+            if ( canBeKilled )
                 ss << "(background)";
             curopMessage = ss.str();
         }
@@ -104,11 +104,7 @@ namespace mongo {
         unsigned long long n = 0;
         unsigned long long numDropped = 0;
 
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns));
-
-        // We're not delegating yielding to the runner because we need to know when a yield
-        // happens.
-        RunnerYieldPolicy yieldPolicy;
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns,collection));
 
         std::string idxName = descriptor->indexName();
 
@@ -122,15 +118,15 @@ namespace mongo {
             try {
                 if ( !dupsAllowed && dropDups ) {
                     LastError::Disabled led( lastError.get() );
-                    addKeysToIndex(collection, descriptor, accessMethod, js, loc);
+                    addKeysToIndex(txn, collection, descriptor, accessMethod, js, loc);
                 }
                 else {
-                    addKeysToIndex(collection, descriptor, accessMethod, js, loc);
+                    addKeysToIndex(txn, collection, descriptor, accessMethod, js, loc);
                 }
             }
             catch( AssertionException& e ) {
                 if (ErrorCodes::isInterruption(DBException::convertExceptionCode(e.getCode()))) {
-                    killCurrentOp.checkForInterrupt();
+                    txn->checkForInterrupt();
                 }
 
                 // TODO: Does exception really imply dropDups exception?
@@ -138,8 +134,8 @@ namespace mongo {
                     bool runnerEOF = runner->isEOF();
                     runner->saveState();
                     BSONObj toDelete;
-                    collection->deleteDocument( loc, false, true, &toDelete );
-                    logOp( "d", ns.c_str(), toDelete );
+                    collection->deleteDocument( txn, loc, false, true, &toDelete );
+                    logOp( txn, "d", ns.c_str(), toDelete );
 
                     if (!runner->restoreState()) {
                         // Runner got killed somehow.  This probably shouldn't happen.
@@ -167,26 +163,17 @@ namespace mongo {
             progress.hit();
 
             getDur().commitIfNeeded();
-            if (shouldYield && yieldPolicy.shouldYield()) {
-                // Note: yieldAndCheckIfOK checks for interrupt and thus can throw
-                if (!yieldPolicy.yieldAndCheckIfOK(runner.get())) {
-                    uasserted(ErrorCodes::CursorNotFound, "cursor gone during bg index");
-                    break;
-                }
 
+            if (canBeKilled) {
                 // Checking for interrupt here is necessary because the bg index 
                 // interruptors can only interrupt this index build while they hold 
                 // a write lock, and yieldAndCheckIfOK only checks for
                 // interrupt prior to yielding our write lock. We need to check the kill flag
                 // here before another iteration of the loop.
-                killCurrentOp.checkForInterrupt();
-
-                progress.setTotalWhileRunning( collection->numRecords() );
-                // Recalculate idxNo if we yielded
-                IndexDescriptor* idx = collection->getIndexCatalog()->findIndexByName( idxName,
-                                                                                       true );
-                verify( idx && idx == descriptor );
+                txn->checkForInterrupt();
             }
+
+            progress.setTotalWhileRunning( collection->numRecords() );
         }
 
         progress.finished();
@@ -198,7 +185,8 @@ namespace mongo {
     // ---------------------------
 
     // throws DBException
-    void buildAnIndex( Collection* collection,
+    void buildAnIndex( OperationContext* txn,
+                       Collection* collection,
                        IndexCatalogEntry* btreeState,
                        bool mayInterrupt ) {
 
@@ -218,7 +206,7 @@ namespace mongo {
         collection->infoCache()->addedIndex();
 
         if ( collection->numRecords() == 0 ) {
-            Status status = btreeState->accessMethod()->initializeAsEmpty();
+            Status status = btreeState->accessMethod()->initializeAsEmpty(txn);
             massert( 17343,
                      str::stream() << "IndexAccessMethod::initializeAsEmpty failed" << status.toString(),
                      status.isOK() );
@@ -238,21 +226,22 @@ namespace mongo {
             log() << "\t building index in background";
         }
 
-        Status status = btreeState->accessMethod()->initializeAsEmpty();
+        Status status = btreeState->accessMethod()->initializeAsEmpty(txn);
         massert( 17342,
                  str::stream()
                  << "IndexAccessMethod::initializeAsEmpty failed"
                  << status.toString(),
                  status.isOK() );
 
-        IndexAccessMethod* bulk = doInBackground ? NULL : btreeState->accessMethod()->initiateBulk();
+        IndexAccessMethod* bulk = doInBackground ? NULL : btreeState->accessMethod()->initiateBulk(txn);
         scoped_ptr<IndexAccessMethod> bulkHolder(bulk);
         IndexAccessMethod* iam = bulk ? bulk : btreeState->accessMethod();
 
         if ( bulk )
             log() << "\t building index using bulk method";
 
-        unsigned long long n = addExistingToIndex( collection,
+        unsigned long long n = addExistingToIndex( txn,
+                                                   collection,
                                                    btreeState->descriptor(),
                                                    iam,
                                                    doInBackground );
@@ -264,6 +253,13 @@ namespace mongo {
             Status status = btreeState->accessMethod()->commitBulk( bulk,
                                                                     mayInterrupt,
                                                                     &dupsToDrop );
+
+            // Code above us expects a uassert in case of dupkey errors.
+            if (ErrorCodes::DuplicateKey == status.code()) {
+                uassertStatusOK(status);
+            }
+
+            // Any other errors are probably bad and deserve a massert.
             massert( 17398,
                      str::stream() << "commitBulk failed: " << status.toString(),
                      status.isOK() );
@@ -273,18 +269,19 @@ namespace mongo {
 
             for( set<DiskLoc>::const_iterator i = dupsToDrop.begin(); i != dupsToDrop.end(); ++i ) {
                 BSONObj toDelete;
-                collection->deleteDocument( *i,
+                collection->deleteDocument( txn,
+                                            *i,
                                             false /* cappedOk */,
                                             true /* noWarn */,
                                             &toDelete );
-                if ( isMaster( ns.c_str() ) ) {
-                    logOp( "d", ns.c_str(), toDelete );
+                if (isMasterNs(ns.c_str())) {
+                    logOp( txn, "d", ns.c_str(), toDelete );
                 }
                 
                 getDur().commitIfNeeded();
 
                 RARELY if ( mayInterrupt ) {
-                    killCurrentOp.checkForInterrupt();
+                    txn->checkForInterrupt();
                 }
             }
         }
@@ -299,8 +296,8 @@ namespace mongo {
 
     // ----------------------------
 
-    MultiIndexBlock::MultiIndexBlock( Collection* collection )
-        : _collection( collection ) {
+    MultiIndexBlock::MultiIndexBlock(OperationContext* txn, Collection* collection)
+        : _collection(collection), _txn(txn) {
     }
 
     MultiIndexBlock::~MultiIndexBlock() {
@@ -311,14 +308,13 @@ namespace mongo {
     }
 
     Status MultiIndexBlock::init(std::vector<BSONObj>& indexSpecs) {
-
         for ( size_t i = 0; i < indexSpecs.size(); i++ ) {
             BSONObj info = indexSpecs[i];
 
             string pluginName = IndexNames::findPluginName( info["key"].Obj() );
             if ( pluginName.size() ) {
                 Status s =
-                    _collection->getIndexCatalog()->_upgradeDatabaseMinorVersionIfNeeded(pluginName);
+                    _collection->getIndexCatalog()->_upgradeDatabaseMinorVersionIfNeeded(_txn, pluginName);
                 if ( !s.isOK() )
                     return s;
             }
@@ -335,17 +331,17 @@ namespace mongo {
             info = statusWithInfo.getValue();
 
             IndexState state;
-            state.block = new IndexCatalog::IndexBuildBlock( _collection, info );
+            state.block = new IndexCatalog::IndexBuildBlock(_txn, _collection, info);
             status = state.block->init();
             if ( !status.isOK() )
                 return status;
 
             state.real = state.block->getEntry()->accessMethod();
-            status = state.real->initializeAsEmpty();
+            status = state.real->initializeAsEmpty(_txn);
             if ( !status.isOK() )
                 return status;
 
-            state.bulk = state.real->initiateBulk();
+            state.bulk = state.real->initiateBulk(_txn);
 
             _states.push_back( state );
         }
@@ -358,7 +354,8 @@ namespace mongo {
                                     const InsertDeleteOptions& options ) {
 
         for ( size_t i = 0; i < _states.size(); i++ ) {
-            Status idxStatus = _states[i].forInsert()->insert( doc,
+            Status idxStatus = _states[i].forInsert()->insert( _txn,
+                                                               doc,
                                                                loc,
                                                                options,
                                                                NULL );

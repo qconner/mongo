@@ -41,12 +41,9 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/fail_point_registry.h"
-#include "mongo/util/fail_point_service.h"
 
 namespace QueryStageFetch {
 
@@ -59,7 +56,7 @@ namespace QueryStageFetch {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            CollectionIterator* it = coll->getIterator(DiskLoc(), false,
+            RecordIterator* it = coll->getIterator(DiskLoc(), false,
                                                        CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
@@ -85,224 +82,17 @@ namespace QueryStageFetch {
     DBDirectClient QueryStageFetchBase::_client;
 
     //
-    // Test that a fetch is passed up when it's not in memory.
-    //
-    class FetchStageNotInMemory : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
-
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
-
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
-
-            // Set the fail point to return not in memory.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
-
-            // First call should return a fetch request as it's not in memory.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_FETCH, state);
-
-            // Let's do the fetch ourselves (though it doesn't really matter)
-            WorkingSetMember* member = ws.get(id);
-            ASSERT_FALSE(member->hasObj());
-            member->loc.rec()->touch();
-
-            // Next call to work() should give us the object in a diff. state
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-            ASSERT_EQUALS(WorkingSetMember::LOC_AND_UNOWNED_OBJ, member->state);
-
-            // We should be able to get data from the obj now.
-            BSONElement elt;
-            ASSERT_TRUE(member->getFieldDotted("foo", &elt));
-            ASSERT_EQUALS(elt.numberInt(), 5);
-
-            // Mock stage is EOF so fetch should be too.
-            ASSERT_TRUE(fetchStage->isEOF());
-
-            // Turn off fail point for further tests.
-            fetchInMemoryFail->setMode(FailPoint::off);
-        }
-    };
-
-    //
-    // Test that a fetch is not passed up when it's in memory.
-    //
-    class FetchStageInMemory : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
-
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
-
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
-
-            // Set the fail point to return in memory.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemorySucceed = reg->getFailPoint("fetchInMemorySucceed");
-            fetchInMemorySucceed->setMode(FailPoint::alwaysOn);
-
-            // First call fetches as expected.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-
-            // State should have changed.
-            WorkingSetMember* member = ws.get(id);
-            ASSERT_EQUALS(WorkingSetMember::LOC_AND_UNOWNED_OBJ, member->state);
-
-            // We should be able to get data from the obj now.
-            BSONElement elt;
-            ASSERT_TRUE(member->getFieldDotted("foo", &elt));
-            ASSERT_EQUALS(elt.numberInt(), 5);
-
-            // Mock stage is EOF so fetch should be too.
-            ASSERT_TRUE(fetchStage->isEOF());
-
-            // Turn off fail point for further tests.
-            fetchInMemorySucceed->setMode(FailPoint::off);
-        }
-    };
-
-    //
-    // Test mid-fetch invalidation.
-    //
-    class FetchStageInvalidation : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
-
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
-
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
-
-            // Set the fail point to return not in memory.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
-
-            // First call should return a fetch request as it's not in memory.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_FETCH, state);
-
-            WorkingSetMember* member = ws.get(id);
-
-            // Invalidate the DL.
-            fetchStage->invalidate(member->loc, INVALIDATION_DELETION);
-
-            // Next call to work() should give us the OWNED obj as it was invalidated mid-page-in.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-            ASSERT_EQUALS(WorkingSetMember::OWNED_OBJ, member->state);
-
-            // We should be able to get data from the obj now.
-            BSONElement elt;
-            ASSERT_TRUE(member->getFieldDotted("foo", &elt));
-            ASSERT_EQUALS(elt.numberInt(), 5);
-
-            // Mock stage is EOF so fetch should be too.
-            ASSERT_TRUE(fetchStage->isEOF());
-
-            // Turn off fail point for further tests.
-            fetchInMemoryFail->setMode(FailPoint::off);
-        }
-    };
-
-
-    //
     // Test that a WSM with an obj is passed through verbatim.
     //
     class FetchStageAlreadyFetched : public QueryStageFetchBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
             WorkingSet ws;
 
@@ -320,7 +110,7 @@ namespace QueryStageFetch {
                 WorkingSetMember mockMember;
                 mockMember.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
                 mockMember.loc = *locs.begin();
-                mockMember.obj = mockMember.loc.obj();
+                mockMember.obj = coll->docFor(mockMember.loc);
                 // Points into our DB.
                 ASSERT_FALSE(mockMember.obj.isOwned());
                 mockStage->pushBack(mockMember);
@@ -332,12 +122,7 @@ namespace QueryStageFetch {
                 mockStage->pushBack(mockMember);
             }
 
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
-
-            // Set the fail point to return not in memory so we get a fetch request.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
+            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL, coll));
 
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state;
@@ -351,8 +136,6 @@ namespace QueryStageFetch {
             // No more data to fetch, so, EOF.
             state = fetchStage->work(&id);
             ASSERT_EQUALS(PlanStage::IS_EOF, state);
-
-            fetchInMemoryFail->setMode(FailPoint::off);
         }
     };
 
@@ -363,10 +146,11 @@ namespace QueryStageFetch {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
             WorkingSet ws;
 
@@ -398,19 +182,12 @@ namespace QueryStageFetch {
             auto_ptr<MatchExpression> filterExpr(swme.getValue());
 
             // Matcher requires that foo==6 but we only have data with foo==5.
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(),
-                                                           filterExpr.get()));
-
-            // Set the fail point to return not in memory so we get a fetch request.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
+            auto_ptr<FetchStage> fetchStage(
+                new FetchStage(&ws, mockStage.release(), filterExpr.get(), coll));
 
             // First call should return a fetch request as it's not in memory.
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_FETCH, state);
 
             // Normally we'd return the object but we have a filter that prevents it.
             state = fetchStage->work(&id);
@@ -419,8 +196,6 @@ namespace QueryStageFetch {
             // No more data to fetch, so, EOF.
             state = fetchStage->work(&id);
             ASSERT_EQUALS(PlanStage::IS_EOF, state);
-
-            fetchInMemoryFail->setMode(FailPoint::off);
         }
     };
 
@@ -429,10 +204,7 @@ namespace QueryStageFetch {
         All() : Suite( "query_stage_fetch" ) { }
 
         void setupTests() {
-            add<FetchStageNotInMemory>();
-            add<FetchStageInMemory>();
             add<FetchStageAlreadyFetched>();
-            add<FetchStageInvalidation>();
             add<FetchStageFilter>();
         }
     }  queryStageFetchAll;

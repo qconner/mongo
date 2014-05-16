@@ -42,6 +42,8 @@
 
 namespace mongo {
 
+    class OperationContext;
+
     namespace mr {
 
         typedef vector<BSONObj> BSONList;
@@ -234,7 +236,10 @@ namespace mongo {
          */
         class State {
         public:
-            State( const Config& c );
+            /**
+             * txn must outlive this State.
+             */
+            State( OperationContext* txn, const Config& c );
             ~State();
 
             void init();
@@ -314,7 +319,7 @@ namespace mongo {
 
             const Config& config() { return _config; }
 
-            const bool isOnDisk() { return _onDisk; }
+            bool isOnDisk() { return _onDisk; }
 
             long long numEmits() const { if (_jsMode) return _scope->getNumberLongLong("_emitCt"); return _numEmits; }
             long long numReduces() const { if (_jsMode) return _scope->getNumberLongLong("_redCt"); return _config.reducer->numReduces; }
@@ -338,6 +343,7 @@ namespace mongo {
              */
             int _add(InMemory* im , const BSONObj& a);
 
+            OperationContext* _txn;
             scoped_ptr<Scope> _scope;
             bool _onDisk; // if the end result of this map reduce is disk or not
 

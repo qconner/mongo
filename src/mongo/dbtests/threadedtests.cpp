@@ -182,7 +182,7 @@ namespace ThreadedTests {
                     if( i > N/2 ) { 
                         int q = i % 11;
                         if( q == 0 ) { 
-                            char what = Lock::dbLevelLockingEnabled() ? 'r' : 'R';
+                            char what = 'r';
                             Lock::DBRead r("foo");
                             ASSERT( Lock::isLocked() == what && Lock::atLeastReadLocked("foo") );
                             ASSERT( !Lock::nested() );
@@ -235,7 +235,7 @@ namespace ThreadedTests {
                                 "bar6", "bar7", "bar8", "bar9", "bar10" };
                             Lock::DBWrite w(dbnames[q]);
                             {
-                                Lock::DBWrite::UpgradeToExclusive wToX;
+                                Lock::UpgradeGlobalLockToExclusive wToX;
                                 if (wToX.gotUpgrade()) {
                                     ++wToXSuccessfulUpgradeCount;
                                 }
@@ -829,19 +829,22 @@ namespace ThreadedTests {
         }
     };
 
-    class WriteLocksAreGreedy : public ThreadedTest<3> {
+    const int WriteLocksAreGreedy_ThreadCount = 3;
+    class WriteLocksAreGreedy : public ThreadedTest<WriteLocksAreGreedy_ThreadCount> {
     public:
-        WriteLocksAreGreedy() : m("gtest") {}
+        WriteLocksAreGreedy() : m("gtest"), _barrier(WriteLocksAreGreedy_ThreadCount) {}
     private:
         RWLock m;
+        boost::barrier _barrier;
         virtual void validate() { }
         virtual void subthread(int x) {
+            _barrier.wait();
             int Z = 0;
             Client::initThread("utest");
             if( x == 1 ) { 
                 LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1" << endl;
                 rwlock_shared lk(m);
-                sleepmillis(300);
+                sleepmillis(400);
                 LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1x" << endl;
             }
             if( x == 2 ) {
@@ -863,11 +866,11 @@ namespace ThreadedTests {
         }
     };
 
-    const int ThreadTest_ThreadCount = 3;
-    class QLockTest : public ThreadedTest<ThreadTest_ThreadCount> {
+    const int QLockTest_ThreadCount = 3;
+    class QLockTest : public ThreadedTest<QLockTest_ThreadCount> {
     public:
         bool gotW;
-        QLockTest() : gotW(false), m(), _barrier(ThreadTest_ThreadCount) { }
+        QLockTest() : gotW(false), m(), _barrier(QLockTest_ThreadCount) { }
         void setup() {}
         ~QLockTest() {}
     private:
@@ -882,7 +885,7 @@ namespace ThreadedTests {
                 LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1 lock_r()..." << endl;
                 m.lock_r();
                 LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1            got" << endl;
-                sleepmillis(300);
+                sleepmillis(400);
                 m.unlock_r();
                 LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1 unlock_r()" << endl;
             }

@@ -56,17 +56,11 @@ namespace mongo {
         virtual ~ClusterWriteCmd() {
         }
 
-        bool logTheOp() {
-            return false;
-        }
-
         bool slaveOk() const {
             return false;
         }
 
-        LockType locktype() const {
-            return Command::NONE;
-        }
+        bool isWriteCommandForConfigServer() const { return false; }
 
         Status checkAuthForCommand( ClientBasic* client,
                                     const std::string& dbname,
@@ -87,7 +81,7 @@ namespace mongo {
         }
 
         // Cluster write command entry point.
-        bool run( const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                   BSONObj& cmdObj,
                   int options,
                   string& errmsg,
@@ -150,7 +144,7 @@ namespace mongo {
     // Cluster write command implementation(s) below
     //
 
-    bool ClusterWriteCmd::run( const string& dbName,
+    bool ClusterWriteCmd::run(OperationContext* txn, const string& dbName,
                                BSONObj& cmdObj,
                                int options,
                                string& errMsg,

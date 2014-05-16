@@ -27,10 +27,10 @@
  */
 
 #include "mongo/base/counter.h"
-#include "mongo/db/commands/server_status.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/repl/is_master.h"
-#include "mongo/db/repl/replication_server_status.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/write_concern.h"

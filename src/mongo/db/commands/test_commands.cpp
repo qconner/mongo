@@ -34,9 +34,10 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/kill_current_op.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
 
@@ -45,9 +46,8 @@ namespace mongo {
     public:
         GodInsert() : Command( "godinsert" ) { }
         virtual bool adminOnly() const { return false; }
-        virtual bool logTheOp() { return false; }
         virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -55,7 +55,7 @@ namespace mongo {
         virtual void help( stringstream &help ) const {
             help << "internal. for testing only.";
         }
-        virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             string coll = cmdObj[ "godinsert" ].valuestrsafe();
             log() << "test only command godinsert invoked coll:" << coll << endl;
             uassert( 13049, "godinsert must specify a collection", !coll.empty() );
@@ -67,13 +67,13 @@ namespace mongo {
             Database* db = ctx.db();
             Collection* collection = db->getCollection( ns );
             if ( !collection ) {
-                collection = db->createCollection( ns );
+                collection = db->createCollection( txn, ns );
                 if ( !collection ) {
                     errmsg = "could not create collection";
                     return false;
                 }
             }
-            StatusWith<DiskLoc> res = collection->insertDocument( obj, false );
+            StatusWith<DiskLoc> res = collection->insertDocument( txn, obj, false );
             return appendCommandStatus( result, res.getStatus() );
         }
     };
@@ -81,9 +81,8 @@ namespace mongo {
     /* for diagnostic / testing purposes. Enabled via command line. */
     class CmdSleep : public Command {
     public:
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool adminOnly() const { return true; }
-        virtual bool logTheOp() { return false; }
         virtual bool slaveOk() const { return true; }
         virtual void help( stringstream& help ) const {
             help << "internal testing command.  Makes db block (in a read lock) for 100 seconds\n";
@@ -94,7 +93,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
         CmdSleep() : Command("sleep") { }
-        bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             log() << "test only command sleep invoked" << endl;
             long long millis = 10 * 1000;
 
@@ -129,30 +128,32 @@ namespace mongo {
     public:
         CapTrunc() : Command( "captrunc" ) {}
         virtual bool slaveOk() const { return false; }
-        virtual LockType locktype() const { return WRITE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             string coll = cmdObj[ "captrunc" ].valuestrsafe();
             uassert( 13416, "captrunc must specify a collection", !coll.empty() );
-            string ns = dbname + "." + coll;
+            NamespaceString nss( dbname, coll );
             int n = cmdObj.getIntField( "n" );
+            bool inc = cmdObj.getBoolField( "inc" ); // inclusive range?
 
-            // inclusive range?
-            bool inc = cmdObj.getBoolField( "inc" );
-            NamespaceDetails *nsd = nsdetails( ns );
-            massert( 13417, "captrunc collection not found or empty", nsd);
+            Client::WriteContext ctx( nss.ns() );
+            Collection* collection = ctx.ctx().db()->getCollection( nss.ns() );
+            massert( 13417, "captrunc collection not found or empty", collection);
 
-            boost::scoped_ptr<Runner> runner(InternalPlanner::collectionScan(ns, InternalPlanner::BACKWARD));
+            boost::scoped_ptr<Runner> runner(InternalPlanner::collectionScan(nss.ns(),
+                                                                             collection,
+                                                                             InternalPlanner::BACKWARD));
             DiskLoc end;
             // We remove 'n' elements so the start is one past that
             for( int i = 0; i < n + 1; ++i ) {
                 Runner::RunnerState state = runner->getNext(NULL, &end);
                 massert( 13418, "captrunc invalid n", Runner::RUNNER_ADVANCED == state);
             }
-            nsd->cappedTruncateAfter( ns.c_str(), end, inc );
+            collection->temp_cappedTruncateAfter( txn, end, inc );
             return true;
         }
     };
@@ -162,7 +163,7 @@ namespace mongo {
     public:
         EmptyCapped() : Command( "emptycapped" ) {}
         virtual bool slaveOk() const { return false; }
-        virtual LockType locktype() const { return WRITE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool logTheOp() { return true; }
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
@@ -179,19 +180,26 @@ namespace mongo {
             return IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
         }
 
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             string coll = cmdObj[ "emptycapped" ].valuestrsafe();
             uassert( 13428, "emptycapped must specify a collection", !coll.empty() );
-            string ns = dbname + "." + coll;
-            NamespaceDetails *nsd = nsdetails( ns );
-            massert( 13429, "emptycapped no such collection", nsd );
+            NamespaceString nss( dbname, coll );
 
-            std::vector<BSONObj> indexes = stopIndexBuilds(cc().database(), cmdObj);
+            Client::WriteContext ctx( nss.ns() );
+            Database* db = ctx.ctx().db();
+            Collection* collection = db->getCollection( nss.ns() );
+            massert( 13429, "emptycapped no such collection", collection );
 
-            nsd->emptyCappedCollection( ns.c_str() );
+            std::vector<BSONObj> indexes = stopIndexBuilds(db, cmdObj);
+
+            Status status = collection->truncate(txn);
+            if ( !status.isOK() )
+                return appendCommandStatus( result, status );
 
             IndexBuilder::restoreIndexes(indexes);
 
+            if (!fromRepl)
+                logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
             return true;
         }
     };

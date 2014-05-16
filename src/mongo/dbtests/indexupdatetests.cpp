@@ -28,15 +28,13 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/db/structure/btree/btree.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/db/index/btree_based_bulk_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/kill_current_op.h"
-#include "mongo/db/sort_phase_one.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/platform/cstdint.h"
 
 #include "mongo/dbtests/dbtests.h"
@@ -45,7 +43,7 @@ namespace IndexUpdateTests {
 
     static const char* const _ns = "unittests.indexupdate";
     DBDirectClient _client;
-    ExternalSortComparison* _aFirstSort = BtreeBasedAccessMethod::getComparison(0, BSON("a" << 1));
+    ExternalSortComparison* _aFirstSort = BtreeBasedBulkAccessMethod::getComparison(0, BSON("a" << 1));
 
     /**
      * Test fixture for a write locked test using collection _ns.  Includes functionality to
@@ -92,6 +90,7 @@ namespace IndexUpdateTests {
         }
 #endif
         Client::WriteContext _ctx;
+        OperationContextImpl _txn;
     };
 
     /** addKeysToPhaseOne() adds keys from a collection's documents to an external sorter. */
@@ -316,14 +315,14 @@ namespace IndexUpdateTests {
         void run() {
             // Create a new collection.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( _ns );
-            Collection* coll = db->createCollection( _ns );
+            db->dropCollection( &_txn, _ns );
+            Collection* coll = db->createCollection( &_txn, _ns );
             // Drop all indexes including id index.
-            coll->getIndexCatalog()->dropAllIndexes( true );
+            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
             // Insert some documents with enforceQuota=true.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( BSON( "a" << i ), true );
+                coll->insertDocument( &_txn, BSON( "a" << i ), true );
             }
             // Initialize curop.
             cc().curop()->reset();
@@ -331,8 +330,10 @@ namespace IndexUpdateTests {
             killCurrentOp.killAll();
             BSONObj indexInfo = BSON( "key" << BSON( "a" << 1 ) << "ns" << _ns << "name" << "a_1" );
             // The call is interrupted because mayInterrupt == true.
-            Status status = coll->getIndexCatalog()->createIndex( indexInfo, true );
+            Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, true );
             ASSERT_NOT_OK( status.code() );
+            // only want to interrupt the index build
+            killCurrentOp.reset();
             // The new index is not listed in the index catalog because the index build failed.
             ASSERT( !coll->getIndexCatalog()->findIndexByName( "a_1" ) );
         }
@@ -344,13 +345,13 @@ namespace IndexUpdateTests {
         void run() {
             // Create a new collection.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( _ns );
-            Collection* coll = db->createCollection( _ns );
-            coll->getIndexCatalog()->dropAllIndexes( true );
+            db->dropCollection( &_txn, _ns );
+            Collection* coll = db->createCollection( &_txn, _ns );
+            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
             // Insert some documents.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( BSON( "a" << i ), true );
+                coll->insertDocument( &_txn, BSON( "a" << i ), true );
             }
             // Initialize curop.
             cc().curop()->reset();
@@ -358,8 +359,10 @@ namespace IndexUpdateTests {
             killCurrentOp.killAll();
             BSONObj indexInfo = BSON( "key" << BSON( "a" << 1 ) << "ns" << _ns << "name" << "a_1" );
             // The call is not interrupted because mayInterrupt == false.
-            Status status = coll->getIndexCatalog()->createIndex( indexInfo, false );
+            Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, false );
             ASSERT_OK( status.code() );
+            // only want to interrupt the index build
+            killCurrentOp.reset();
             // The new index is listed in the index catalog because the index build completed.
             ASSERT( coll->getIndexCatalog()->findIndexByName( "a_1" ) );
         }
@@ -371,16 +374,16 @@ namespace IndexUpdateTests {
         void run() {
             // Recreate the collection as capped, without an _id index.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( _ns );
+            db->dropCollection( &_txn, _ns );
             CollectionOptions options;
             options.capped = true;
             options.cappedSize = 10 * 1024;
-            Collection* coll = db->createCollection( _ns, options );
-            coll->getIndexCatalog()->dropAllIndexes( true );
+            Collection* coll = db->createCollection( &_txn, _ns, options );
+            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
             // Insert some documents.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( BSON( "_id" << i ), true );
+                coll->insertDocument( &_txn, BSON( "_id" << i ), true );
             }
             // Initialize curop.
             cc().curop()->reset();
@@ -390,8 +393,10 @@ namespace IndexUpdateTests {
                                       "ns" << _ns <<
                                       "name" << "_id_" );
             // The call is interrupted because mayInterrupt == true.
-            Status status = coll->getIndexCatalog()->createIndex( indexInfo, true );
+            Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, true );
             ASSERT_NOT_OK( status.code() );
+            // only want to interrupt the index build
+            killCurrentOp.reset();
             // The new index is not listed in the index catalog because the index build failed.
             ASSERT( !coll->getIndexCatalog()->findIndexByName( "_id_" ) );
         }
@@ -403,16 +408,16 @@ namespace IndexUpdateTests {
         void run() {
             // Recreate the collection as capped, without an _id index.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( _ns );
+            db->dropCollection( &_txn, _ns );
             CollectionOptions options;
             options.capped = true;
             options.cappedSize = 10 * 1024;
-            Collection* coll = db->createCollection( _ns, options );
-            coll->getIndexCatalog()->dropAllIndexes( true );
+            Collection* coll = db->createCollection( &_txn, _ns, options );
+            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
             // Insert some documents.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( BSON( "_id" << i ), true );
+                coll->insertDocument( &_txn, BSON( "_id" << i ), true );
             }
             // Initialize curop.
             cc().curop()->reset();
@@ -422,8 +427,10 @@ namespace IndexUpdateTests {
                                       "ns" << _ns <<
                                       "name" << "_id_" );
             // The call is not interrupted because mayInterrupt == false.
-            Status status = coll->getIndexCatalog()->createIndex( indexInfo, false );
+            Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, false );
             ASSERT_OK( status.code() );
+            // only want to interrupt the index build
+            killCurrentOp.reset();
             // The new index is listed in the index catalog because the index build succeeded.
             ASSERT( coll->getIndexCatalog()->findIndexByName( "_id_" ) );
         }
@@ -445,6 +452,8 @@ namespace IndexUpdateTests {
             killCurrentOp.killAll();
             // The call is not interrupted.
             _client.ensureIndex( _ns, BSON( "a" << 1 ) );
+            // only want to interrupt the index build
+            killCurrentOp.reset();
             // The new index is listed in system.indexes because the index build completed.
             ASSERT_EQUALS( 1U,
                            _client.count( "unittests.system.indexes",
@@ -456,6 +465,7 @@ namespace IndexUpdateTests {
     class HelpersEnsureIndexInterruptDisallowed : public IndexBuildBase {
     public:
         void run() {
+            OperationContextImpl txn;
             // Insert some documents.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
@@ -466,7 +476,9 @@ namespace IndexUpdateTests {
             // Request an interrupt.
             killCurrentOp.killAll();
             // The call is not interrupted.
-            Helpers::ensureIndex( _ns, BSON( "a" << 1 ), false, "a_1" );
+            Helpers::ensureIndex( &txn, collection(), BSON( "a" << 1 ), false, "a_1" );
+            // only want to interrupt the index build
+            killCurrentOp.reset();
             // The new index is listed in system.indexes because the index build completed.
             ASSERT_EQUALS( 1U,
                            _client.count( "unittests.system.indexes",
@@ -486,24 +498,24 @@ namespace IndexUpdateTests {
             IndexCatalog::IndexBuildBlock* b = halfAddIndex("b");
             IndexCatalog::IndexBuildBlock* c = halfAddIndex("c");
             IndexCatalog::IndexBuildBlock* d = halfAddIndex("d");
-            int offset = nsd->findIndexByName( "b_1", true );
+            int offset = nsd->_catalogFindIndexByName( "b_1", true );
             ASSERT_EQUALS(2, offset);
 
             delete b;
 
-            ASSERT_EQUALS(2, nsd->findIndexByName( "c_1", true ) );
-            ASSERT_EQUALS(3, nsd->findIndexByName( "d_1", true ) );
+            ASSERT_EQUALS(2, nsd->_catalogFindIndexByName( "c_1", true ) );
+            ASSERT_EQUALS(3, nsd->_catalogFindIndexByName( "d_1", true ) );
 
-            offset = nsd->findIndexByName( "d_1", true );
+            offset = nsd->_catalogFindIndexByName( "d_1", true );
             delete d;
 
-            ASSERT_EQUALS(2, nsd->findIndexByName( "c_1", true ) );
-            ASSERT( nsd->findIndexByName( "d_1", true ) < 0 );
+            ASSERT_EQUALS(2, nsd->_catalogFindIndexByName( "c_1", true ) );
+            ASSERT( nsd->_catalogFindIndexByName( "d_1", true ) < 0 );
 
-            offset = nsd->findIndexByName( "a_1", true );
+            offset = nsd->_catalogFindIndexByName( "a_1", true );
             delete a;
 
-            ASSERT_EQUALS(1, nsd->findIndexByName( "c_1", true ));
+            ASSERT_EQUALS(1, nsd->_catalogFindIndexByName( "c_1", true ));
             delete c;
         }
 

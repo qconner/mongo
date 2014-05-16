@@ -176,18 +176,9 @@ namespace mongo {
     }
 
     // --------  FilteringClientCursor -----------
-    FilteringClientCursor::FilteringClientCursor( const BSONObj filter )
-        : _matcher( filter ) , _pcmData( NULL ), _done( true ) {
+    FilteringClientCursor::FilteringClientCursor()
+        : _pcmData( NULL ), _done( true ) {
     }
-
-    FilteringClientCursor::FilteringClientCursor( auto_ptr<DBClientCursor> cursor , const BSONObj filter )
-        : _matcher( filter ) , _cursor( cursor ) , _pcmData( NULL ), _done( cursor.get() == 0 ) {
-    }
-
-    FilteringClientCursor::FilteringClientCursor( DBClientCursor* cursor , const BSONObj filter )
-        : _matcher( filter ) , _cursor( cursor ) , _pcmData( NULL ), _done( cursor == 0 ) {
-    }
-
 
     FilteringClientCursor::~FilteringClientCursor() {
         // Don't use _pcmData
@@ -243,12 +234,10 @@ namespace mongo {
 
         while ( _cursor->more() ) {
             _next = _cursor->next();
-            if ( _matcher.matches( _next ) ) {
-                if ( ! _cursor->moreInCurrentBatch() )
-                    _next = _next.getOwned();
-                return;
+            if (!_cursor->moreInCurrentBatch()) {
+                _next = _next.getOwned();
             }
-            _next = BSONObj();
+            return;
         }
         _done = true;
     }
@@ -620,10 +609,8 @@ namespace mongo {
     
     void ParallelSortClusteredCursor::startInit() {
 
-        bool returnPartial = ( _qSpec.options() & QueryOption_PartialResults );
-        bool specialVersion = _cInfo.versionedNS.size() > 0;
-        bool specialFilter = ! _cInfo.cmdFilter.isEmpty();
-        NamespaceString ns( specialVersion ? _cInfo.versionedNS : _qSpec.ns() );
+        const bool returnPartial = ( _qSpec.options() & QueryOption_PartialResults );
+        NamespaceString ns( !_cInfo.isEmpty() ? _cInfo.versionedNS : _qSpec.ns() );
 
         ChunkManagerPtr manager;
         ShardPtr primary;
@@ -662,7 +649,7 @@ namespace mongo {
                 }
             }
 
-            if( manager ) manager->getShardsForQuery( todo, specialFilter ? _cInfo.cmdFilter : _qSpec.filter() );
+            if( manager ) manager->getShardsForQuery( todo, !_cInfo.isEmpty() ? _cInfo.cmdFilter : _qSpec.filter() );
             else if( primary ) todo.insert( *primary );
 
             // Close all cursors on extra shards first, as these will be invalid
@@ -1538,8 +1525,19 @@ namespace mongo {
     // ---- Future -----
     // -----------------
 
-    Future::CommandResult::CommandResult( const string& server , const string& db , const BSONObj& cmd , int options , DBClientBase * conn )
-        :_server(server) ,_db(db) , _options(options), _cmd(cmd) ,_conn(conn) ,_done(false)
+    Future::CommandResult::CommandResult( const string& server,
+                                          const string& db,
+                                          const BSONObj& cmd,
+                                          int options,
+                                          DBClientBase * conn,
+                                          bool useShardedConn ):
+                _server(server),
+                _db(db),
+                _options(options),
+                _cmd(cmd),
+                _conn(conn),
+                _useShardConn(useShardedConn),
+                _done(false)
     {
         init();
     }
@@ -1547,7 +1545,12 @@ namespace mongo {
     void Future::CommandResult::init(){
         try {
             if ( ! _conn ){
-                _connHolder.reset( new ScopedDbConnection( _server ) );
+                if ( _useShardConn) {
+                    _connHolder.reset( new ShardConnection( _server, "" ));
+                }
+                else {
+                    _connHolder.reset( new ScopedDbConnection( _server ) );
+                }
                 _conn = _connHolder->get();
             }
 
@@ -1641,8 +1644,19 @@ namespace mongo {
         return _ok;
     }
 
-    shared_ptr<Future::CommandResult> Future::spawnCommand( const string& server , const string& db , const BSONObj& cmd , int options , DBClientBase * conn ) {
-        shared_ptr<Future::CommandResult> res (new Future::CommandResult( server , db , cmd , options , conn  ));
+    shared_ptr<Future::CommandResult> Future::spawnCommand( const string& server,
+                                                            const string& db,
+                                                            const BSONObj& cmd,
+                                                            int options,
+                                                            DBClientBase * conn,
+                                                            bool useShardConn ) {
+        shared_ptr<Future::CommandResult> res (
+                new Future::CommandResult( server,
+                                           db,
+                                           cmd,
+                                           options,
+                                           conn,
+                                           useShardConn));
         return res;
     }
 

@@ -33,6 +33,7 @@ namespace mongo {
     class Client;
     class Database;
     class Timer;
+    class OperationContext;
 
 namespace mutablebson {
     class Document;
@@ -61,10 +62,6 @@ namespace mutablebson {
         ResourcePattern parseResourcePattern(const std::string& dbname,
                                              const BSONObj& cmdObj) const;
 
-        // warning: isAuthorized uses the lockType() return values, and values are being passed 
-        // around as ints so be careful as it isn't really typesafe and will need cleanup later
-        enum LockType { READ = -1 , NONE = 0 , WRITE = 1 };
-
         const string name;
 
         /* run the given command
@@ -75,19 +72,23 @@ namespace mutablebson {
 
            return value is true if succeeded.  if false, set errmsg text.
         */
-        virtual bool run(const string& db, BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool fromRepl = false ) = 0;
+        virtual bool run(OperationContext* txn,
+                         const string& db,
+                         BSONObj& cmdObj,
+                         int options,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl = false ) = 0;
 
-        /*
-           note: logTheOp() MUST be false if READ
-           if NONE, can't use Client::Context setup
-                    use with caution
+        /**
+         * This designation for the command is only used by the 'help' call and has nothing to do 
+         * with lock acquisition. The reason we need to have it there is because 
+         * SyncClusterConnection uses this to determine whether the command is update and needs to
+         * be sent to all three servers or just one.
+         *
+         * Eventually when SyncClusterConnection is refactored out, we can get rid of it.
          */
-        virtual LockType locktype() const = 0;
-
-        /** if true, lock globally instead of just the one database. by default only the one 
-            database will be locked. 
-        */
-        virtual bool lockGlobally() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const = 0;
 
         /* Return true if only the admin ns has privileges to run this command. */
         virtual bool adminOnly() const {
@@ -115,13 +116,6 @@ namespace mutablebson {
         virtual bool slaveOverrideOk() const {
             return false;
         }
-
-        /* Override and return true to if true,log the operation (logOp()) to the replication log.
-           (not done if fromRepl of course)
-
-           Note if run() returns false, we do NOT log.
-        */
-        virtual bool logTheOp() { return false; }
 
         /**
          * Override and return fales if the command opcounters should not be incremented on
@@ -164,7 +158,6 @@ namespace mutablebson {
         virtual ~Command() {}
 
     protected:
-
         /**
          * Appends to "*out" the privileges required to run this command on database "dbname" with
          * the invocation described by "cmdObj".  New commands shouldn't implement this, they should
@@ -203,10 +196,10 @@ namespace mutablebson {
                                          BSONObj& jsobj,
                                          BSONObjBuilder& anObjBuilder,
                                          int queryOptions = 0);
-        static LockType locktype( const string& name );
         static Command * findCommand( const string& name );
         // For mongod and webserver.
-        static void execCommand(Command* c,
+        static void execCommand(OperationContext* txn,
+                                Command* c,
                                 Client& client,
                                 int queryOptions,
                                 const char *ns,
@@ -214,7 +207,8 @@ namespace mutablebson {
                                 BSONObjBuilder& result,
                                 bool fromRepl );
         // For mongos
-        static void execCommandClientBasic(Command* c,
+        static void execCommandClientBasic(OperationContext* txn,
+                                           Command* c,
                                            ClientBasic& client,
                                            int queryOptions,
                                            const char *ns,
@@ -237,6 +231,7 @@ namespace mutablebson {
         static int testCommandsEnabled;
 
     private:
+
         /**
          * Checks to see if the client is authorized to run the given command with the given
          * parameters on the given named database.
@@ -256,6 +251,12 @@ namespace mutablebson {
                                           bool fromRepl);
     };
 
-    bool _runCommands(const char *ns, BSONObj& jsobj, BufBuilder &b, BSONObjBuilder& anObjBuilder, bool fromRepl, int queryOptions);
+    bool _runCommands(OperationContext* txn,
+                      const char* ns,
+                      BSONObj& jsobj,
+                      BufBuilder& b,
+                      BSONObjBuilder& anObjBuilder,
+                      bool fromRepl,
+                      int queryOptions);
 
 } // namespace mongo

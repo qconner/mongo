@@ -33,11 +33,13 @@
 #include <string>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/db/catalog/collection_cursor_cache.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/structure/capped_callback.h"
 #include "mongo/db/structure/record_store.h"
 #include "mongo/db/catalog/collection_info_cache.h"
 #include "mongo/platform/cstdint.h"
@@ -49,20 +51,13 @@ namespace mongo {
     class NamespaceDetails;
     class IndexCatalog;
     class MultiIndexBlock;
+    class OperationContext;
 
-    class CollectionIterator;
+    class RecordIterator;
     class FlatIterator;
     class CappedIterator;
 
     class OpDebug;
-
-    class DocWriter {
-    public:
-        virtual ~DocWriter() {}
-        virtual void writeDocument( char* buf ) const = 0;
-        virtual size_t documentSize() const = 0;
-        virtual bool addPadding() const { return true; }
-    };
 
     struct CompactOptions {
 
@@ -105,18 +100,19 @@ namespace mongo {
      * this is NOT safe through a yield right now
      * not sure if it will be, or what yet
      */
-    class Collection {
+    class Collection : CappedDocumentDeleteCallback {
     public:
-        Collection( const StringData& fullNS,
-                        NamespaceDetails* details,
-                        Database* database );
+        Collection( OperationContext* txn,
+                    const StringData& fullNS,
+                    NamespaceDetails* details,
+                    Database* database );
 
         ~Collection();
 
         bool ok() const { return _magic == 1357924; }
 
-        NamespaceDetails* details() { return _details; } // TODO: remove
-        const NamespaceDetails* details() const { return _details; }
+        NamespaceDetails* detailsWritable() { return _details; } // TODO: remove
+        const NamespaceDetails* detailsDeprecated() const { return _details; }
 
         CollectionInfoCache* infoCache() { return &_infoCache; }
         const CollectionInfoCache* infoCache() const { return &_infoCache; }
@@ -126,19 +122,29 @@ namespace mongo {
         const IndexCatalog* getIndexCatalog() const { return &_indexCatalog; }
         IndexCatalog* getIndexCatalog() { return &_indexCatalog; }
 
+        const RecordStore* getRecordStore() const { return _recordStore.get(); }
+
         CollectionCursorCache* cursorCache() const { return &_cursorCache; }
 
         bool requiresIdIndex() const;
 
-        BSONObj docFor( const DiskLoc& loc );
+        BSONObj docFor(const DiskLoc& loc) const;
 
         // ---- things that should move to a CollectionAccessMethod like thing
         /**
          * canonical to get all would be
          * getIterator( DiskLoc(), false, CollectionScanParams::FORWARD )
          */
-        CollectionIterator* getIterator( const DiskLoc& start, bool tailable,
-                                         const CollectionScanParams::Direction& dir) const;
+        RecordIterator* getIterator( const DiskLoc& start = DiskLoc(),
+                                     bool tailable = false,
+                                     const CollectionScanParams::Direction& dir = CollectionScanParams::FORWARD ) const;
+
+        /**
+         * Returns many iterators that partition the Collection into many disjoint sets. Iterating
+         * all returned iterators is equivalent to Iterating the full collection.
+         * Caller owns all pointers in the vector.
+         */
+        std::vector<RecordIterator*> getManyIterators() const;
 
 
         /**
@@ -148,7 +154,8 @@ namespace mongo {
          */
         int64_t countTableScan( const MatchExpression* expression );
 
-        void deleteDocument( const DiskLoc& loc,
+        void deleteDocument( OperationContext* txn,
+                             const DiskLoc& loc,
                              bool cappedOK = false,
                              bool noWarn = false,
                              BSONObj* deletedId = 0 );
@@ -157,11 +164,17 @@ namespace mongo {
          * this does NOT modify the doc before inserting
          * i.e. will not add an _id field for documents that are missing it
          */
-        StatusWith<DiskLoc> insertDocument( const BSONObj& doc, bool enforceQuota );
+        StatusWith<DiskLoc> insertDocument( OperationContext* txn,
+                                            const BSONObj& doc,
+                                            bool enforceQuota );
 
-        StatusWith<DiskLoc> insertDocument( const DocWriter* doc, bool enforceQuota );
+        StatusWith<DiskLoc> insertDocument( OperationContext* txn,
+                                            const DocWriter* doc,
+                                            bool enforceQuota );
 
-        StatusWith<DiskLoc> insertDocument( const BSONObj& doc, MultiIndexBlock& indexBlock );
+        StatusWith<DiskLoc> insertDocument( OperationContext* txn,
+                                            const BSONObj& doc,
+                                            MultiIndexBlock& indexBlock );
 
         /**
          * updates the document @ oldLocation with newDoc
@@ -169,16 +182,57 @@ namespace mongo {
          * if not, it is moved
          * @return the post update location of the doc (may or may not be the same as oldLocation)
          */
-        StatusWith<DiskLoc> updateDocument( const DiskLoc& oldLocation,
+        StatusWith<DiskLoc> updateDocument( OperationContext* txn,
+                                            const DiskLoc& oldLocation,
                                             const BSONObj& newDoc,
                                             bool enforceQuota,
                                             OpDebug* debug );
 
-        int64_t storageSize( int* numExtents = NULL, BSONArrayBuilder* extentInfo = NULL ) const;
+        /**
+         * right now not allowed to modify indexes
+         */
+        Status updateDocumentWithDamages( OperationContext* txn,
+                                          const DiskLoc& loc,
+                                          const char* damangeSource,
+                                          const mutablebson::DamageVector& damages );
 
         // -----------
 
-        StatusWith<CompactStats> compact( const CompactOptions* options );
+        StatusWith<CompactStats> compact(OperationContext* txn, const CompactOptions* options);
+
+        /**
+         * removes all documents as fast as possible
+         * indexes before and after will be the same
+         * as will other characteristics
+         */
+        Status truncate(OperationContext* txn);
+
+        /**
+         * @param full - does more checks
+         * @param scanData - scans each document
+         * @return OK if the validate run successfully
+         *         OK will be returned even if corruption is found
+         *         deatils will be in result
+         */
+        Status validate( OperationContext* txn,
+                         bool full, bool scanData,
+                         ValidateResults* results, BSONObjBuilder* output );
+
+        /**
+         * forces data into cache
+         */
+        Status touch( OperationContext* txn,
+                      bool touchData, bool touchIndexes,
+                      BSONObjBuilder* output ) const;
+
+        /**
+         * Truncate documents newer than the document at 'end' from the capped
+         * collection.  The collection cannot be completely emptied using this
+         * function.  An assertion will be thrown if that is attempted.
+         * @param inclusive - Truncate 'end' as well iff true
+         * XXX: this will go away soon, just needed to move for now
+         */
+        void temp_cappedTruncateAfter( OperationContext* txn, DiskLoc end, bool inclusive );
 
         // -----------
 
@@ -187,11 +241,17 @@ namespace mongo {
         // this will add a new extent the collection
         // the new extent will be returned
         // it will have been added to the linked list already
-        Extent* increaseStorageSize( int size, bool enforceQuota );
+        void increaseStorageSize( OperationContext* txn, int size, bool enforceQuota );
 
         //
         // Stats
         //
+
+        /**
+         * @param scaleSize - amount by which to scale size metrics
+         * appends any custom stats from the RecordStore or other unique stats
+         */
+        void appendCustomStats( BSONObjBuilder* resuits, double scaleSize = 1 ) const;
 
         bool isCapped() const;
 
@@ -206,18 +266,36 @@ namespace mongo {
             return static_cast<int>( dataSize() / n );
         }
 
+        // TODO(erh) - below till next mark are suspect
+        bool isUserFlagSet( int flag ) const;
+        bool setUserFlag( OperationContext* txn, int flag );
+        bool clearUserFlag( OperationContext* txn, int flag );
+
+        void setMaxCappedDocs( OperationContext* txn, long long max );
+        // --- end suspect things
+
     private:
+
+        Status aboutToDeleteCapped( OperationContext* txn, const DiskLoc& loc );
+
         /**
          * same semantics as insertDocument, but doesn't do:
          *  - some user error checks
          *  - adjust padding
          */
-        StatusWith<DiskLoc> _insertDocument( const BSONObj& doc,
+        StatusWith<DiskLoc> _insertDocument( OperationContext* txn,
+                                             const BSONObj& doc,
                                              bool enforceQuota );
 
-        void _compactExtent(const DiskLoc diskloc, int extentNumber,
+        void _compactExtent(OperationContext* txn,
+                            const DiskLoc diskloc,
+                            int extentNumber,
                             MultiIndexBlock& indexesToInsertTo,
-                            const CompactOptions* compactOptions, CompactStats* stats );
+                            const CompactOptions* compactOptions,
+                            CompactStats* stats );
+
+        void _syncUserFlags(OperationContext* txn); // TODO: this is bizarre, should go away
+
 
         // @return 0 for inf., otherwise a number of files
         int largestFileNumberInQuota() const;
@@ -243,6 +321,7 @@ namespace mongo {
         friend class FlatIterator;
         friend class CappedIterator;
         friend class IndexCatalog;
+        friend class NamespaceDetails;
     };
 
 }

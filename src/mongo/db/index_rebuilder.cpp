@@ -30,11 +30,13 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/repl/rs.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -61,13 +63,13 @@ namespace mongo {
                  dbName < dbNames.end();
                  dbName++) {
                 Client::ReadContext ctx(*dbName);
-                Database* db = cc().database();
+                Database* db = ctx.ctx().db();
                 db->namespaceIndex().getNamespaces(collNames, /* onlyCollections */ true);
             }
             checkNS(collNames);
         }
-        catch (const DBException&) {
-            warning() << "index rebuilding did not complete" << endl;
+        catch (const DBException& e) {
+            warning() << "Index rebuilding did not complete: " << e.what() << endl;
         }
         boost::unique_lock<boost::mutex> lk(ReplSet::rss.mtx);
         ReplSet::rss.indexRebuildDone = true;
@@ -88,6 +90,8 @@ namespace mongo {
             // This write lock is held throughout the index building process
             // for this namespace.
             Client::WriteContext ctx(ns);
+            OperationContextImpl txn;  // XXX???
+
             Collection* collection = ctx.ctx().db()->getCollection( ns );
             if ( collection == NULL )
                 continue;
@@ -96,11 +100,11 @@ namespace mongo {
 
             if ( collection->ns().isOplog() && indexCatalog->numIndexesTotal() > 0 ) {
                 warning() << ns << " had illegal indexes, removing";
-                indexCatalog->dropAllIndexes( true );
+                indexCatalog->dropAllIndexes(&txn, true);
                 continue;
             }
 
-            vector<BSONObj> indexesToBuild = indexCatalog->getAndClearUnfinishedIndexes();
+            vector<BSONObj> indexesToBuild = indexCatalog->getAndClearUnfinishedIndexes(&txn);
 
             // The indexes have now been removed from system.indexes, so the only record is
             // in-memory. If there is a journal commit between now and when insert() rewrites
@@ -131,7 +135,7 @@ namespace mongo {
 
                 log() << "going to rebuild: " << indexObj;
 
-                Status status = indexCatalog->createIndex( indexObj, false );
+                Status status = indexCatalog->createIndex(&txn, indexObj, false);
                 if ( !status.isOK() ) {
                     log() << "building index failed: " << status.toString() << " index: " << indexObj;
                 }

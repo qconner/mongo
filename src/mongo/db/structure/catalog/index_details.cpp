@@ -28,36 +28,10 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
-
 #include "mongo/db/structure/catalog/index_details.h"
-
-#include <boost/checked_delete.hpp>
-
-#include "mongo/db/client.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    int IndexDetails::keyPatternOffset( const string& key ) const {
-        BSONObjIterator i( keyPattern() );
-        int n = 0;
-        while ( i.more() ) {
-            BSONElement e = i.next();
-            if ( key == e.fieldName() )
-                return n;
-            n++;
-        }
-        return -1;
-    }
-
-    /* delete this index.  does NOT clean up the system catalog
-       (system.indexes or system.namespaces) -- only NamespaceIndex.
-       TOOD: above comment is wrong, also, document durability assumptions
-    */
     void IndexDetails::_reset() {
         head.setInvalid();
         info.setInvalid();

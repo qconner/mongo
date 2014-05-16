@@ -82,13 +82,6 @@ namespace mongo {
         void kill();
 
         //
-        // Yielding.
-        //
-
-        static void staticYield(int micros, const StringData& ns, const Record* rec);
-        static int suggestYieldMicros();
-
-        //
         // Timing and timeouts
         //
 
@@ -149,8 +142,8 @@ namespace mongo {
 
     private:
         friend class ClientCursorMonitor;
-        friend class ClientCursorPin;
         friend class CmdCursorInfo;
+        friend class CollectionCursorCache;
 
         /**
          * Initialization common between both constructors for the ClientCursor.

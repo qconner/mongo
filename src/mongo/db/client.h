@@ -58,7 +58,6 @@ namespace mongo {
     class Client;
     class AbstractMessagingPort;
     class LockCollectionForReading;
-    class PageFaultRetryableSection;
 
     TSP_DECLARE(Client, currentClient)
 
@@ -94,14 +93,9 @@ namespace mongo {
         string clientAddress(bool includePort=false) const;
         CurOp* curop() const { return _curOp; }
         Context* getContext() const { return _context; }
-        Database* database() const {  return _context ? _context->db() : 0; }
-        const char *ns() const { return _context->ns(); }
         const StringData desc() const { return _desc; }
         void setLastOp( OpTime op ) { _lastOp = op; }
         OpTime getLastOp() const { return _lastOp; }
-
-        /** caution -- use Context class instead */
-        void setContext(Context *c) { _context = c; }
 
         /* report what the last operation was.  used by getlasterror */
         void appendLastOp( BSONObjBuilder& b ) const;
@@ -109,13 +103,10 @@ namespace mongo {
         bool isGod() const { return _god; } /* this is for map/reduce writes */
         bool setGod(bool newVal) { const bool prev = _god; _god = newVal; return prev; }
         string toString() const;
-        void gotHandshake( const BSONObj& o );
+        bool gotHandshake( const BSONObj& o );
         BSONObj getRemoteID() const { return _remoteId; }
         BSONObj getHandshake() const { return _handshake; }
         ConnectionId getConnectionId() const { return _connectionId; }
-
-        bool inPageFaultRetryableSection() const { return _pageFaultRetryableSection != 0; }
-        PageFaultRetryableSection* getPageFaultRetryableSection() const { return _pageFaultRetryableSection; }
 
         void writeHappened() { _hasWrittenSinceCheckpoint = true; _hasWrittenThisOperation = true; }
         bool hasWrittenSinceCheckpoint() const { return _hasWrittenSinceCheckpoint; }
@@ -125,14 +116,6 @@ namespace mongo {
             _hasWrittenThisOperation = false;
             _hasWrittenSinceCheckpoint = false;
         }
-
-        /**
-         * Call this to allow PageFaultExceptions even if writes happened before this was called.
-         * Writes after this is called still prevent PFEs from being thrown.
-         */
-        void clearHasWrittenThisOperation() { _hasWrittenThisOperation = false; }
-
-        bool allowedToThrowPageFaultException() const;
 
         LockState& lockState() { return _ls; }
 
@@ -152,12 +135,9 @@ namespace mongo {
 
         bool _hasWrittenThisOperation;
         bool _hasWrittenSinceCheckpoint;
-        PageFaultRetryableSection *_pageFaultRetryableSection;
 
         LockState _ls;
         
-        friend class PageFaultRetryableSection; // TEMP
-        friend class NoPageFaultsAllowed; // TEMP
     public:
 
         /** "read lock, and set my context, all in one operation" 
@@ -165,7 +145,9 @@ namespace mongo {
          */
         class ReadContext : boost::noncopyable { 
         public:
-            ReadContext(const std::string& ns, const std::string& path=storageGlobalParams.dbpath);
+            ReadContext(const std::string& ns,
+                        const std::string& path=storageGlobalParams.dbpath,
+                        bool doVersion = true);
             Context& ctx() { return *c.get(); }
         private:
             scoped_ptr<Lock::DBRead> lk;
@@ -179,7 +161,7 @@ namespace mongo {
         public:
             /** this is probably what you want */
             Context(const string& ns, const std::string& path=storageGlobalParams.dbpath,
-                    bool doVersion=true);
+                    bool doVersion = true);
 
             /** note: this does not call finishInit -- i.e., does not call 
                       shardVersionOk() for example. 
@@ -188,7 +170,7 @@ namespace mongo {
             Context(const std::string& ns , Database * db);
 
             // used by ReadContext
-            Context(const string& path, const string& ns, Database *db);
+            Context(const string& path, const string& ns, Database *db, bool doVersion = true);
 
             ~Context();
             Client* getClient() const { return _client; }
@@ -236,7 +218,9 @@ namespace mongo {
 
         class WriteContext : boost::noncopyable {
         public:
-            WriteContext(const string& ns, const std::string& path=storageGlobalParams.dbpath);
+            WriteContext(const string& ns,
+                         const std::string& path=storageGlobalParams.dbpath,
+                         bool doVersion = true);
             Context& ctx() { return _c; }
         private:
             Lock::DBWrite _lk;
@@ -254,6 +238,6 @@ namespace mongo {
         return *c;
     }
 
-    inline bool haveClient() { return currentClient.get() > 0; }
+    inline bool haveClient() { return currentClient.get() != NULL; }
 
 };

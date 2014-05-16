@@ -48,7 +48,13 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/storage/data_file.h"
+#include "mongo/db/storage/extent.h"
+#include "mongo/db/storage/extent_manager.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
 #include "mongo/db/storage_options.h"
+#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/db/catalog/collection.h"
 
 namespace mongo {
@@ -74,8 +80,6 @@ namespace mongo {
                     return Status( ErrorCodes::BadValue, "size has to be >= 0" );
                 cappedSize += 0xff;
                 cappedSize &= 0xffffffffffffff00LL;
-                if ( cappedSize < Extent::minSize() )
-                    cappedSize = Extent::minSize();
             }
             else if ( fieldName == "max" ) {
                 if ( !e.isNumber() )
@@ -192,10 +196,10 @@ namespace mongo {
         return Status::OK();
     }
 
-    Database::Database(const char *nm, bool& newDb, const string& path )
+    Database::Database(OperationContext* txn, const char *nm, bool& newDb, const string& path )
         : _name(nm), _path(path),
           _namespaceIndex( _path, _name ),
-          _extentManager(_name, _path, storageGlobalParams.directoryperdb),
+          _extentManager(new MmapV1ExtentManager(_name, _path, storageGlobalParams.directoryperdb)),
           _profileName(_name + ".system.profile"),
           _namespacesName(_name + ".system.namespaces"),
           _indexesName(_name + ".system.indexes"),
@@ -215,18 +219,19 @@ namespace mongo {
             // If already exists, open.  Otherwise behave as if empty until
             // there's a write, then open.
             if (!newDb) {
-                _namespaceIndex.init();
-                openAllFiles();
+                _namespaceIndex.init( txn );
+                openAllFiles(txn);
 
                 // upgrade freelist
                 string oldFreeList = _name + ".$freelist";
                 NamespaceDetails* details = _namespaceIndex.details( oldFreeList );
                 if ( details ) {
                     if ( !details->firstExtent().isNull() ) {
-                        _extentManager.freeExtents(details->firstExtent(),
-                                                   details->lastExtent());
+                        _extentManager->freeExtents(txn,
+                                                    details->firstExtent(),
+                                                    details->lastExtent());
                     }
-                    _namespaceIndex.kill_ns( oldFreeList );
+                    _namespaceIndex.kill_ns( txn, oldFreeList );
                 }
             }
             _magic = 781231;
@@ -294,44 +299,43 @@ namespace mongo {
     // todo : we stop once a datafile dne.
     //        if one datafile were missing we should keep going for
     //        repair purposes yet we do not.
-    void Database::openAllFiles() {
+    void Database::openAllFiles(OperationContext* txn) {
         verify(this);
-        Status s = _extentManager.init();
+        Status s = _extentManager->init(txn);
         if ( !s.isOK() ) {
             msgasserted( 16966, str::stream() << "_extentManager.init failed: " << s.toString() );
         }
     }
 
-    void Database::clearTmpCollections() {
+    void Database::clearTmpCollections(OperationContext* txn) {
 
         Lock::assertWriteLocked( _name );
-        Client::Context ctx( _name );
-
-        string systemNamespaces =  _name + ".system.namespaces";
 
         // Note: we build up a toDelete vector rather than dropping the collection inside the loop
         // to avoid modifying the system.namespaces collection while iterating over it since that
         // would corrupt the cursor.
         vector<string> toDelete;
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemNamespaces));
-        BSONObj nsObj;
-        Runner::RunnerState state;
-        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&nsObj, NULL))) {
-            BSONElement e = nsObj.getFieldDotted( "options.temp" );
-            if ( !e.trueValue() )
-                continue;
+        {
+            Collection* coll = getCollection( txn, _namespacesName );
+            if ( coll ) {
+                scoped_ptr<RecordIterator> it( coll->getIterator() );
+                DiskLoc next;
+                while ( !( next = it->getNext() ).isNull() ) {
+                    BSONObj nsObj = coll->docFor( next );
 
-            string ns = nsObj["name"].String();
+                    BSONElement e = nsObj.getFieldDotted( "options.temp" );
+                    if ( !e.trueValue() )
+                        continue;
 
-            // Do not attempt to drop indexes
-            if ( !NamespaceString::normal(ns.c_str()) )
-                continue;
+                    string ns = nsObj["name"].String();
 
-            toDelete.push_back(ns);
-        }
+                    // Do not attempt to drop indexes
+                    if ( !NamespaceString::normal(ns.c_str()) )
+                        continue;
 
-        if (Runner::RUNNER_EOF != state) {
-            warning() << "Internal error while reading collection " << systemNamespaces << endl;
+                    toDelete.push_back(ns);
+                }
+            }
         }
 
         for (size_t i=0; i < toDelete.size(); i++) {
@@ -343,7 +347,13 @@ namespace mongo {
         }
     }
 
-    bool Database::setProfilingLevel( int newLevel , string& errmsg ) {
+    long long Database::fileSize() const { return _extentManager->fileSize(); }
+
+    int Database::numFiles() const { return _extentManager->numFiles(); }
+
+    void Database::flushFiles( bool sync ) { return _extentManager->flushFiles( sync ); }
+
+    bool Database::setProfilingLevel( OperationContext* txn, int newLevel , string& errmsg ) {
         if ( _profile == newLevel )
             return true;
 
@@ -357,20 +367,18 @@ namespace mongo {
             return true;
         }
 
-        verify( cc().database() == this );
-
-        if (!getOrCreateProfileCollection(this, true, &errmsg))
+        if (!getOrCreateProfileCollection(txn, this, true, &errmsg))
             return false;
 
         _profile = newLevel;
         return true;
     }
 
-    Status Database::dropCollection( const StringData& fullns ) {
+    Status Database::dropCollection( OperationContext* txn, const StringData& fullns ) {
         LOG(1) << "dropCollection: " << fullns << endl;
         massertNamespaceNotIndex( fullns, "dropCollection" );
 
-        Collection* collection = getCollection( fullns );
+        Collection* collection = getCollection( txn, fullns );
         if ( !collection ) {
             // collection doesn't exist
             return Status::OK();
@@ -397,7 +405,7 @@ namespace mongo {
         audit::logDropCollection( currentClient.get(), fullns );
 
         try {
-            Status s = collection->getIndexCatalog()->dropAllIndexes( true );
+            Status s = collection->getIndexCatalog()->dropAllIndexes(txn, true);
             if ( !s.isOK() ) {
                 warning() << "could not drop collection, trying to drop indexes"
                           << fullns << " because of " << s.toString();
@@ -417,7 +425,7 @@ namespace mongo {
 
         Top::global.collectionDropped( fullns );
 
-        Status s = _dropNS( fullns );
+        Status s = _dropNS( txn, fullns );
 
         _clearCollectionCache( fullns ); // we want to do this always
 
@@ -459,6 +467,11 @@ namespace mongo {
     }
 
     Collection* Database::getCollection( const StringData& ns ) {
+        OperationContextImpl txn; // TODO remove once we require reads to have transactions
+        return getCollection(&txn, ns);
+    }
+
+    Collection* Database::getCollection( OperationContext* txn, const StringData& ns ) {
         verify( _name == nsToDatabaseSubstring( ns ) );
 
         scoped_lock lk( _collectionLock );
@@ -484,18 +497,20 @@ namespace mongo {
             return NULL;
         }
 
-        Collection* c = new Collection( ns, details, this );
+        Collection* c = new Collection( txn, ns, details, this );
         _collections[ns] = c;
         return c;
     }
 
 
 
-    Status Database::renameCollection( const StringData& fromNS, const StringData& toNS,
+    Status Database::renameCollection( OperationContext* txn,
+                                       const StringData& fromNS,
+                                       const StringData& toNS,
                                        bool stayTemp ) {
 
         // move data namespace
-        Status s = _renameSingleNamespace( fromNS, toNS, stayTemp );
+        Status s = _renameSingleNamespace( txn, fromNS, toNS, stayTemp );
         if ( !s.isOK() )
             return s;
 
@@ -504,9 +519,11 @@ namespace mongo {
 
         audit::logRenameCollection( currentClient.get(), fromNS, toNS );
 
+        Collection* systemIndexCollection = getCollection(txn, _indexesName);
+
         // move index namespaces
         BSONObj oldIndexSpec;
-        while( Helpers::findOne( _indexesName, BSON( "ns" << fromNS ), oldIndexSpec ) ) {
+        while (Helpers::findOne(systemIndexCollection, BSON("ns" << fromNS), oldIndexSpec)) {
             oldIndexSpec = oldIndexSpec.getOwned();
 
             BSONObj newIndexSpec;
@@ -524,21 +541,32 @@ namespace mongo {
             }
 
             StatusWith<DiskLoc> newIndexSpecLoc =
-                getCollection( _indexesName )->insertDocument( newIndexSpec, false );
+                systemIndexCollection->insertDocument( txn, newIndexSpec, false );
             if ( !newIndexSpecLoc.isOK() )
                 return newIndexSpecLoc.getStatus();
 
-            int indexI = details->_catalogFindIndexByName( oldIndexSpec.getStringField( "name" ) );
-            IndexDetails &indexDetails = details->idx(indexI);
-            string oldIndexNs = indexDetails.indexNamespace();
-            indexDetails.info = newIndexSpecLoc.getValue();
-            string newIndexNs = indexDetails.indexNamespace();
+            const string& indexName = oldIndexSpec.getStringField( "name" );
 
-            Status s = _renameSingleNamespace( oldIndexNs, newIndexNs, false );
-            if ( !s.isOK() )
-                return s;
+            {
+                // fix IndexDetails pointer
+                int indexI = details->_catalogFindIndexByName(
+                                        systemIndexCollection, indexName, false);
 
-            deleteObjects( _indexesName, oldIndexSpec, true, false, true );
+                IndexDetails& indexDetails = details->idx(indexI);
+                *txn->recoveryUnit()->writing(&indexDetails.info) = newIndexSpecLoc.getValue(); // XXX: dur
+            }
+
+            {
+                // move underlying namespac
+                string oldIndexNs = IndexDescriptor::makeIndexNamespace( fromNS, indexName );
+                string newIndexNs = IndexDescriptor::makeIndexNamespace( toNS, indexName );
+
+                Status s = _renameSingleNamespace( txn, oldIndexNs, newIndexNs, false );
+                if ( !s.isOK() )
+                    return s;
+            }
+
+            deleteObjects(txn, this, _indexesName, oldIndexSpec, true, false, true);
         }
 
         Top::global.collectionDropped( fromNS.toString() );
@@ -546,7 +574,9 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status Database::_renameSingleNamespace( const StringData& fromNS, const StringData& toNS,
+    Status Database::_renameSingleNamespace( OperationContext* txn,
+                                             const StringData& fromNS,
+                                             const StringData& toNS,
                                              bool stayTemp ) {
 
         // TODO: make it so we dont't need to do this
@@ -575,22 +605,25 @@ namespace mongo {
         // ----
 
         // this could throw, but if it does we're ok
-        _namespaceIndex.add_ns( toNS, fromDetails );
+        _namespaceIndex.add_ns( txn, toNS, fromDetails );
         NamespaceDetails* toDetails = _namespaceIndex.details( toNS );
 
         try {
-            toDetails->copyingFrom(toNSString.c_str(), fromDetails); // fixes extraOffset
+            toDetails->copyingFrom(txn,
+                                   toNSString.c_str(),
+                                   _namespaceIndex,
+                                   fromDetails); // fixes extraOffset
         }
         catch( DBException& ) {
             // could end up here if .ns is full - if so try to clean up / roll back a little
-            _namespaceIndex.kill_ns( toNSString );
+            _namespaceIndex.kill_ns( txn, toNSString );
             _clearCollectionCache(toNSString);
             throw;
         }
 
         // at this point, code .ns stuff moved
 
-        _namespaceIndex.kill_ns( fromNSString );
+        _namespaceIndex.kill_ns( txn, fromNSString );
         _clearCollectionCache(fromNSString);
         fromDetails = NULL;
 
@@ -599,7 +632,9 @@ namespace mongo {
         {
 
             BSONObj oldSpec;
-            if ( !Helpers::findOne( _namespacesName, BSON( "name" << fromNS ), oldSpec ) )
+            if ( !Helpers::findOne( getCollection( txn, _namespacesName ),
+                                    BSON( "name" << fromNS ),
+                                    oldSpec ) )
                 return Status( ErrorCodes::InternalError, "can't find system.namespaces entry" );
 
             BSONObjBuilder b;
@@ -617,38 +652,43 @@ namespace mongo {
             newSpec = b.obj();
         }
 
-        _addNamespaceToCatalog( toNSString, newSpec.isEmpty() ? 0 : &newSpec );
+        _addNamespaceToCatalog( txn, toNSString, newSpec.isEmpty() ? 0 : &newSpec );
 
-        deleteObjects( _namespacesName, BSON( "name" << fromNS ), false, false, true );
+        deleteObjects(txn, this, _namespacesName, BSON("name" << fromNS), false, false, true);
 
         return Status::OK();
     }
 
     Collection* Database::getOrCreateCollection( const StringData& ns ) {
-        Collection* c = getCollection( ns );
+        OperationContextImpl txn; // TODO remove once we require reads to have transactions
+        return getOrCreateCollection(&txn, ns);
+    }
+    Collection* Database::getOrCreateCollection(OperationContext* txn, const StringData& ns) {
+        Collection* c = getCollection( txn, ns );
         if ( !c ) {
-            c = createCollection( ns );
+            c = createCollection( txn, ns );
         }
         return c;
     }
 
     namespace {
-        int _massageExtentSize( long long size ) {
-            if ( size < Extent::minSize() )
-                return Extent::minSize();
-            if ( size > Extent::maxSize() )
-                return Extent::maxSize();
+        int _massageExtentSize( const ExtentManager* em, long long size ) {
+            if ( size < em->minSize() )
+                return em->minSize();
+            if ( size > em->maxSize() )
+                return em->maxSize();
             return static_cast<int>( size );
         }
     }
 
-    Collection* Database::createCollection( const StringData& ns,
+    Collection* Database::createCollection( OperationContext* txn,
+                                            const StringData& ns,
                                             const CollectionOptions& options,
                                             bool allocateDefaultSpace,
                                             bool createIdIndex ) {
         massert( 17399, "collection already exists", _namespaceIndex.details( ns ) == NULL );
         massertNamespaceNotIndex( ns, "createCollection" );
-        _namespaceIndex.init();
+        _namespaceIndex.init( txn );
 
         if ( serverGlobalParams.configsvr &&
              !( ns.startsWith( "config." ) ||
@@ -669,54 +709,53 @@ namespace mongo {
 
         audit::logCreateCollection( currentClient.get(), ns );
 
-        _namespaceIndex.add_ns( ns, DiskLoc(), options.capped );
+        _namespaceIndex.add_ns( txn, ns, DiskLoc(), options.capped );
         BSONObj optionsAsBSON = options.toBSON();
-        _addNamespaceToCatalog( ns, &optionsAsBSON );
+        _addNamespaceToCatalog( txn, ns, &optionsAsBSON );
 
-        Collection* collection = getCollection( ns );
+        Collection* collection = getCollection( txn, ns );
         massert( 17400, "_namespaceIndex.add_ns failed?", collection );
-
-        NamespaceDetails* nsd = collection->details();
 
         // allocation strategy set explicitly in flags or by server-wide default
         if ( !options.capped ) {
             if ( options.flagsSet ) {
-                nsd->setUserFlag( options.flags );
+                collection->setUserFlag( txn, options.flags );
             }
             else if ( newCollectionsUsePowerOf2Sizes ) {
-                nsd->setUserFlag( NamespaceDetails::Flag_UsePowerOf2Sizes );
+                collection->setUserFlag( txn, NamespaceDetails::Flag_UsePowerOf2Sizes );
             }
         }
 
         if ( options.cappedMaxDocs > 0 )
-            nsd->setMaxCappedDocs( options.cappedMaxDocs );
+            collection->setMaxCappedDocs( txn, options.cappedMaxDocs );
 
         if ( allocateDefaultSpace ) {
             if ( options.initialNumExtents > 0 ) {
-                int size = _massageExtentSize( options.cappedSize );
+                int size = _massageExtentSize( _extentManager.get(),
+                                               options.cappedSize );
                 for ( int i = 0; i < options.initialNumExtents; i++ ) {
-                    collection->increaseStorageSize( size, false );
+                    collection->increaseStorageSize( txn, size, false );
                 }
             }
             else if ( !options.initialExtentSizes.empty() ) {
                 for ( size_t i = 0; i < options.initialExtentSizes.size(); i++ ) {
                     int size = options.initialExtentSizes[i];
-                    size = _massageExtentSize( size );
-                    collection->increaseStorageSize( size, false );
+                    size = _massageExtentSize( _extentManager.get(),
+                                               size );
+                    collection->increaseStorageSize( txn, size, false );
                 }
             }
             else if ( options.capped ) {
                 // normal
-                long long size = options.cappedSize;
-                while ( size > 0 ) {
-                    int mySize = _massageExtentSize( size );
-                    mySize &= 0xffffff00;
-                    Extent* e = collection->increaseStorageSize( mySize, true );
-                    size -= e->length;
+                while ( collection->getRecordStore()->storageSize() < options.cappedSize ) {
+                    int sz = _massageExtentSize( _extentManager.get(),
+                                                 options.cappedSize - collection->getRecordStore()->storageSize() );
+                    sz &= 0xffffff00;
+                    collection->increaseStorageSize( txn, sz, true );
                 }
             }
             else {
-                collection->increaseStorageSize( Extent::initialSize( 128 ), false );
+                collection->increaseStorageSize( txn, _extentManager->initialSize( 128 ), false );
             }
         }
 
@@ -724,12 +763,12 @@ namespace mongo {
             if ( collection->requiresIdIndex() ) {
                 if ( options.autoIndexId == CollectionOptions::YES ||
                      options.autoIndexId == CollectionOptions::DEFAULT ) {
-                    uassertStatusOK( collection->getIndexCatalog()->ensureHaveIdIndex() );
+                    uassertStatusOK( collection->getIndexCatalog()->ensureHaveIdIndex(txn) );
                 }
             }
 
             if ( nss.isSystem() ) {
-                authindex::createSystemIndexes( collection );
+                authindex::createSystemIndexes( txn, collection );
             }
 
         }
@@ -738,7 +777,9 @@ namespace mongo {
     }
 
 
-    void Database::_addNamespaceToCatalog( const StringData& ns, const BSONObj* options ) {
+    void Database::_addNamespaceToCatalog( OperationContext* txn,
+                                           const StringData& ns,
+                                           const BSONObj* options ) {
         LOG(1) << "Database::_addNamespaceToCatalog ns: " << ns << endl;
         if ( nsToCollectionSubstring( ns ) == "system.namespaces" ) {
             // system.namespaces holds all the others, so it is not explicitly listed in the catalog.
@@ -751,14 +792,14 @@ namespace mongo {
             b.append("options", *options);
         BSONObj obj = b.done();
 
-        Collection* collection = getCollection( _namespacesName );
+        Collection* collection = getCollection( txn, _namespacesName );
         if ( !collection )
-            collection = createCollection( _namespacesName );
-        StatusWith<DiskLoc> loc = collection->insertDocument( obj, false );
+            collection = createCollection( txn, _namespacesName );
+        StatusWith<DiskLoc> loc = collection->insertDocument( txn, obj, false );
         uassertStatusOK( loc.getStatus() );
     }
 
-    Status Database::_dropNS( const StringData& ns ) {
+    Status Database::_dropNS( OperationContext* txn, const StringData& ns ) {
 
         NamespaceDetails* d = _namespaceIndex.details( ns );
         if ( !d )
@@ -770,29 +811,30 @@ namespace mongo {
         {
             // remove from the system catalog
             BSONObj cond = BSON( "name" << ns );   // { name: "colltodropname" }
-            deleteObjects( _namespacesName, cond, false, false, true);
+            deleteObjects(txn, this, _namespacesName, cond, false, false, true);
         }
 
         // free extents
         if( !d->firstExtent().isNull() ) {
-            _extentManager.freeExtents(d->firstExtent(), d->lastExtent());
-            d->setFirstExtentInvalid();
-            d->setLastExtentInvalid();
+            _extentManager->freeExtents(txn, d->firstExtent(), d->lastExtent());
+            d->setFirstExtentInvalid(txn);
+            d->setLastExtentInvalid(txn);
         }
 
         // remove from the catalog hashtable
-        _namespaceIndex.kill_ns( ns );
+        _namespaceIndex.kill_ns( txn, ns );
 
         return Status::OK();
     }
 
     void Database::getFileFormat( int* major, int* minor ) {
-        if ( _extentManager.numFiles() == 0 ) {
+        if ( _extentManager->numFiles() == 0 ) {
             *major = 0;
             *minor = 0;
             return;
         }
-        const DataFile* df = _extentManager.getFile( 0 );
+        OperationContextImpl txn; // TODO get rid of this once reads need transactions
+        const DataFile* df = _extentManager->getFile( &txn, 0 );
         *major = df->getHeader()->version;
         *minor = df->getHeader()->versionMinor;
     }

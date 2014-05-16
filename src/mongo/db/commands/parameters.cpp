@@ -58,7 +58,7 @@ namespace mongo {
         CmdGet() : Command( "getParameter" ) { }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -72,7 +72,7 @@ namespace mongo {
             appendParameterNames( help );
             help << "{ getParameter:'*' } to get everything\n";
         }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             bool all = *cmdObj.firstElement().valuestrsafe() == '*';
 
             int before = result.len();
@@ -113,7 +113,7 @@ namespace mongo {
         CmdSet() : Command( "setParameter" ) { }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -126,7 +126,7 @@ namespace mongo {
             help << "{ setParameter:1, <param>:<value> }\n";
             appendParameterNames( help );
         }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             int s = 0;
             bool found = false;
 

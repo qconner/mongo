@@ -32,12 +32,11 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/pdfile.h"
 
 namespace mongo {
 
-    PlanExecutor::PlanExecutor(WorkingSet* ws, PlanStage* rt)
-        : _workingSet(ws) , _root(rt) , _killed(false) { }
+    PlanExecutor::PlanExecutor(WorkingSet* ws, PlanStage* rt, const Collection* collection)
+        : _collection(collection), _workingSet(ws), _root(rt), _killed(false) {}
 
     PlanExecutor::~PlanExecutor() { }
 
@@ -64,27 +63,10 @@ namespace mongo {
         if (!_killed) { _root->invalidate(dl, type); }
     }
 
-    void PlanExecutor::setYieldPolicy(Runner::YieldPolicy policy) {
-        if (Runner::YIELD_MANUAL == policy) {
-            _yieldPolicy.reset();
-        }
-        else {
-            _yieldPolicy.reset(new RunnerYieldPolicy());
-        }
-    }
-
     Runner::RunnerState PlanExecutor::getNext(BSONObj* objOut, DiskLoc* dlOut) {
         if (_killed) { return Runner::RUNNER_DEAD; }
 
         for (;;) {
-            // Yield, if we can yield ourselves.
-            if (NULL != _yieldPolicy.get() && _yieldPolicy->shouldYield()) {
-                saveState();
-                _yieldPolicy->yield();
-                if (_killed) { return Runner::RUNNER_DEAD; }
-                restoreState();
-            }
-
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState code = _root->work(&id);
 
@@ -146,30 +128,7 @@ namespace mongo {
                 // lock between receiving the NEED_FETCH and actually fetching(?).
                 verify(member->hasLoc());
 
-                // Actually bring record into memory.
-                Record* record = member->loc.rec();
-
-                // If we're allowed to, go to disk outside of the lock.
-                if (NULL != _yieldPolicy.get()) {
-                    saveState();
-                    _yieldPolicy->yield(record);
-                    if (_killed) { return Runner::RUNNER_DEAD; }
-                    restoreState();
-                }
-                else {
-                    // We're set to manually yield.  We go to disk in the lock.
-                    record->touch();
-                }
-
-                // Record should be in memory now.  Log if it's not.
-                if (!Record::likelyInPhysicalMemory(record->dataNoThrowing())) {
-                    OCCASIONALLY {
-                        warning() << "Record wasn't in memory immediately after fetch: "
-                                  << member->loc.toString() << endl;
-                    }
-                }
-
-                // Note that we're not freeing id.  Fetch semantics say that we shouldn't.
+                // XXX: remove NEED_FETCH
             }
             else if (PlanStage::IS_EOF == code) {
                 return Runner::RUNNER_EOF;

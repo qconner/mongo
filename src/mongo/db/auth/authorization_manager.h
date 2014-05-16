@@ -38,6 +38,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/element.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/role_graph.h"
@@ -127,17 +128,6 @@ namespace mongo {
         // TODO: Make the following functions no longer static.
 
         /**
-         * Sets whether or not we allow old style (pre v2.4) privilege documents for this whole
-         * server.  Only relevant prior to upgrade.
-         */
-        static void setSupportOldStylePrivilegeDocuments(bool enabled);
-
-        /**
-         * Returns true if we allow old style privilege privilege documents for this whole server.
-         */
-        static bool getSupportOldStylePrivilegeDocuments();
-
-        /**
          * Takes a vector of privileges and fills the output param "resultArray" with a BSON array
          * representation of the privileges.
          */
@@ -175,6 +165,11 @@ namespace mongo {
          * schemaVersionInvalid (0).
          */
         Status getAuthorizationVersion(int* version);
+
+        /**
+         * Returns the user cache generation identifier.
+         */
+        OID getCacheGeneration();
 
         // Returns true if there exists at least one privilege document in the system.
         bool hasAnyPrivilegeDocuments() const;
@@ -445,6 +440,21 @@ namespace mongo {
         void _invalidateUserCache_inlock();
 
         /**
+         * Given the objects describing an oplog entry that affects authorization data, invalidates
+         * the portion of the user cache that is affected by that operation.  Should only be called
+         * with oplog entries that have been pre-verified to actually affect authorization data.
+         */
+        void _invalidateRelevantCacheData(const char* op,
+                                          const char* ns,
+                                          const BSONObj& o,
+                                          const BSONObj* o2);
+
+        /**
+         * Updates _cacheGeneration to a new OID
+         */
+        void _updateCacheGeneration_inlock();
+
+        /**
          * Fetches user information from a v2-schema user document for the named user,
          * and stores a pointer to a new user object into *acquiredUser on success.
          */
@@ -456,8 +466,6 @@ namespace mongo {
          * process.  Stores a pointer to a new user object into *acquiredUser on success.
          */
         Status _fetchUserV1(const UserName& userName, std::auto_ptr<User>* acquiredUser);
-
-        static bool _doesSupportOldStylePrivileges;
 
         /**
          * True if access control enforcement is enabled in this AuthorizationManager.
@@ -488,10 +496,10 @@ namespace mongo {
         unordered_map<UserName, User*> _userCache;
 
         /**
-         * Current generation of cached data.  Bumped every time part of the cache gets
-         * invalidated.
+         * Current generation of cached data.  Updated every time part of the cache gets
+         * invalidated.  Protected by CacheGuard.
          */
-        uint64_t _cacheGeneration;
+        OID _cacheGeneration;
 
         /**
          * True if there is an update to the _userCache in progress, and that update is currently in

@@ -90,7 +90,6 @@ namespace mongo {
         return ResourcePattern::forExactNamespace(NamespaceString(ns));
     }
 
-
     void Command::htmlHelp(stringstream& ss) const {
         string helpStr;
         {
@@ -105,16 +104,16 @@ namespace mongo {
         if( web ) ss << "</a>";
         ss << "</td>\n";
         ss << "<td>";
-        int l = locktype();
-        //if( l == NONE ) ss << "N ";
-        if( l == READ ) ss << "R ";
-        else if( l == WRITE ) ss << "W ";
+        if (isWriteCommandForConfigServer()) { 
+            ss << "W "; 
+        }
+        else { 
+            ss << "R "; 
+        }
         if( slaveOk() )
             ss << "S ";
         if( adminOnly() )
             ss << "A";
-        if( lockGlobally() ) 
-            ss << " lockGlobally ";
         ss << "</td>";
         ss << "<td>";
         if( helpStr != "no help defined" ) {
@@ -195,13 +194,6 @@ namespace mongo {
         if ( i == _commands->end() )
             return 0;
         return i->second;
-    }
-
-    Command::LockType Command::locktype( const string& name ) {
-        Command * c = findCommand( name );
-        if ( ! c )
-            return WRITE;
-        return c->locktype();
     }
 
     bool Command::appendCommandStatus(BSONObjBuilder& result, const Status& status) {
@@ -335,7 +327,7 @@ namespace mongo {
     public:
         PoolFlushCmd() : Command( "connPoolSync" , false , "connpoolsync" ) {}
         virtual void help( stringstream &help ) const { help<<"internal"; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -344,7 +336,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        virtual bool run(const string&, mongo::BSONObj&, int, std::string&, mongo::BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string&, mongo::BSONObj&, int, std::string&, mongo::BSONObjBuilder& result, bool) {
             shardConnectionPool.flush();
             pool.flush();
             return true;
@@ -359,7 +351,7 @@ namespace mongo {
     public:
         PoolStats() : Command( "connPoolStats" ) {}
         virtual void help( stringstream &help ) const { help<<"stats about connection pool"; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -367,7 +359,7 @@ namespace mongo {
             actions.addAction(ActionType::connPoolStats);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string&, mongo::BSONObj&, int, std::string&, mongo::BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string&, mongo::BSONObj&, int, std::string&, mongo::BSONObjBuilder& result, bool) {
             pool.appendInfo( result );
             result.append( "numDBClientConnection" , DBClientConnection::getNumConnections() );
             result.append( "numAScopedConnection" , AScopedConnection::getNumConnections() );

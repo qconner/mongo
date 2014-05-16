@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -30,11 +30,12 @@
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
+#include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/query/single_solution_runner.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/query/multi_plan_runner.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 
@@ -63,8 +64,8 @@ namespace QueryMultiPlanRunner {
             _client.ensureIndex(ns(), obj);
         }
 
-        IndexDescriptor* getIndex(const BSONObj& obj) {
-            Collection* collection = cc().database()->getCollection( ns() );
+        IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
+            const Collection* collection = db->getCollection( ns() );
             return collection->getIndexCatalog()->findIndexByKeyPattern(obj);
         }
 
@@ -102,48 +103,59 @@ namespace QueryMultiPlanRunner {
             // Every call to work() returns something so this should clearly win (by current scoring
             // at least).
             IndexScanParams ixparams;
-            ixparams.descriptor = getIndex(BSON("foo" << 1));
+            ixparams.descriptor = getIndex(ctx.ctx().db(), BSON("foo" << 1));
             ixparams.bounds.isSimpleRange = true;
             ixparams.bounds.startKey = BSON("" << 7);
             ixparams.bounds.endKey = BSON("" << 7);
             ixparams.bounds.endKeyInclusive = true;
             ixparams.direction = 1;
-            auto_ptr<WorkingSet> firstWs(new WorkingSet());
-            IndexScan* ix = new IndexScan(ixparams, firstWs.get(), NULL);
-            auto_ptr<PlanStage> firstRoot(new FetchStage(firstWs.get(), ix, NULL));
+
+            const Collection* coll = ctx.ctx().db()->getCollection(ns());
+
+            auto_ptr<WorkingSet> sharedWs(new WorkingSet());
+            IndexScan* ix = new IndexScan(ixparams, sharedWs.get(), NULL);
+            auto_ptr<PlanStage> firstRoot(new FetchStage(sharedWs.get(), ix, NULL, coll));
 
             // Plan 1: CollScan with matcher.
             CollectionScanParams csparams;
-            csparams.ns = ns();
+            csparams.collection = ctx.ctx().db()->getCollection( ns() );
             csparams.direction = CollectionScanParams::FORWARD;
-            auto_ptr<WorkingSet> secondWs(new WorkingSet());
+
             // Make the filter.
             BSONObj filterObj = BSON("foo" << 7);
             StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
             verify(swme.isOK());
             auto_ptr<MatchExpression> filter(swme.getValue());
             // Make the stage.
-            auto_ptr<PlanStage> secondRoot(new CollectionScan(csparams, secondWs.get(),
+            auto_ptr<PlanStage> secondRoot(new CollectionScan(csparams, sharedWs.get(),
                                                               filter.get()));
 
             // Hand the plans off to the runner.
             CanonicalQuery* cq = NULL;
             verify(CanonicalQuery::canonicalize(ns(), BSON("foo" << 7), &cq).isOK());
             verify(NULL != cq);
-            MultiPlanRunner mpr(ctx.ctx().db()->getCollection(ns()),cq);
-            mpr.addPlan(createQuerySolution(), firstRoot.release(), firstWs.release());
-            mpr.addPlan(createQuerySolution(), secondRoot.release(), secondWs.release());
+
+            MultiPlanStage* mps = new MultiPlanStage(ctx.ctx().db()->getCollection(ns()),cq);
+            mps->addPlan(createQuerySolution(), firstRoot.release(), sharedWs.get());
+            mps->addPlan(createQuerySolution(), secondRoot.release(), sharedWs.get());
 
             // Plan 0 aka the first plan aka the index scan should be the best.
-            size_t best;
-            BSONObj unused;
-            ASSERT(mpr.pickBestPlan(&best, &unused));
-            ASSERT_EQUALS(size_t(0), best);
+            mps->pickBestPlan();
+            ASSERT(mps->bestPlanChosen());
+            ASSERT_EQUALS(0, mps->bestPlanIdx());
+
+            SingleSolutionRunner sr(
+                ctx.ctx().db()->getCollection(ns()),
+                cq,
+                mps->bestSolution(),
+                mps,
+                sharedWs.release()
+            );
 
             // Get all our results out.
             int results = 0;
             BSONObj obj;
-            while (Runner::RUNNER_ADVANCED == mpr.getNext(&obj, NULL)) {
+            while (Runner::RUNNER_ADVANCED == sr.getNext(&obj, NULL)) {
                 ASSERT_EQUALS(obj["foo"].numberInt(), 7);
                 ++results;
             }

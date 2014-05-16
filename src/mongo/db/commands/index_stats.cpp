@@ -17,6 +17,8 @@
  *    limitations under the License.
  */
 
+#if 0 // disabled pending SERVER-13555
+
 #include "mongo/pch.h"
 
 #include <iostream>
@@ -30,13 +32,14 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/structure/btree/btree.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
-#include "mongo/db/structure/catalog/index_details.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/kill_current_op.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
+#include "mongo/db/structure/btree/btree.h"
 #include "mongo/util/descriptive_stats.h"
 
 namespace mongo {
@@ -353,41 +356,35 @@ namespace mongo {
      *
      * @return true on success, false otherwise
      */
-    bool runInternal(const NamespaceDetails* nsd, IndexStatsParams params, string& errmsg,
+    bool runInternal(const Collection* collection, IndexStatsParams params, string& errmsg,
                      BSONObjBuilder& result) {
 
-        const IndexDetails* details = NULL;
+        const IndexCatalog* indexCatalog = collection->getIndexCatalog();
 
-        // casting away const, we are not going to modify NamespaceDetails
-        // but ii() is not marked const, see SERVER-7619
-        for (NamespaceDetails::IndexIterator it = const_cast<NamespaceDetails*>(nsd)->ii();
-             it.more();) {
-            IndexDetails& cur = it.next();
-            if (cur.indexName() == params.indexName) details = &cur;
-        }
+        IndexDescriptor* descriptor = indexCatalog->findIndexByName( params.indexName );
 
-        if (details == NULL) {
+        if (descriptor == NULL) {
             errmsg = "the requested index does not exist";
             return false;
         }
 
-        result << "index" << details->indexName()
-               << "version" << details->version()
-               << "isIdIndex" << details->isIdIndex()
-               << "keyPattern" << details->keyPattern()
-               << "storageNs" << details->indexNamespace();
+        result << "index" << descriptor->indexName()
+               << "version" << descriptor->version()
+               << "isIdIndex" << descriptor->isIdIndex()
+               << "keyPattern" << descriptor->keyPattern()
+               << "storageNs" << descriptor->indexNamespace();
 
         scoped_ptr<BtreeInspector> inspector(NULL);
-        switch (details->version()) {
+        switch (descriptor->version()) {
           case 1: inspector.reset(new BtreeInspectorV1(params.expandNodes)); break;
           case 0: inspector.reset(new BtreeInspectorV0(params.expandNodes)); break;
           default:
-            errmsg = str::stream() << "index version " << details->version() << " is "
+            errmsg = str::stream() << "index version " << descriptor->version() << " is "
                                    << "not supported";
             return false;
         }
 
-        inspector->inspect(details->head);
+        inspector->inspect( indexCatalog->getEntry( descriptor )->head() );
 
         inspector->stats().appendTo(result);
 
@@ -485,7 +482,7 @@ namespace mongo {
               << "and the fifth child of root.";
         }
 
-        virtual LockType locktype() const { return READ; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -495,15 +492,18 @@ namespace mongo {
             out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg,
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg,
                  BSONObjBuilder& result, bool fromRepl) {
 
-            string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
-            const NamespaceDetails* nsd = nsdetails(ns);
+            NamespaceString nss( dbname, cmdObj.firstElement().valuestrsafe() );
             if (!serverGlobalParams.quiet) {
-                MONGO_TLOG(0) << "CMD: indexStats " << ns << endl;
+                MONGO_TLOG(0) << "CMD: indexStats " << nss;
             }
-            if (!nsd) {
+
+            Client::ReadContext ctx(nss.ns());
+
+            const Collection* collection = ctx.ctx().db()->getCollection( nss.ns() );
+            if (!collection) {
                 errmsg = "ns not found";
                 return false;
             }
@@ -535,7 +535,7 @@ namespace mongo {
             }
 
             BSONObjBuilder resultBuilder;
-            if (!runInternal(nsd, params, errmsg, resultBuilder))
+            if (!runInternal(collection, params, errmsg, resultBuilder))
                 return false;
             result.appendElements(resultBuilder.obj());
             return true;
@@ -553,3 +553,4 @@ namespace mongo {
 
 } // namespace mongo
 
+#endif

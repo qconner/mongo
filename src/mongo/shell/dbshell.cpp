@@ -28,7 +28,7 @@
 #include "mongo/client/clientOnly-private.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/db/repl/rs_member.h"
+#include "mongo/db/repl/heartbeat_info.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
@@ -225,13 +225,8 @@ char * strsignal(int sig){
 #endif
 
 void quitAbruptly( int sig ) {
-    ostringstream ossSig;
-    ossSig << "mongo got signal " << sig << " (" << strsignal( sig ) << "), stack trace: " << endl;
-    mongo::rawOut( ossSig.str() );
-
-    ostringstream ossBt;
-    mongo::printStackTrace( ossBt );
-    mongo::rawOut( ossBt.str() );
+    log() << "mongo got signal " << sig << " (" << strsignal( sig ) << "), stack trace: ";
+    mongo::printStackTrace();
 
     mongo::shell_utils::KillMongoProgramInstances();
     ::_exit( 14 );
@@ -240,8 +235,7 @@ void quitAbruptly( int sig ) {
 // this will be called in certain c++ error cases, for example if there are two active
 // exceptions
 void myterminate() {
-    mongo::rawOut( "terminate() called in shell, printing stack:" );
-    mongo::printStackTrace();
+    mongo::printStackTrace(severe().stream() << "terminate() called in shell, printing stack:\n");
     ::_exit( 14 );
 }
 

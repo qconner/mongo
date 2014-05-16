@@ -32,7 +32,6 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/index/btree_index_cursor.h"
-#include "mongo/db/index/btree_interface.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/pdfile.h"
@@ -67,7 +66,10 @@ namespace mongo {
     }
 
     void BtreeAccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) {
-        _keyGenerator->getKeys(obj, keys);
+        Status s = _keyGenerator->getKeys(obj, keys);
+        if (!s.isOK()) {
+            uasserted(17485, s.toString());
+        }
     }
 
 }  // namespace mongo

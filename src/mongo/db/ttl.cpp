@@ -37,12 +37,13 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
-#include "mongo/db/commands/server_status.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/background.h"
 
 namespace mongo {
@@ -66,7 +67,9 @@ namespace mongo {
         
         void doTTLForDB( const string& dbName ) {
 
-            bool isMaster = isMasterNs( dbName.c_str() );
+            if ( !isMasterNs( dbName.c_str() ) )
+                return;
+
             vector<BSONObj> indexes;
             {
                 auto_ptr<DBClientCursor> cursor =
@@ -112,21 +115,17 @@ namespace mongo {
                 {
                     string ns = idx["ns"].String();
                     Client::WriteContext ctx( ns );
+                    OperationContextImpl txn;
                     Collection* collection = ctx.ctx().db()->getCollection( ns );
                     if ( !collection ) {
                         // collection was dropped
                         continue;
                     }
 
-                    NamespaceDetails* nsd = collection->details();
-                    if ( nsd->setUserFlag( NamespaceDetails::Flag_UsePowerOf2Sizes ) ) {
-                        // TODO: wish there was a cleaner way to do this
-                        nsd->syncUserFlags( ns );
-                    }
-
-                    // only do deletes if on master
-                    if ( ! isMaster ) {
-                        continue;
+                    if ( !isMasterNs( dbName.c_str() ) ) {
+                        // we've stepped down since we started this function,
+                        // so we should stop working as we only do deletes on the primary
+                        break;
                     }
 
                     if ( collection->getIndexCatalog()->findIndexByKeyPattern( key ) == NULL ) {
@@ -135,7 +134,7 @@ namespace mongo {
                         continue;
                     }
 
-                    n = deleteObjects( ns , query , false , true );
+                    n = deleteObjects(&txn, ctx.ctx().db(), ns, query, false, true);
                     ttlDeletedDocuments.increment( n );
                 }
 

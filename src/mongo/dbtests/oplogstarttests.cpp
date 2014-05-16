@@ -29,7 +29,8 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/internal_runner.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 
 namespace OplogStartTests {
@@ -37,11 +38,12 @@ namespace OplogStartTests {
     class Base {
     public:
         Base() : _context(ns()) {
-            Collection* c = _context.db()->getCollection(ns());
+            OperationContextImpl txn;
+            Collection* c = _context.db()->getCollection(&txn, ns());
             if (!c) {
-                c = _context.db()->createCollection(ns());
+                c = _context.db()->createCollection(&txn, ns());
             }
-            c->getIndexCatalog()->ensureHaveIdIndex();
+            c->getIndexCatalog()->ensureHaveIdIndex(&txn);
         }
 
         ~Base() {
@@ -59,6 +61,10 @@ namespace OplogStartTests {
             return "oplogstarttests";
         }
 
+        Collection* collection() {
+            return _context.db()->getCollection( ns() );
+        }
+
         DBDirectClient *client() const { return &_client; }
 
         void setupFromQuery(const BSONObj& query) {
@@ -67,7 +73,7 @@ namespace OplogStartTests {
             ASSERT(s.isOK());
             _cq.reset(cq);
             _oplogws.reset(new WorkingSet());
-            _stage.reset(new OplogStart(_cq->ns(), _cq->root(), _oplogws.get()));
+            _stage.reset(new OplogStart(collection(), _cq->root(), _oplogws.get()));
         }
 
         void assertWorkingSetMemberHasId(WorkingSetID id, int expectedId) {
@@ -161,13 +167,7 @@ namespace OplogStartTests {
             // ensure that we go into extent hopping mode immediately
             _stage->setBackwardsScanTime(0);
 
-            // collection scan needs to initialize itself
-            ASSERT_EQUALS(_stage->work(&id), PlanStage::NEED_TIME);
-            // collection scan finds the first diskloc in
-            // the backwards scan
-            ASSERT_EQUALS(_stage->work(&id), PlanStage::NEED_TIME);
-            ASSERT(_stage->isBackwardsScanning());
-            // Now we switch to extent hopping mode, and
+            // We immediately switch to extent hopping mode, and
             // should find the beginning of the extent
             ASSERT_EQUALS(_stage->work(&id), PlanStage::ADVANCED);
             ASSERT(_stage->isExtentHopping());
@@ -194,12 +194,6 @@ namespace OplogStartTests {
             // ensure that we go into extent hopping mode immediately
             _stage->setBackwardsScanTime(0);
 
-            // collection scan needs to initialize itself
-            ASSERT_EQUALS(_stage->work(&id), PlanStage::NEED_TIME);
-            // collection scan finds the first diskloc in
-            // the backwards scan
-            ASSERT_EQUALS(_stage->work(&id), PlanStage::NEED_TIME);
-            ASSERT(_stage->isBackwardsScanning());
             // hop back extent by extent
             for (int i = 0; i < numHops(); i++) {
                 ASSERT_EQUALS(_stage->work(&id), PlanStage::NEED_TIME);

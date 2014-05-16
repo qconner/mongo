@@ -42,8 +42,8 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_registry.h"
@@ -60,7 +60,7 @@ namespace QueryStageKeep {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            CollectionIterator* it = coll->getIterator(DiskLoc(), false,
+            RecordIterator* it = coll->getIterator(DiskLoc(), false,
                                                        CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
@@ -105,10 +105,11 @@ namespace QueryStageKeep {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
             WorkingSet ws;
 
@@ -128,7 +129,7 @@ namespace QueryStageKeep {
 
             // Create a collscan to provide the 10 objects in the collection.
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = coll;
             params.direction = CollectionScanParams::FORWARD;
             params.tailable = false;
             params.start = DiskLoc();

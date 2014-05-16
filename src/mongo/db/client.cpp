@@ -55,7 +55,6 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pagefault.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/s/chunk_version.h"
@@ -67,15 +66,6 @@
 #include "mongo/util/mongoutils/checksum.h"
 #include "mongo/util/mongoutils/str.h"
 
-#ifndef __has_feature
-#define __has_feature(x) 0
-#endif
-
-#define ASAN_ENABLED __has_feature(address_sanitizer)
-#define MSAN_ENABLED __has_feature(memory_sanitizer)
-#define TSAN_ENABLED __has_feature(thread_sanitizer)
-#define XSAN_ENABLED (ASAN_ENABLED || MSAN_ENABLED || TSAN_ENABLED)
-
 namespace mongo {
 
     mongo::mutex& Client::clientsMutex = *(new mutex("clientsMutex"));
@@ -83,67 +73,10 @@ namespace mongo {
 
     TSP_DEFINE(Client, currentClient)
 
-#if defined(_DEBUG) && !defined(MONGO_OPTIMIZED_BUILD) && !XSAN_ENABLED
-    struct StackChecker;
-    ThreadLocalValue<StackChecker *> checker;
-
-    struct StackChecker { 
-#if defined(_WIN32)
-        enum { SZ = 330 * 1024 };
-#elif defined(__APPLE__) && defined(__MACH__)
-        enum { SZ = 374 * 1024 };
-#elif defined(__linux__)
-        enum { SZ = 235 * 1024 };
-#else
-        enum { SZ = 235 * 1024 };   // default size, same as Linux to match old behavior
-#endif
-        char buf[SZ];
-        StackChecker() { 
-            checker.set(this);
-        }
-        void init() { 
-            memset(buf, 42, sizeof(buf)); 
-        }
-        static void check(StringData tname) {
-            static int max;
-            StackChecker *sc = checker.get();
-            const char *p = sc->buf;
-
-            int lastStackByteModifed = 0;
-            for( ; lastStackByteModifed < SZ; lastStackByteModifed++ ) { 
-                if( p[lastStackByteModifed] != 42 )
-                    break;
-            }
-            int numberBytesUsed = SZ-lastStackByteModifed;
-            
-            if( numberBytesUsed > max ) {
-                max = numberBytesUsed;
-                log() << "thread " << tname << " stack usage was " << numberBytesUsed << " bytes, " 
-                      << " which is the most so far" << endl;
-            }
-            
-            if ( numberBytesUsed > ( SZ - 16000 ) ) {
-                // we are within 16000 bytes of SZ
-                log() << "used " << numberBytesUsed << " bytes, max is " << (int)SZ << " exiting" << endl;
-                fassertFailed( 16151 );
-            }
-
-        }
-    };
-#endif
-
     /* each thread which does db operations has a Client object in TLS.
        call this when your thread starts.
     */
     Client& Client::initThread(const char *desc, AbstractMessagingPort *mp) {
-#if defined(_DEBUG) && !defined(MONGO_OPTIMIZED_BUILD) && !XSAN_ENABLED
-        {
-            if( sizeof(void*) == 8 ) {
-                StackChecker sc;
-                sc.init();
-            }
-        }
-#endif
         verify( currentClient.get() == 0 );
 
         string fullDesc = desc;
@@ -171,7 +104,6 @@ namespace mongo {
     {
         _hasWrittenThisOperation = false;
         _hasWrittenSinceCheckpoint = false;
-        _pageFaultRetryableSection = 0;
         _connectionId = p ? p->connectionId() : 0;
         _curOp = new CurOp( this );
 #ifndef _WIN32
@@ -220,13 +152,6 @@ namespace mongo {
     }
 
     bool Client::shutdown() {
-#if defined(_DEBUG) && !defined(MONGO_OPTIMIZED_BUILD) && !XSAN_ENABLED
-        {
-            if( sizeof(void*) == 8 ) {
-                StackChecker::check( desc() );
-            }
-        }
-#endif
         _shutdown = true;
         if ( inShutdown() )
             return false;
@@ -268,12 +193,14 @@ namespace mongo {
     /** "read lock, and set my context, all in one operation" 
      *  This handles (if not recursively locked) opening an unopened database.
      */
-    Client::ReadContext::ReadContext(const string& ns, const std::string& path) {
+    Client::ReadContext::ReadContext(const string& ns,
+                                     const std::string& path,
+                                     bool doVersion) {
         {
             lk.reset( new Lock::DBRead(ns) );
             Database *db = dbHolder().get(ns, path);
             if( db ) {
-                c.reset( new Context(path, ns, db) );
+                c.reset( new Context(path, ns, db, doVersion) );
                 return;
             }
         }
@@ -284,17 +211,17 @@ namespace mongo {
             if( Lock::isW() ) { 
                 // write locked already
                 DEV RARELY log() << "write locked on ReadContext construction " << ns << endl;
-                c.reset(new Context(ns, path));
+                c.reset(new Context(ns, path, doVersion));
             }
             else if( !Lock::nested() ) { 
                 lk.reset(0);
                 {
                     Lock::GlobalWrite w;
-                    Context c(ns, path);
+                    Context c(ns, path, doVersion);
                 }
                 // db could be closed at this interim point -- that is ok, we will throw, and don't mind throwing.
                 lk.reset( new Lock::DBRead(ns) );
-                c.reset(new Context(ns, path));
+                c.reset(new Context(ns, path, doVersion));
             }
             else { 
                 uasserted(15928, str::stream() << "can't open a database from a nested read lock " << ns);
@@ -306,9 +233,9 @@ namespace mongo {
         //       it would be easy to first check that there is at least a .ns file, or something similar.
     }
 
-    Client::WriteContext::WriteContext(const string& ns, const std::string& path)
+    Client::WriteContext::WriteContext(const string& ns, const std::string& path, bool doVersion)
         : _lk( ns ) ,
-          _c(ns, path) {
+          _c(ns, path, doVersion) {
     }
 
 
@@ -332,12 +259,12 @@ namespace mongo {
     }
 
     // invoked from ReadContext
-    Client::Context::Context(const string& path, const string& ns, Database *db) :
+    Client::Context::Context(const string& path, const string& ns, Database *db, bool doVersion) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
         _path( path ), 
         _justCreated(false),
-        _doVersion( true ),
+        _doVersion( doVersion ),
         _ns( ns ), 
         _db(db)
     {
@@ -410,7 +337,7 @@ namespace mongo {
         return c->toString();
     }
 
-    void Client::gotHandshake( const BSONObj& o ) {
+    bool Client::gotHandshake( const BSONObj& o ) {
         BSONObjIterator i(o);
 
         {
@@ -427,9 +354,11 @@ namespace mongo {
 
         _handshake = b.obj();
 
-        if (theReplSet && o.hasField("member")) {
-            theReplSet->registerSlave(_remoteId, o["member"].Int());
+        if (!theReplSet || !o.hasField("member")) {
+            return false;
         }
+
+        return theReplSet->registerSlave(_remoteId, o["member"].Int());
     }
 
     bool ClientBasic::hasCurrent() {
@@ -444,7 +373,7 @@ namespace mongo {
     public:
         void help(stringstream& h) const { h << "internal"; }
         HandshakeCmd() : Command( "handshake" ) {}
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
@@ -454,7 +383,7 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             Client& c = cc();
             c.gotHandshake( cmdObj );
             return 1;
@@ -518,24 +447,6 @@ namespace mongo {
         }
 
         return writers + readers;
-    }
-
-    bool Client::allowedToThrowPageFaultException() const {
-        if ( _hasWrittenThisOperation )
-            return false;
-
-        if ( ! _pageFaultRetryableSection )
-            return false;
-
-        if ( _pageFaultRetryableSection->laps() >= 100 )
-            return false;
-        
-        // if we've done a normal yield, it means we're in a ClientCursor or something similar
-        // in that case, that code should be handling yielding, not us
-        if ( _curOp && _curOp->numYields() > 0 ) 
-            return false;
-
-        return true;
     }
 
     void OpDebug::reset() {

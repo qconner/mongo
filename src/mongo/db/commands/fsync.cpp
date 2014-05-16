@@ -41,7 +41,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/dur.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/background.h"
@@ -81,7 +81,7 @@ namespace mongo {
         boost::condition _unlockSync;
 
         FSyncCommand() : Command( "fsync" ), m("lockfsync") { locked=false; pendingUnlock=false; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
         virtual void help(stringstream& h) const { h << url(); }
@@ -92,7 +92,7 @@ namespace mongo {
             actions.addAction(ActionType::fsync);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
 
             if (Lock::isLocked()) {
                 errmsg = "fsync: Cannot execute fsync command from contexts that hold a data lock";

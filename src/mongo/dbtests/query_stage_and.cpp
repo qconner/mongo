@@ -43,8 +43,8 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -71,7 +71,7 @@ namespace QueryStageAnd {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            CollectionIterator* it = coll->getIterator(DiskLoc(), false,
+            RecordIterator* it = coll->getIterator(DiskLoc(), false,
                                                        CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
@@ -127,10 +127,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -141,7 +142,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -177,9 +178,9 @@ namespace QueryStageAnd {
             getLocs(&data, coll);
             size_t memUsageBefore = ah->getMemUsage();
             for (set<DiskLoc>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (it->obj()["foo"].numberInt() == 15) {
+                if (coll->docFor(*it)["foo"].numberInt() == 15) {
                     ah->invalidate(*it, INVALIDATION_DELETION);
-                    remove(it->obj());
+                    remove(coll->docFor(*it));
                     break;
                 }
             }
@@ -228,10 +229,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -243,7 +245,7 @@ namespace QueryStageAnd {
             addIndex(BSON("baz" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20 (descending)
             IndexScanParams params;
@@ -278,7 +280,7 @@ namespace QueryStageAnd {
 
             size_t memUsageBefore = ah->getMemUsage();
             for (set<DiskLoc>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (0 == deletedObj.woCompare(it->obj())) {
+                if (0 == deletedObj.woCompare(coll->docFor(*it))) {
                     ah->invalidate(*it, INVALIDATION_DELETION);
                     break;
                 }
@@ -300,7 +302,7 @@ namespace QueryStageAnd {
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
                 WorkingSetMember* wsm = ws.get(id);
-                ASSERT_NOT_EQUALS(0, deletedObj.woCompare(wsm->loc.obj()));
+                ASSERT_NOT_EQUALS(0, deletedObj.woCompare(coll->docFor(wsm->loc)));
                 ++count;
             }
 
@@ -313,10 +315,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -327,7 +330,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -361,10 +364,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             // Generate large keys for {foo: 1, big: 1} index.
@@ -380,7 +384,7 @@ namespace QueryStageAnd {
             // before hashed AND is done reading the first child (stage has to
             // hold 21 keys in buffer for Foo <= 20).
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, 20 * big.size()));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll, 20 * big.size()));
 
             // Foo <= 20
             IndexScanParams params;
@@ -412,10 +416,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             // Generate large keys for {baz: 1, big: 1} index.
@@ -431,7 +436,7 @@ namespace QueryStageAnd {
             // keys in last child's index are not buffered. There are 6 keys
             // that satisfy the criteria Foo <= 20 and Bar >= 10 and 5 <= baz <= 15.
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, 5 * big.size()));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll, 5 * big.size()));
 
             // Foo <= 20
             IndexScanParams params;
@@ -462,10 +467,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -477,7 +483,7 @@ namespace QueryStageAnd {
             addIndex(BSON("baz" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -522,10 +528,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             // Generate large keys for {bar: 1, big: 1} index.
@@ -542,7 +549,7 @@ namespace QueryStageAnd {
             // before hashed AND is done reading the second child (stage has to
             // hold 11 keys in buffer for Foo <= 20 and Bar >= 10).
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, 10 * big.size()));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll, 10 * big.size()));
 
             // Foo <= 20
             IndexScanParams params;
@@ -580,10 +587,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -594,7 +602,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -638,10 +646,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 10; ++i) {
@@ -653,7 +662,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo >= 100
             IndexScanParams params;
@@ -685,10 +694,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -703,7 +713,7 @@ namespace QueryStageAnd {
             StatusWithMatchExpression swme = MatchExpressionParser::parse(filter);
             verify(swme.isOK());
             auto_ptr<MatchExpression> filterExpr(swme.getValue());
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, filterExpr.get()));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, filterExpr.get(), coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -740,10 +750,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             // Insert a bunch of data
@@ -754,7 +765,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -787,7 +798,7 @@ namespace QueryStageAnd {
             // and make sure it shows up in the flagged results.
             ah->prepareToYield();
             ah->invalidate(*data.begin(), INVALIDATION_DELETION);
-            remove(data.begin()->obj());
+            remove(coll->docFor(*data.begin()));
             ah->recoverFromYield();
 
             // Make sure the nuked obj is actually in the flagged data.
@@ -826,7 +837,7 @@ namespace QueryStageAnd {
             // not flagged.
             ah->prepareToYield();
             ah->invalidate(*it, INVALIDATION_DELETION);
-            remove(it->obj());
+            remove(coll->docFor(*it));
             ah->recoverFromYield();
 
             // Get all results aside from the two we killed.
@@ -856,10 +867,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             // Insert a bunch of data
@@ -879,7 +891,7 @@ namespace QueryStageAnd {
             addIndex(BSON("baz" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -908,10 +920,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
 
@@ -923,7 +936,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // Foo == 7.  Should be EOF.
             IndexScanParams params;
@@ -952,10 +965,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -970,7 +984,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // foo == 7.
             IndexScanParams params;
@@ -999,10 +1013,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -1017,7 +1032,7 @@ namespace QueryStageAnd {
             StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
             verify(swme.isOK());
             auto_ptr<MatchExpression> filterExpr(swme.getValue());
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, filterExpr.get()));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, filterExpr.get(), coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -1043,10 +1058,11 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -1057,7 +1073,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -1082,11 +1098,11 @@ namespace QueryStageAnd {
                 WorkingSetID id = WorkingSet::INVALID_ID;
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
-                BSONObj thisObj = ws.get(id)->loc.obj();
+                BSONObj thisObj = coll->docFor(ws.get(id)->loc);
                 ASSERT_EQUALS(7 + count, thisObj["bar"].numberInt());
                 ++count;
                 if (WorkingSet::INVALID_ID != lastId) {
-                    BSONObj lastObj = ws.get(lastId)->loc.obj();
+                    BSONObj lastObj = coll->docFor(ws.get(lastId)->loc);
                     ASSERT_LESS_THAN(lastObj["bar"].woCompare(thisObj["bar"]), 0);
                 }
                 lastId = id;

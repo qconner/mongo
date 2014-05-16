@@ -41,6 +41,8 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/structure/catalog/namespace_details.h"
 
 /* Scenarios
 
@@ -228,8 +230,9 @@ namespace mongo {
         verify( Lock::isLocked() );
         Client::Context c(rsoplog);
 
-        boost::scoped_ptr<Runner> runner(
-            InternalPlanner::collectionScan(rsoplog, InternalPlanner::BACKWARD));
+        boost::scoped_ptr<Runner> runner(InternalPlanner::collectionScan(rsoplog,
+                                                                         c.db()->getCollection(rsoplog),
+                                                                         InternalPlanner::BACKWARD));
 
         BSONObj ourObj;
         DiskLoc ourLoc;
@@ -334,6 +337,7 @@ namespace mongo {
 
     void ReplSetImpl::syncFixUp(HowToFixUp& h, OplogReader& r) {
         DBClientConnection *them = r.conn();
+        OperationContextImpl txn;
 
         // fetch all first so we needn't handle interruption in a fancy way
 
@@ -405,11 +409,11 @@ namespace mongo {
 
                 Client::Context c(ns);
                 {
-                    c.db()->dropCollection(ns);
+                    c.db()->dropCollection(&txn, ns);
                     {
                         string errmsg;
                         dbtemprelease r;
-                        bool ok = Cloner::copyCollectionFromRemote(them->getServerAddress(), ns, errmsg);
+                        bool ok = Cloner::copyCollectionFromRemote(&txn, them->getServerAddress(), ns, errmsg);
                         uassert(15909, str::stream() << "replSet rollback error resyncing collection " << ns << ' ' << errmsg, ok);
                     }
                 }
@@ -456,7 +460,7 @@ namespace mongo {
             Client::Context c(*i);
             try {
                 log() << "replSet rollback drop: " << *i << rsLog;
-                c.db()->dropCollection(*i);
+                c.db()->dropCollection(&txn, *i);
             }
             catch(...) {
                 log() << "replset rollback error dropping collection " << *i << rsLog;
@@ -483,7 +487,7 @@ namespace mongo {
                     continue;
                 }
 
-                getDur().commitIfNeeded();
+                txn.recoveryUnit()->commitIfNeeded();
 
                 /* keep an archive of items rolled back */
                 shared_ptr<Helpers::RemoveSaver>& rs = removeSavers[d.ns];
@@ -495,7 +499,7 @@ namespace mongo {
 
                 // Add the doc to our rollback file
                 BSONObj obj;
-                bool found = Helpers::findOne(d.ns, pattern, obj, false);
+                bool found = Helpers::findOne(c.db()->getCollection(d.ns), pattern, obj, false);
                 if ( found ) {
                     rs->goingToDelete( obj );
                 } else {
@@ -516,19 +520,18 @@ namespace mongo {
                                 /** todo: IIRC cappedTruncateAfter does not handle completely empty.  todo. */
                                 // this will crazy slow if no _id index.
                                 long long start = Listener::getElapsedTimeMillis();
-                                DiskLoc loc = Helpers::findOne(d.ns, pattern, false);
+                                DiskLoc loc = Helpers::findOne(collection, pattern, false);
                                 if( Listener::getElapsedTimeMillis() - start > 200 )
                                     log() << "replSet warning roll back slow no _id index for " << d.ns << " perhaps?" << rsLog;
-                                NamespaceDetails* nsd = collection->details();
                                 //would be faster but requires index: DiskLoc loc = Helpers::findById(nsd, pattern);
                                 if( !loc.isNull() ) {
                                     try {
-                                        nsd->cappedTruncateAfter(d.ns, loc, true);
+                                        collection->temp_cappedTruncateAfter(&txn, loc, true);
                                     }
                                     catch(DBException& e) {
                                         if( e.getCode() == 13415 ) {
                                             // hack: need to just make cappedTruncate do this...
-                                            nsd->emptyCappedCollection(d.ns);
+                                            uassertStatusOK( collection->truncate(&txn ) );
                                         }
                                         else {
                                             throw;
@@ -543,7 +546,13 @@ namespace mongo {
                         else {
                             try {
                                 deletes++;
-                                deleteObjects(d.ns, pattern, /*justone*/true, /*logop*/false, /*god*/true);
+                                deleteObjects(&txn, 
+                                              c.db(),
+                                              d.ns,
+                                              pattern,
+                                              true,     /*justone*/
+                                              false,    /*logop*/
+                                              true);    /*god*/
                             }
                             catch(...) {
                                 log() << "replSet error rollback delete failed ns:" << d.ns << rsLog;
@@ -552,12 +561,12 @@ namespace mongo {
                         // did we just empty the collection?  if so let's check if it even exists on the source.
                         if( collection->numRecords() == 0 ) {
                             try {
-                                string sys = cc().database()->name() + ".system.namespaces";
+                                string sys = c.db()->name() + ".system.namespaces";
                                 bo o = them->findOne(sys, QUERY("name"<<d.ns));
                                 if( o.isEmpty() ) {
                                     // we should drop
                                     try {
-                                        cc().database()->dropCollection(d.ns);
+                                        c.db()->dropCollection(&txn, d.ns);
                                     }
                                     catch(...) {
                                         log() << "replset error rolling back collection " << d.ns << rsLog;
@@ -586,7 +595,7 @@ namespace mongo {
                     UpdateLifecycleImpl updateLifecycle(true, requestNs);
                     request.setLifecycle(&updateLifecycle);
 
-                    update(request, &debug);
+                    update(&txn, c.db(), request, &debug);
 
                 }
             }
@@ -605,7 +614,7 @@ namespace mongo {
         // clean up oplog
         LOG(2) << "replSet rollback truncate oplog after " << h.commonPoint.toStringPretty() << rsLog;
         // todo: fatal error if this throws?
-        oplogCollection->details()->cappedTruncateAfter(rsoplog, h.commonPointOurDiskloc, false);
+        oplogCollection->temp_cappedTruncateAfter(&txn, h.commonPointOurDiskloc, false);
 
         Status status = getGlobalAuthorizationManager()->initialize();
         if (!status.isOK()) {

@@ -33,14 +33,13 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/index/btree_interface.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/structure/btree/btree_interface.h"
 
 namespace mongo {
 
-    class BtreeBulk;
     class ExternalSortComparison;
 
     /**
@@ -61,12 +60,14 @@ namespace mongo {
 
         virtual ~BtreeBasedAccessMethod() { }
 
-        virtual Status insert(const BSONObj& obj,
+        virtual Status insert(OperationContext* txn,
+                              const BSONObj& obj,
                               const DiskLoc& loc,
                               const InsertDeleteOptions& options,
                               int64_t* numInserted);
 
-        virtual Status remove(const BSONObj& obj,
+        virtual Status remove(OperationContext* txn,
+                              const BSONObj& obj,
                               const DiskLoc& loc,
                               const InsertDeleteOptions& options,
                               int64_t* numDeleted);
@@ -77,13 +78,15 @@ namespace mongo {
                                       const InsertDeleteOptions& options,
                                       UpdateTicket* ticket);
 
-        virtual Status update(const UpdateTicket& ticket, int64_t* numUpdated);
+        virtual Status update(OperationContext* txn,
+                              const UpdateTicket& ticket,
+                              int64_t* numUpdated);
 
         virtual Status newCursor(IndexCursor **out) const;
 
-        virtual Status initializeAsEmpty();
+        virtual Status initializeAsEmpty(OperationContext* txn);
 
-        virtual IndexAccessMethod* initiateBulk() ;
+        virtual IndexAccessMethod* initiateBulk(OperationContext* txn) ;
 
         virtual Status commitBulk( IndexAccessMethod* bulk,
                                    bool mayInterrupt,
@@ -91,18 +94,16 @@ namespace mongo {
 
         virtual Status touch(const BSONObj& obj);
 
+        virtual Status touch(OperationContext* txn) const;
+
         virtual Status validate(int64_t* numKeys);
 
         // XXX: consider migrating callers to use IndexCursor instead
         virtual DiskLoc findSingle( const BSONObj& key ) const;
 
-        // exposed for testing, used for bulk commit
-        static ExternalSortComparison* getComparison(int version,
-                                                     const BSONObj& keyPattern);
-
     protected:
         // Friends who need getKeys.
-        friend class BtreeBulk;
+        friend class BtreeBasedBulkAccessMethod;
 
         // See below for body.
         class BtreeBasedPrivateUpdateData;
@@ -112,11 +113,19 @@ namespace mongo {
         IndexCatalogEntry* _btreeState; // owned by IndexCatalogEntry
         const IndexDescriptor* _descriptor;
 
-        // There are 2 types of Btree disk formats.  We put them both behind one interface.
-        BtreeInterface* _interface;
+        /**
+         * The collection is needed for resolving record locations to actual objects.
+         */
+        const Collection* collection() const {
+            return _btreeState->collection();
+        }
 
     private:
-        bool removeOneKey(const BSONObj& key, const DiskLoc& loc);
+        bool removeOneKey(OperationContext* txn,
+                          const BSONObj& key,
+                          const DiskLoc& loc);
+
+        scoped_ptr<BtreeInterface> _newInterface;
     };
 
     /**

@@ -50,10 +50,12 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
+#include "mongo/db/repl/repl_settings.h"  // replSettings
 #include "mongo/db/repl/rs.h" // replLocalAuth()
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
+#include "mongo/util/exit.h"
 
 namespace mongo {
 
@@ -160,20 +162,21 @@ namespace mongo {
         string myname = getHostName();
         {
             Client::WriteContext ctx("local");
+            OperationContextImpl txn;
             // local.me is an identifier for a server for getLastError w:2+
             if (!Helpers::getSingleton("local.me", _me) ||
                 !_me.hasField("host") ||
                 _me["host"].String() != myname) {
 
                 // clean out local.me
-                Helpers::emptyCollection("local.me");
+                Helpers::emptyCollection(&txn, "local.me");
 
                 // repopulate
                 BSONObjBuilder b;
                 b.appendOID("_id", 0, true);
                 b.append("host", myname);
                 _me = b.obj();
-                Helpers::putSingleton("local.me", _me);
+                Helpers::putSingleton(&txn, "local.me", _me);
             }
         }
     }
@@ -193,6 +196,7 @@ namespace mongo {
         {
             OpDebug debug;
             Client::Context ctx("local.sources");
+            OperationContextImpl txn;
 
             const NamespaceString requestNs("local.sources");
             UpdateRequest request(requestNs);
@@ -201,7 +205,7 @@ namespace mongo {
             request.setUpdates(o);
             request.setUpsert();
 
-            UpdateResult res = update(request, &debug);
+            UpdateResult res = update(&txn, ctx.db(), request, &debug);
 
             verify( ! res.modifiers );
             verify( res.numMatched == 1 );
@@ -227,7 +231,8 @@ namespace mongo {
        and cursor in effect.
     */
     void ReplSource::loadAll(SourceVector &v) {
-        Client::Context ctx("local.sources");
+        const char* localSources = "local.sources";
+        Client::Context ctx(localSources);
         SourceVector old = v;
         v.clear();
 
@@ -236,7 +241,8 @@ namespace mongo {
             // check that no items are in sources other than that
             // add if missing
             int n = 0;
-            auto_ptr<Runner> runner(InternalPlanner::collectionScan("local.sources"));
+            auto_ptr<Runner> runner(InternalPlanner::collectionScan(localSources,
+                                                                    ctx.db()->getCollection(localSources)));
             BSONObj obj;
             Runner::RunnerState state;
             while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
@@ -278,7 +284,8 @@ namespace mongo {
             }
         }
 
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan("local.sources"));
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(localSources,
+                                                                ctx.db()->getCollection(localSources)));
         BSONObj obj;
         Runner::RunnerState state;
         while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
@@ -297,28 +304,28 @@ namespace mongo {
         uassert(17066, "Internal error reading from local.sources", Runner::RUNNER_EOF == state);
     }
 
-    bool ReplSource::throttledForceResyncDead( const char *requester ) {
+    bool ReplSource::throttledForceResyncDead( OperationContext* txn, const char *requester ) {
         if ( time( 0 ) - lastForcedResync > 600 ) {
-            forceResyncDead( requester );
+            forceResyncDead( txn, requester );
             lastForcedResync = time( 0 );
             return true;
         }
         return false;
     }
 
-    void ReplSource::forceResyncDead( const char *requester ) {
+    void ReplSource::forceResyncDead( OperationContext* txn, const char *requester ) {
         if ( !replAllDead )
             return;
         SourceVector sources;
         ReplSource::loadAll(sources);
         for( SourceVector::iterator i = sources.begin(); i != sources.end(); ++i ) {
             log() << requester << " forcing resync from "  << (*i)->hostName << endl;
-            (*i)->forceResync( requester );
+            (*i)->forceResync( txn, requester );
         }
         replAllDead = 0;
     }
 
-    void ReplSource::forceResync( const char *requester ) {
+    void ReplSource::forceResync( OperationContext* txn, const char *requester ) {
         BSONObj info;
         {
             dbtemprelease t;
@@ -338,7 +345,7 @@ namespace mongo {
             if ( !e.embeddedObject().getBoolField( "empty" ) ) {
                 if ( name != "local" ) {
                     if ( only.empty() || only == name ) {
-                        resyncDrop( name );
+                        resyncDrop( txn, name );
                     }
                 }
             }
@@ -348,16 +355,16 @@ namespace mongo {
         save();
     }
 
-    void ReplSource::resyncDrop( const string& db ) {
+    void ReplSource::resyncDrop( OperationContext* txn, const string& db ) {
         log() << "resync: dropping database " << db;
         Client::Context ctx(db);
-        dropDatabase(db);
+        dropDatabase(txn, ctx.db());
     }
 
     /* grab initial copy of a database from the master */
-    void ReplSource::resync(const std::string& dbName) {
+    void ReplSource::resync(OperationContext* txn, const std::string& dbName) {
         const std::string db(dbName);   // need local copy of the name, we're dropping the original
-        resyncDrop( db );
+        resyncDrop( txn, db );
         Client::Context ctx( db );
         {
             log() << "resync: cloning database " << db << " to get an initial copy" << endl;
@@ -372,11 +379,11 @@ namespace mongo {
             cloneOptions.snapshot = true;
             cloneOptions.mayYield = true;
             cloneOptions.mayBeInterrupted = false;
-            bool ok = Cloner::cloneFrom(ctx,hostName, cloneOptions, errmsg, &errCode);
+            bool ok = Cloner::cloneFrom(txn, ctx,hostName, cloneOptions, errmsg, &errCode);
 
             if ( !ok ) {
                 if ( errCode == DatabaseDifferCaseCode ) {
-                    resyncDrop( db );
+                    resyncDrop( txn,  db );
                     log() << "resync: database " << db << " not valid on the master due to a name conflict, dropping." << endl;
                     return;
                 }
@@ -413,7 +420,10 @@ namespace mongo {
         }
     }
 
-    bool ReplSource::handleDuplicateDbName( const BSONObj &op, const char *ns, const char *db ) {
+    bool ReplSource::handleDuplicateDbName( OperationContext* txn,
+                                            const BSONObj &op,
+                                            const char* ns,
+                                            const char* db ) {
         if (dbHolder()._isLoaded(ns, storageGlobalParams.dbpath)) {
             // Database is already present.
             return true;   
@@ -486,7 +496,7 @@ namespace mongo {
             incompleteCloneDbs.erase(*i);
             addDbNextPass.erase(*i);
             Client::Context ctx(*i);
-            dropDatabase(*i);
+            dropDatabase(txn, ctx.db());
         }
         
         massert( 14034, "Duplicate database names present after attempting to delete duplicates",
@@ -494,13 +504,15 @@ namespace mongo {
         return true;
     }
 
-    void ReplSource::applyOperation(const BSONObj& op) {
+    void ReplSource::applyOperation(OperationContext* txn, Database* db, const BSONObj& op) {
         try {
-            bool failedUpdate = applyOperation_inlock( op );
+            bool failedUpdate = applyOperation_inlock( txn, db, op );
             if (failedUpdate) {
                 Sync sync(hostName);
                 if (sync.shouldRetry(op)) {
-                    uassert(15914, "Failure retrying initial sync update", !applyOperation_inlock(op));
+                    uassert(15914,
+                            "Failure retrying initial sync update",
+                            !applyOperation_inlock(txn, db, op));
                 }
             }
         }
@@ -586,6 +598,7 @@ namespace mongo {
         }
 
         scoped_ptr<Lock::GlobalWrite> lk( alreadyLocked ? 0 : new Lock::GlobalWrite() );
+        OperationContextImpl txn; // XXX?
 
         if ( replAllDead ) {
             // hmmm why is this check here and not at top of this function? does it get set between top and here?
@@ -593,7 +606,7 @@ namespace mongo {
             throw SyncException();
         }
 
-        if ( !handleDuplicateDbName( op, ns, clientName ) ) {
+        if ( !handleDuplicateDbName( &txn, op, ns, clientName ) ) {
             return;   
         }
                 
@@ -608,7 +621,7 @@ namespace mongo {
         // always apply admin command command
         // this is a bit hacky -- the semantics of replication/commands aren't well specified
         if ( strcmp( clientName, "admin" ) == 0 && *op.getStringField( "op" ) == 'c' ) {
-            applyOperation( op );
+            applyOperation( &txn, ctx.db(), op );
             return;
         }
 
@@ -630,14 +643,14 @@ namespace mongo {
                 save();
                 Client::Context ctx(ns);
                 nClonedThisPass++;
-                resync(ctx.db()->name());
+                resync(&txn, ctx.db()->name());
                 addDbNextPass.erase(clientName);
                 incompleteCloneDbs.erase( clientName );
             }
             save();
         }
         else {
-            applyOperation( op );
+            applyOperation( &txn, ctx.db(), op );
             addDbNextPass.erase( clientName );
         }
     }
@@ -1077,9 +1090,10 @@ namespace mongo {
             int s = 0;
             {
                 Lock::GlobalWrite lk;
+                OperationContextImpl txn;
                 if ( replAllDead ) {
                     // throttledForceResyncDead can throw
-                    if ( !replSettings.autoresync || !ReplSource::throttledForceResyncDead( "auto" ) ) {
+                    if ( !replSettings.autoresync || !ReplSource::throttledForceResyncDead( &txn, "auto" ) ) {
                         log() << "all sources dead: " << replAllDead << ", sleeping for 5 seconds" << endl;
                         break;
                     }
@@ -1251,7 +1265,7 @@ namespace mongo {
                     b.append(_id);
                     BSONObj result;
                     Client::Context ctx( ns );
-                    if( Helpers::findById(cc(), ns, b.done(), result) )
+                    if( Helpers::findById(ctx.db(), ns, b.done(), result) )
                         _dummy_z += result.objsize(); // touch
                 }
             }
@@ -1285,7 +1299,7 @@ namespace mongo {
                 b.append(_id);
                 BSONObj result;
                 Client::ReadContext ctx( ns );
-                if( Helpers::findById(cc(), ns, b.done(), result) )
+                if( Helpers::findById(ctx.ctx().db(), ns, b.done(), result) )
                     _dummy_z += result.objsize(); // touch
             }
         }

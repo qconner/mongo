@@ -36,11 +36,14 @@
 #include "mongo/db/cloner.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/bson/optime.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
-#include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/initial_sync.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -95,6 +98,7 @@ namespace mongo {
                 sethbmsg( str::stream() << "initial sync cloning indexes for : " << db , 0);
 
             Client::WriteContext ctx(db);
+            OperationContextImpl txn;
 
             string err;
             int errCode;
@@ -109,7 +113,7 @@ namespace mongo {
             options.syncData = dataPass;
             options.syncIndexes = ! dataPass;
 
-            if (!cloner.go(ctx.ctx(), master, options, NULL, err, &errCode)) {
+            if (!cloner.go(&txn, ctx.ctx(), master, options, NULL, err, &errCode)) {
                 sethbmsg(str::stream() << "initial sync: error while "
                                        << (dataPass ? "cloning " : "indexing ") << db
                                        << ".  " << (err.empty() ? "" : err + ".  ")
@@ -125,6 +129,7 @@ namespace mongo {
 
     static void emptyOplog() {
         Client::WriteContext ctx(rsoplog);
+        OperationContextImpl txn;
         Collection* collection = ctx.ctx().db()->getCollection(rsoplog);
 
         // temp
@@ -132,12 +137,7 @@ namespace mongo {
             return; // already empty, ok.
 
         LOG(1) << "replSet empty oplog" << rsLog;
-        collection->details()->emptyCappedCollection(rsoplog);
-    }
-
-    bool Member::syncable() const {
-        bool buildIndexes = theReplSet ? theReplSet->buildIndexes() : true;
-        return hbinfo().up() && (config().buildIndexes || !buildIndexes) && state().readable();
+        uassertStatusOK( collection->truncate(&txn) );
     }
 
     const Member* ReplSetImpl::getMemberToSyncTo() {

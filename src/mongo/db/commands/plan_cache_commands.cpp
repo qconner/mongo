@@ -114,7 +114,7 @@ namespace mongo {
           helpText(helpText),
           actionType(actionType) { }
 
-    bool PlanCacheCommand::run(const string& dbname, BSONObj& cmdObj, int options,
+    bool PlanCacheCommand::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
                                string& errmsg, BSONObjBuilder& result, bool fromRepl) {
         string ns = parseNs(dbname, cmdObj);
 
@@ -128,9 +128,7 @@ namespace mongo {
         return true;
     }
 
-    Command::LockType PlanCacheCommand::locktype() const {
-        return NONE;
-    }
+    bool PlanCacheCommand::isWriteCommandForConfigServer() const { return false; }
 
     bool PlanCacheCommand::slaveOk() const {
         return false;
@@ -190,7 +188,12 @@ namespace mongo {
 
         // Create canonical query
         CanonicalQuery* cqRaw;
-        Status result = CanonicalQuery::canonicalize(ns, queryObj, sortObj, projObj, &cqRaw);
+
+        const NamespaceString nss(ns);
+        const WhereCallbackReal whereCallback(nss.db());
+
+        Status result = CanonicalQuery::canonicalize(
+                            ns, queryObj, sortObj, projObj, &cqRaw, whereCallback);
         if (!result.isOK()) {
             return result;
         }

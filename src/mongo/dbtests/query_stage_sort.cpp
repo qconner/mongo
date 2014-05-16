@@ -35,8 +35,8 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -64,7 +64,7 @@ namespace QueryStageSortTests {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            CollectionIterator* it = coll->getIterator(DiskLoc(), false,
+            RecordIterator* it = coll->getIterator(DiskLoc(), false,
                                                        CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
@@ -89,7 +89,7 @@ namespace QueryStageSortTests {
                 WorkingSetMember member;
                 member.loc = *it;
                 member.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                member.obj = it->obj();
+                member.obj = coll->docFor(*it);
                 ASSERT_FALSE(member.obj.isOwned());
                 ms->pushBack(member);
             }
@@ -117,11 +117,13 @@ namespace QueryStageSortTests {
             insertVarietyOfObjects(ms, coll);
 
             SortStageParams params;
+            params.collection = coll;
             params.pattern = BSON("foo" << direction);
             params.limit = limit();
 
             // Must fetch so we can look at the doc as a BSONObj.
-            PlanExecutor runner(ws, new FetchStage(ws, new SortStage(params, ws, ms), NULL));
+            PlanExecutor runner(
+                    ws, new FetchStage(ws, new SortStage(params, ws, ms), NULL, coll), coll);
 
             // Look at pairs of objects to make sure that the sort order is pairwise (and therefore
             // totally) correct.
@@ -179,10 +181,11 @@ namespace QueryStageSortTests {
 
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             fillData();
@@ -197,10 +200,11 @@ namespace QueryStageSortTests {
 
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             fillData();
@@ -224,10 +228,11 @@ namespace QueryStageSortTests {
 
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             fillData();
@@ -242,10 +247,11 @@ namespace QueryStageSortTests {
 
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
             fillData();
 
@@ -259,6 +265,7 @@ namespace QueryStageSortTests {
             insertVarietyOfObjects(ms.get(), coll);
 
             SortStageParams params;
+            params.collection = coll;
             params.pattern = BSON("foo" << 1);
             params.limit = limit();
             auto_ptr<SortStage> ss(new SortStage(params, &ws, ms.get()));
@@ -330,10 +337,11 @@ namespace QueryStageSortTests {
 
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             WorkingSet* ws = new WorkingSet();
@@ -351,11 +359,13 @@ namespace QueryStageSortTests {
             }
 
             SortStageParams params;
+            params.collection = coll;
             params.pattern = BSON("b" << -1 << "c" << 1 << "a" << 1);
             params.limit = 0;
 
             // We don't get results back since we're sorting some parallel arrays.
-            PlanExecutor runner(ws, new FetchStage(ws, new SortStage(params, ws, ms), NULL));
+            PlanExecutor runner(
+                    ws, new FetchStage(ws, new SortStage(params, ws, ms), NULL, coll), coll);
             Runner::RunnerState runnerState = runner.getNext(NULL, NULL);
             ASSERT_EQUALS(Runner::RUNNER_ERROR, runnerState);
         }

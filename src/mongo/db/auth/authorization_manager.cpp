@@ -109,8 +109,6 @@ namespace mongo {
     const int AuthorizationManager::schemaVersion26Final;
 #endif
 
-    bool AuthorizationManager::_doesSupportOldStylePrivileges = true;
-
     /**
      * Guard object for synchronizing accesses to data cached in AuthorizationManager instances.
      * This guard allows one thread to access the cache at a time, and provides an exception-safe
@@ -238,18 +236,18 @@ namespace mongo {
             _authzManager->_isFetchPhaseBusy = true;
         }
 
-        uint64_t _startGeneration;
+        OID _startGeneration;
         bool _isThisGuardInFetchPhase;
         AuthorizationManager* _authzManager;
         boost::unique_lock<boost::mutex> _lock;
     };
 
     AuthorizationManager::AuthorizationManager(AuthzManagerExternalState* externalState) :
-        _authEnabled(false),
-        _externalState(externalState),
-        _version(schemaVersionInvalid),
-        _cacheGeneration(0),
-        _isFetchPhaseBusy(false) {
+            _authEnabled(false),
+            _externalState(externalState),
+            _version(schemaVersionInvalid),
+            _isFetchPhaseBusy(false) {
+        _updateCacheGeneration_inlock();
     }
 
     AuthorizationManager::~AuthorizationManager() {
@@ -284,12 +282,9 @@ namespace mongo {
         return Status::OK();
     }
 
-    void AuthorizationManager::setSupportOldStylePrivilegeDocuments(bool enabled) {
-        _doesSupportOldStylePrivileges = enabled;
-    }
-
-    bool AuthorizationManager::getSupportOldStylePrivilegeDocuments() {
-        return _doesSupportOldStylePrivileges;
+    OID AuthorizationManager::getCacheGeneration() {
+        CacheGuard guard(this, CacheGuard::fetchSynchronizationManual);
+        return _cacheGeneration;
     }
 
     void AuthorizationManager::setAuthEnabled(bool enabled) {
@@ -791,7 +786,9 @@ namespace mongo {
                 _initializeUserPrivilegesFromRolesV1(user.get());
                 user->markProbedV1(dbname);
             }
-            else if (status != ErrorCodes::UserNotFound) {
+            else if (status == ErrorCodes::UserNotFound) {
+                user->markProbedV1(dbname);
+            } else {
                 return status;
             }
         }
@@ -838,7 +835,7 @@ namespace mongo {
 
     void AuthorizationManager::invalidateUserByName(const UserName& userName) {
         CacheGuard guard(this, CacheGuard::fetchSynchronizationManual);
-        ++_cacheGeneration;
+        _updateCacheGeneration_inlock();
         unordered_map<UserName, User*>::iterator it = _userCache.find(userName);
         if (it == _userCache.end()) {
             return;
@@ -851,7 +848,7 @@ namespace mongo {
 
     void AuthorizationManager::invalidateUsersFromDB(const std::string& dbname) {
         CacheGuard guard(this, CacheGuard::fetchSynchronizationManual);
-        ++_cacheGeneration;
+        _updateCacheGeneration_inlock();
         unordered_map<UserName, User*>::iterator it = _userCache.begin();
         while (it != _userCache.end()) {
             User* user = it->second;
@@ -870,7 +867,7 @@ namespace mongo {
     }
 
     void AuthorizationManager::_invalidateUserCache_inlock() {
-        ++_cacheGeneration;
+        _updateCacheGeneration_inlock();
         for (unordered_map<UserName, User*>::iterator it = _userCache.begin();
                 it != _userCache.end(); ++it) {
             fassert(17266, it->second != internalSecurity.user);
@@ -1386,6 +1383,7 @@ namespace {
         case 'i':
         case 'u':
         case 'd':
+            if (op[1] != '\0') return false; // "db" op type
             return isAuthzNamespace(ns);
         case 'c':
             return loggedCommandOperatesOnAuthzData(ns, o);
@@ -1396,7 +1394,59 @@ namespace {
             return true;
         }
     }
+
+    // Updates to users in the oplog are done by matching on the _id, which will always have the
+    // form "<dbname>.<username>".  This function extracts the UserName from that string.
+    StatusWith<UserName> extractUserNameFromIdString(const StringData& idstr) {
+        size_t splitPoint = idstr.find('.');
+        if (splitPoint == string::npos) {
+            return StatusWith<UserName>(
+                    ErrorCodes::FailedToParse,
+                    mongoutils::str::stream() << "_id entries for user documents must be of "
+                            "the form <dbname>.<username>.  Found: " << idstr);
+        }
+        return StatusWith<UserName>(UserName(idstr.substr(splitPoint),
+                                             idstr.substr(0, splitPoint)));
+    }
+
 }  // namespace
+
+    void AuthorizationManager::_updateCacheGeneration_inlock() {
+        _cacheGeneration = OID::gen();
+    }
+
+    void AuthorizationManager::_invalidateRelevantCacheData(const char* op,
+                                                            const char* ns,
+                                                            const BSONObj& o,
+                                                            const BSONObj* o2) {
+        if (ns == AuthorizationManager::rolesCollectionNamespace.ns() ||
+                ns == AuthorizationManager::versionCollectionNamespace.ns()) {
+            invalidateUserCache();
+            return;
+        }
+
+        if (*op == 'i' || *op == 'd' || *op == 'u') {
+            // If you got into this function isAuthzNamespace() must have returned true, and we've
+            // already checked that it's not the roles or version collection.
+            invariant(ns == AuthorizationManager::usersCollectionNamespace.ns());
+
+            StatusWith<UserName> userName(Status::OK());
+            if (*op == 'u') {
+                userName = extractUserNameFromIdString((*o2)["_id"].str());
+            } else {
+                userName = extractUserNameFromIdString(o["_id"].str());
+            }
+            if (!userName.isOK()) {
+                warning() << "Invalidating user cache based on user being updated failed, will "
+                        "invalidate the entire cache instead: " << userName.getStatus() << endl;
+                invalidateUserCache();
+                return;
+            }
+            invalidateUserByName(userName.getValue());
+        } else {
+            invalidateUserCache();
+        }
+    }
 
     void AuthorizationManager::logOp(
             const char* op,
@@ -1407,8 +1457,7 @@ namespace {
 
         _externalState->logOp(op, ns, o, o2, b);
         if (appliesToAuthzData(op, ns, o)) {
-            CacheGuard guard(this, CacheGuard::fetchSynchronizationManual);
-            _invalidateUserCache_inlock();
+            _invalidateRelevantCacheData(op, ns, o, o2);
         }
     }
 

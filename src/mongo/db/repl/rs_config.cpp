@@ -35,9 +35,11 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/heartbeat.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
+#include "mongo/db/repl/repl_settings.h"  // replSettings
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/text.h"
 
@@ -49,7 +51,7 @@ namespace mongo {
     const int ReplSetConfig::DEFAULT_HB_TIMEOUT = 10;
 
     static AtomicUInt _warnedAboutVotes = 0;
-    void logOpInitiate(const bo&);
+    void logOpInitiate(OperationContext* txn, const bo&);
 
     void assertOnlyHas(BSONObj o, const set<string>& fields) {
         BSONObj::iterator i(o);
@@ -80,14 +82,16 @@ namespace mongo {
               << newConfigBSON << rsLog;
         {
             Client::WriteContext cx( rsConfigNs );
+            OperationContextImpl txn;
 
             //theReplSet->lastOpTimeWritten = ??;
             //rather than above, do a logOp()? probably
-            Helpers::putSingletonGod(rsConfigNs.c_str(),
+            Helpers::putSingletonGod(&txn,
+                                     rsConfigNs.c_str(),
                                      newConfigBSON,
                                      false/*logOp=false; local db so would work regardless...*/);
             if( !comment.isEmpty() && (!theReplSet || theReplSet->isPrimary()) )
-                logOpInitiate(comment);
+                logOpInitiate(&txn, comment);
         }
         log() << "replSet saveConfigLocally done" << rsLog;
     }

@@ -35,7 +35,6 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/query/lite_parsed_query.h"
-#include "mongo/db/queryutil.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/platform/random.h"
 #include "mongo/s/chunk_diff.h"
@@ -52,6 +51,10 @@
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/timer.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/index_bounds_builder.h"
 
 namespace mongo {
 
@@ -211,33 +214,29 @@ namespace mongo {
         conn.done();
     }
 
-    BSONObj Chunk::singleSplit( bool force , BSONObj& res ) const {
-        vector<BSONObj> splitPoint;
-
+    void Chunk::determineSplitPoints(bool atMedian, std::vector<BSONObj>* splitPoints) const {
         // if splitting is not obligatory we may return early if there are not enough data
         // we cap the number of objects that would fall in the first half (before the split point)
         // the rationale is we'll find a split point without traversing all the data
-        if ( ! force ) {
-            vector<BSONObj> candidates;
-            const int maxPoints = 2;
-            pickSplitVector( candidates , getManager()->getCurrentDesiredChunkSize() , maxPoints , MaxObjectPerChunk );
-            if ( candidates.size() <= 1 ) {
-                // no split points means there isn't enough data to split on
-                // 1 split point means we have between half the chunk size to full chunk size
-                // so we shouldn't split
-                LOG(1) << "chunk not full enough to trigger auto-split " << ( candidates.size() == 0 ? "no split entry" : candidates[0].toString() ) << endl;
-                return BSONObj();
-            }
-
-            splitPoint.push_back( candidates.front() );
-
-        }
-        else {
-            // if forcing a split, use the chunk's median key
+        if ( atMedian ) {
             BSONObj medianKey;
             pickMedianKey( medianKey );
             if ( ! medianKey.isEmpty() )
-                splitPoint.push_back( medianKey );
+                splitPoints->push_back( medianKey );
+        }
+        else {
+            pickSplitVector( *splitPoints, Chunk::MaxChunkSize, 0, MaxObjectPerChunk );
+
+            if ( splitPoints->size() <= 1 ) {
+                // no split points means there isn't enough data to split on
+                // 1 split point means we have between half the chunk size to full chunk size
+                // so we shouldn't split
+                splitPoints->clear();
+            }
+        }
+
+        if (splitPoints->empty()) {
+            return;
         }
 
         // We assume that if the chunk being split is the first (or last) one on the collection,
@@ -249,36 +248,67 @@ namespace mongo {
         // use that better method to determine whether to apply heuristic here.
         if ( ! skey().isSpecial() ){
             if ( minIsInf() ) {
-                splitPoint.clear();
                 BSONObj key = _getExtremeKey( 1 );
                 if ( ! key.isEmpty() ) {
-                    splitPoint.push_back( key );
+                    (*splitPoints)[0] = key.getOwned();
                 }
             }
             else if ( maxIsInf() ) {
-                splitPoint.clear();
                 BSONObj key = _getExtremeKey( -1 );
                 if ( ! key.isEmpty() ) {
-                    splitPoint.push_back( key );
+                    splitPoints->pop_back();
+                    splitPoints->push_back( key );
                 }
             }
         }
-
-        // Normally, we'd have a sound split point here if the chunk is not empty. It's also a good place to
-        // sanity check.
-        if ( splitPoint.empty() || _min == splitPoint.front() || _max == splitPoint.front() ) {
-            log() << "want to split chunk, but can't find split point chunk " << toString()
-                  << " got: " << ( splitPoint.empty() ? "<empty>" : splitPoint.front().toString() ) << endl;
-            return BSONObj();
-        }
-        
-        if (multiSplit( splitPoint , res ))
-            return splitPoint.front();
-        else
-            return BSONObj();
     }
 
-    bool Chunk::multiSplit( const vector<BSONObj>& m , BSONObj& res ) const {
+    Status Chunk::split( bool atMedian, size_t* resultingSplits ) const {
+        size_t dummy;
+        if (resultingSplits == NULL) {
+            resultingSplits = &dummy;
+        }
+
+        vector<BSONObj> splitPoints;
+        determineSplitPoints( atMedian, &splitPoints );
+
+        if (splitPoints.empty()) {
+            string msg;
+            if (atMedian) {
+                msg = "cannot find median in chunk, possibly empty";
+            }
+            else {
+                msg = "chunk not full enough to trigger auto-split";
+            }
+
+            LOG(1) << msg << endl;
+            return Status(ErrorCodes::CannotSplit, msg);
+        }
+
+        // Normally, we'd have a sound split point here if the chunk is not empty.
+        // It's also a good place to sanity check.
+        if ( _min == splitPoints.front() ) {
+            string msg(str::stream() << "not splitting chunk " << toString()
+                                     << ", split point " << splitPoints.front()
+                                     << " is exactly on chunk bounds");
+            log() << msg << endl;
+            return Status(ErrorCodes::CannotSplit, msg);
+        }
+
+        if ( _max == splitPoints.back() ) {
+            string msg(str::stream() << "not splitting chunk " << toString()
+                                     << ", split point " << splitPoints.back()
+                                     << " is exactly on chunk bounds");
+            log() << msg << endl;
+            return Status(ErrorCodes::CannotSplit, msg);
+        }
+
+        Status status = multiSplit( splitPoints );
+        *resultingSplits = splitPoints.size();
+        return status;
+    }
+
+    Status Chunk::multiSplit( const vector<BSONObj>& m ) const {
         const size_t maxSplitPoints = 8192;
 
         uassert( 10165 , "can't split as shard doesn't have a manager" , _manager );
@@ -299,14 +329,17 @@ namespace mongo {
         cmd.append( "configdb" , configServer.modelServer() );
         BSONObj cmdObj = cmd.obj();
 
+        BSONObj res;
         if ( ! conn->runCommand( "admin" , cmdObj , res )) {
-            warning() << "splitChunk failed - cmd: " << cmdObj << " result: " << res << endl;
+            string msg(str::stream() << "splitChunk failed - cmd: "
+                                     << cmdObj << " result: " << res);
+            warning() << msg << endl;
             conn.done();
 
             // Mark the minor version for *eventual* reload
             _manager->markMinorForReload( this->_lastmod );
 
-            return false;
+            return Status(ErrorCodes::SplitFailed, msg);
         }
 
         conn.done();
@@ -314,7 +347,7 @@ namespace mongo {
         // force reload of config
         _manager->reload();
 
-        return true;
+        return Status::OK();
     }
 
     bool Chunk::moveAndCommit(const Shard& to,
@@ -398,9 +431,11 @@ namespace mongo {
             LOG(1) << "about to initiate autosplit: " << *this << " dataWritten: " << _dataWritten << " splitThreshold: " << splitThreshold << endl;
 
             BSONObj res;
-            BSONObj splitPoint = singleSplit( false /* does not force a split if not enough data */ , res );
-            if ( splitPoint.isEmpty() ) {
-                // singleSplit would have issued a message if we got here
+            size_t splitCount = 0;
+            Status status = split( false /* does not force a split if not enough data */,
+                                   &splitCount );
+            if ( !status.isOK() ) {
+                // split would have issued a message if we got here
                 _dataWritten = 0; // this means there wasn't enough data to split, so don't want to try again until considerable more data
                 return false;
             }
@@ -414,8 +449,10 @@ namespace mongo {
 
             bool shouldBalance = grid.shouldBalance( _manager->getns() );
 
-            log() << "autosplitted " << _manager->getns() << " shard: " << toString()
-                  << " on: " << splitPoint << " (splitThreshold " << splitThreshold << ")"
+            log() << "autosplitted " << _manager->getns()
+                  << " shard: " << toString()
+                  << " into " << (splitCount + 1)
+                  << " (splitThreshold " << splitThreshold << ")"
 #ifdef _DEBUG
                   << " size: " << getPhysicalSize() // slow - but can be useful when debugging
 #endif
@@ -1122,49 +1159,44 @@ namespace mongo {
     }
 
     void ChunkManager::getShardsForQuery( set<Shard>& shards , const BSONObj& query ) const {
-        // TODO Determine if the third argument to OrRangeGenerator() is necessary, see SERVER-5165.
-        OrRangeGenerator org(_ns.c_str(), query, false);
-
-        const SpecialIndices special = org.getSpecial();
-        if (special.has("2d") || special.has("2dsphere")) {
-            BSONForEach(field, query) {
-                if (getGtLtOp(field) == BSONObj::opNEAR) {
-                    uassert(13501, "use geoNear command rather than $near query", false);
-                    // TODO: convert to geoNear rather than erroring out
-                }
-                // $within queries are fine
-            }
-        } else if (!special.empty()) {
-            uassert(13502, "unrecognized special query type: " + special.toString(), false);
-        }
-
-        do {
-            boost::scoped_ptr<FieldRangeSetPair> frsp (org.topFrsp());
-
-            // special case if most-significant field isn't in query
-            FieldRange range = frsp->shardKeyRange(_key.key().firstElementFieldName());
-            if ( range.universal() ) {
-                getShardsForRange( shards, _key.globalMin(), _key.globalMax() );
-                return;
-            }
-            
-            if ( frsp->matchPossibleForSingleKeyFRS( _key.key() ) ) {
-                BoundList ranges = _key.keyBounds( frsp->getSingleKeyFRS() );
-                for ( BoundList::const_iterator it=ranges.begin(); it != ranges.end(); ++it ){
-
-                    getShardsForRange( shards, it->first /*min*/, it->second /*max*/ );
-
-                    // once we know we need to visit all shards no need to keep looping
-                    if( shards.size() == _shards.size() ) return;
-                }
-            }
-
-            if (!org.orRangesExhausted())
-                org.popOrClauseSingleKey();
-
-        }
-        while (!org.orRangesExhausted());
+        CanonicalQuery* canonicalQuery = NULL;
+        Status status = CanonicalQuery::canonicalize(
+                            _ns,
+                            query,
+                            &canonicalQuery,
+                            WhereCallbackNoop());
+                            
+        boost::scoped_ptr<CanonicalQuery> canonicalQueryPtr(canonicalQuery);
         
+        uassert(status.code(), status.reason(), status.isOK());
+
+        // Query validation
+        if (QueryPlannerCommon::hasNode(canonicalQuery->root(), MatchExpression::GEO_NEAR)) {
+            uassert(13501, "use geoNear command rather than $near query", false);
+        }
+
+        // Transforms query into bounds for each field in the shard key
+        // for example :
+        //   Key { a: 1, b: 1 },
+        //   Query { a : { $gte : 1, $lt : 2 },
+        //            b : { $gte : 3, $lt : 4 } }
+        //   => Bounds { a : [1, 2), b : [3, 4) }
+        IndexBounds bounds = getIndexBoundsForQuery(_key.key(), canonicalQuery);
+
+        // Transforms bounds for each shard key field into full shard key ranges
+        // for example :
+        //   Key { a : 1, b : 1 }
+        //   Bounds { a : [1, 2), b : [3, 4) }
+        //   => Ranges { a : 1, b : 3 } => { a : 2, b : 4 }
+        BoundList ranges = KeyPattern::keyBounds(_key.key(), bounds);
+
+        for ( BoundList::const_iterator it=ranges.begin(); it != ranges.end(); ++it ){
+            getShardsForRange( shards, it->first /*min*/, it->second /*max*/ );
+
+            // once we know we need to visit all shards no need to keep looping
+            if( shards.size() == _shards.size() ) break;
+        }
+
         // SERVER-4914 Some clients of getShardsForQuery() assume at least one shard will be
         // returned.  For now, we satisfy that assumption by adding a shard with no matches rather
         // than return an empty set of shards.
@@ -1195,6 +1227,106 @@ namespace mongo {
 
     void ChunkManager::getAllShards( set<Shard>& all ) const {
         all.insert(_shards.begin(), _shards.end());
+    }
+
+    IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key, const CanonicalQuery* canonicalQuery) {
+        // $text is not allowed in planning since we don't have text index on mongos.
+        //
+        // TODO: Treat $text query as a no-op in planning. So with shard key {a: 1},
+        //       the query { a: 2, $text: { ... } } will only target to {a: 2}.
+        if (QueryPlannerCommon::hasNode(canonicalQuery->root(), MatchExpression::TEXT)) {
+            IndexBounds bounds;
+            IndexBoundsBuilder::allValuesBounds(key, &bounds); // [minKey, maxKey]
+            return bounds;
+        }
+
+        // Consider shard key as an index
+        string accessMethod = IndexNames::BTREE;
+        if (KeyPattern::isHashed(key.firstElement())) {
+            accessMethod = IndexNames::HASHED;
+        }
+
+        // Use query framework to generate index bounds
+        QueryPlannerParams plannerParams;
+        // Must use "shard key" index
+        plannerParams.options = QueryPlannerParams::NO_TABLE_SCAN;
+        IndexEntry indexEntry(key, accessMethod, false /* multiKey */, false /* sparse */, "shardkey", BSONObj());
+        plannerParams.indices.push_back(indexEntry);
+
+        OwnedPointerVector<QuerySolution> solutions;
+        Status status = QueryPlanner::plan(*canonicalQuery, plannerParams, &solutions.mutableVector());
+        uassert(status.code(), status.reason(), status.isOK());
+
+        IndexBounds bounds;
+
+        for (vector<QuerySolution*>::const_iterator it = solutions.begin();
+                bounds.size() == 0 && it != solutions.end(); it++) {
+            // Try next solution if we failed to generate index bounds, i.e. bounds.size() == 0
+            bounds = collapseQuerySolution((*it)->root.get());
+        }
+
+        if (bounds.size() == 0) {
+            // We cannot plan the query without collection scan, so target to all shards.
+            IndexBoundsBuilder::allValuesBounds(key, &bounds); // [minKey, maxKey]
+        }
+        return bounds;
+    }
+
+    IndexBounds ChunkManager::collapseQuerySolution( const QuerySolutionNode* node ) {
+        if (node->children.size() == 0) {
+            invariant(node->getType() == STAGE_IXSCAN);
+
+            const IndexScanNode* ixNode = static_cast<const IndexScanNode*>( node );
+            return ixNode->bounds;
+        }
+
+        if (node->children.size() == 1) {
+            // e.g. FETCH -> IXSCAN
+            return collapseQuerySolution( node->children.front() );
+        }
+
+        // children.size() > 1, assert it's OR / SORT_MERGE.
+        if ( node->getType() != STAGE_OR && node->getType() != STAGE_SORT_MERGE ) {
+            // Unexpected node. We should never reach here.
+            error() << "could not generate index bounds on query solution tree: " << node->toString();
+            dassert(false); // We'd like to know this error in testing.
+
+            // Bail out with all shards in production, since this isn't a fatal error.
+            return IndexBounds();
+        }
+
+        IndexBounds bounds;
+        for ( vector<QuerySolutionNode*>::const_iterator it = node->children.begin();
+                it != node->children.end(); it++ )
+        {
+            // The first branch under OR
+            if ( it == node->children.begin() ) {
+                invariant(bounds.size() == 0);
+                bounds = collapseQuerySolution( *it );
+                if (bounds.size() == 0) { // Got unexpected node in query solution tree
+                    return IndexBounds();
+                }
+                continue;
+            }
+
+            IndexBounds childBounds = collapseQuerySolution( *it );
+            if (childBounds.size() == 0) { // Got unexpected node in query solution tree
+                return IndexBounds();
+            }
+
+            invariant(childBounds.size() == bounds.size());
+            for ( size_t i = 0; i < bounds.size(); i++ ) {
+                bounds.fields[i].intervals.insert( bounds.fields[i].intervals.end(),
+                                                   childBounds.fields[i].intervals.begin(),
+                                                   childBounds.fields[i].intervals.end() );
+            }
+        }
+
+        for ( size_t i = 0; i < bounds.size(); i++ ) {
+            IndexBoundsBuilder::unionize( &bounds.fields[i] );
+        }
+
+        return bounds;
     }
 
     bool ChunkManager::compatibleWith( const ChunkManager& other, const Shard& shard ) const {

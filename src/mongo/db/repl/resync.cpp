@@ -28,8 +28,9 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/master_slave.h"  // replSettings
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
+#include "mongo/db/repl/repl_settings.h"  // replSettings
 #include "mongo/db/repl/rs.h" // replLocalAuth()
+#include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
 
@@ -42,9 +43,7 @@ namespace mongo {
         virtual bool adminOnly() const {
             return true;
         }
-        virtual bool logTheOp() { return false; }
-        virtual bool lockGlobally() const { return true; }
-        virtual LockType locktype() const { return WRITE; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -58,12 +57,18 @@ namespace mongo {
         }
 
         CmdResync() : Command("resync") { }
-        virtual bool run(const string&,
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
                          BSONObjBuilder& result,
                          bool fromRepl) {
+
+            const std::string ns = parseNs(dbname, cmdObj);
+            Lock::GlobalWrite globalWriteLock;
+            Client::Context ctx(ns);
+
             if (replSettings.usingReplSets()) {
                 if (theReplSet->isPrimary()) {
                     errmsg = "primaries cannot resync";
@@ -85,7 +90,7 @@ namespace mongo {
             if ( !waitForSyncToFinish( errmsg ) )
                 return false;
 
-            ReplSource::forceResyncDead( "client" );
+            ReplSource::forceResyncDead( txn, "client" );
             result.append( "info", "triggered resync for all sources" );
             return true;
         }

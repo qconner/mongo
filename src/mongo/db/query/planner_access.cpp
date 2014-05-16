@@ -184,10 +184,42 @@ namespace mongo {
         const StageType type = node->getType();
         verify(STAGE_GEO_NEAR_2D != type);
 
-        if (STAGE_GEO_2D == type || STAGE_TEXT == type ||
-            STAGE_GEO_NEAR_2DSPHERE == type) {
-            return true;
+        const MatchExpression::MatchType exprType = expr->matchType();
+
+        //
+        // First handle special solution tree leaf types. In general, normal index bounds
+        // building is not used for special leaf types, and hence we cannot merge leaves.
+        //
+        // This rule is always true for OR, but there are exceptions for AND.
+        // Specifically, we can often merge a predicate with a special leaf type
+        // by adding a filter to the special leaf type.
+        //
+
+        if (STAGE_GEO_2D == type) {
+            // Don't merge GEO with a geo leaf. Instead, we will generate an AND_HASH solution
+            // with two separate leaves.
+            return MatchExpression::AND == mergeType
+                && MatchExpression::GEO != exprType;
         }
+
+        if (STAGE_TEXT == type) {
+            // Currently only one text predicate is allowed, but to be safe, make sure that we
+            // do not try to merge two text predicates.
+            return MatchExpression::AND == mergeType
+                && MatchExpression::TEXT != exprType;
+        }
+
+        if (STAGE_GEO_NEAR_2DSPHERE == type) {
+            // Currently only one GEO_NEAR is allowed, but to be safe, make sure that we
+            // do not try to merge two GEO_NEAR predicates.
+            return MatchExpression::AND == mergeType
+                && MatchExpression::GEO_NEAR != exprType;
+        }
+
+        //
+        // If we're here, then we're done checking for special leaf nodes, and the leaf
+        // must be a regular index scan.
+        //
 
         invariant(type == STAGE_IXSCAN);
         IndexScanNode* scan = static_cast<IndexScanNode*>(node);
@@ -450,16 +482,20 @@ namespace mongo {
 
     // static
     void QueryPlannerAccess::findElemMatchChildren(const MatchExpression* node,
-                                                   vector<MatchExpression*>* out) {
+                                                   vector<MatchExpression*>* out,
+                                                   vector<MatchExpression*>* subnodesOut) {
         for (size_t i = 0; i < node->numChildren(); ++i) {
             MatchExpression* child = node->getChild(i);
-            if (Indexability::nodeCanUseIndexOnOwnField(child) &&
+            if (Indexability::isBoundsGenerating(child) &&
                 NULL != child->getTag()) {
                 out->push_back(child);
             }
             else if (MatchExpression::AND == child->matchType() ||
-                     MatchExpression::ELEM_MATCH_OBJECT == child->matchType()) {
-                findElemMatchChildren(child, out);
+                     Indexability::arrayUsesIndexOnChildren(child)) {
+                findElemMatchChildren(child, out, subnodesOut);
+            }
+            else if (NULL != child->getTag()) {
+                subnodesOut->push_back(child);
             }
         }
     }
@@ -513,10 +549,42 @@ namespace mongo {
                     // predicates from inside the $elemMatch, and try to merge them with
                     // the current index scan.
 
-                    // Populate 'emChildren' with tagged predicates from inside the
-                    // tree rooted at 'child.
+                    // Contains tagged predicates from inside the tree rooted at 'child'
+                    // which are logically part of the AND.
                     vector<MatchExpression*> emChildren;
-                    findElemMatchChildren(child, &emChildren);
+
+                    // Contains tagged nodes that are not logically part of the AND and
+                    // cannot use the index directly (e.g. OR nodes which are tagged to
+                    // be indexed).
+                    vector<MatchExpression*> emSubnodes;
+
+                    // Populate 'emChildren' and 'emSubnodes'.
+                    findElemMatchChildren(child, &emChildren, &emSubnodes);
+
+                    // Recursively build data access for the nodes inside 'emSubnodes'.
+                    for (size_t i = 0; i < emSubnodes.size(); ++i) {
+                        MatchExpression* subnode = emSubnodes[i];
+
+                        if (!Indexability::isBoundsGenerating(subnode)) {
+                            // Must pass true for 'inArrayOperator' because the subnode is
+                            // beneath an ELEM_MATCH_OBJECT.
+                            QuerySolutionNode* childSolution = buildIndexedDataAccess(query,
+                                                                                      subnode,
+                                                                                      true,
+                                                                                      indices);
+
+                            // buildIndexedDataAccess(...) returns NULL in error conditions, when
+                            // it is unable to construct a query solution from a tagged match
+                            // expression tree. If we are unable to construct a solution according
+                            // to the instructions from the enumerator, then we  bail out early
+                            // (by returning false) rather than continuing on and potentially
+                            // constructing an invalid solution tree.
+                            if (NULL == childSolution) { return false; }
+
+                            // Output the resulting solution tree.
+                            out->push_back(childSolution);
+                        }
+                    }
 
                     // For each predicate in 'emChildren', try to merge it with the
                     // current index scan.
@@ -535,12 +603,12 @@ namespace mongo {
                         invariant(NULL != emChild->getTag());
                         IndexTag* innerTag = static_cast<IndexTag*>(emChild->getTag());
 
-                        if (NULL != currentScan.get() && (currentIndexNumber == ixtag->index) &&
+                        if (NULL != currentScan.get() && (currentIndexNumber == innerTag->index) &&
                             shouldMergeWithLeaf(emChild, indices[currentIndexNumber], innerTag->pos,
                                                 currentScan.get(), root->matchType())) {
                             // The child uses the same index we're currently building a scan for.  Merge
                             // the bounds and filters.
-                            verify(currentIndexNumber == ixtag->index);
+                            verify(currentIndexNumber == innerTag->index);
 
                             IndexBoundsBuilder::BoundsTightness tightness = IndexBoundsBuilder::INEXACT_FETCH;
                             mergeWithLeafNode(emChild, indices[currentIndexNumber], innerTag->pos, &tightness,
@@ -565,7 +633,7 @@ namespace mongo {
                                 verify(IndexTag::kNoIndex == currentIndexNumber);
                             }
 
-                            currentIndexNumber = ixtag->index;
+                            currentIndexNumber = innerTag->index;
 
                             IndexBoundsBuilder::BoundsTightness tightness = IndexBoundsBuilder::INEXACT_FETCH;
                             currentScan.reset(makeLeafNode(query, indices[currentIndexNumber], innerTag->pos,
@@ -652,7 +720,13 @@ namespace mongo {
                 mergeWithLeafNode(child, indices[currentIndexNumber], ixtag->pos, &tightness,
                                   currentScan.get(), root->matchType());
 
-                if (tightness == IndexBoundsBuilder::EXACT) {
+                if (inArrayOperator) {
+                    // We're inside an array operator. The entire array operator expression
+                    // should always be affixed as a filter. We keep 'curChild' in the $and
+                    // for affixing later.
+                    ++curChild;
+                }
+                else if (tightness == IndexBoundsBuilder::EXACT) {
                     root->getChildVector()->erase(root->getChildVector()->begin()
                                                   + curChild);
                     delete child;
@@ -716,7 +790,13 @@ namespace mongo {
                 currentScan.reset(makeLeafNode(query, indices[currentIndexNumber], ixtag->pos,
                                                 child, &tightness));
 
-                if (tightness == IndexBoundsBuilder::EXACT && !inArrayOperator) {
+                if (inArrayOperator) {
+                    // We're inside an array operator. The entire array operator expression
+                    // should always be affixed as a filter. We keep 'curChild' in the $and
+                    // for affixing later.
+                    ++curChild;
+                }
+                else if (tightness == IndexBoundsBuilder::EXACT) {
                     // The bounds answer the predicate, and we can remove the expression from the
                     // root.  NOTE(opt): Erasing entry 0, 1, 2, ... could be kind of n^2, maybe
                     // optimize later.

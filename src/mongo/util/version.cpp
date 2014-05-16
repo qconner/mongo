@@ -31,7 +31,7 @@ namespace mongo {
      *      1.2.3-rc4-pre-
      * If you really need to do something else you'll need to fix _versionArray()
      */
-    const char versionString[] = "2.7.0-pre-";
+    const char versionString[] = "2.7.1-pre-";
 
     // See unit test for example outputs
     BSONArray toVersionArray(const char* version){
@@ -109,17 +109,7 @@ namespace mongo {
     const char * compilerFlags() { return ""; }
 
 #if defined(_WIN32)
-    string sysInfo() {
-        stringstream ss;
-        ss << "not-scons win";
-        ss << " mscver:" << _MSC_FULL_VER << " built:" << __DATE__;
-        ss << " boostver:" << BOOST_VERSION;
-#if( !defined(_MT) )
-#error _MT is not defined
-#endif  // !defined(_MT)
-        ss << (sizeof(char *) == 8 ? " 64bit" : " 32bit");
-        return ss.str();
-    }
+
 #else  // defined(_WIN32)
     string sysInfo() { return ""; }
 

@@ -88,7 +88,7 @@ use_clang = False
 options = {}
 
 def add_option( name, help, nargs, contributesToVariantDir,
-                dest=None, default = None, type="string", choices=None, metavar=None ):
+                dest=None, default = None, type="string", choices=None, metavar=None, const=None ):
 
     if dest is None:
         dest = name
@@ -104,6 +104,7 @@ def add_option( name, help, nargs, contributesToVariantDir,
                choices=choices,
                default=default,
                metavar=metavar,
+               const=const,
                help=help )
 
     options[name] = { "help" : help ,
@@ -130,6 +131,13 @@ def has_option( name ):
 
 def use_system_version_of_library(name):
     return has_option('use-system-all') or has_option('use-system-' + name)
+
+# Returns true if we have been configured to use a system version of any C++ library. If you
+# add a new C++ library dependency that may be shimmed out to the system, add it to the below
+# list.
+def using_system_version_of_cxx_libraries():
+    cxx_library_names = ["tcmalloc", "boost", "v8"]
+    return True in [use_system_version_of_library(x) for x in cxx_library_names]
 
 def get_variant_dir():
     if has_option('variant-dir'):
@@ -188,16 +196,12 @@ add_option( "extra-variant-dirs", "extra variant dir components, separated by co
 add_option( "add-branch-to-variant-dir", "add current git branch to the variant dir", 0, False )
 add_option( "variant-dir", "override variant subdirectory", 1, False )
 
-add_option( "sharedclient", "build a libmongoclient.so/.dll [DEPRECATED/IGNORED]" , 0 , False )
-add_option( "full", "include client and headers when doing scons install [DEPRECATED/IGNORED]", 0 , False )
-
 # linking options
 add_option( "release" , "release build" , 0 , True )
 add_option( "static" , "fully static build" , 0 , False )
 add_option( "static-libstdc++" , "statically link libstdc++" , 0 , False )
 add_option( "lto", "enable link time optimizations (experimental, except with MSVC)" , 0 , True )
 add_option( "dynamic-windows", "dynamically link on Windows", 0, True)
-add_option( "disable-declspec-thread", "don't use __declspec(thread) on Windows [DEPRECATED/IGNORED]", 0, True)
 
 # base compile flags
 add_option( "64" , "whether to force 64 bit" , 0 , True , "force64" )
@@ -208,7 +212,8 @@ add_option( "cc", "compiler to use for c" , 1 , True )
 add_option( "cc-use-shell-environment", "use $CC from shell for C compiler" , 0 , False )
 add_option( "cxx-use-shell-environment", "use $CXX from shell for C++ compiler" , 0 , False )
 add_option( "ld", "linker to use" , 1 , True )
-add_option( "c++11", "enable c++11 support (experimental)", 0, True )
+add_option( "c++11", "enable c++11 support (experimental)", "?", True,
+            type="choice", choices=["on", "off", "auto"], const="on", default="auto" )
 
 add_option( "cpppath", "Include path if you have headers in a nonstandard directory" , 1 , False )
 add_option( "libpath", "Library path if you have libraries in a nonstandard directory" , 1 , False )
@@ -225,7 +230,9 @@ add_option( "asio" , "Use Asynchronous IO (NOT READY YET)" , 0 , True )
 add_option( "ssl" , "Enable SSL" , 0 , True )
 
 # library choices
-add_option( "usev8" , "use v8 for javascript" , 0 , True )
+js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
+add_option( "js-engine", "JavaScript scripting engine implementation", 1, False,
+           type='choice', default=js_engine_choices[0], choices=js_engine_choices)
 add_option( "libc++", "use libc++ (experimental, requires clang)", 0, True )
 
 # mongo feature options
@@ -240,11 +247,11 @@ add_option( "d", "debug build no optimization, etc..." , 0 , True , "debugBuild"
 add_option( "dd", "debug build no optimization, additional debug logging, etc..." , 0 , True , "debugBuildAndLogging" )
 
 # new style debug and optimize flags
-add_option( "dbg", "Enable runtime debugging checks", 1, True, "dbg",
-            type="choice", choices=["on", "off"] )
+add_option( "dbg", "Enable runtime debugging checks", "?", True, "dbg",
+            type="choice", choices=["on", "off"], const="on" )
 
-add_option( "opt", "Enable compile-time optimization", 1, True, "opt",
-            type="choice", choices=["on", "off"] )
+add_option( "opt", "Enable compile-time optimization", "?", True, "opt",
+            type="choice", choices=["on", "off"], const="on" )
 
 sanitizer_choices = ["address", "memory", "thread", "undefined"]
 add_option( "sanitize", "enable selected sanitizer", 1, True,
@@ -257,9 +264,7 @@ add_option( "pch" , "use precompiled headers to speed up the build (experimental
 add_option( "distcc" , "use distcc for distributing builds" , 0 , False )
 
 # debugging/profiling help
-if os.sys.platform.startswith("linux") and (os.uname()[-1] == 'x86_64'):
-    defaultAllocator = 'tcmalloc'
-elif (os.sys.platform == "darwin") and (os.uname()[-1] == 'x86_64'):
+if os.sys.platform.startswith("linux") or (os.sys.platform == "darwin"):
     defaultAllocator = 'tcmalloc'
 else:
     defaultAllocator = 'system'
@@ -294,10 +299,9 @@ add_option( "use-cpu-profiler",
             "Link against the google-perftools profiler library",
             0, False )
 
-add_option("mongod-concurrency-level", "Concurrency level, \"global\" or \"db\"", 1, True,
-           type="choice", choices=["global", "db"])
-
 add_option('build-fast-and-loose', "NEVER for production builds", 0, False)
+
+add_option('disable-warnings-as-errors', "Don't add -Werror to compiler command line", 0, False)
 
 add_option('propagate-shell-environment',
            "Pass shell environment to sub-processes (NEVER for production builds)",
@@ -363,86 +367,38 @@ elif force64:
 
 releaseBuild = has_option("release")
 
-# validate debug and optimization options
-usingOldOptDbgOptions = has_option("debugBuild") or has_option("debugBuildAndLogging")
-usingNewOptDbgOptions = has_option('dbg') or has_option('opt')
-
-if usingOldOptDbgOptions and usingNewOptDbgOptions:
-    print("Error: Cannot mix old style --d or --dd options with new --dbg and --opt options")
+if has_option("debugBuild") or has_option("debugBuildAndLogging"):
+    print("Error: the --d and --dd flags are no longer permitted; use --dbg and --opt instead")
     Exit(1)
 
-# By default, if no options are specified, we assume the new style options and defaults.
-if not usingOldOptDbgOptions:
+dbg_opt_mapping = {
+    # --dbg, --opt   :   dbg    opt
+    ( None,  None  ) : ( False, True ),
+    ( None,  "on"  ) : ( False, True ),
+    ( None,  "off" ) : ( False, False ),
+    ( "on",  None  ) : ( True,  False ),  # special case interaction
+    ( "on",  "on"  ) : ( True,  True ),
+    ( "on",  "off" ) : ( True,  False ),
+    ( "off", None  ) : ( False, True ),
+    ( "off", "on"  ) : ( False, True ),
+    ( "off", "off" ) : ( False, False ),
+}
+debugBuild, optBuild = dbg_opt_mapping[(get_option('dbg'), get_option('opt'))]
 
-    dbg_opt_mapping = {
-        # --dbg, --opt   :   dbg    opt
-        ( None,  None  ) : ( False, True ),
-        ( None,  "on"  ) : ( False, True ),
-        ( None,  "off" ) : ( False, False ),
-        ( "on",  None  ) : ( True,  False ),  # special case interaction
-        ( "on",  "on"  ) : ( True,  True ),
-        ( "on",  "off" ) : ( True,  False ),
-        ( "off", None  ) : ( False, True ),
-        ( "off", "on"  ) : ( False, True ),
-        ( "off", "off" ) : ( False, False ),
-    }
-    debugBuild, optBuild = dbg_opt_mapping[(get_option('dbg'), get_option('opt'))]
-
-    if releaseBuild and (debugBuild or not optBuild):
-        print("Error: A --release build may not have debugging, and must have optimization")
-        Exit(1)
-
-else:
-    # TODO: Once all buildbots and variants have switched to the new flags,
-    # remove support for --d and --dd
-
-    d_provided = has_option( "debugBuild" )
-    dd_provided = has_option( "debugBuildAndLogging" )
-
-    dbg_opt_mapping = {
-        # win    --d    --dd   --release :   dbg    opt   release
-        ( False, False, False, False )   : ( False, True, False ),
-        ( False, False, False, True  )   : ( False, True, True ),
-
-        ( False, False, True,  False )   : ( True, False, False ),
-        ( False, False, True,  True  )   : None,
-
-
-        ( False, True, False, False )    : ( False, False, False ),
-        ( False, True, False, True  )    : None,
-
-        ( False, True, True,  False )    : ( True, False, False ),
-        ( False, True, True,  True  )    : None,
-
-
-
-
-        ( True, False, False, False )    : ( False, False, False ),
-        ( True, False, False, True  )    : ( False, True, True ),
-
-        ( True, False, True,  False )    : ( True, False, False ),
-        ( True, False, True,  True  )    : ( False, True, True ),  # --release dominates on windows
-
-
-        ( True, True, False, False )     : ( True, False, False ),
-        ( True, True, False, True  )     : ( False, True, True ),  # --release dominates on windows
-
-        ( True, True, True,  False )     : ( True, False, False ),
-        ( True, True, True,  True  )     : ( False, True, True ),  # --release dominates on windows
-    }
-
-    values = dbg_opt_mapping.get((windows, d_provided, dd_provided, releaseBuild))
-    if not values:
-        print("Error: An invalid combination of --d, --dd, and --release was specified")
-        Exit(1)
-
-    debugBuild, optBuild, releaseBuild = values
+if releaseBuild and (debugBuild or not optBuild):
+    print("Error: A --release build may not have debugging, and must have optimization")
+    Exit(1)
 
 static = has_option( "static" )
 
 noshell = has_option( "noshell" ) 
 
-usev8 = has_option( "usev8" ) 
+jsEngine = get_option( "js-engine")
+
+usev8 = (jsEngine != 'none')
+
+v8version = jsEngine[3:] if jsEngine.startswith('v8-') else 'none'
+v8suffix = '' if v8version == '3.12' else '-' + v8version
 
 asio = has_option( "asio" )
 
@@ -454,8 +410,6 @@ env = Environment( BUILD_DIR=variantDir,
                    MODULE_BANNERS=[],
                    ARCHIVE_ADDITION_DIR_MAP={},
                    ARCHIVE_ADDITIONS=[],
-                   MODULETEST_ALIAS='moduletests',
-                   MODULETEST_LIST='#build/moduletests.txt',
                    MSVS_ARCH=msarch ,
                    PYTHON=utils.find_python(),
                    SERVER_ARCHIVE='${SERVER_DIST_BASENAME}${DIST_ARCHIVE_SUFFIX}',
@@ -516,9 +470,6 @@ if has_option('mute'):
     env.Append( LINKCOMSTR = "Linking $TARGET" )
     env.Append( SHLINKCOMSTR = env["LINKCOMSTR"] )
     env.Append( ARCOMSTR = "Generating library $TARGET" )
-
-if has_option('mongod-concurrency-level'):
-    env.Append(CPPDEFINES=['MONGOD_CONCURRENCY_LEVEL=MONGOD_CONCURRENCY_LEVEL_%s' % get_option('mongod-concurrency-level').upper()])
 
 libdeps.setup_environment( env )
 
@@ -600,8 +551,6 @@ if has_option( "durableDefaultOn" ):
 if has_option( "durableDefaultOff" ):
     env.Append( CPPDEFINES=[ "_DURABLEDEFAULTOFF" ] )
 
-usev8 = True
-
 extraLibPlaces = []
 
 env['EXTRACPPPATH'] = []
@@ -666,7 +615,6 @@ elif linux:
 
     if force32:
         env.Append( EXTRALIBPATH=["/usr/lib32"] )
-        env.Append( CCFLAGS=["-mmmx"] )
 
     if static:
         env.Append( LINKFLAGS=" -static " )
@@ -688,6 +636,7 @@ elif openbsd:
     env.Append( EXTRACPPPATH=[ "/usr/local/include" ] )
     env.Append( EXTRALIBPATH=[ "/usr/local/lib" ] )
     env.Append( CPPDEFINES=[ "__openbsd__" ] )
+    env.Append( LIBS=[ "kvm" ] )
 
 elif windows:
     dynamicCRT = has_option("dynamic-windows")
@@ -775,6 +724,13 @@ elif windows:
 
     env.Append(CCFLAGS=[winRuntimeLibMap[(dynamicCRT, debugBuild)]])
 
+    # With VS 2012 and later we need to specify 5.01 as the target console
+    # so that our 32-bit builds run on Windows XP
+    # See https://software.intel.com/en-us/articles/linking-applications-using-visual-studio-2012-to-run-on-windows-xp
+    #
+    if msarch == "x86":
+        env.Append( LINKFLAGS=["/SUBSYSTEM:CONSOLE,5.01"])
+
     if optBuild:
         # /O2:  optimize for speed (as opposed to size)
         # /Oy-: disable frame pointer optimization (overrides /O2, only affects 32-bit)
@@ -809,7 +765,7 @@ if nix:
         env["CXX"] = "distcc " + env["CXX"]
 
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
-    env.Append( CCFLAGS=["-fPIC",
+    env.Append( CCFLAGS=["-fPIE",
                          "-fno-strict-aliasing",
                          "-ggdb",
                          "-pthread",
@@ -819,11 +775,13 @@ if nix:
                          "-Winvalid-pch"] )
     # env.Append( " -Wconversion" ) TODO: this doesn't really work yet
     if linux or darwin:
-        env.Append( CCFLAGS=["-Werror", "-pipe"] )
+        env.Append( CCFLAGS=["-pipe"] )
+        if not has_option("disable-warnings-as-errors"):
+            env.Append( CCFLAGS=["-Werror"] )
 
     env.Append( CPPDEFINES=["_FILE_OFFSET_BITS=64"] )
     env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
-    env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
+    env.Append( LINKFLAGS=["-fPIE", "-pthread"] )
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
@@ -1067,6 +1025,41 @@ def doConfigure(myenv):
         env.Append( CPPDEFINES=[("_WIN32_WINNT", "0x" + win_version_min[0])] )
         env.Append( CPPDEFINES=[("NTDDI_VERSION", "0x" + win_version_min[0] + win_version_min[1])] )
 
+    if using_gcc() or using_clang():
+
+        # If we are using GCC or clang to target 32 or x86, set the ISA minimum to 'nocona',
+        # and the tuning to 'generic'. The choice of 'nocona' is selected because it
+        #  -- includes MMX extenions which we need for tcmalloc on 32-bit
+        #  -- can target 32 bit
+        #  -- is at the time of this writing a widely-deployed 10 year old microarchitecture
+        #  -- is available as a target architecture from GCC 4.0+
+        # However, we only want to select an ISA, not the nocona specific scheduling, so we
+        # select the generic tuning. For installations where hardware and system compiler rev are
+        # contemporaries, the generic scheduling should be appropriate for a wide range of
+        # deployed hardware.
+
+        def CheckForx86(context):
+            # See http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
+            test_body = """
+            #if defined(__i386) || defined(_M_IX86)
+            /* x86 32-bit */
+            #else
+            #error not 32-bit x86
+            #endif
+            """
+            context.Message('Checking if target architecture is 32-bit x86...')
+            ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+            context.Result(ret)
+            return ret
+
+        conf = Configure(myenv, help=False, custom_tests = {
+            'CheckForx86' : CheckForx86,
+        })
+
+        if conf.CheckForx86():
+            myenv.Append( CCFLAGS=['-march=nocona', '-mtune=generic'] )
+        conf.Finish()
+
     # Enable PCH if we are on using gcc or clang and the 'Gch' tool is enabled. Otherwise,
     # remove any pre-compiled header since the compiler may try to use it if it exists.
     if usePCH and (using_gcc() or using_clang()):
@@ -1165,28 +1158,6 @@ def doConfigure(myenv):
         # primary mongo sources as well.
         AddToCCFLAGSIfSupported(myenv, "-Wno-unused-const-variable")
 
-    if has_option('c++11'):
-        # The Microsoft compiler does not need a switch to enable C++11. Again we should be
-        # checking for MSVC, not windows. In theory, we might be using clang or icc on windows.
-        if not using_msvc():
-            # For our other compilers (gcc and clang) we need to pass -std=c++0x or -std=c++11,
-            # but we prefer the latter. Try that first, and fall back to c++0x if we don't
-            # detect that --std=c++11 works.
-            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
-                if not AddToCXXFLAGSIfSupported(myenv, '-std=c++0x'):
-                    print( 'C++11 mode requested, but cannot find a flag to enable it' )
-                    Exit(1)
-            # Our current builtin tcmalloc is not compilable in C++11 mode. Remove this
-            # check when our builtin release of tcmalloc contains the resolution to
-            # http://code.google.com/p/gperftools/issues/detail?id=477.
-            if get_option('allocator') == 'tcmalloc':
-                if not use_system_version_of_library('tcmalloc'):
-                    print( 'TCMalloc is not currently compatible with C++11' )
-                    Exit(1)
-
-            if not AddToCFLAGSIfSupported(myenv, '-std=c99'):
-                print( 'C++11 mode selected for C++ files, but failed to enable C99 for C files' )
-
     # This needs to happen before we check for libc++, since it affects whether libc++ is available.
     if darwin and has_option('osx-version-min'):
         min_version = get_option('osx-version-min')
@@ -1196,6 +1167,7 @@ def doConfigure(myenv):
             Exit(1)
         myenv.AppendUnique(LINKFLAGS=[min_version_flag])
 
+    usingLibStdCxx = False
     if has_option('libc++'):
         if not using_clang():
             print( 'libc++ is currently only supported for clang')
@@ -1207,29 +1179,46 @@ def doConfigure(myenv):
         else:
             print( 'libc++ requested, but compiler does not support -stdlib=libc++' )
             Exit(1)
+    else:
+        def CheckLibStdCxx(context):
+            test_body = """
+            #include <vector>
+            #if !defined(__GLIBCXX__)
+            #error
+            #endif
+            """
 
-    # Check to see if we are trying to use an outdated libstdc++ in C++11 mode. This is
-    # primarly to help people using clang in C++11 mode on OS X but forgetting to use
-    # --libc++. We would, ideally, check the __GLIBCXX__ version, but for various reasons this
-    # is not workable. Instead, we switch on the fact that std::is_nothrow_constructible wasn't
-    # introduced until libstdc++ 4.6.0. Earlier versions of libstdc++ than 4.6 are unlikely to
-    # work well anyway.
-    if has_option('c++11') and not has_option('libc++'):
+            context.Message('Checking if we are using libstdc++... ')
+            ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+            context.Result(ret)
+            return ret
+
+        conf = Configure(myenv, help=False, custom_tests = {
+            'CheckLibStdCxx' : CheckLibStdCxx,
+        })
+        usingLibStdCxx = conf.CheckLibStdCxx()
+        conf.Finish()
+
+    # Check to see if we are trying to use an elderly libstdc++, which we arbitrarily define as
+    # 4.6.0. This is primarly to help people using clang in C++11 mode on OS X but forgetting
+    # to use --libc++. We also use it to decide if we trust the libstdc++ debug mode. We would,
+    # ideally, check the __GLIBCXX__ version, but for various reasons this is not
+    # workable. Instead, we switch on the fact that _GLIBCXX_BEGIN_NAMESPACE_VERSION wasn't
+    # introduced until libstdc++ 4.6.0.
+
+    haveGoodLibStdCxx = False
+    if usingLibStdCxx:
 
         def CheckModernLibStdCxx(context):
 
             test_body = """
             #include <vector>
-            #include <cstdlib>
-            #if defined(__GLIBCXX__)
-            #include <type_traits>
-            int main() {
-                return std::is_nothrow_constructible<int>::value ? EXIT_SUCCESS : EXIT_FAILURE;
-            }
+            #if !defined(_GLIBCXX_BEGIN_NAMESPACE_VERSION)
+            #error libstdcxx older than 4.6.0
             #endif
             """
 
-            context.Message('Checking for libstdc++ 4.6.0 or better (for C++11 support)... ')
+            context.Message('Checking for libstdc++ 4.6.0 or better... ')
             ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
             context.Result(ret)
             return ret
@@ -1240,11 +1229,123 @@ def doConfigure(myenv):
         haveGoodLibStdCxx = conf.CheckModernLibStdCxx()
         conf.Finish()
 
-        if not haveGoodLibStdCxx:
-            print( 'Detected libstdc++ is too old to support C++11 mode' )
-            if darwin:
-                print( 'Try building with --libc++ and --osx-version-min=10.7 or higher' )
-            Exit(1)
+    # Sort out whether we can and should use C++11:
+    cxx11_mode = get_option("c++11")
+
+    if using_msvc():
+        if cxx11_mode == "off":
+            print( 'WARNING: Cannot disable C++11 features when using MSVC' )
+    else:
+
+        # In C++11 'auto' mode, don't use C++11 if we are linking against any system C++ libs.
+        if cxx11_mode == "auto" and using_system_version_of_cxx_libraries():
+            cxx11_mode = "off"
+
+        # If we are using libstdc++, only allow C++11 mode with our line-in-the-sand good
+        # libstdc++. As always, if in auto mode fall back to disabling if we don't have a good
+        # libstdc++, otherwise fail the build because we can't honor the explicit request.
+        if cxx11_mode != "off" and usingLibStdCxx:
+            if not haveGoodLibStdCxx:
+                if cxx11_mode == "auto":
+                    cxx11_mode = "off"
+                else:
+                    print( 'Detected libstdc++ is too old to support C++11 mode' )
+                    if darwin:
+                        print( 'Try building with --libc++ and --osx-version-min=10.7 or higher' )
+                    Exit(1)
+
+        # We are going to be adding flags to the environment, but we don't want to persist
+        # those changes unless we pass all the below checks. Make a copy of the environment
+        # that we will modify, we will only "commit" the changes to the env if we pass all the
+        # checks.
+        cxx11Env = myenv.Clone()
+
+        # For our other compilers (gcc and clang) we need to pass -std=c++0x or -std=c++11,
+        # but we prefer the latter. Try that first, and fall back to c++0x if we don't
+        # detect that --std=c++11 works. If we can't find a flag and C++11 was explicitly
+        # requested, error out, otherwise turn off C++11 support in auto mode.
+        if cxx11_mode != "off":
+            if not AddToCXXFLAGSIfSupported(cxx11Env, '-std=c++11'):
+                if not AddToCXXFLAGSIfSupported(cxx11Env, '-std=c++0x'):
+                    if cxx11_mode == "auto":
+                        cxx11_mode = "off"
+                    else:
+                        print( 'C++11 mode requested, but cannot find a flag to enable it' )
+                        Exit(1)
+
+        # We appear to have C++11, or at least a flag to enable it, which is now set in the
+        # environment. If we are in auto mode, check if the compiler claims that it strictly
+        # supports C++11, and disable C++11 if not. If the user has explicitly requested C++11,
+        # we don't care about what the compiler claims to support, trust the user.
+        if cxx11_mode == "auto":
+            def CheckCxx11Official(context):
+                test_body = """
+                #if __cplusplus < 201103L
+                #error
+                #endif
+                const int not_an_empty_file = 0;
+                """
+
+                context.Message('Checking if __cplusplus >= 201103L to auto-enable C++11... ')
+                ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+                context.Result(ret)
+                return ret
+
+            conf = Configure(cxx11Env, help=False, custom_tests = {
+                'CheckCxx11Official' : CheckCxx11Official,
+            })
+
+            if cxx11_mode == "auto" and not conf.CheckCxx11Official():
+                cxx11_mode = "off"
+
+            conf.Finish()
+
+        # We require c99 mode for C files when C++11 is enabled, so perform the same dance
+        # as above: if C++11 mode is not off, try the flag, if we are in auto mode and we fail
+        # then turn off C++11, otherwise C++11 was explicitly requested and we should error out.
+        if cxx11_mode != "off":
+            if not AddToCFLAGSIfSupported(cxx11Env, '-std=c99'):
+                if cxx11_mode == "auto":
+                    cxx11_mode = "off"
+                else:
+                    print( "C++11 mode selected for C++ files, but can't enable C99 for C files" )
+                    Exit(1)
+
+        # If we got here and cxx11_mode hasn't become false, then its true, so swap in the
+        # modified environment.
+        if cxx11_mode != "off":
+            cxx11_mode = "on"
+            myenv = cxx11Env
+
+    # If we are using a modern libstdc++ and this is a debug build and we control all C++
+    # dependencies, then turn on the debugging features in libstdc++.
+    if debugBuild and usingLibStdCxx and haveGoodLibStdCxx:
+        # We can't do this if we are using any system C++ libraries.
+        if (not using_system_version_of_cxx_libraries()):
+            myenv.Append(CPPDEFINES=["_GLIBCXX_DEBUG"]);
+
+    # Check if we are on a POSIX system by testing if _POSIX_VERSION is defined.
+    def CheckPosixSystem(context):
+
+        test_body = """
+        // POSIX requires the existence of unistd.h, so if we can't include unistd.h, we
+        // are definitely not a POSIX system.
+        #include <unistd.h>
+        #if !defined(_POSIX_VERSION)
+        #error not a POSIX system
+        #endif
+        """
+
+        context.Message('Checking if we are on a POSIX system... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+        context.Result(ret)
+        return ret
+
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckPosixSystem' : CheckPosixSystem,
+    })
+    posix_system = conf.CheckPosixSystem()
+    conf.Finish()
 
     if has_option('sanitize'):
         if not (using_clang() or using_gcc()):
@@ -1331,6 +1432,30 @@ def doConfigure(myenv):
         if haveUUThread:
             myenv.Append(CPPDEFINES=['MONGO_HAVE___THREAD'])
 
+    if using_gcc() or using_clang():
+        def CheckGCCAtomicBuiltins(context):
+            test_body = """
+            int main(int argc, char **argv) {
+                int a = 0;
+                int b = 0;
+                int c = 0;
+
+                __atomic_compare_exchange(&a, &b, &c, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                return 0;
+            }
+            """
+            context.Message('Checking for gcc atomic builtins... ')
+            ret = context.TryLink(textwrap.dedent(test_body), '.cpp')
+            context.Result(ret)
+            return ret
+        conf = Configure(myenv, help=False, custom_tests = {
+            'CheckGCCAtomicBuiltins': CheckGCCAtomicBuiltins,
+        })
+        haveGCCAtomicBuiltins = conf.CheckGCCAtomicBuiltins()
+        conf.Finish()
+        if haveGCCAtomicBuiltins:
+            conf.env.Append(CPPDEFINES=["HAVE_GCC_ATOMIC_BUILTINS"])
+
     conf = Configure(myenv)
     libdeps.setup_conftests(conf)
 
@@ -1360,11 +1485,10 @@ def doConfigure(myenv):
             boostlib = "boost_" + b
             conf.FindSysLibDep( boostlib, [ boostlib + "-mt", boostlib ], language='C++' )
 
-    if conf.CheckHeader('unistd.h'):
+    if posix_system:
         conf.env.Append(CPPDEFINES=['MONGO_HAVE_HEADER_UNISTD_H'])
-
-    if solaris or conf.CheckDeclaration('clock_gettime', includes='#include <time.h>'):
         conf.CheckLib('rt')
+        conf.CheckLib('dl')
 
     if (conf.CheckCXXHeader( "execinfo.h" ) and
         conf.CheckDeclaration('backtrace', includes='#include <execinfo.h>') and
@@ -1659,7 +1783,8 @@ Export("get_option")
 Export("has_option use_system_version_of_library")
 Export("mongoCodeVersion")
 Export("usev8")
-Export("darwin windows solaris linux freebsd nix")
+Export("v8version v8suffix")
+Export("darwin windows solaris linux freebsd nix openbsd")
 Export('module_sconscripts')
 Export("debugBuild optBuild")
 Export("enforce_glibc")
@@ -1667,7 +1792,6 @@ Export("s3push")
 Export("use_clang")
 
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
-env.SConscript('src/SConscript.client', variant_dir='$BUILD_DIR/client_build', duplicate=False)
 env.SConscript(['SConscript.buildinfo', 'SConscript.smoke'])
 
 def clean_old_dist_builds(env, target, source):
@@ -1685,4 +1809,4 @@ def clean_old_dist_builds(env, target, source):
 env.Alias("dist_clean", [], [clean_old_dist_builds])
 env.AlwaysBuild("dist_clean")
 
-env.Alias('all', ['core', 'tools', 'test', 'unittests', 'moduletests'])
+env.Alias('all', ['core', 'tools', 'dbtest', 'unittests'])

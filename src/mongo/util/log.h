@@ -98,12 +98,8 @@ namespace logger {
     if ((!::mongo::debug && ((DLEVEL) > tlogLevel)) || !::mongo::logger::globalLogDomain()->shouldLog(::mongo::LogstreamBuilder::severityCast(DLEVEL))) {} \
     else LogstreamBuilder(::mongo::logger::globalLogDomain(), getThreadName(), ::mongo::LogstreamBuilder::severityCast(DLEVEL))
 
-    /* default impl returns "" -- mongod overrides */
-    extern const char * (*getcurns)();
-
     inline LogstreamBuilder problem() {
-        std::string curns = getcurns();
-        return log().setBaseMessage(curns);
+        return log();
     }
 
     /**
@@ -127,19 +123,6 @@ namespace logger {
     extern Tee* const startupWarningsLog; // Things put here get reported in MMS
 
     string errnoWithDescription(int errorcode = -1);
-    void rawOut( const StringData &s );
-
-    /*
-     * Redirects the output of "rawOut" to stderr.  The default is stdout.
-     *
-     * NOTE: This needs to be here because the tools such as mongoexport and mongodump sometimes
-     * send data to stdout and share this code, so they need to be able to redirect output to
-     * stderr.  Eventually rawOut should be replaced with something better and our tools should not
-     * need to call internal server shutdown functions.
-     *
-     * NOTE: This function is not thread safe and should not be called from a multithreaded context.
-     */
-    void setRawOutToStderr();
 
     /**
      * Write the current context (backtrace), along with the optional "msg".

@@ -46,7 +46,7 @@ def addSmoketest( name, deps, extraSmokeArgs=[] ):
     target = name
     if name.startswith("smoke"):
         if name == "smoke":
-            target = File("test").path
+            target = File("dbtest").path
         else:
             target = name[5].lower() + name[6:]
 
@@ -66,12 +66,11 @@ def addSmokeSuite( name, suitefile, needMongod=False ):
         smoke_args.append('--dont-start-mongod')
     addTest(name, [suitefile], utils.run_smoke_command(*smoke_args))
 
-addSmoketest( "smoke", [ add_exe( "test" ), add_exe( "mongod" ), add_exe( "mongo" ) ] )
+addSmoketest( "smoke", [ add_exe( "dbtest" ), add_exe( "mongod" ), add_exe( "mongo" ) ] )
 addSmoketest( "smokePerf", [ add_exe("perftest") ]  )
 
 addSmoketest( "mongosTest", [ add_exe( 'mongos' ) ])
 addSmokeSuite( "smokeCppUnittests", "$UNITTEST_LIST" )
-addSmokeSuite( "smokeModuleTests", "$MODULETEST_LIST" )
 
 # These tests require the mongo shell
 if shellEnv is not None:
@@ -86,8 +85,10 @@ if shellEnv is not None:
     addSmoketest( "smokeParallel", [ add_exe( "mongo" ), add_exe( "mongod" ) ] )
     addSmoketest( "smokeSharding", [ add_exe("mongo"), add_exe("mongod"), add_exe("mongos"), add_exe('mongofiles') ] )
     addSmoketest( "smokeJsPerf", [ add_exe("mongo"), add_exe("mongod") ] )
-    addSmoketest( "smokeJsSlowNightly", [add_exe("mongo"), add_exe("mongod"), add_exe("mongos") ])
-    addSmoketest( "smokeJsSlowWeekly", [add_exe("mongo"), add_exe("mongod"), add_exe("mongos") ])
+    addSmoketest( "smokeNoPassthroughWithMongod", [add_exe("mongo"), add_exe("mongod"), add_exe("mongos") ])
+    addSmoketest( "smokeNoPassthrough", [add_exe("mongo"), add_exe("mongod"), add_exe("mongos") ])
+    addSmoketest( "smokeSlow1", [add_exe("mongo"), add_exe("mongod"), add_exe("mongos") ])
+    addSmoketest( "smokeSlow2", [add_exe("mongo"), add_exe("mongod"), add_exe("mongos") ])
     addSmoketest( "smokeQuota", [ add_exe("mongo"), add_exe("mongod") ] )
     addSmoketest( "smokeTool", [ add_exe( "mongo" ), add_exe("mongod"), add_exe("mongos"), "tools" ] )
     addSmoketest( "smokeAggregation", [ add_exe( "mongo" ), add_exe( "mongod" ), add_exe( "mongos" ) ] )

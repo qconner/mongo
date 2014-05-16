@@ -42,10 +42,11 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/json.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/db/storage_options.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/platform/posix_fadvise.h"
 #include "mongo/util/exception_filter_win32.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/password.h"
@@ -274,7 +275,8 @@ namespace mongo {
     int BSONTool::run() {
 
         if (bsonToolGlobalParams.hasFilter) {
-            _matcher.reset(new Matcher(fromjson(bsonToolGlobalParams.filter)));
+            _matcher.reset(new Matcher(fromjson(bsonToolGlobalParams.filter),
+                                       MatchExpressionParser::WhereCallback()));
         }
 
         return doRun();

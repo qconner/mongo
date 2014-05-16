@@ -31,11 +31,13 @@
 #include <string>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/repl/oplogreader.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -46,12 +48,12 @@ namespace mongo {
         hn = hostname;
     }
 
-    BSONObj Sync::getMissingDoc(const BSONObj& o) {
+    BSONObj Sync::getMissingDoc(Database* db, const BSONObj& o) {
         OplogReader missingObjReader; // why are we using OplogReader to run a non-oplog query?
         const char *ns = o.getStringField("ns");
 
         // capped collections
-        Collection* collection = cc().database()->getCollection(ns);
+        Collection* collection = db->getCollection(ns);
         if ( collection && collection->isCapped() ) {
             log() << "replication missing doc, but this is okay for a capped collection (" << ns << ")" << endl;
             return BSONObj();
@@ -108,11 +110,12 @@ namespace mongo {
         // should already have write lock
         const char *ns = o.getStringField("ns");
         Client::Context ctx(ns);
+        OperationContextImpl txn;
 
         // we don't have the object yet, which is possible on initial sync.  get it.
         log() << "replication info adding missing object" << endl; // rare enough we can log
 
-        BSONObj missingObj = getMissingDoc(o);
+        BSONObj missingObj = getMissingDoc(ctx.db(), o);
 
         if( missingObj.isEmpty() ) {
             log() << "replication missing object not found on source. presumably deleted later in oplog" << endl;
@@ -124,7 +127,7 @@ namespace mongo {
         else {
             Collection* collection = ctx.db()->getOrCreateCollection( ns );
             verify( collection ); // should never happen
-            StatusWith<DiskLoc> result = collection->insertDocument( missingObj, true );
+            StatusWith<DiskLoc> result = collection->insertDocument( &txn, missingObj, true );
             uassert(15917,
                     str::stream() << "failed to insert missing doc: " << result.toString(),
                     result.isOK() );

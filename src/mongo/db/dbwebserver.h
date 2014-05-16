@@ -34,6 +34,7 @@
 
 #include "mongo/util/admin_access.h"
 #include "mongo/util/net/sock.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 
@@ -54,7 +55,8 @@ namespace mongo {
 
         virtual bool requiresREST( const string& url ) const { return _requiresREST; }
 
-        virtual void handle( const char *rq, // the full request
+        virtual void handle( OperationContext* txn,
+                             const char *rq, // the full request
                              const std::string& url,
                              BSONObj params,
                              // set these and return them:
@@ -94,8 +96,7 @@ namespace mongo {
         static vector<WebStatusPlugin*> * _plugins;
 
     };
-
-    void webServerThread( const AdminAccess* admins );
+    void webServerThread( const AdminAccess* admins, OperationContext::Factory transactionFactory );
     string prettyHostName();
 
 };

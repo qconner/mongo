@@ -117,7 +117,6 @@ namespace {
         }
 
         // These are all no-ops for PipelineRunners
-        virtual void setYieldPolicy(YieldPolicy policy) {}
         virtual void saveState() {}
         virtual bool restoreState() { return true; }
         virtual const Collection* collection() { return NULL; }
@@ -254,7 +253,7 @@ namespace {
         PipelineCommand() :Command(Pipeline::commandName) {} // command is called "aggregate"
 
         // Locks are managed manually, in particular by DocumentSourceCursor.
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return false; }
         virtual bool slaveOverrideOk() const { return true; }
         virtual void help(stringstream &help) const {
@@ -274,7 +273,7 @@ namespace {
             Pipeline::addRequiredPrivileges(this, dbname, cmdObj, out);
         }
 
-        virtual bool run(const string &db, BSONObj &cmdObj, int options, string &errmsg,
+        virtual bool run(OperationContext* txn, const string &db, BSONObj &cmdObj, int options, string &errmsg,
                          BSONObjBuilder &result, bool fromRepl) {
 
             string ns = parseNs(db, cmdObj);
@@ -319,7 +318,9 @@ namespace {
 
                 // This does mongod-specific stuff like creating the input Runner and adding to the
                 // front of the pipeline if needed.
-                boost::shared_ptr<Runner> input = PipelineD::prepareCursorSource(pPipeline, pCtx);
+                boost::shared_ptr<Runner> input = PipelineD::prepareCursorSource(collection,
+                                                                                 pPipeline,
+                                                                                 pCtx);
                 pPipeline->stitch();
 
                 runnerHolder.reset(new PipelineRunner(pPipeline, input));

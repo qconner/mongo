@@ -31,6 +31,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/geo/geoconstants.h"
@@ -39,7 +40,6 @@
 #include "mongo/db/index_names.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/query/type_explain.h"
@@ -52,7 +52,7 @@ namespace mongo {
     public:
         Geo2dFindNearCmd() : Command("geoNear") {}
 
-        virtual LockType locktype() const { return READ; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         bool slaveOk() const { return true; }
         bool slaveOverrideOk() const { return true; }
 
@@ -68,15 +68,17 @@ namespace mongo {
             out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            string ns = dbname + "." + cmdObj.firstElement().valuestr();
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            const string ns = dbname + "." + cmdObj.firstElement().valuestr();
 
             if (!cmdObj["start"].eoo()) {
                 errmsg = "using deprecated 'start' argument to geoNear";
                 return false;
             }
 
-            Database* db = cc().database();
+            Client::ReadContext ctx(ns);
+
+            Database* db = ctx.ctx().db();
             if ( !db ) {
                 errmsg = "can't find ns";
                 return false;
@@ -168,20 +170,31 @@ namespace mongo {
                                    "$dis" << BSON("$meta" << LiteParsedQuery::metaGeoNearDistance));
 
             CanonicalQuery* cq;
-            if (!CanonicalQuery::canonicalize(ns, rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), &cq).isOK()) {
+
+            const NamespaceString nss(dbname);
+            const WhereCallbackReal whereCallback(nss.db());
+
+            if (!CanonicalQuery::canonicalize(ns,
+                                              rewritten,
+                                              BSONObj(),
+                                              projObj,
+                                              0,
+                                              numWanted,
+                                              BSONObj(),
+                                              &cq,
+                                              whereCallback).isOK()) {
                 errmsg = "Can't parse filter / create query";
                 return false;
             }
 
             Runner* rawRunner;
-            if (!getRunner(cq, &rawRunner, 0).isOK()) {
+            if (!getRunner(collection, cq, &rawRunner, 0).isOK()) {
                 errmsg = "can't get query runner";
                 return false;
             }
 
             auto_ptr<Runner> runner(rawRunner);
             const ScopedRunnerRegistration safety(runner.get());
-            runner->setYieldPolicy(Runner::YIELD_AUTO);
 
             double totalDistance = 0;
             BSONObjBuilder resultBuilder(result.subarrayStart("results"));
@@ -190,21 +203,14 @@ namespace mongo {
             BSONObj currObj;
             int results = 0;
             while ((results < numWanted) && Runner::RUNNER_ADVANCED == runner->getNext(&currObj, NULL)) {
-                // cout << "result is " << currObj.toString() << endl;
 
+                // Come up with the correct distance.
                 double dist = currObj["$dis"].number() * distanceMultiplier;
-                // cout << std::setprecision(10) << "HK GEON mul'd dist is " << dist << " raw dist is " << currObj["$dis"].number() << endl;
                 totalDistance += dist;
                 if (dist > farthestDist) { farthestDist = dist; }
 
-                BSONObjBuilder oneResultBuilder(
-                    resultBuilder.subobjStart(BSONObjBuilder::numStr(results)));
-                oneResultBuilder.append("dis", dist);
-                if (includeLocs) {
-                    oneResultBuilder.appendAs(currObj["$pt"], "loc");
-                }
-
-                // strip out '$dis' and '$pt' and the rest gets added as 'obj'.
+                // Strip out '$dis' and '$pt' from the result obj.  The rest gets added as 'obj'
+                // in the command result.
                 BSONObjIterator resIt(currObj);
                 BSONObjBuilder resBob;
                 while (resIt.more()) {
@@ -214,7 +220,23 @@ namespace mongo {
                         resBob.append(elt);
                     }
                 }
-                oneResultBuilder.append("obj", resBob.obj());
+                BSONObj resObj = resBob.obj();
+
+                // Don't make a too-big result object.
+                if (resultBuilder.len() + resObj.objsize()> BSONObjMaxUserSize) {
+                    warning() << "Too many geoNear results for query " << rewritten.toString()
+                              << ", truncating output.";
+                    break;
+                }
+
+                // Add the next result to the result builder.
+                BSONObjBuilder oneResultBuilder(
+                    resultBuilder.subobjStart(BSONObjBuilder::numStr(results)));
+                oneResultBuilder.append("dis", dist);
+                if (includeLocs) {
+                    oneResultBuilder.appendAs(currObj["$pt"], "loc");
+                }
+                oneResultBuilder.append("obj", resObj);
                 oneResultBuilder.done();
                 ++results;
             }

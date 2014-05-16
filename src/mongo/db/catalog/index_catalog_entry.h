@@ -39,9 +39,11 @@
 namespace mongo {
 
     class Collection;
+    class HeadManager;
+    class IndexAccessMethod;
     class IndexDescriptor;
     class RecordStore;
-    class IndexAccessMethod;
+    class OperationContext;
 
     class IndexCatalogEntry {
         MONGO_DISALLOW_COPYING( IndexCatalogEntry );
@@ -62,10 +64,6 @@ namespace mongo {
         IndexAccessMethod* accessMethod() { return _accessMethod; }
         const IndexAccessMethod* accessMethod() const { return _accessMethod; }
 
-        IndexAccessMethod* forcedBtreeIndex() { return _forcedBtreeIndex; }
-        // ownership passes
-        void setForcedBtreeIndex( IndexAccessMethod* iam ) { _forcedBtreeIndex = iam; }
-
         RecordStore* recordStore() { return _recordStore; }
         const RecordStore* recordStore() const { return _recordStore; }
 
@@ -75,15 +73,17 @@ namespace mongo {
 
         const DiskLoc& head() const;
 
-        void setHead( DiskLoc newHead );
+        void setHead( OperationContext* txn, DiskLoc newHead );
 
         void setIsReady( bool newIsReady );
+
+        HeadManager* headManager() const { return _headManager; }
 
         // --
 
         bool isMultikey() const;
 
-        void setMultikey();
+        void setMultikey( OperationContext* txn );
 
         // if this ready is ready for queries
         bool isReady() const;
@@ -105,7 +105,9 @@ namespace mongo {
         RecordStore* _recordStore; // owned here
 
         IndexAccessMethod* _accessMethod; // owned here
-        IndexAccessMethod* _forcedBtreeIndex; // owned here
+
+        // Owned here.
+        HeadManager* _headManager;
 
         // cached stuff
 
@@ -142,10 +144,6 @@ namespace mongo {
 
         // pass ownership to EntryContainer
         void add( IndexCatalogEntry* entry ) { _entries.mutableVector().push_back( entry ); }
-
-        // TODO: should the findIndexBy* methods be done here
-        // and proxied in IndexCatatalog
-        //IndexCatalogEntry* findIndexByName();
 
     private:
         OwnedPointerVector<IndexCatalogEntry> _entries;

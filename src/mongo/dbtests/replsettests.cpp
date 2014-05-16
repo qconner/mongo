@@ -32,14 +32,16 @@
 #include "mongo/pch.h"
 
 #include "mongo/db/db.h"
+#include "mongo/db/global_optime.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
+#include "mongo/db/repl/repl_settings.h"  // replSettings
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/time_support.h"
 
@@ -61,6 +63,9 @@ namespace ReplSetTests {
         static ReplSetTest* make() {
             auto_ptr<ReplSetTest> ret(new ReplSetTest());
             ret->init();
+            // we need to get() the BackgroundSync so that it has its s_instance initialized
+            // since applyOps() eventually calls notify() which makes use of the s_instance
+            replset::BackgroundSync::get();
             return ret.release();
         }
         virtual ~ReplSetTest() {
@@ -148,14 +153,15 @@ namespace ReplSetTests {
         static void insert( const BSONObj &o, bool god = false ) {
             Lock::DBWrite lk(ns());
             Client::Context ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             if (o.hasField("_id")) {
-                coll->insertDocument(o, true);
+                coll->insertDocument(&txn, o, true);
                 return;
             }
 
@@ -164,7 +170,7 @@ namespace ReplSetTests {
             id.init();
             b.appendOID("_id", &id);
             b.appendElements(o);
-            coll->insertDocument(b.obj(), true);
+            coll->insertDocument(&txn, b.obj(), true);
         }
 
         BSONObj findOne( const BSONObj &query = BSONObj() ) const {
@@ -173,14 +179,15 @@ namespace ReplSetTests {
 
         void drop() {
             Client::WriteContext c(ns());
-            string errmsg;
-            BSONObjBuilder result;
+            OperationContextImpl txn;
 
-            if (nsdetails(ns()) == NULL) {
+            Database* db = c.ctx().db();
+
+            if ( db->getCollection( ns() ) == NULL ) {
                 return;
             }
 
-            c.ctx().db()->dropCollection(ns());
+            db->dropCollection(&txn, ns());
         }
         static void setup() {
             replSettings.replSet = "foo";
@@ -236,13 +243,7 @@ namespace ReplSetTests {
     class TestInitApplyOp : public Base {
     public:
         void run() {
-
-            OpTime o;
-
-            {
-                mongo::mutex::scoped_lock lk2(OpTime::m);
-                o = OpTime::now(lk2);
-            }
+            OpTime o(getNextGlobalOptime());
 
             BSONObjBuilder b;
             b.append("ns","dummy");
@@ -283,7 +284,7 @@ namespace ReplSetTests {
     class TestInitApplyOp2 : public Base {
     public:
         void run() {
-            OpTime o = OpTime::_now();
+            OpTime o(getNextGlobalOptime());
 
             BSONObjBuilder b;
             b.appendTimestamp("ts", o.asLL());
@@ -317,25 +318,24 @@ namespace ReplSetTests {
 
         void create() {
             Client::Context c(_cappedNs);
-            string err;
-            ASSERT(userCreateNS( _cappedNs.c_str(), fromjson( spec() ), err, false ));
+            OperationContextImpl txn;
+            ASSERT( userCreateNS( &txn, c.db(), _cappedNs, fromjson( spec() ), false ).isOK() );
         }
 
         void dropCapped() {
             Client::Context c(_cappedNs);
-            if (nsdetails(_cappedNs) != NULL) {
-                string errmsg;
-                BSONObjBuilder result;
-                c.db()->dropCollection( _cappedNs );
+            OperationContextImpl txn;
+            Database* db = c.db();
+            if ( db->getCollection( &txn, _cappedNs ) ) {
+                db->dropCollection( &txn, _cappedNs );
             }
         }
 
         BSONObj updateFail() {
             BSONObjBuilder b;
-            {
-                mongo::mutex::scoped_lock lk2(OpTime::m);
-                b.appendTimestamp("ts", OpTime::now(lk2).asLL());
-            }
+            OpTime ts(getNextGlobalOptime());
+
+            b.appendTimestamp("ts", ts.asLL());
             b.append("op", "u");
             b.append("o", BSON("$set" << BSON("x" << 456)));
             b.append("o2", BSON("_id" << 123 << "x" << 123));
@@ -361,8 +361,9 @@ namespace ReplSetTests {
         // returns true on success, false on failure
         bool apply(const BSONObj& op) {
             Client::Context ctx( _cappedNs );
+            OperationContextImpl txn;
             // in an annoying twist of api, returns true on failure
-            return !applyOperation_inlock(op, true);
+            return !applyOperation_inlock(&txn, ctx.db(), op, true);
         }
 
         void run() {
@@ -378,10 +379,9 @@ namespace ReplSetTests {
     class CappedUpdate : public CappedInitialSync {
         void updateSucceed() {
             BSONObjBuilder b;
-            {
-                mongo::mutex::scoped_lock lk2(OpTime::m);
-                b.appendTimestamp("ts", OpTime::now(lk2).asLL());
-            }
+            OpTime ts(getNextGlobalOptime());
+
+            b.appendTimestamp("ts", ts.asLL());
             b.append("op", "u");
             b.append("o", BSON("$set" << BSON("x" << 789)));
             b.append("o2", BSON("x" << 456));
@@ -392,14 +392,15 @@ namespace ReplSetTests {
 
         void insert() {
             Client::Context ctx(cappedNs());
+            OperationContextImpl txn;
             Database* db = ctx.db();
-            Collection* coll = db->getCollection(cappedNs());
+            Collection* coll = db->getCollection(&txn, cappedNs());
             if (!coll) {
-                coll = db->createCollection(cappedNs());
+                coll = db->createCollection(&txn, cappedNs());
             }
 
             BSONObj o = BSON(GENOID << "x" << 456);
-            DiskLoc loc = coll->insertDocument(o, true).getValue();
+            DiskLoc loc = coll->insertDocument(&txn, o, true).getValue();
             verify(!loc.isNull());
         }
     public:
@@ -425,10 +426,9 @@ namespace ReplSetTests {
     class CappedInsert : public CappedInitialSync {
         void insertSucceed() {
             BSONObjBuilder b;
-            {
-                mongo::mutex::scoped_lock lk2(OpTime::m);
-                b.appendTimestamp("ts", OpTime::now(lk2).asLL());
-            }
+            OpTime ts(getNextGlobalOptime());
+
+            b.appendTimestamp("ts", ts.asLL());
             b.append("op", "i");
             b.append("o", BSON("_id" << 123 << "x" << 456));
             b.append("ns", cappedNs());
@@ -454,11 +454,7 @@ namespace ReplSetTests {
 
         void addOp(const string& op, BSONObj o, BSONObj* o2 = NULL, const char* coll = NULL,
                    int version = 0) {
-            OpTime ts;
-            {
-                Lock::GlobalWrite lk;
-                ts = OpTime::_now();
-            }
+            OpTime ts(getNextGlobalOptime());
 
             BSONObjBuilder b;
             b.appendTimestamp("ts", ts.asLL());
@@ -534,6 +530,8 @@ namespace ReplSetTests {
     public:
         void run() {
             const int expected = 100;
+
+            theReplSet->syncSourceFeedback.ensureMe();
 
             drop();
             addInserts(100);

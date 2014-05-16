@@ -38,8 +38,8 @@
 
 
 #include "mongo/db/d_concurrency.h"
-#include "mongo/db/dur.h"
-#include "mongo/db/dur_journalformat.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/storage/mmap_v1/dur_journalformat.h"
 #include "mongo/util/mongoutils/str.h"
 
 using namespace mongoutils;
@@ -48,6 +48,8 @@ namespace mongo {
 
     void DurableMappedFile::remapThePrivateView() {
         verify(storageGlobalParams.dur);
+
+        _willNeedRemap = false;
 
         // todo 1.9 : it turns out we require that we always remap to the same address.
         // so the remove / add isn't necessary and can be removed?

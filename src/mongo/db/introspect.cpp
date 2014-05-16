@@ -50,7 +50,7 @@ namespace {
 namespace mongo {
 
 namespace {
-    void _appendUserInfo(const Client& c,
+    void _appendUserInfo(const CurOp& c,
                          BSONObjBuilder& builder,
                          AuthorizationSession* authSession) {
         UserNameIterator nameIter = authSession->getAuthenticatedUserNames();
@@ -59,7 +59,7 @@ namespace {
         if (nameIter.more())
             bestUser = *nameIter;
 
-        StringData opdb( nsToDatabaseSubstring( c.ns() ) );
+        StringData opdb( nsToDatabaseSubstring( c.getNS() ) );
 
         BSONArrayBuilder allUsers(builder.subarrayStart("allUsers"));
         for ( ; nameIter.more(); nameIter.next()) {
@@ -79,9 +79,12 @@ namespace {
     }
 } // namespace
 
-    static void _profile(const Client& c, CurOp& currentOp, BufBuilder& profileBufBuilder) {
-        Database *db = c.database();
-        DEV verify( db );
+    static void _profile(OperationContext* txn,
+                         const Client& c,
+                         Database* db,
+                         CurOp& currentOp,
+                         BufBuilder& profileBufBuilder) {
+        dassert( db );
 
         // build object
         BSONObjBuilder b(profileBufBuilder);
@@ -93,7 +96,7 @@ namespace {
         b.append("client", c.clientAddress());
 
         AuthorizationSession * authSession = c.getAuthorizationSession();
-        _appendUserInfo(c, b, authSession);
+        _appendUserInfo(currentOp, b, authSession);
 
         BSONObj p = b.done();
 
@@ -106,7 +109,7 @@ namespace {
             BSONObjBuilder b(profileBufBuilder);
             b.appendDate("ts", jsTime());
             b.append("client", c.clientAddress() );
-            _appendUserInfo(c, b, authSession);
+            _appendUserInfo(currentOp, b, authSession);
 
             b.append("err", "profile line too large (max is 100KB)");
 
@@ -120,22 +123,25 @@ namespace {
 
         // write: not replicated
         // get or create the profiling collection
-        Collection* profileCollection = getOrCreateProfileCollection(db);
+        Collection* profileCollection = getOrCreateProfileCollection(txn, db);
         if ( profileCollection ) {
-            profileCollection->insertDocument( p, false );
+            profileCollection->insertDocument( txn, p, false );
         }
     }
 
-    void profile(const Client& c, int op, CurOp& currentOp) {
+    void profile(OperationContext* txn, const Client& c, int op, CurOp& currentOp) {
         // initialize with 1kb to start, to avoid realloc later
         // doing this outside the dblock to improve performance
         BufBuilder profileBufBuilder(1024);
 
         try {
+            // NOTE: It's kind of weird that we lock the op's namespace, but have to for now since
+            // we're sometimes inside the lock already
             Lock::DBWrite lk( currentOp.getNS() );
             if (dbHolder()._isLoaded(nsToDatabase(currentOp.getNS()), storageGlobalParams.dbpath)) {
-                Client::Context cx(currentOp.getNS(), storageGlobalParams.dbpath);
-                _profile(c, currentOp, profileBufBuilder);
+                Client::Context cx(currentOp.getNS(), storageGlobalParams.dbpath, false);
+                _profile(txn, c, cx.db(),
+                         currentOp, profileBufBuilder);
             }
             else {
                 mongo::log() << "note: not profiling because db went away - probably a close on: "
@@ -149,10 +155,13 @@ namespace {
         }
     }
 
-    Collection* getOrCreateProfileCollection(Database *db, bool force, string* errmsg ) {
+    Collection* getOrCreateProfileCollection(OperationContext* txn,
+                                             Database *db,
+                                             bool force,
+                                             string* errmsg ) {
         fassert(16372, db);
         const char* profileName = db->getProfilingNS();
-        Collection* collection = db->getCollection( profileName );
+        Collection* collection = db->getCollection( txn, profileName );
 
         if ( collection ) {
             if ( !collection->isCapped() ) {
@@ -179,18 +188,13 @@ namespace {
 
         // system.profile namespace doesn't exist; create it
         log() << "creating profile collection: " << profileName << endl;
-        string myerrmsg;
-        if (!userCreateNS(profileName,
-                          BSON("capped" << true << "size" << 1024 * 1024), myerrmsg , false)) {
-            myerrmsg = str::stream() << "could not create ns " << profileName << ": " << myerrmsg;
-            log() << myerrmsg << endl;
-            if ( errmsg )
-                *errmsg = myerrmsg;
-            return NULL;
-        }
 
-        collection = db->getCollection( profileName );
-        verify( collection );
+        CollectionOptions collectionOptions;
+        collectionOptions.capped = true;
+        collectionOptions.cappedSize = 1024 * 1024;
+
+        collection = db->createCollection( txn, profileName, collectionOptions );
+        invariant( collection );
         return collection;
     }
 

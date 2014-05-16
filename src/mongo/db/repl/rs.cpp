@@ -39,11 +39,14 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
+#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/repl_start.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/platform/bits.h"
 #include "mongo/s/d_logic.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/net/sock.h"
 
 using namespace std;
@@ -117,6 +120,7 @@ namespace {
     void dropAllTempCollections() {
         vector<string> dbNames;
         getDatabaseNames(dbNames);
+        OperationContextImpl txn;
         for (vector<string>::const_iterator it = dbNames.begin(); it != dbNames.end(); ++it) {
             // The local db is special because it isn't replicated. It is cleared at startup even on
             // replica set members.
@@ -124,13 +128,13 @@ namespace {
                 continue;
 
             Client::Context ctx(*it);
-            cc().database()->clearTmpCollections();
+            ctx.db()->clearTmpCollections(&txn);
         }
     }
 }
 
     void ReplSetImpl::assumePrimary() {
-        LOG(2) << "replSet assuming primary" << endl;
+        LOG(1) << "replSet assuming primary" << endl;
         verify( iAmPotentiallyHot() );
 
         // Wait for replication to stop and buffer to be consumed
@@ -138,17 +142,14 @@ namespace {
         replset::BackgroundSync::get()->stopReplicationAndFlushBuffer();
 
         // Lock here to prevent stepping down & becoming primary from getting interleaved
+        LOG(1) << "replSet waiting for global write lock";
         Lock::GlobalWrite lk;
 
-        // Make sure that new OpTimes are higher than existing ones even with clock skew
-        DBDirectClient c;
-        BSONObj lastOp = c.findOne( "local.oplog.rs", Query().sort(reverseNaturalObj), NULL, QueryOption_SlaveOk );
-        if ( !lastOp.isEmpty() ) {
-            OpTime::setLast( lastOp[ "ts" ].date() );
-        }
+        initOpTimeFromOplog("local.oplog.rs");
 
         // Generate new election unique id
         elect.setElectionId(OID::gen());
+        LOG(1) << "replSet truly becoming primary";
         changeState(MemberState::RS_PRIMARY);
 
         // This must be done after becoming primary but before releasing the write lock. This adds
@@ -385,55 +386,8 @@ namespace {
         b.append("me", myConfig().h.toString());
     }
 
-    /** @param cfgString <setname>/<seedhost1>,<seedhost2> */
-
-    void parseReplsetCmdLine(const std::string& cfgString,
-                             string& setname,
-                             vector<HostAndPort>& seeds,
-                             set<HostAndPort>& seedSet ) {
-        const char *p = cfgString.c_str();
-        const char *slash = strchr(p, '/');
-        if( slash )
-            setname = string(p, slash-p);
-        else
-            setname = p;
-        uassert(13093, "bad --replSet config string format is: <setname>[/<seedhost1>,<seedhost2>,...]", !setname.empty());
-
-        if( slash == 0 )
-            return;
-
-        p = slash + 1;
-        while( 1 ) {
-            const char *comma = strchr(p, ',');
-            if( comma == 0 ) comma = strchr(p,0);
-            if( p == comma )
-                break;
-            {
-                HostAndPort m;
-                try {
-                    m = HostAndPort( string(p, comma-p) );
-                }
-                catch(...) {
-                    uassert(13114, "bad --replSet seed hostname", false);
-                }
-                uassert(13096, "bad --replSet command line config string - dups?", seedSet.count(m) == 0 );
-                seedSet.insert(m);
-                //uassert(13101, "can't use localhost in replset host list", !m.isLocalHost());
-                if( m.isSelf() ) {
-                    LOG(1) << "replSet ignoring seed " << m.toString() << " (=self)" << rsLog;
-                }
-                else
-                    seeds.push_back(m);
-                if( *comma == 0 )
-                    break;
-                p = comma + 1;
-            }
-        }
-    }
-
     void ReplSetImpl::init(ReplSetCmdline& replSetCmdline) {
         mgr = new Manager(this);
-        ghost = new GhostSync(this);
 
         _cfg = 0;
         memset(_hbmsg, 0, sizeof(_hbmsg));
@@ -486,7 +440,6 @@ namespace {
         _self(0),
         _maintenanceMode(0),
         mgr(0),
-        ghost(0),
         _writerPool(replWriterThreadCount),
         _prefetcherPool(replPrefetcherThreadCount),
         oplogVersion(0),
@@ -672,7 +625,6 @@ namespace {
                 // we have new configs for existing members, so we need to repopulate _members
                 // with the most recent configs
                 _members.orphanAll();
-                ghost->clearCache();
 
                 // for logging
                 string members = "";
@@ -687,9 +639,6 @@ namespace {
                     if (m.h.isSelf()) {
                         verify(me++ == 0);
                         mi = new Member(m.h, m._id, &m, true);
-                        if (!reconf) {
-                            log() << "replSet I am " << m.h.toString() << rsLog;
-                        }
                         setSelfTo(mi);
                     }
                     else {
@@ -729,10 +678,6 @@ namespace {
 
         endOldHealthTasks();
         
-        // Clear out our memory of who might have been syncing from us.
-        // Any incoming handshake connections after this point will be newly registered.
-        ghost->clearCache();
-
         int oldPrimaryId = -1;
         {
             const Member *p = box.getPrimary();
@@ -994,12 +939,14 @@ namespace {
 
     void ReplSetImpl::clearInitialSyncFlag() {
         Lock::DBWrite lk( "local" );
-        Helpers::putSingleton("local.replset.minvalid", BSON( "$unset" << _initialSyncFlag ));
+        OperationContextImpl txn; // XXX?
+        Helpers::putSingleton(&txn, "local.replset.minvalid", BSON( "$unset" << _initialSyncFlag ));
     }
 
     void ReplSetImpl::setInitialSyncFlag() {
         Lock::DBWrite lk( "local" );
-        Helpers::putSingleton("local.replset.minvalid", BSON( "$set" << _initialSyncFlag ));
+        OperationContextImpl txn; // XXX?
+        Helpers::putSingleton(&txn, "local.replset.minvalid", BSON( "$set" << _initialSyncFlag ));
     }
 
     bool ReplSetImpl::getInitialSyncFlag() {
@@ -1017,7 +964,8 @@ namespace {
         subobj.appendTimestamp("ts", obj["ts"].date());
         subobj.done();
         Lock::DBWrite lk( "local" );
-        Helpers::putSingleton("local.replset.minvalid", builder.obj());
+        OperationContextImpl txn; // XXX?
+        Helpers::putSingleton(&txn, "local.replset.minvalid", builder.obj());
     }
 
     OpTime ReplSetImpl::getMinValid() {
@@ -1029,14 +977,20 @@ namespace {
         return OpTime();
     }
 
-    void ReplSetImpl::registerSlave(const BSONObj& rid, const int memberId) {
-        // To prevent race conditions with clearing the cache at reconfig time,
-        // we lock the replset mutex here.
+    bool ReplSetImpl::registerSlave(const BSONObj& rid, const int memberId) {
+        Member* member = NULL;
         {
             lock lk(this);
-            ghost->associateSlave(rid, memberId);
+            member = getMutableMember(memberId);
         }
-        syncSourceFeedback.associateMember(rid, memberId);
+
+        // it is possible that a node that was removed in a reconfig tried to handshake this node
+        // in that case, the Member will no longer be in the _members List and member will be NULL
+        if (!member) {
+            return false;
+        }
+        syncSourceFeedback.associateMember(rid, member);
+        return true;
     }
 
     class ReplIndexPrefetch : public ServerParameter {

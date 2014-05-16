@@ -252,53 +252,32 @@ public:
         return _repair(toolGlobalParams.db);
     }
     
-    DiskLoc _repairExtent( Database* db , string ns, bool forward , DiskLoc eLoc , Writer& w ){
-        LogIndentLevel lil;
-        
-        if ( eLoc.getOfs() <= 0 ){
-            toolError() << "invalid extent ofs: " << eLoc.getOfs() << std::endl;
-            return DiskLoc();
-        }
+    void _repairExtents(Collection* coll, Writer& writer) {
+        scoped_ptr<RecordIterator> iter(coll->getRecordStore()->getIteratorForRepair());
 
-        Extent * e = db->getExtentManager().getExtent( eLoc, false );
-        if ( ! e->isOk() ){
-            toolError() << "Extent not ok magic: " << e->magic << " going to try to continue"
-                      << std::endl;
-        }
-
-        toolInfoLog() << "length:" << e->length << std::endl;
-        
-        LogIndentLevel lil2;
-        
-        set<DiskLoc> seen;
-
-        DiskLoc loc = forward ? e->firstRecord : e->lastRecord;
-        while ( ! loc.isNull() ){
-            
-            if ( ! seen.insert( loc ).second ) {
-                toolError() << "infinite loop in extent, seen: " << loc << " before" << std::endl;
-                break;
-            }
-
-            if ( loc.getOfs() <= 0 ){
-                toolError() << "offset is 0 for record which should be impossible" << std::endl;
-                break;
-            }
+        for (DiskLoc currLoc = iter->getNext(); !currLoc.isNull(); currLoc = iter->getNext()) {
             if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))) {
-                toolInfoLog() << loc << std::endl;
+                toolInfoLog() << currLoc << std::endl;
             }
-            Record* rec = loc.rec();
+
             BSONObj obj;
             try {
-                obj = loc.obj();
-                verify( obj.valid() );
+                obj = coll->docFor(currLoc);
+
+                // If this is a corrupted object, just skip it, but do not abort the scan
+                //
+                if (!obj.valid()) {
+                    continue;
+                }
+
                 if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))) {
                     toolInfoLog() << obj << std::endl;
                 }
-                w( obj );
+
+                writer(obj);
             }
             catch ( std::exception& e ) {
-                toolError() << "found invalid document @ " << loc << " " << e.what() << std::endl;
+                toolError() << "found invalid document @ " << currLoc << " " << e.what() << std::endl;
                 if ( ! obj.isEmpty() ) {
                     try {
                         BSONElement e = obj.firstElement();
@@ -307,21 +286,11 @@ public:
                         toolError() << ss.str() << std::endl;
                     }
                     catch ( std::exception& ) {
-                        toolError() << "unable to log invalid document @ " << loc << std::endl;
+                        toolError() << "unable to log invalid document @ " << currLoc << std::endl;
                     }
                 }
             }
-            loc = forward ? rec->getNext( loc ) : rec->getPrev( loc );
-
-            // break when new loc is outside current extent boundary
-            if ( ( forward && loc.compare( e->lastRecord ) > 0 ) || 
-                 ( ! forward && loc.compare( e->firstRecord ) < 0 ) ) 
-            {
-                break;
-            }
         }
-        toolInfoLog() << "wrote " << seen.size() << " documents" << std::endl;
-        return forward ? e->xnext : e->xprev;
     }
 
     /*
@@ -330,21 +299,9 @@ public:
      */
     void _repair( Database* db , string ns , boost::filesystem::path outfile ){
         Collection* collection = db->getCollection( ns );
-        const NamespaceDetails * nsd = collection->details();
-        toolInfoLog() << "nrecords: " << nsd->numRecords()
-                      << " datasize: " << nsd->dataSize()
-                      << " firstExtent: " << nsd->firstExtent()
+        toolInfoLog() << "nrecords: " << collection->numRecords()
+                      << " datasize: " << collection->dataSize()
                       << std::endl;
-
-        if ( nsd->firstExtent().isNull() ){
-            toolError() << " ERROR fisrtExtent is null" << std::endl;
-            return;
-        }
-
-        if ( ! nsd->firstExtent().isValid() ){
-            toolError() << " ERROR fisrtExtent is not valid" << std::endl;
-            return;
-        }
 
         outfile /= ( ns.substr( ns.find( "." ) + 1 ) + ".bson" );
         toolInfoLog() << "writing to: " << outfile.string() << std::endl;
@@ -352,36 +309,17 @@ public:
         FilePtr f (fopen(outfile.string().c_str(), "wb"));
 
         // init with double the docs count because we make two passes 
-        ProgressMeter m( nsd->numRecords() * 2 );
+        ProgressMeter m( collection->numRecords() * 2 );
         m.setName("Repair Progress");
         m.setUnits("documents");
 
         Writer w( f , &m );
 
         try {
-            toolInfoLog() << "forward extent pass" << std::endl;
-            LogIndentLevel lil;
-            DiskLoc eLoc = nsd->firstExtent();
-            while ( ! eLoc.isNull() ){
-                toolInfoLog() << "extent loc: " << eLoc << std::endl;
-                eLoc = _repairExtent( db , ns , true , eLoc , w );
-            }
+            _repairExtents(collection, w);
         }
         catch ( DBException& e ){
-            toolError() << "forward extent pass failed:" << e.toString() << std::endl;
-        }
-        
-        try {
-            toolInfoLog() << "backwards extent pass" << std::endl;
-            LogIndentLevel lil;
-            DiskLoc eLoc = nsd->lastExtent();
-            while ( ! eLoc.isNull() ){
-                toolInfoLog() << "extent loc: " << eLoc << std::endl;
-                eLoc = _repairExtent( db , ns , false , eLoc , w );
-            }
-        }
-        catch ( DBException& e ){
-            toolError() << "ERROR: backwards extent pass failed:" << e.toString() << std::endl;
+            toolError() << "Repair scan failed: " << e.toString() << std::endl;
         }
 
         toolInfoLog() << "\t\t " << m.done() << " documents" << std::endl;
@@ -415,7 +353,7 @@ public:
 
             toolInfoLog() << "trying to recover: " << ns << std::endl;
             
-            LogIndentLevel lil2;
+            LogIndentLevel lil1;
             try {
                 _repair( db , ns , root );
             }

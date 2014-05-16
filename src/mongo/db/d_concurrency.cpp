@@ -36,7 +36,7 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/d_globals.h"
-#include "mongo/db/dur.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/lockstat.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/server.h"
@@ -54,16 +54,7 @@
 // yielding
 // commitIfNeeded
 
-#define MONGOD_CONCURRENCY_LEVEL_GLOBAL 0
-#define MONGOD_CONCURRENCY_LEVEL_DB 1
-
-#ifndef MONGOD_CONCURRENCY_LEVEL
-#define MONGOD_CONCURRENCY_LEVEL MONGOD_CONCURRENCY_LEVEL_DB
-#endif
-
 namespace mongo { 
-
-    static const bool DB_LEVEL_LOCKING_ENABLED = ( ( MONGOD_CONCURRENCY_LEVEL ) >= MONGOD_CONCURRENCY_LEVEL_DB );
 
     inline LockState& lockState() { 
         return cc().lockState();
@@ -105,7 +96,7 @@ namespace mongo {
     };
 
     LockStat* Lock::nestableLockStat( Nestable db ) {
-        return &nestableLocks[db]->stats;
+        return &nestableLocks[db]->getStats();
     }
 
     static void locked_W();
@@ -266,9 +257,6 @@ namespace mongo {
             lockState().dump();
             msgasserted(16105, str::stream() << "expected to be write locked for " << ns);
         }
-    }
-    bool Lock::dbLevelLockingEnabled() {
-        return DB_LEVEL_LOCKING_ENABLED;
     }
 
     RWLockRecursive &Lock::ParallelBatchWriterMode::_batchLock = *(new RWLockRecursive("special"));
@@ -519,26 +507,27 @@ namespace mongo {
     }
 
     void Lock::DBWrite::lockOther(const StringData& db) {
-        fassert( 16252, !db.empty() );
+        fassert(16252, !db.empty());
         LockState& ls = lockState();
 
         // we do checks first, as on assert destructor won't be called so don't want to be half finished with our work.
-        if( ls.otherCount() ) { 
+        if (ls.otherCount()) {
             // nested. if/when we do temprelease with DBWrite we will need to increment here
             // (so we can not release or assert if nested).
-            massert(16106, str::stream() << "internal error tried to lock two databases at the same time. old:" << ls.otherName() << " new:" << db , db == ls.otherName() );
+            massert(16106, str::stream() << "internal error tried to lock two databases at the same time. old:" << ls.otherName() << " new:" << db, db == ls.otherName());
             return;
         }
 
         // first lock for this db. check consistent order with local db lock so we never deadlock. local always comes last
         massert(16098, str::stream() << "can't dblock:" << db << " when local or admin is already locked", ls.nestableCount() == 0);
 
-        if( db != ls.otherName() )
-        {
+        if (db != ls.otherName()) {
             DBLocksMap::ref r(dblocks);
             WrapperForRWLock*& lock = r[db];
-            if( lock == 0 )
+            if (lock == NULL) {
                 lock = new WrapperForRWLock(db);
+            }
+
             ls.lockedOther( db , 1 , lock );
         }
         else { 
@@ -568,30 +557,23 @@ namespace mongo {
         _locked_w=false; 
         _weLocked=0;
 
-
         massert( 16186 , "can't get a DBWrite while having a read lock" , ! ls.hasAnyReadLock() );
         if( ls.isW() )
             return;
 
-        if (DB_LEVEL_LOCKING_ENABLED) {
-            StringData db = nsToDatabaseSubstring( ns );
-            Nestable nested = n(db);
-            if( nested == admin ) { 
-                // we can't nestedly lock both admin and local as implemented. so lock_W.
-                qlk.lock_W();
-                _locked_W = true;
-                return;
-            } 
-            if( !nested )
-                lockOther(db);
-            lockTop(ls);
-            if( nested )
-                lockNestable(nested);
-        } 
-        else {
+        StringData db = nsToDatabaseSubstring( ns );
+        Nestable nested = n(db);
+        if( nested == admin ) { 
+            // we can't nestedly lock both admin and local as implemented. so lock_W.
             qlk.lock_W();
-            _locked_w = true;
-        }
+            _locked_W = true;
+            return;
+        } 
+        if( !nested )
+            lockOther(db);
+        lockTop(ls);
+        if( nested )
+            lockNestable(nested);
     }
 
     void Lock::DBRead::lockDB(const string& ns) {
@@ -604,19 +586,14 @@ namespace mongo {
 
         if ( ls.isRW() )
             return;
-        if (DB_LEVEL_LOCKING_ENABLED) {
-            StringData db = nsToDatabaseSubstring(ns);
-            Nestable nested = n(db);
-            if( !nested )
-                lockOther(db);
-            lockTop(ls);
-            if( nested )
-                lockNestable(nested);
-        } 
-        else {
-            qlk.lock_R();
-            _locked_r = true;
-        }
+
+        StringData db = nsToDatabaseSubstring(ns);
+        Nestable nested = n(db);
+        if( !nested )
+            lockOther(db);
+        lockTop(ls);
+        if( nested )
+            lockNestable(nested);
     }
 
     Lock::DBWrite::DBWrite( const StringData& ns )
@@ -649,15 +626,13 @@ namespace mongo {
         }
 
         if( _locked_w ) {
-            if (DB_LEVEL_LOCKING_ENABLED) {
-                qlk.unlock_w();
-            } else {
-                qlk.unlock_W();
-            }
+            qlk.unlock_w();
         }
+
         if( _locked_W ) {
             qlk.unlock_W();
         }
+
         _weLocked = 0;
         _locked_W = _locked_w = false;
     }
@@ -674,11 +649,7 @@ namespace mongo {
         }
 
         if( _locked_r ) {
-            if (DB_LEVEL_LOCKING_ENABLED) {
-                qlk.unlock_r();
-            } else {
-                qlk.unlock_R();
-            }
+            qlk.unlock_r();
         }
         _weLocked = 0;
         _locked_r = false;
@@ -723,24 +694,26 @@ namespace mongo {
         // first lock for this db. check consistent order with local db lock so we never deadlock. local always comes last
         massert(16100, str::stream() << "can't dblock:" << db << " when local or admin is already locked", ls.nestableCount() == 0);
 
-        if( db != ls.otherName() )
-        {
+        if (db != ls.otherName()) {
             DBLocksMap::ref r(dblocks);
             WrapperForRWLock*& lock = r[db];
-            if( lock == 0 )
+            if (lock == NULL) {
                 lock = new WrapperForRWLock(db);
+            }
+
             ls.lockedOther( db , -1 , lock );
         }
         else { 
             DEV OCCASIONALLY { dassert( dblocks.get(db) == ls.otherLock() ); }
             ls.lockedOther(-1);
         }
+
         fassert(16135,_weLocked==0);
         ls.otherLock()->lock_shared();
         _weLocked = ls.otherLock();
     }
 
-    Lock::DBWrite::UpgradeToExclusive::UpgradeToExclusive() {
+    Lock::UpgradeGlobalLockToExclusive::UpgradeGlobalLockToExclusive() {
         fassert( 16187, lockState().threadState() == 'w' );
 
         // We're about to temporarily drop w, so stop the lock time stopwatch
@@ -753,7 +726,7 @@ namespace mongo {
         }
     }
 
-    Lock::DBWrite::UpgradeToExclusive::~UpgradeToExclusive() {
+    Lock::UpgradeGlobalLockToExclusive::~UpgradeGlobalLockToExclusive() {
         if ( _gotUpgrade ) {
             fassert( 16188, lockState().threadState() == 'W' );
             lockState().recordLockTime();
@@ -859,12 +832,12 @@ namespace mongo {
         BSONObj generateSection( const BSONElement& configElement ) const {
             BSONObjBuilder b;
             b.append(".", qlk.stats.report());
-            b.append("admin", nestableLocks[Lock::admin]->stats.report());
-            b.append("local", nestableLocks[Lock::local]->stats.report());
+            b.append("admin", nestableLocks[Lock::admin]->getStats().report());
+            b.append("local", nestableLocks[Lock::local]->getStats().report());
             {
                 DBLocksMap::ref r(dblocks);
                 for( DBLocksMap::const_iterator i = r.r.begin(); i != r.r.end(); ++i ) {
-                    b.append(i->first, i->second->stats.report());
+                    b.append(i->first, i->second->getStats().report());
                 }
             }
             return b.obj();

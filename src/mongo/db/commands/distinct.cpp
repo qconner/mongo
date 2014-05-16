@@ -34,6 +34,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
@@ -53,7 +54,7 @@ namespace mongo {
 
         virtual bool slaveOk() const { return false; }
         virtual bool slaveOverrideOk() const { return true; }
-        virtual LockType locktype() const { return READ; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -67,7 +68,7 @@ namespace mongo {
             help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
         }
 
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result,
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result,
                  bool fromRepl ) {
 
             Timer t;
@@ -89,7 +90,9 @@ namespace mongo {
             long long nscannedObjects = 0; // full objects looked at
             long long n = 0; // matches
 
-            Collection* collection = cc().database()->getCollection( ns );
+            Client::ReadContext ctx(ns);
+
+            Collection* collection = ctx.ctx().db()->getCollection( ns );
 
             if (!collection) {
                 result.appendArray( "values" , BSONObj() );
@@ -109,7 +112,6 @@ namespace mongo {
 
             auto_ptr<Runner> runner(rawRunner);
             const ScopedRunnerRegistration safety(runner.get());
-            runner->setYieldPolicy(Runner::YIELD_AUTO);
 
             string cursorName;
             BSONObj obj;

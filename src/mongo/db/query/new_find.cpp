@@ -91,12 +91,26 @@ namespace {
         return n >= pq.getNumToReturn();
     }
 
+    /**
+     * Returns true if 'me' is a GTE or GE predicate over the "ts" field.
+     * Such predicates can be used for the oplog start hack.
+     */
+    bool isOplogTsPred(const mongo::MatchExpression* me) {
+        if (mongo::MatchExpression::GT != me->matchType()
+            && mongo::MatchExpression::GTE != me->matchType()) {
+            return false;
+        }
+
+        return mongoutils::str::equals(me->path().rawData(), "ts");
+    }
+
 }  // namespace
 
 namespace mongo {
 
     // TODO: Move this and the other command stuff in newRunQuery outta here and up a level.
-    static bool runCommands(const char *ns,
+    static bool runCommands(OperationContext* txn,
+                            const char *ns,
                             BSONObj& jsobj,
                             CurOp& curop,
                             BufBuilder &b,
@@ -104,7 +118,7 @@ namespace mongo {
                             bool fromRepl,
                             int queryOptions) {
         try {
-            return _runCommands(ns, jsobj, b, anObjBuilder, fromRepl, queryOptions);
+            return _runCommands(txn, ns, jsobj, b, anObjBuilder, fromRepl, queryOptions);
         }
         catch( SendStaleConfigException& ){
             throw;
@@ -142,7 +156,7 @@ namespace mongo {
         // passing in a query object (necessary to check SlaveOK query option), the only state where
         // reads are allowed is PRIMARY (or master in master/slave).  This function uasserts if
         // reads are not okay.
-        replVerifyReadsOk();
+        replVerifyReadsOk(ns, NULL);
 
         // A pin performs a CC lookup and if there is a CC, increments the CC's pin value so it
         // doesn't time out.  Also informs ClientCursor that there is somebody actively holding the
@@ -322,20 +336,45 @@ namespace mongo {
             return Status(ErrorCodes::InternalError,
                           "getOplogStartHack called with a NULL collection" );
 
+        // A query can only do oplog start finding if it has a top-level $gt or $gte predicate over
+        // the "ts" field (the operation's timestamp). Find that predicate and pass it to
+        // the OplogStart stage.
+        MatchExpression* tsExpr = NULL;
+        if (MatchExpression::AND == cq->root()->matchType()) {
+            // The query has an AND at the top-level. See if any of the children
+            // of the AND are $gt or $gte predicates over 'ts'.
+            for (size_t i = 0; i < cq->root()->numChildren(); ++i) {
+                MatchExpression* me = cq->root()->getChild(i);
+                if (isOplogTsPred(me)) {
+                    tsExpr = me;
+                    break;
+                }
+            }
+        }
+        else if (isOplogTsPred(cq->root())) {
+            // The root of the tree is a $gt or $gte predicate over 'ts'.
+            tsExpr = cq->root();
+        }
+
+        if (NULL == tsExpr) {
+            return Status(ErrorCodes::OplogOperationUnsupported,
+                          "OplogReplay query does not contain top-level "
+                          "$gt or $gte over the 'ts' field.");
+        }
+
         // Make an oplog start finding stage.
         WorkingSet* oplogws = new WorkingSet();
-        OplogStart* stage = new OplogStart(cq->ns(), cq->root(), oplogws);
+        OplogStart* stage = new OplogStart(collection, tsExpr, oplogws);
 
         // Takes ownership of ws and stage.
         auto_ptr<InternalRunner> runner(new InternalRunner(collection, stage, oplogws));
-        runner->setYieldPolicy(Runner::YIELD_AUTO);
 
         // The stage returns a DiskLoc of where to start.
         DiskLoc startLoc;
         Runner::RunnerState state = runner->getNext(NULL, &startLoc);
 
         // This is normal.  The start of the oplog is the beginning of the collection.
-        if (Runner::RUNNER_EOF == state) { return getRunner(cq, runnerOut); }
+        if (Runner::RUNNER_EOF == state) { return getRunner(collection, cq, runnerOut); }
 
         // This is not normal.  An error was encountered.
         if (Runner::RUNNER_ADVANCED != state) {
@@ -347,7 +386,7 @@ namespace mongo {
 
         // Build our collection scan...
         CollectionScanParams params;
-        params.ns = cq->ns();
+        params.collection = collection;
         params.start = startLoc;
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = cq->getParsed().hasOption(QueryOption_CursorTailable);
@@ -359,7 +398,11 @@ namespace mongo {
         return Status::OK();
     }
 
-    std::string newRunQuery(Message& m, QueryMessage& q, CurOp& curop, Message &result) {
+    std::string newRunQuery(OperationContext* txn,
+                            Message& m,
+                            QueryMessage& q,
+                            CurOp& curop,
+                            Message &result) {
         // Validate the namespace.
         const char *ns = q.ns;
         uassert(16332, "can't have an empty ns", ns[0]);
@@ -386,7 +429,7 @@ namespace mongo {
             bb.skip(sizeof(QueryResult));
 
             BSONObjBuilder cmdResBuf;
-            if (!runCommands(ns, q.query, curop, bb, cmdResBuf, false, q.queryOptions)) {
+            if (!runCommands(txn, ns, q.query, curop, bb, cmdResBuf, false, q.queryOptions)) {
                 uasserted(13530, "bad or malformed command request?");
             }
 
@@ -415,7 +458,8 @@ namespace mongo {
 
         // Parse the qm into a CanonicalQuery.
         CanonicalQuery* cq;
-        Status canonStatus = CanonicalQuery::canonicalize(q, &cq);
+        Status canonStatus = CanonicalQuery::canonicalize(
+                                q, &cq, WhereCallbackReal(StringData(ctx.ctx().db()->name())));
         if (!canonStatus.isOK()) {
             uasserted(17287, str::stream() << "Can't canonicalize query: " << canonStatus.toString());
         }
@@ -456,7 +500,7 @@ namespace mongo {
             if (shardingState.needCollectionMetadata(pq.ns())) {
                 options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
             }
-            status = getRunner(cq, &rawRunner, options);
+            status = getRunner(collection, cq, &rawRunner, options);
         }
 
         if (!status.isOK()) {
@@ -475,7 +519,7 @@ namespace mongo {
         killCurrentOp.checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
         // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-        replVerifyReadsOk(&pq);
+        replVerifyReadsOk(cq->ns(), &pq);
 
         // If this exists, the collection is sharded.
         // If it doesn't exist, we can assume we're not sharded.
@@ -508,7 +552,6 @@ namespace mongo {
         // We turn on auto-yielding for the runner here.  The runner registers itself with the
         // active runners list in ClientCursor.
         auto_ptr<ScopedRunnerRegistration> safety(new ScopedRunnerRegistration(runner.get()));
-        runner->setYieldPolicy(Runner::YIELD_AUTO);
 
         BSONObj obj;
         Runner::RunnerState state;

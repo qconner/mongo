@@ -33,10 +33,9 @@
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
+#include "mongo/util/fail_point_service.h"
 
 #include "mongo/db/client.h" // XXX-ERH
-#include "mongo/db/pdfile.h" // XXX-ERH/ACM
 
 namespace mongo {
 
@@ -52,21 +51,22 @@ namespace mongo {
         ++_commonStats.works;
         if (_nsDropped) { return PlanStage::DEAD; }
 
+        // Do some init if we haven't already.
         if (NULL == _iter) {
-            Collection* collection = cc().database()->getCollection( _params.ns );
-            if ( collection == NULL ) {
+            if ( _params.collection == NULL ) {
                 _nsDropped = true;
                 return PlanStage::DEAD;
             }
 
-            _iter.reset( collection->getIterator( _params.start,
-                                                  _params.tailable,
-                                                  _params.direction ) );
+            _iter.reset( _params.collection->getIterator( _params.start,
+                                                          _params.tailable,
+                                                          _params.direction ) );
 
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
 
+        // What we'll return to the user.
         DiskLoc nextLoc;
 
         // Should we try getNext() on the underlying _iter if we're EOF?  Yes, if we're tailable.
@@ -90,7 +90,7 @@ namespace mongo {
         WorkingSetID id = _workingSet->allocate();
         WorkingSetMember* member = _workingSet->get(id);
         member->loc = nextLoc;
-        member->obj = member->loc.obj();
+        member->obj = _params.collection->docFor(member->loc);
         member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
 
         ++_specificStats.docsTested;
@@ -120,8 +120,15 @@ namespace mongo {
         ++_commonStats.invalidates;
 
         // We don't care about mutations since we apply any filters to the result when we (possibly)
-        // return it.  Deletions can harm the underlying CollectionIterator so we pass them down.
-        if (NULL != _iter && (INVALIDATION_DELETION == type)) {
+        // return it.
+        if (INVALIDATION_DELETION != type) {
+            return;
+        }
+
+        // If we're here, 'dl' is being deleted.
+
+        // Deletions can harm the underlying RecordIterator so we must pass them down.
+        if (NULL != _iter) {
             _iter->invalidate(dl);
         }
     }
@@ -137,7 +144,7 @@ namespace mongo {
         ++_commonStats.unyields;
         if (NULL != _iter) {
             if (!_iter->recoverFromYield()) {
-                warning() << "collection dropped during yield of collscan or state deleted";
+                warning() << "Collection dropped or state deleted during yield of CollectionScan";
                 _nsDropped = true;
             }
         }

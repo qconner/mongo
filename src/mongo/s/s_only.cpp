@@ -24,7 +24,6 @@
 #include "mongo/db/auth/authz_session_external_state_s.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/matcher.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request.h"
@@ -55,7 +54,6 @@ namespace mongo {
 
     Client::Client(const string& desc, AbstractMessagingPort *p) :
         ClientBasic(p),
-        _context(0),
         _shutdown(false),
         _desc(desc),
         _god(0),
@@ -93,17 +91,19 @@ namespace mongo {
 
     // Need a version that takes a Client to match the mongod interface so the web server can call
     // execCommand and not need to worry if it's in a mongod or mongos.
-    void Command::execCommand(Command * c,
+    void Command::execCommand(OperationContext* txn,
+                              Command * c,
                               Client& client,
                               int queryOptions,
                               const char *ns,
                               BSONObj& cmdObj,
                               BSONObjBuilder& result,
                               bool fromRepl ) {
-        execCommandClientBasic(c, client, queryOptions, ns, cmdObj, result, fromRepl);
+        execCommandClientBasic(txn, c, client, queryOptions, ns, cmdObj, result, fromRepl);
     }
 
-    void Command::execCommandClientBasic(Command * c ,
+    void Command::execCommandClientBasic(OperationContext* txn,
+                                         Command * c ,
                                          ClientBasic& client,
                                          int queryOptions,
                                          const char *ns,
@@ -117,7 +117,7 @@ namespace mongo {
             help << "help for: " << c->name << " ";
             c->help( help );
             result.append( "help" , help.str() );
-            result.append( "lockType" , c->locktype() );
+            result.append("lockType", c->isWriteCommandForConfigServer() ? 1 : 0);
             appendCommandStatus(result, true, "");
             return;
         }
@@ -131,7 +131,7 @@ namespace mongo {
         std::string errmsg;
         bool ok;
         try {
-            ok = c->run( dbname , cmdObj, queryOptions, errmsg, result, false );
+            ok = c->run( txn, dbname , cmdObj, queryOptions, errmsg, result, false );
         }
         catch (DBException& e) {
             ok = false;

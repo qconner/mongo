@@ -113,6 +113,7 @@ namespace {
 
     class CmdAuthSchemaUpgradeD : public CmdAuthSchemaUpgrade {
         virtual bool run(
+                OperationContext* txn,
                 const string& dbname,
                 BSONObj& cmdObj,
                 int options,

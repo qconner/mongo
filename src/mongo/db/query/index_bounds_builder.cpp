@@ -197,7 +197,14 @@ namespace mongo {
                                                const IndexEntry& index,
                                                OrderedIntervalList* oilOut,
                                                BoundsTightness* tightnessOut) {
-        translate(expr, elt, index, oilOut, tightnessOut);
+        OrderedIntervalList arg;
+        translate(expr, elt, index, &arg, tightnessOut);
+
+        // Append the new intervals to oilOut.
+        oilOut->intervals.insert(oilOut->intervals.end(), arg.intervals.begin(),
+                                 arg.intervals.end());
+
+        // Union the appended intervals with the existing ones.
         unionize(oilOut);
     }
 
@@ -216,6 +223,9 @@ namespace mongo {
                                        const IndexEntry& index,
                                        OrderedIntervalList* oilOut,
                                        BoundsTightness* tightnessOut) {
+        // We expect that the OIL we are constructing starts out empty.
+        invariant(oilOut->intervals.empty());
+
         oilOut->name = elt.fieldName();
 
         bool isHashed = false;
@@ -274,6 +284,15 @@ namespace mongo {
                 // bounds of the NOT's child and then complement them.
                 translate(expr->getChild(0), elt, index, oilOut, tightnessOut);
                 oilOut->complement();
+
+                // If the index is multikey, it doesn't matter what the tightness
+                // of the child is, we must return INEXACT_FETCH. Consider a multikey
+                // index on 'a' with document {a: [1, 2, 3]} and query {a: {$ne: 3}}.
+                // If we treated the bounds [MinKey, 3), (3, MaxKey] as exact, then
+                // we would erroneously return the document!
+                if (index.multikey) {
+                    *tightnessOut = INEXACT_FETCH;
+                }
             }
             else {
                 // TODO: In the future we shouldn't need this. We handle this case for the time
@@ -337,6 +356,14 @@ namespace mongo {
                 return;
             }
 
+            // Only NaN is <= NaN.
+            if (isNaN(dataElt.numberDouble())) {
+                double nan = dataElt.numberDouble();
+                oilOut->intervals.push_back(makePointInterval(nan));
+                *tightnessOut = IndexBoundsBuilder::EXACT;
+                return;
+            }
+
             BSONObjBuilder bob;
             // Use -infinity for one-sided numerical bounds
             if (dataElt.isNumber()) {
@@ -364,6 +391,12 @@ namespace mongo {
             // Everything is <= MaxKey.
             if (MaxKey == dataElt.type()) {
                 oilOut->intervals.push_back(allValues());
+                *tightnessOut = IndexBoundsBuilder::EXACT;
+                return;
+            }
+
+            // Nothing is < NaN.
+            if (isNaN(dataElt.numberDouble())) {
                 *tightnessOut = IndexBoundsBuilder::EXACT;
                 return;
             }
@@ -405,6 +438,12 @@ namespace mongo {
                 return;
             }
 
+            // Nothing is > NaN.
+            if (isNaN(dataElt.numberDouble())) {
+                *tightnessOut = IndexBoundsBuilder::EXACT;
+                return;
+            }
+
             BSONObjBuilder bob;
             bob.appendAs(node->getData(), "");
             if (dataElt.isNumber()) {
@@ -437,6 +476,14 @@ namespace mongo {
             // Everything is >= MinKey.
             if (MinKey == dataElt.type()) {
                 oilOut->intervals.push_back(allValues());
+                *tightnessOut = IndexBoundsBuilder::EXACT;
+                return;
+            }
+
+            // Only NaN is >= NaN.
+            if (isNaN(dataElt.numberDouble())) {
+                double nan = dataElt.numberDouble();
+                oilOut->intervals.push_back(makePointInterval(nan));
                 *tightnessOut = IndexBoundsBuilder::EXACT;
                 return;
             }
@@ -528,8 +575,8 @@ namespace mongo {
             const GeoMatchExpression* gme = static_cast<const GeoMatchExpression*>(expr);
             // Can only do this for 2dsphere.
             if (!mongoutils::str::equals("2dsphere", elt.valuestrsafe())) {
-                warning() << "Planner error trying to build geo bounds for " << elt.toString()
-                          << " index element.";
+                warning() << "Planner error, trying to build geo bounds for non-2dsphere"
+                          << " index element: "  << elt.toString() << endl;
                 verify(0);
             }
 
@@ -538,7 +585,7 @@ namespace mongo {
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         }
         else {
-            warning() << "Planner error, trying to build bounds for expr "
+            warning() << "Planner error, trying to build bounds for expression: "
                       << expr->toString() << endl;
             verify(0);
         }
@@ -690,6 +737,13 @@ namespace mongo {
     Interval IndexBoundsBuilder::makePointInterval(const string& str) {
         BSONObjBuilder bob;
         bob.append("", str);
+        return makePointInterval(bob.obj());
+    }
+
+    // static
+    Interval IndexBoundsBuilder::makePointInterval(double d) {
+        BSONObjBuilder bob;
+        bob.append("", d);
         return makePointInterval(bob.obj());
     }
 

@@ -55,6 +55,9 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/server.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/lruishmap.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/processinfo.h"
@@ -94,11 +97,11 @@ namespace mongo {
         CmdCloud() : Command( "cloud" ) { }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void help( stringstream &help ) const {
             help << "internal command facilitating running in certain cloud computing environments";
         }
-        bool run(const string& dbname, BSONObj& obj, int options, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& obj, int options, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             if( !obj.hasElement("servers") ) { 
                 vector<string> ips;
                 obj["servers"].Obj().Vals(ips);
@@ -121,7 +124,7 @@ namespace mongo {
         CmdBuildInfo() : Command( "buildInfo", true, "buildinfo" ) {}
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return false; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -130,7 +133,7 @@ namespace mongo {
             help << "{ buildinfo:1 }";
         }
 
-        bool run(const std::string& dbname,
+        bool run(OperationContext* txn, const std::string& dbname,
                  BSONObj& jsobj,
                  int, // options
                  std::string& errmsg,
@@ -149,11 +152,11 @@ namespace mongo {
         PingCommand() : Command( "ping" ) {}
         virtual bool slaveOk() const { return true; }
         virtual void help( stringstream &help ) const { help << "a way to check that the server is alive. responds immediately even if server is in a db lock."; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(const string& badns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& badns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             // IMPORTANT: Don't put anything in here that might lock db - including authentication
             return true;
         }
@@ -164,11 +167,11 @@ namespace mongo {
         FeaturesCmd() : Command( "features", true ) {}
         void help(stringstream& h) const { h << "return build level feature settings"; }
         virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if ( globalScriptEngine ) {
                 BSONObjBuilder bb( result.subobjStart( "js" ) );
                 result.append( "utf8" , globalScriptEngine->utf8Ok() );
@@ -191,7 +194,7 @@ namespace mongo {
             return true;
         }
 
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help( stringstream& help ) const {
             help << "returns information about the daemon's host";
@@ -203,7 +206,7 @@ namespace mongo {
             actions.addAction(ActionType::hostInfo);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             ProcessInfo p;
             BSONObjBuilder bSys, bOs;
 
@@ -230,7 +233,7 @@ namespace mongo {
     class LogRotateCmd : public Command {
     public:
         LogRotateCmd() : Command( "logRotate" ) {}
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
         virtual void addRequiredPrivileges(const std::string& dbname,
@@ -240,7 +243,7 @@ namespace mongo {
             actions.addAction(ActionType::logRotate);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             bool didRotate = rotateLogs();
             if (didRotate)
                 logProcessDetailsForLogRotate();
@@ -253,13 +256,13 @@ namespace mongo {
     public:
         virtual void help( stringstream &help ) const { help << "get a list of all db commands"; }
         ListCommandsCmd() : Command( "listCommands", false ) {}
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             BSONObjBuilder b( result.subobjStart( "commands" ) );
             for ( map<string,Command*>::iterator i=_commands->begin(); i!=_commands->end(); ++i ) {
                 Command * c = i->second;
@@ -288,7 +291,28 @@ namespace mongo {
 
     } listCommandsCmd;
 
+    namespace {
+        MONGO_FP_DECLARE(crashOnShutdown);
+
+        int* volatile illegalAddress;
+    }  // namespace
+
+    void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
+        const BSONObj& cmdObj,
+        std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::shutdown);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
+
     bool CmdShutdown::shutdownHelper() {
+        MONGO_FAIL_POINT_BLOCK(crashOnShutdown, crashBlock) {
+            const std::string crashHow = crashBlock.getData()["how"].str();
+            if (crashHow == "fault") {
+                ++*illegalAddress;
+            }
+            ::abort();
+        }
         Client * c = currentClient.get();
         if ( c ) {
             c->shutdown();
@@ -307,18 +331,15 @@ namespace mongo {
         virtual void help( stringstream& help ) const {
             help << "for testing purposes only.  forces a user assertion exception";
         }
-        virtual bool logTheOp() {
-            return false;
-        }
         virtual bool slaveOk() const {
             return true;
         }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         CmdForceError() : Command("forceerror") {}
-        bool run(const string& dbnamne, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const string& dbnamne, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             uassert( 10038 , "forced error", false);
             return true;
         }
@@ -328,11 +349,11 @@ namespace mongo {
     public:
         AvailableQueryOptions() : Command( "availableQueryOptions" , false , "availablequeryoptions" ) {}
         virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             result << "options" << QueryOption_AllSupported;
             return true;
         }
@@ -343,7 +364,7 @@ namespace mongo {
         GetLogCmd() : Command( "getLog" ){}
 
         virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool adminOnly() const { return true; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -356,7 +377,7 @@ namespace mongo {
             help << "{ getLog : '*' }  OR { getLog : 'global' }";
         }
 
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             string p = cmdObj.firstElement().String();
             if ( p == "*" ) {
                 vector<string> names;
@@ -393,7 +414,7 @@ namespace mongo {
     public:
         CmdGetCmdLineOpts(): Command("getCmdLineOpts") {}
         void help(stringstream& h) const { h << "get argv"; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool adminOnly() const { return true; }
         virtual bool slaveOk() const { return true; }
         virtual void addRequiredPrivileges(const std::string& dbname,
@@ -403,7 +424,7 @@ namespace mongo {
             actions.addAction(ActionType::getCmdLineOpts);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             result.append("argv", serverGlobalParams.argvArray);
             result.append("parsed", serverGlobalParams.parsedOpts);
             return true;

@@ -82,7 +82,8 @@ namespace optionenvironment {
         Status typeToBoostType(std::auto_ptr<po::value_semantic>* boostType,
                 OptionType type,
                 const Value defaultValue = Value(),
-                const Value implicitValue = Value()) {
+                const Value implicitValue = Value(),
+                bool getSwitchAsBool = false) {
             switch (type) {
                 case StringVector:
                     {
@@ -123,6 +124,26 @@ namespace optionenvironment {
                         }
 
                         return Status::OK();
+                    }
+                case Switch:
+                    {
+                        // In boost, switches default to false which makes it impossible to tell if
+                        // a switch in a config file is not present or was explicitly set to false.
+                        //
+                        // Because of this, and because of the fact that we use the same set of
+                        // options for the legacy key=value config file, we need a way to control
+                        // whether we are telling boost that an option is a switch type or that an
+                        // option is a bool type.
+                        if (!getSwitchAsBool) {
+                            *boostType = std::auto_ptr<po::value_semantic>(po::bool_switch());
+                            return Status::OK();
+                        }
+                        else {
+                            // Switches should be true if they are present with no explicit value.
+                            *boostType = std::auto_ptr<po::typed_value<bool> >(po::value<bool>()
+                                                                            ->implicit_value(true));
+                            return Status::OK();
+                        }
                     }
                 case Bool:
                     {
@@ -338,11 +359,6 @@ namespace optionenvironment {
 
                         return Status::OK();
                     }
-                case Switch:
-                    {
-                        *boostType = std::auto_ptr<po::value_semantic>(po::bool_switch());
-                        return Status::OK();
-                    }
                 default:
                     {
                         StringBuilder sb;
@@ -369,7 +385,8 @@ namespace optionenvironment {
                 Status ret = typeToBoostType(&boostType,
                                              oditerator->_type,
                                              includeDefaults ? oditerator->_default : Value(),
-                                             oditerator->_implicit);
+                                             oditerator->_implicit,
+                                             !(sources & SourceCommandLine));
                 if (!ret.isOK()) {
                     StringBuilder sb;
                     sb << "Error getting boost type for option \""

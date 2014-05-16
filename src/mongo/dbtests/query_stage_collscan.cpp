@@ -31,6 +31,8 @@
  */
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/instance.h"
@@ -38,7 +40,14 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/storage/extent.h"
+#include "mongo/db/storage/extent_manager.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
+#include "mongo/db/structure/catalog/namespace_details.h"
+#include "mongo/db/structure/record_store.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace QueryStageCollectionScan {
 
@@ -50,7 +59,7 @@ namespace QueryStageCollectionScan {
         QueryStageCollectionScanCappedBase() : _context(ns()) { }
 
         virtual ~QueryStageCollectionScanCappedBase() {
-            _context.db()->dropCollection( ns() );
+            _context.db()->dropCollection( &_txn, ns() );
         }
 
         void run() {
@@ -58,14 +67,13 @@ namespace QueryStageCollectionScan {
             stringstream spec;
             spec << "{\"capped\":true,\"size\":2000,\"$nExtents\":" << nExtents() << "}";
 
-            string err;
-            ASSERT( userCreateNS( ns(), fromjson( spec.str() ), err, false ) );
+            ASSERT( userCreateNS( &_txn, db(), ns(), fromjson( spec.str() ), false ).isOK() );
 
             // Tell the test to add data/extents/etc.
             insertTestData();
 
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = collection();
             params.direction = CollectionScanParams::FORWARD;
             params.tailable = false;
             params.start = DiskLoc();
@@ -75,7 +83,7 @@ namespace QueryStageCollectionScan {
                 // Create an executor to handle the scan.
                 WorkingSet* ws = new WorkingSet();
                 PlanStage* ps = new CollectionScan(params, ws, NULL);
-                PlanExecutor runner(ws, ps);
+                PlanExecutor runner(ws, ps, collection());
 
                 int resultCount = 0;
                 BSONObj obj;
@@ -93,7 +101,7 @@ namespace QueryStageCollectionScan {
 
                 WorkingSet* ws = new WorkingSet();
                 PlanStage* ps = new CollectionScan(params, ws, NULL);
-                PlanExecutor runner(ws, ps);
+                PlanExecutor runner(ws, ps, collection());
 
                 // Going backwards.
                 int resultCount = expectedCount() - 1;
@@ -118,22 +126,25 @@ namespace QueryStageCollectionScan {
         virtual int nExtents() const = 0;
 
         // Quote: bypass standard alloc/insert routines to use the extent we want.
-        static DiskLoc insert( const DiskLoc& ext, int i ) {
+        DiskLoc insert( const DiskLoc& ext, int i ) {
             // Copied verbatim.
             BSONObjBuilder b;
             b.append( "a", i );
             BSONObj o = b.done();
             int len = o.objsize();
-            Extent *e = ext.ext();
-            e = getDur().writing(e);
+            Extent *e = extentManager()->getExtent(ext);
+            e = _txn.recoveryUnit()->writing(e);
             int ofs;
-            if ( e->lastRecord.isNull() )
+            if ( e->lastRecord.isNull() ) {
                 ofs = ext.getOfs() + ( e->_extentData - (char *)e );
-            else
-                ofs = e->lastRecord.getOfs() + e->lastRecord.rec()->lengthWithHeaders();
+            }
+            else {
+                ofs = e->lastRecord.getOfs()
+                    + recordStore()->recordFor(e->lastRecord)->lengthWithHeaders();
+            }
             DiskLoc dl( ext.a(), ofs );
-            Record *r = dl.rec();
-            r = (Record*) getDur().writingPtr(r, Record::HeaderSize + len);
+            Record *r = recordStore()->recordFor(dl);
+            r = (Record*) _txn.recoveryUnit()->writingPtr(r, Record::HeaderSize + len);
             r->lengthWithHeaders() = Record::HeaderSize + len;
             r->extentOfs() = e->myLoc.getOfs();
             r->nextOfs() = DiskLoc::NullOfs;
@@ -142,18 +153,29 @@ namespace QueryStageCollectionScan {
             if ( e->firstRecord.isNull() )
                 e->firstRecord = dl;
             else
-                getDur().writingInt(e->lastRecord.rec()->nextOfs()) = ofs;
+                _txn.recoveryUnit()->writingInt(recordStore()->recordFor(e->lastRecord)->nextOfs()) = ofs;
             e->lastRecord = dl;
             return dl;
         }
 
         static const char *ns() { return "unittests.QueryStageCollectionScanCapped"; }
 
-        static NamespaceDetails *nsd() { return nsdetails(ns()); }
+        Database* db() { return _context.db(); }
+        ExtentManager* extentManager() { return db()->getExtentManager(); }
+        Collection* collection() { return db()->getCollection( ns() ); }
+        NamespaceDetails *nsd() { return collection()->detailsWritable(); }
 
-    private:
+    protected:
+        const RecordStore* recordStore() {
+            Collection* c = collection();
+            if ( !c )
+                return NULL;
+            return c->getRecordStore();
+        }
+
         Lock::GlobalWrite lk_;
         Client::Context _context;
+        OperationContextImpl _txn;
     };
 
     class QueryStageCollscanEmpty : public QueryStageCollectionScanCappedBase {
@@ -164,7 +186,7 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanEmptyLooped : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->writingWithExtra()->capFirstNewRecord() = DiskLoc();
+            nsd()->setCapFirstNewRecord( &_txn, DiskLoc() );
         }
         virtual int expectedCount() const { return 0; }
         virtual int nExtents() const { return 0; }
@@ -172,7 +194,7 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanEmptyMultiExtentLooped : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->writingWithExtra()->capFirstNewRecord() = DiskLoc();
+            nsd()->setCapFirstNewRecord( &_txn, DiskLoc() );
         }
         virtual int expectedCount() const { return 0; }
         virtual int nExtents() const { return 3; }
@@ -180,7 +202,7 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanSingle : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->writingWithExtra()->capFirstNewRecord() = insert( nsd()->capExtent(), 0 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 0 ) );
         }
         virtual int expectedCount() const { return 1; }
         virtual int nExtents() const { return 0; }
@@ -189,7 +211,7 @@ namespace QueryStageCollectionScan {
     class QueryStageCollscanNewCapFirst : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
             DiskLoc x = insert( nsd()->capExtent(), 0 );
-            nsd()->writingWithExtra()->capFirstNewRecord() = x;
+            nsd()->setCapFirstNewRecord( &_txn, x );
             insert( nsd()->capExtent(), 1 );
         }
         virtual int expectedCount() const { return 2; }
@@ -199,7 +221,7 @@ namespace QueryStageCollectionScan {
     class QueryStageCollscanNewCapLast : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
             insert( nsd()->capExtent(), 0 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 1 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 1 ) );
         }
         virtual int expectedCount() const { return 2; }
         virtual int nExtents() const { return 0; }
@@ -208,7 +230,7 @@ namespace QueryStageCollectionScan {
     class QueryStageCollscanNewCapMiddle : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
             insert( nsd()->capExtent(), 0 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 1 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 1 ) );
             insert( nsd()->capExtent(), 2 );
         }
         virtual int expectedCount() const { return 3; }
@@ -219,7 +241,7 @@ namespace QueryStageCollectionScan {
         virtual void insertTestData() {
             insert( nsd()->capExtent(), 0 );
             insert( nsd()->lastExtent(), 1 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 2 ) );
             insert( nsd()->capExtent(), 3 );
         }
         virtual int expectedCount() const { return 4; }
@@ -228,10 +250,10 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanLastExtent : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->capExtent().writing() = nsd()->lastExtent();
+            nsd()->setCapExtent( &_txn, nsd()->lastExtent() );
             insert( nsd()->capExtent(), 0 );
             insert( nsd()->firstExtent(), 1 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 2 ) );
             insert( nsd()->capExtent(), 3 );
         }
         virtual int expectedCount() const { return 4; }
@@ -240,11 +262,11 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanMidExtent : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
+            nsd()->setCapExtent( &_txn, extentManager()->getExtent(nsd()->firstExtent())->xnext );
             insert( nsd()->capExtent(), 0 );
             insert( nsd()->lastExtent(), 1 );
             insert( nsd()->firstExtent(), 2 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 3 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 3 ) );
             insert( nsd()->capExtent(), 4 );
         }
         virtual int expectedCount() const { return 5; }
@@ -253,10 +275,10 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanAloneInExtent : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
+            nsd()->setCapExtent( &_txn, extentManager()->getExtent(nsd()->firstExtent())->xnext );
             insert( nsd()->lastExtent(), 0 );
             insert( nsd()->firstExtent(), 1 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 2 ) );
         }
         virtual int expectedCount() const { return 3; }
         virtual int nExtents() const { return 3; }
@@ -264,10 +286,10 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanFirstInExtent : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
+            nsd()->setCapExtent( &_txn, extentManager()->getExtent(nsd()->firstExtent())->xnext );
             insert( nsd()->lastExtent(), 0 );
             insert( nsd()->firstExtent(), 1 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 2 ) );
             insert( nsd()->capExtent(), 3 );
         }
         virtual int expectedCount() const { return 4; }
@@ -276,11 +298,11 @@ namespace QueryStageCollectionScan {
 
     class QueryStageCollscanLastInExtent : public QueryStageCollectionScanCappedBase {
         virtual void insertTestData() {
-            nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
+            nsd()->setCapExtent( &_txn, extentManager()->getExtent(nsd()->firstExtent())->xnext );
             insert( nsd()->capExtent(), 0 );
             insert( nsd()->lastExtent(), 1 );
             insert( nsd()->firstExtent(), 2 );
-            nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 3 );
+            nsd()->setCapFirstNewRecord( &_txn, insert( nsd()->capExtent(), 3 ) );
         }
         virtual int expectedCount() const { return 4; }
         virtual int nExtents() const { return 3; }
@@ -316,7 +338,7 @@ namespace QueryStageCollectionScan {
 
             // Configure the scan.
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = ctx.ctx().db()->getCollection( ns() );
             params.direction = direction;
             params.tailable = false;
 
@@ -328,7 +350,7 @@ namespace QueryStageCollectionScan {
             // Make a scan and have the runner own it.
             WorkingSet* ws = new WorkingSet();
             PlanStage* ps = new CollectionScan(params, ws, filterExpr.get());
-            PlanExecutor runner(ws, ps);
+            PlanExecutor runner(ws, ps, params.collection);
 
             // Use the runner to count the number of objects scanned.
             int count = 0;
@@ -336,11 +358,13 @@ namespace QueryStageCollectionScan {
             return count;
         }
 
-        void getLocs(CollectionScanParams::Direction direction, vector<DiskLoc>* out) {
+        void getLocs(Collection* collection,
+                     CollectionScanParams::Direction direction,
+                     vector<DiskLoc>* out) {
             WorkingSet ws;
 
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = collection;
             params.direction = direction;
             params.tailable = false;
 
@@ -422,14 +446,14 @@ namespace QueryStageCollectionScan {
 
             // Configure the scan.
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = ctx.ctx().db()->getCollection( ns() );
             params.direction = CollectionScanParams::FORWARD;
             params.tailable = false;
 
             // Make a scan and have the runner own it.
             WorkingSet* ws = new WorkingSet();
             PlanStage* ps = new CollectionScan(params, ws, NULL);
-            PlanExecutor runner(ws, ps);
+            PlanExecutor runner(ws, ps, params.collection);
 
             int count = 0;
             for (BSONObj obj; Runner::RUNNER_ADVANCED == runner.getNext(&obj, NULL); ) {
@@ -452,13 +476,13 @@ namespace QueryStageCollectionScan {
             Client::ReadContext ctx(ns());
 
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = ctx.ctx().db()->getCollection( ns() );
             params.direction = CollectionScanParams::BACKWARD;
             params.tailable = false;
 
             WorkingSet* ws = new WorkingSet();
             PlanStage* ps = new CollectionScan(params, ws, NULL);
-            PlanExecutor runner(ws, ps);
+            PlanExecutor runner(ws, ps, params.collection);
 
             int count = 0;
             for (BSONObj obj; Runner::RUNNER_ADVANCED == runner.getNext(&obj, NULL); ) {
@@ -480,13 +504,15 @@ namespace QueryStageCollectionScan {
         void run() {
             Client::WriteContext ctx(ns());
 
+            Collection* coll = ctx.ctx().db()->getCollection( ns() );
+
             // Get the DiskLocs that would be returned by an in-order scan.
             vector<DiskLoc> locs;
-            getLocs(CollectionScanParams::FORWARD, &locs);
+            getLocs(coll, CollectionScanParams::FORWARD, &locs);
 
             // Configure the scan.
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = coll;
             params.direction = CollectionScanParams::FORWARD;
             params.tailable = false;
 
@@ -499,7 +525,7 @@ namespace QueryStageCollectionScan {
                 PlanStage::StageState state = scan->work(&id);
                 if (PlanStage::ADVANCED == state) {
                     WorkingSetMember* member = ws.get(id);
-                    ASSERT_EQUALS(locs[count].obj()["foo"].numberInt(),
+                    ASSERT_EQUALS(coll->docFor(locs[count])["foo"].numberInt(),
                                   member->obj["foo"].numberInt());
                     ++count;
                 }
@@ -508,7 +534,7 @@ namespace QueryStageCollectionScan {
             // Remove locs[count].
             scan->prepareToYield();
             scan->invalidate(locs[count], INVALIDATION_DELETION);
-            remove(locs[count].obj());
+            remove(coll->docFor(locs[count]));
             scan->recoverFromYield();
 
             // Skip over locs[count].
@@ -520,7 +546,7 @@ namespace QueryStageCollectionScan {
                 PlanStage::StageState state = scan->work(&id);
                 if (PlanStage::ADVANCED == state) {
                     WorkingSetMember* member = ws.get(id);
-                    ASSERT_EQUALS(locs[count].obj()["foo"].numberInt(),
+                    ASSERT_EQUALS(coll->docFor(locs[count])["foo"].numberInt(),
                                   member->obj["foo"].numberInt());
                     ++count;
                 }
@@ -539,14 +565,15 @@ namespace QueryStageCollectionScan {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            Collection* coll = ctx.ctx().db()->getCollection(ns());
 
             // Get the DiskLocs that would be returned by an in-order scan.
             vector<DiskLoc> locs;
-            getLocs(CollectionScanParams::BACKWARD, &locs);
+            getLocs(coll, CollectionScanParams::BACKWARD, &locs);
 
             // Configure the scan.
             CollectionScanParams params;
-            params.ns = ns();
+            params.collection = coll;
             params.direction = CollectionScanParams::BACKWARD;
             params.tailable = false;
 
@@ -559,7 +586,7 @@ namespace QueryStageCollectionScan {
                 PlanStage::StageState state = scan->work(&id);
                 if (PlanStage::ADVANCED == state) {
                     WorkingSetMember* member = ws.get(id);
-                    ASSERT_EQUALS(locs[count].obj()["foo"].numberInt(),
+                    ASSERT_EQUALS(coll->docFor(locs[count])["foo"].numberInt(),
                                   member->obj["foo"].numberInt());
                     ++count;
                 }
@@ -568,7 +595,7 @@ namespace QueryStageCollectionScan {
             // Remove locs[count].
             scan->prepareToYield();
             scan->invalidate(locs[count], INVALIDATION_DELETION);
-            remove(locs[count].obj());
+            remove(coll->docFor(locs[count]));
             scan->recoverFromYield();
 
             // Skip over locs[count].
@@ -580,7 +607,7 @@ namespace QueryStageCollectionScan {
                 PlanStage::StageState state = scan->work(&id);
                 if (PlanStage::ADVANCED == state) {
                     WorkingSetMember* member = ws.get(id);
-                    ASSERT_EQUALS(locs[count].obj()["foo"].numberInt(),
+                    ASSERT_EQUALS(coll->docFor(locs[count])["foo"].numberInt(),
                                   member->obj["foo"].numberInt());
                     ++count;
                 }

@@ -37,6 +37,7 @@
 #include "mongo/s/shard.h"
 #include "mongo/s/shardkey.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/db/query/query_solution.h"
 
 namespace mongo {
 
@@ -125,21 +126,27 @@ namespace mongo {
         /**
          * Splits this chunk at a non-specificed split key to be chosen by the mongod holding this chunk.
          *
-         * @param force if set to true, will split the chunk regardless if the split is really necessary size wise
-         *              if set to false, will only split if the chunk has reached the currently desired maximum size
+         * @param atMedian if set to true, will split the chunk at the middle regardless if
+         *      the split is really necessary size wise. If set to false, will only split if
+         *      the chunk has reached the currently desired maximum size. Setting to false also
+         *      has the effect of splitting the chunk such that the resulting chunks will never
+         *      be greater than the current chunk size setting.
          * @param res the object containing details about the split execution
-         * @return splitPoint if found a key and split successfully, else empty BSONObj
+         * @param resultingSplits the number of resulting split points. Set to NULL to ignore.
+         *
+         * @throws UserException
          */
-        BSONObj singleSplit( bool force , BSONObj& res ) const;
+        Status split( bool atMedian, size_t* resultingSplits ) const;
 
         /**
          * Splits this chunk at the given key (or keys)
          *
          * @param splitPoints the vector of keys that should be used to divide this chunk
          * @param res the object containing details about the split execution
-         * @return if the split was successful
+         *
+         * @throws UserException
          */
-        bool multiSplit( const  vector<BSONObj>& splitPoints , BSONObj& res ) const;
+        Status multiSplit( const vector<BSONObj>& splitPoints ) const;
 
         /**
          * Asks the mongod holding this chunk to find a key that approximately divides this chunk in two
@@ -257,6 +264,14 @@ namespace mongo {
          * will return empty object if have none
          */
         BSONObj _getExtremeKey( int sort ) const;
+
+        /**
+         * Determines the appropriate split points for this chunk.
+         *
+         * @param atMedian perform a single split at the middle of this chunk.
+         * @param splitPoints out parameter containing the chosen split points. Can be empty.
+         */
+        void determineSplitPoints(bool atMedian, std::vector<BSONObj>* splitPoints) const;
 
         /** initializes _dataWritten with a random value so that a mongos restart wouldn't cause delay in splitting */
         static int mkDataWritten();
@@ -423,6 +438,24 @@ namespace mongo {
         void getAllShards( set<Shard>& all ) const;
         /** @param shards set to the shards covered by the interval [min, max], see SERVER-4791 */
         void getShardsForRange( set<Shard>& shards, const BSONObj& min, const BSONObj& max ) const;
+
+        // Transforms query into bounds for each field in the shard key
+        // for example :
+        //   Key { a: 1, b: 1 },
+        //   Query { a : { $gte : 1, $lt : 2 },
+        //            b : { $gte : 3, $lt : 4 } }
+        //   => Bounds { a : [1, 2), b : [3, 4) }
+        static IndexBounds getIndexBoundsForQuery(const BSONObj& key, const CanonicalQuery* canonicalQuery);
+
+        // Collapse query solution tree.
+        //
+        // If it has OR node, the result could be a superset of the index bounds generated.
+        // Since to give a single IndexBounds, this gives the union of bounds on each field.
+        // for example:
+        //   OR: { a: (0, 1), b: (0, 1) },
+        //       { a: (2, 3), b: (2, 3) }
+        //   =>  { a: (0, 1), (2, 3), b: (0, 1), (2, 3) }
+        static IndexBounds collapseQuerySolution( const QuerySolutionNode* node );
 
         ChunkMap getChunkMap() const { return _chunkMap; }
 

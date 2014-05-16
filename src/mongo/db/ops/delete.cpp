@@ -38,7 +38,13 @@ namespace mongo {
        justOne: stop after 1 match
        god:     allow access to system namespaces, and don't yield
     */
-    long long deleteObjects(const StringData& ns, BSONObj pattern, bool justOne, bool logop, bool god) {
+    long long deleteObjects(OperationContext* txn,
+                            Database* db,
+                            const StringData& ns,
+                            BSONObj pattern,
+                            bool justOne,
+                            bool logop,
+                            bool god) {
         NamespaceString nsString(ns);
         DeleteRequest request(nsString);
         request.setQuery(pattern);
@@ -46,7 +52,7 @@ namespace mongo {
         request.setUpdateOpLog(logop);
         request.setGod(god);
         DeleteExecutor executor(&request);
-        return executor.execute();
+        return executor.execute(txn, db);
     }
 
 }  // namespace mongo

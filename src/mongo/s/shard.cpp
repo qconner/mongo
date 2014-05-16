@@ -49,6 +49,7 @@
 #include "mongo/s/client_info.h"
 #include "mongo/s/config.h"
 #include "mongo/s/request.h"
+#include "mongo/s/scc_fast_query_handler.h"
 #include "mongo/s/type_shard.h"
 #include "mongo/s/version_manager.h"
 
@@ -312,7 +313,7 @@ namespace mongo {
     public:
         CmdGetShardMap() : Command( "getShardMap" ){}
         virtual void help( stringstream &help ) const { help<<"internal"; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
         virtual void addRequiredPrivileges(const std::string& dbname,
@@ -322,7 +323,7 @@ namespace mongo {
             actions.addAction(ActionType::getShardMap);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string&, mongo::BSONObj&, int, std::string& errmsg , mongo::BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string&, mongo::BSONObj&, int, std::string& errmsg , mongo::BSONObjBuilder& result, bool) {
             return staticShardInfo.getShardMap( result , errmsg );
         }
     } cmdGetShardMap;
@@ -497,6 +498,15 @@ namespace mongo {
         // to the end of every runCommand.  mongod uses this information to produce auditing
         // records attributed to the proper authenticated user(s).
         conn->setRunCommandHook(boost::bind(&audit::appendImpersonatedUsers, _1));
+
+        // For every SCC created, add a hook that will allow fastest-config-first config reads if
+        // the appropriate server options are set.
+        if ( conn->type() == ConnectionString::SYNC ) {
+            SyncClusterConnection* scc = dynamic_cast<SyncClusterConnection*>( conn );
+            if ( scc ) {
+                scc->attachQueryHandler( new SCCFastQueryHandler );
+            }
+        }
     }
 
     void ShardingConnectionHook::onDestroy( DBClientBase * conn ) {

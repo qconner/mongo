@@ -42,7 +42,7 @@
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/repl/master_slave.h"
-#include "mongo/db/repl/replication_server_status.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/mongoutils/html.h"
@@ -66,7 +66,8 @@ namespace mongo {
                 url.find_last_of( '/' ) > 0;
         }
 
-        virtual void handle( const char *rq, const std::string& url, BSONObj params,
+        virtual void handle( OperationContext* txn,
+                             const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
 

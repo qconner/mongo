@@ -35,8 +35,8 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -71,7 +71,7 @@ namespace QueryStageMergeSortTests {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            CollectionIterator* it = coll->getIterator(DiskLoc(), false,
+            RecordIterator* it = coll->getIterator(DiskLoc(), false,
                                                        CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
@@ -107,10 +107,11 @@ namespace QueryStageMergeSortTests {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             const int N = 50;
@@ -130,7 +131,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(msparams, ws);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -147,7 +148,7 @@ namespace QueryStageMergeSortTests {
             ms->addChild(new IndexScan(params, ws, NULL));
 
             // Must fetch if we want to easily pull out an obj.
-            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL));
+            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL, coll), coll);
 
             for (int i = 0; i < N; ++i) {
                 BSONObj first, second;
@@ -170,10 +171,11 @@ namespace QueryStageMergeSortTests {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             const int N = 50;
@@ -193,7 +195,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(msparams, ws);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -209,7 +211,7 @@ namespace QueryStageMergeSortTests {
             params.descriptor = getIndex(secondIndex, coll);
             ms->addChild(new IndexScan(params, ws, NULL));
 
-            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL));
+            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL, coll), coll);
 
             for (int i = 0; i < N; ++i) {
                 BSONObj first, second;
@@ -232,10 +234,11 @@ namespace QueryStageMergeSortTests {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             const int N = 50;
@@ -255,7 +258,7 @@ namespace QueryStageMergeSortTests {
             MergeSortStageParams msparams;
             msparams.dedup = false;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(msparams, ws);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -271,7 +274,7 @@ namespace QueryStageMergeSortTests {
             params.descriptor = getIndex(secondIndex, coll);
             ms->addChild(new IndexScan(params, ws, NULL));
 
-            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL));
+            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL, coll), coll);
 
             for (int i = 0; i < N; ++i) {
                 BSONObj first, second;
@@ -295,10 +298,11 @@ namespace QueryStageMergeSortTests {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             const int N = 50;
@@ -319,7 +323,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:-1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << -1);
-            MergeSortStage* ms = new MergeSortStage(msparams, ws);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -336,7 +340,7 @@ namespace QueryStageMergeSortTests {
             params.descriptor = getIndex(secondIndex, coll);
             ms->addChild(new IndexScan(params, ws, NULL));
 
-            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL));
+            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL, coll), coll);
 
             for (int i = 0; i < N; ++i) {
                 BSONObj first, second;
@@ -359,10 +363,11 @@ namespace QueryStageMergeSortTests {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             const int N = 50;
@@ -382,7 +387,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(msparams, ws);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -400,7 +405,7 @@ namespace QueryStageMergeSortTests {
             params.bounds.endKey = BSON("" << 51 << "" << MaxKey);
             ms->addChild(new IndexScan(params, ws, NULL));
 
-            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL));
+            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL, coll), coll);
 
             // Only getting results from the a:1 index scan.
             for (int i = 0; i < N; ++i) {
@@ -421,17 +426,18 @@ namespace QueryStageMergeSortTests {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             WorkingSet* ws = new WorkingSet();
             // Sort by foo:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("foo" << 1);
-            MergeSortStage* ms = new MergeSortStage(msparams, ws);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             IndexScanParams params;
             params.bounds.isSimpleRange = true;
@@ -452,7 +458,7 @@ namespace QueryStageMergeSortTests {
                 ms->addChild(new IndexScan(params, ws, NULL));
             }
 
-            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL));
+            PlanExecutor runner(ws, new FetchStage(ws, ms, NULL, coll), coll);
 
             for (int i = 0; i < numIndices; ++i) {
                 BSONObj obj;
@@ -473,17 +479,18 @@ namespace QueryStageMergeSortTests {
     public:
         void run() {
             Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(ns());
+                coll = db->createCollection(&txn, ns());
             }
 
             WorkingSet ws;
             // Sort by foo:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("foo" << 1);
-            auto_ptr<MergeSortStage> ms(new MergeSortStage(msparams, &ws));
+            auto_ptr<MergeSortStage> ms(new MergeSortStage(msparams, &ws, coll));
 
             IndexScanParams params;
             params.bounds.isSimpleRange = true;

@@ -43,6 +43,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
 
@@ -51,11 +52,10 @@ namespace mongo {
 
     class CompactCmd : public Command {
     public:
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool adminOnly() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool maintenanceMode() const { return true; }
-        virtual bool logTheOp() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -83,7 +83,7 @@ namespace mongo {
             return IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
         }
 
-        virtual bool run(const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             string coll = cmdObj.firstElement().valuestr();
             if( coll.empty() || db.empty() ) {
                 errmsg = "no collection name specified";
@@ -161,7 +161,7 @@ namespace mongo {
 
             std::vector<BSONObj> indexesInProg = stopIndexBuilds(ctx.db(), cmdObj);
 
-            StatusWith<CompactStats> status = collection->compact( &compactOptions );
+            StatusWith<CompactStats> status = collection->compact( txn, &compactOptions );
             if ( !status.isOK() )
                 return appendCommandStatus( result, status.getStatus() );
 

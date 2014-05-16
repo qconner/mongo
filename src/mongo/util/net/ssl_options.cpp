@@ -26,7 +26,8 @@ namespace mongo {
     Status addSSLServerOptions(moe::OptionSection* options) {
         options->addOptionChaining("net.ssl.sslOnNormalPorts", "sslOnNormalPorts", moe::Switch,
                 "use ssl on configured ports")
-                                  .setSources(moe::SourceAllLegacy);
+                                  .setSources(moe::SourceAllLegacy)
+                                  .incompatibleWith("net.ssl.mode");
 
         options->addOptionChaining("net.ssl.mode", "sslMode", moe::String,
                 "set the SSL operation mode (disabled|allowSSL|preferSSL|requireSSL)");
@@ -95,6 +96,23 @@ namespace mongo {
         return Status::OK();
     }
 
+    Status canonicalizeSSLServerOptions(moe::Environment* params) {
+
+        if (params->count("net.ssl.sslOnNormalPorts") &&
+            (*params)["net.ssl.sslOnNormalPorts"].as<bool>() == true) {
+            Status ret = params->set("net.ssl.mode", moe::Value(std::string("requireSSL")));
+            if (!ret.isOK()) {
+                return ret;
+            }
+            ret = params->remove("net.ssl.sslOnNormalPorts");
+            if (!ret.isOK()) {
+                return ret;
+            }
+        }
+
+        return Status::OK();
+    }
+
     Status storeSSLServerOptions(const moe::Environment& params) {
 
         if (params.count("net.ssl.mode")) {
@@ -147,23 +165,15 @@ namespace mongo {
         }
 
         if (params.count("net.ssl.weakCertificateValidation")) {
-            sslGlobalParams.sslWeakCertificateValidation = true;
+            sslGlobalParams.sslWeakCertificateValidation =
+                params["net.ssl.weakCertificateValidation"].as<bool>();
         }
         if (params.count("net.ssl.allowInvalidCertificates")) {
-            sslGlobalParams.sslAllowInvalidCertificates = true;
+            sslGlobalParams.sslAllowInvalidCertificates =
+                params["net.ssl.allowInvalidCertificates"].as<bool>();
         }
         if (params.count("net.ssl.FIPSMode")) {
-            sslGlobalParams.sslFIPSMode = true;
-        }
-
-        if (params.count("net.ssl.sslOnNormalPorts")) {
-            if (params.count("net.ssl.mode")) {
-                    return Status(ErrorCodes::BadValue, 
-                                  "can't have both sslMode and sslOnNormalPorts");
-            }
-            else {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_requireSSL);
-            }
+            sslGlobalParams.sslFIPSMode = params["net.ssl.FIPSMode"].as<bool>();
         }
 
         if (sslGlobalParams.sslMode.load() != SSLGlobalParams::SSLMode_disabled) {
@@ -216,7 +226,7 @@ namespace mongo {
     }
 
     Status storeSSLClientOptions(const moe::Environment& params) {
-        if (params.count("ssl")) {
+        if (params.count("ssl") && params["ssl"].as<bool>() == true) {
             sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_requireSSL);
         }
         if (params.count("ssl.PEMKeyFile")) {

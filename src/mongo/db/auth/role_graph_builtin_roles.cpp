@@ -466,9 +466,12 @@ namespace {
     }
 
     void addBackupPrivileges(PrivilegeVector* privileges) {
+        ActionSet normalResourceActions;
+        normalResourceActions << ActionType::find
+                              << ActionType::collStats;
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
-                Privilege(ResourcePattern::forAnyNormalResource(), ActionType::find));
+                Privilege(ResourcePattern::forAnyNormalResource(), normalResourceActions));
 
         ActionSet clusterActions;
         clusterActions << ActionType::getParameter // To check authSchemaVersion
@@ -587,6 +590,13 @@ namespace {
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges, Privilege(ResourcePattern::forClusterResource(),
                                       ActionType::getParameter));
+
+        // Need to be able to create an index on the system.roles collection.
+        Privilege::addPrivilegeToPrivilegeVector(
+                privileges,
+                Privilege(ResourcePattern::forExactNamespace(
+                                  AuthorizationManager::rolesCollectionNamespace),
+                          ActionType::createIndex));
     }
 
     void addRootRolePrivileges(PrivilegeVector* privileges) {

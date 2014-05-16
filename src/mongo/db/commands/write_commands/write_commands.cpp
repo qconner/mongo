@@ -77,14 +77,10 @@ namespace mongo {
         }
     }
 
-    // Write commands are fanned out in oplog as single writes.
-    bool WriteCmd::logTheOp() { return false; }
-
     // Slaves can't perform writes.
     bool WriteCmd::slaveOk() const { return false; }
 
-    // Write commands acquire write lock, but not for entire length of execution.
-    Command::LockType WriteCmd::locktype() const { return NONE; }
+    bool WriteCmd::isWriteCommandForConfigServer() const { return false; }
 
     Status WriteCmd::checkAuthForCommand( ClientBasic* client,
                                           const std::string& dbname,
@@ -106,7 +102,8 @@ namespace mongo {
     // Write commands are counted towards their corresponding opcounters, not command opcounters.
     bool WriteCmd::shouldAffectCommandCounter() const { return false; }
 
-    bool WriteCmd::run(const string& dbName,
+    bool WriteCmd::run(OperationContext* txn,
+                       const string& dbName,
                        BSONObj& cmdObj,
                        int options,
                        string& errMsg,
@@ -136,7 +133,8 @@ namespace mongo {
         // TODO: fix this for sane behavior where we query repl set object
         if ( getLastErrorDefault ) defaultWriteConcern = *getLastErrorDefault;
 
-        WriteBatchExecutor writeBatchExecutor(defaultWriteConcern,
+        WriteBatchExecutor writeBatchExecutor(txn,
+                                              defaultWriteConcern,
                                               &cc(),
                                               &globalOpCounters,
                                               lastError.get());

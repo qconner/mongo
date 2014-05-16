@@ -75,14 +75,14 @@ namespace mongo {
         JournalLatencyTestCmd() : Command( "journalLatencyTest" ) {}
 
         virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool adminOnly() const { return true; }
         virtual void help(stringstream& h) const { h << "test how long to write and fsync to a test file in the journal/ directory"; }
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             boost::filesystem::path p = dur::getJournalDir();
             p /= "journalLatencyTest";
         

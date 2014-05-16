@@ -31,7 +31,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/d_concurrency.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -53,13 +56,18 @@ namespace mongo {
         LOG(2) << "IndexBuilder building index " << _index;
 
         Client::initThread(name().c_str());
+        Lock::ParallelBatchWriterMode::iAmABatchParticipant();
+
         replLocalAuth();
 
         cc().curop()->reset(HostAndPort(), dbInsert);
         NamespaceString ns(_index["ns"].String());
         Client::WriteContext ctx(ns.getSystemIndexesCollection());
+        OperationContextImpl txn;
 
-        Status status = build( ctx.ctx() );
+        Database* db = dbHolder().get(ns.db().toString(), storageGlobalParams.dbpath);
+
+        Status status = build(&txn, db);
         if ( !status.isOK() ) {
             log() << "IndexBuilder could not build index: " << status.toString();
         }
@@ -67,9 +75,9 @@ namespace mongo {
         cc().shutdown();
     }
 
-    Status IndexBuilder::build( Client::Context& context ) const {
-        string ns = _index["ns"].String();
-        Database* db = context.db();
+    Status IndexBuilder::build(OperationContext* txn, Database* db) const {
+        const string ns = _index["ns"].String();
+
         Collection* c = db->getCollection( ns );
         if ( !c ) {
             c = db->getOrCreateCollection( ns );
@@ -77,9 +85,10 @@ namespace mongo {
         }
 
         // Show which index we're building in the curop display.
-        context.getClient()->curop()->setQuery(_index);
+        cc().curop()->setQuery(_index);
 
-        Status status = c->getIndexCatalog()->createIndex( _index, 
+        Status status = c->getIndexCatalog()->createIndex( txn,
+                                                           _index, 
                                                            true, 
                                                            IndexCatalog::SHUTDOWN_LEAVE_DIRTY );
         if ( status.code() == ErrorCodes::IndexAlreadyExists )

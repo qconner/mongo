@@ -35,6 +35,9 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/s/d_logic.h"
+#include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
 
@@ -45,8 +48,7 @@ namespace mongo {
     public:
         CmdCreateIndex() : Command( "createIndexes" ){}
 
-        virtual LockType locktype() const { return NONE; }
-        virtual bool logTheOp() { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return false; } // TODO: this could be made true...
 
         virtual Status checkAuthForCommand(ClientBasic* client,
@@ -68,7 +70,7 @@ namespace mongo {
             return b.obj();
         }
 
-        virtual bool run( const string& dbname, BSONObj& cmdObj, int options,
+        virtual bool run(OperationContext* txn,  const string& dbname, BSONObj& cmdObj, int options,
                           string& errmsg, BSONObjBuilder& result,
                           bool fromRepl = false ) {
 
@@ -129,7 +131,10 @@ namespace mongo {
                 // We first take a read lock to see if we need to do anything
                 // as many calls are ensureIndex (and hence no-ops), this is good so its a shared
                 // lock for common calls. We only take write lock if needed.
-                Client::ReadContext readContext( ns );
+                // Note: createIndexes command does not currently respect shard versioning.
+                Client::ReadContext readContext( ns,
+                                                 storageGlobalParams.dbpath,
+                                                 false /* doVersion */ );
                 const Collection* collection = readContext.ctx().db()->getCollection( ns.ns() );
                 if ( collection ) {
                     for ( size_t i = 0; i < specs.size(); i++ ) {
@@ -158,13 +163,16 @@ namespace mongo {
             }
 
             // now we know we have to create index(es)
-            Client::WriteContext writeContext( ns.ns() );
+            // Note: createIndexes command does not currently respect shard versioning.
+            Client::WriteContext writeContext( ns.ns(),
+                                               storageGlobalParams.dbpath,
+                                               false /* doVersion */ );
             Database* db = writeContext.ctx().db();
 
-            Collection* collection = db->getCollection( ns.ns() );
+            Collection* collection = db->getCollection( txn, ns.ns() );
             result.appendBool( "createdCollectionAutomatically", collection == NULL );
             if ( !collection ) {
-                collection = db->createCollection( ns.ns() );
+                collection = db->createCollection( txn, ns.ns() );
                 invariant( collection );
             }
 
@@ -173,7 +181,16 @@ namespace mongo {
             for ( size_t i = 0; i < specs.size(); i++ ) {
                 BSONObj spec = specs[i];
 
-                status = collection->getIndexCatalog()->createIndex( spec, true );
+                if ( spec["unique"].trueValue() ) {
+                    status = checkUniqueIndexConstraints( ns.ns(), spec["key"].Obj() );
+
+                    if ( !status.isOK() ) {
+                        appendCommandStatus( result, status );
+                        return false;
+                    }
+                }
+
+                status = collection->getIndexCatalog()->createIndex(txn, spec, true);
                 if ( status.code() == ErrorCodes::IndexAlreadyExists ) {
                     if ( !result.hasField( "note" ) )
                         result.append( "note", "index already exists" );
@@ -184,17 +201,39 @@ namespace mongo {
                     appendCommandStatus( result, status );
                     return false;
                 }
+
+                if ( !fromRepl ) {
+                    std::string systemIndexes = ns.getSystemIndexesCollection();
+                    logOp( txn, "i", systemIndexes.c_str(), spec );
+                }
             }
 
             result.append( "numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal() );
-            if ( !fromRepl ) {
-                string cmdNs = ns.getCommandNS();
-                logOp( "c", cmdNs.c_str(), cmdObj );
-            }
 
             return true;
         }
 
+    private:
+        static Status checkUniqueIndexConstraints(const StringData& ns,
+                                                  const BSONObj& newIdxKey) {
+            Lock::assertWriteLocked( ns );
+
+            if ( shardingState.enabled() ) {
+                CollectionMetadataPtr metadata(
+                        shardingState.getCollectionMetadata( ns.toString() ));
+
+                if ( metadata ) {
+                    BSONObj shardKey(metadata->getKeyPattern());
+                    if ( !isUniqueIndexCompatible( shardKey, newIdxKey )) {
+                        return Status(ErrorCodes::CannotCreateIndex,
+                                str::stream() << "cannot create unique index over " << newIdxKey
+                                              << " with shard key pattern " << shardKey);
+                    }
+                }
+            }
+
+            return Status::OK();
+        }
 
     } cmdCreateIndex;
 

@@ -34,10 +34,9 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/repl/health.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_server_status.h"  // replSettings
-#include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs_config.h"
 #include "mongo/db/repl/write_concern.h"
 
@@ -66,7 +65,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
         CmdReplSetTest() : ReplSetCommand("replSetTest") { }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             log() << "replSet replSetTest command received: " << cmdObj.toString() << rsLog;
 
             if( cmdObj.hasElement("forceInitialSyncFailure") ) {
@@ -121,7 +120,7 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) )
                 return false;
             result.append("rbid",rbid);
@@ -156,7 +155,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         CmdReplSetGetStatus() : ReplSetCommand("replSetGetStatus", true) { }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if ( cmdObj["forShell"].trueValue() )
                 lastError.disableForCommand();
 
@@ -183,7 +182,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         CmdReplSetReconfig() : ReplSetCommand("replSetReconfig"), mutex("rsreconfig") { }
-        virtual bool run(const string& a, BSONObj& b, int e, string& errmsg, BSONObjBuilder& c, bool d) {
+        virtual bool run(OperationContext* txn, const string& a, BSONObj& b, int e, string& errmsg, BSONObjBuilder& c, bool d) {
             try {
                 rwlock_try_write lk(mutex);
                 return _run(a,b,e,errmsg,c,d);
@@ -278,7 +277,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") { }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) )
                 return false;
             int secs = (int) cmdObj.firstElement().numberInt();
@@ -308,7 +307,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") { }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) )
                 return false;
             if( !theReplSet->box.getState().primary() ) {
@@ -363,7 +362,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") { }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) )
                 return false;
 
@@ -395,7 +394,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") { }
-        virtual bool run(const string&, 
+        virtual bool run(OperationContext* txn, const string&, 
                          BSONObj& cmdObj, 
                          int, 
                          string& errmsg, 
@@ -423,7 +422,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         CmdReplSetUpdatePosition() : ReplSetCommand("replSetUpdatePosition") { }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg,
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg,
                          BSONObjBuilder& result, bool fromRepl) {
             if (!check(errmsg, result))
                 return false;
@@ -431,9 +430,12 @@ namespace mongo {
             if (cmdObj.hasField("handshake")) {
                 // we have received a handshake, not an update message
                 // handshakes are done here to ensure the receiving end supports the update command
-                cc().gotHandshake(cmdObj["handshake"].embeddedObject());
+                if (!cc().gotHandshake(cmdObj["handshake"].embeddedObject())) {
+                    errmsg = "node could not be found in replica set config during handshake";
+                    return false;
+                }
                 // if we aren't primary, pass the handshake along
-                if (!theReplSet->isPrimary() && theReplSet->syncSourceFeedback.supportsUpdater()) {
+                if (!theReplSet->isPrimary()) {
                     theReplSet->syncSourceFeedback.forwardSlaveHandshake();
                 }
                 return true;
@@ -442,7 +444,11 @@ namespace mongo {
             uassert(16888, "optimes field should be an array with an object for each secondary",
                     cmdObj["optimes"].type() == Array);
             BSONArray newTimes = BSONArray(cmdObj["optimes"].Obj());
-            return updateSlaveLocations(newTimes);
+            if (!updateSlaveLocations(newTimes)) {
+                errmsg = "could not update position upstream; will retry";
+                return false;
+            }
+            return true;
         }
     } cmdReplSetUpdatePosition;
 

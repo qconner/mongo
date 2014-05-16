@@ -23,7 +23,7 @@
 
 #include "mongo/client/export_macros.h"
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/matcher.h"
+#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/stale_exception.h"  // for StaleConfigException
@@ -258,9 +258,7 @@ namespace mongo {
     // TODO:  We probably don't really need this as a separate class.
     class MONGO_CLIENT_API FilteringClientCursor {
     public:
-        FilteringClientCursor( const BSONObj filter = BSONObj() );
-        FilteringClientCursor( DBClientCursor* cursor , const BSONObj filter = BSONObj() );
-        FilteringClientCursor( auto_ptr<DBClientCursor> cursor , const BSONObj filter = BSONObj() );
+        FilteringClientCursor();
         ~FilteringClientCursor();
 
         void reset( auto_ptr<DBClientCursor> cursor );
@@ -283,7 +281,6 @@ namespace mongo {
     private:
         void _advance();
 
-        Matcher _matcher;
         auto_ptr<DBClientCursor> _cursor;
         ParallelConnectionMetadata* _pcmData;
 
@@ -326,7 +323,12 @@ namespace mongo {
 
         private:
 
-            CommandResult( const string& server , const string& db , const BSONObj& cmd , int options , DBClientBase * conn );
+            CommandResult( const string& server,
+                           const string& db,
+                           const BSONObj& cmd,
+                           int options,
+                           DBClientBase * conn,
+                           bool useShardedConn );
             void init();
 
             string _server;
@@ -334,7 +336,8 @@ namespace mongo {
             int _options;
             BSONObj _cmd;
             DBClientBase * _conn;
-            scoped_ptr<ScopedDbConnection> _connHolder; // used if not provided a connection
+            scoped_ptr<AScopedConnection> _connHolder; // used if not provided a connection
+            bool _useShardConn;
 
             scoped_ptr<DBClientCursor> _cursor;
 
@@ -351,8 +354,14 @@ namespace mongo {
          * @param db db name
          * @param cmd cmd to exec
          * @param conn optional connection to use.  will use standard pooled if non-specified
+         * @param useShardConn use ShardConnection
          */
-        static shared_ptr<CommandResult> spawnCommand( const string& server , const string& db , const BSONObj& cmd , int options , DBClientBase * conn = 0 );
+        static shared_ptr<CommandResult> spawnCommand( const string& server,
+                                                       const string& db,
+                                                       const BSONObj& cmd,
+                                                       int options,
+                                                       DBClientBase * conn = 0,
+                                                       bool useShardConn = false );
     };
 
 

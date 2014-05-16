@@ -34,6 +34,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/operation_context_impl.h"
 
 #include "mongo/dbtests/dbtests.h"
 
@@ -44,20 +45,21 @@ namespace CountTests {
         Client::Context _context;
         Database* _database;
         Collection* _collection;
+        OperationContextImpl _txn;
     public:
         Base() : lk(ns()), _context( ns() ) {
             _database = _context.db();
             _collection = _database->getCollection( ns() );
             if ( _collection ) {
-                _database->dropCollection( ns() );
+                _database->dropCollection( &_txn, ns() );
             }
-            _collection = _database->createCollection( ns() );
+            _collection = _database->createCollection( &_txn, ns() );
 
             addIndex( fromjson( "{\"a\":1}" ) );
         }
         ~Base() {
             try {
-                uassertStatusOK( _database->dropCollection( ns() ) );
+                uassertStatusOK( _database->dropCollection( &_txn, ns() ) );
             }
             catch ( ... ) {
                 FAIL( "Exception while cleaning up collection" );
@@ -73,7 +75,7 @@ namespace CountTests {
             b.append( "ns", ns() );
             b.append( "key", key );
             BSONObj o = b.done();
-            Status s = _collection->getIndexCatalog()->createIndex( o, false );
+            Status s = _collection->getIndexCatalog()->createIndex(&_txn, o, false);
             uassertStatusOK( s );
         }
         void insert( const char *s ) {
@@ -86,10 +88,10 @@ namespace CountTests {
                 oid.init();
                 b.appendOID( "_id", &oid );
                 b.appendElements( o );
-                _collection->insertDocument( b.obj(), false );
+                _collection->insertDocument( &_txn, b.obj(), false );
             }
             else {
-                _collection->insertDocument( o, false );
+                _collection->insertDocument( &_txn, o, false );
             }
         }
         static BSONObj countCommand( const BSONObj &query ) {
@@ -213,45 +215,6 @@ namespace CountTests {
         boost::thread _dummyWriter;
     };
     
-    /**
-     * The runCount() function yields deterministically with sufficient cursor iteration and a
-     * mutually exclusive thread awaiting its mutex.  SERVER-5428
-     */
-    class Yield : public Base {
-    public:
-        void run() {
-            // Insert enough documents that counting them will exceed the iteration threshold
-            // to trigger a yield.
-            for( int i = 0; i < 1000; ++i ) {
-                insert( BSON( "a" << 1 ) );
-            }
-            
-            // Call runCount() under a read lock.
-            dbtemprelease release;
-            Client::ReadContext ctx( ns() );
-
-            int numYieldsBeforeCount = numYields();
-            
-            string err;
-            int errCode;
-            ASSERT_EQUALS( 1000, runCount( ns(), countCommand( BSON( "a" << 1 ) ), err, errCode ) );
-            ASSERT_EQUALS( "", err );
-
-            int numYieldsAfterCount = numYields();
-            int numYieldsDuringCount = numYieldsAfterCount - numYieldsBeforeCount;
-
-            // The runCount() function yieled.
-            ASSERT_NOT_EQUALS( 0, numYieldsDuringCount );
-            ASSERT( 0 < numYieldsDuringCount );
-        }
-    private:
-        int numYields() const {
-            return cc().curop()->info()[ "numYields" ].Int();
-        }
-        // A writer client is registered while the test runs, causing runCount() to yield.
-        WriterClientScope _writer;
-    };
-    
     class All : public Suite {
     public:
         All() : Suite( "count" ) {
@@ -263,7 +226,6 @@ namespace CountTests {
             add<Fields>();
             add<QueryFields>();
             add<IndexedRegex>();
-            add<Yield>();
         }
     } myall;
     

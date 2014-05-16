@@ -271,7 +271,9 @@ namespace mongo {
         if (SolutionCacheData::WHOLE_IXSCAN_SOLN == cacheData.solnType) {
             // The solution can be constructed by a scan over the entire index.
             QuerySolution* soln = buildWholeIXSoln(*cacheData.tree->entry,
-                query, params, cacheData.wholeIXSolnDir);
+                                                   query,
+                                                   params,
+                                                   cacheData.wholeIXSolnDir);
             if (soln == NULL) {
                 return Status(ErrorCodes::BadValue,
                               "plan cache error: soln that uses index to provide sort");
@@ -331,7 +333,9 @@ namespace mongo {
 
         if (NULL != solnRoot) {
             // Takes ownership of 'solnRoot'.
-            QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+            QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query,
+                                                                          params,
+                                                                          solnRoot);
             if (NULL != soln) {
                 QLOG() << "Planner: solution constructed from the cache:\n" << soln->toString() << endl;
                 *out = soln;
@@ -369,7 +373,8 @@ namespace mongo {
 
         if (cachedSoln.backupSoln) {
             SolutionCacheData* backupCacheData = cachedSoln.plannerData[*cachedSoln.backupSoln];
-            Status backupStatus = planFromCache(query, params, *backupCacheData, backupOut);
+            Status backupStatus = planFromCache(query, params,
+                                                *backupCacheData, backupOut);
             if (!backupStatus.isOK()) {
                 return backupStatus;
             }
@@ -598,6 +603,8 @@ namespace mongo {
             RelevantTag* tag = static_cast<RelevantTag*>(gnNode->getTag());
             if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
                 QLOG() << "Unable to find index for $geoNear query." << endl;
+                // Don't leave tags on query tree.
+                query.root()->resetTag();
                 return Status(ErrorCodes::BadValue, "unable to find index for $geoNear query");
             }
 
@@ -653,7 +660,9 @@ namespace mongo {
                 // only be first for gnNode.
                 tag->first.erase(tag->first.begin() + i);
 
-                QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+                QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query,
+                                                                              params,
+                                                                              solnRoot);
 
                 if (NULL != soln) {
                     out->push_back(soln);
@@ -743,7 +752,9 @@ namespace mongo {
 
                 if (NULL == solnRoot) { continue; }
 
-                QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+                QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query,
+                                                                              params,
+                                                                              solnRoot);
                 if (NULL != soln) {
                     QLOG() << "Planner: adding solution:" << endl << soln->toString();
                     if (indexTreeStatus.isOK()) {
@@ -780,7 +791,8 @@ namespace mongo {
         // desired behavior when an index is hinted that is not relevant to the query.
         if (!hintIndex.isEmpty()) {
             if (0 == out->size()) {
-                QuerySolution* soln = buildWholeIXSoln(params.indices[hintIndexNumber], query, params);
+                QuerySolution* soln = buildWholeIXSoln(params.indices[hintIndexNumber],
+                                                       query, params);
                 verify(NULL != soln);
                 QLOG() << "Planner: outputting soln that uses hinted index as scan." << endl;
                 out->push_back(soln);
@@ -809,14 +821,33 @@ namespace mongo {
             if (!usingIndexToSort) {
                 for (size_t i = 0; i < params.indices.size(); ++i) {
                     const IndexEntry& index = params.indices[i];
+                    // Only regular (non-plugin) indexes can be used to provide a sort.
+                    if (index.type != INDEX_BTREE) {
+                        continue;
+                    }
+                    // Only non-sparse indexes can be used to provide a sort.
                     if (index.sparse) {
                         continue;
                     }
+
+                    // TODO: Sparse indexes can't normally provide a sort, because non-indexed
+                    // documents could potentially be missing from the result set.  However, if the
+                    // query predicate can be used to guarantee that all documents to be returned
+                    // are indexed, then the index should be able to provide the sort.
+                    //
+                    // For example:
+                    // - Sparse index {a: 1, b: 1} should be able to provide a sort for
+                    //   find({b: 1}).sort({a: 1}).  SERVER-13908.
+                    // - Index {a: 1, b: "2dsphere"} (which is "geo-sparse", if
+                    //   2dsphereIndexVersion=2) should be able to provide a sort for
+                    //   find({b: GEO}).sort({a:1}).  SERVER-10801.
+
                     const BSONObj kp = LiteParsedQuery::normalizeSortOrder(index.keyPattern);
                     if (providesSort(query, kp)) {
                         QLOG() << "Planner: outputting soln that uses index to provide sort."
                                << endl;
-                        QuerySolution* soln = buildWholeIXSoln(params.indices[i], query, params);
+                        QuerySolution* soln = buildWholeIXSoln(params.indices[i],
+                                                               query, params);
                         if (NULL != soln) {
                             PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
                             indexTree->setIndexEntry(params.indices[i]);
@@ -833,7 +864,8 @@ namespace mongo {
                     if (providesSort(query, QueryPlannerCommon::reverseSortObj(kp))) {
                         QLOG() << "Planner: outputting soln that uses (reverse) index "
                                << "to provide sort." << endl;
-                        QuerySolution* soln = buildWholeIXSoln(params.indices[i], query, params, -1);
+                        QuerySolution* soln = buildWholeIXSoln(params.indices[i], query,
+                                                               params, -1);
                         if (NULL != soln) {
                             PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
                             indexTree->setIndexEntry(params.indices[i]);

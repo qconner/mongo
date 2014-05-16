@@ -60,6 +60,7 @@
  *          Can be used to specify options that are common all config servers.
  *       mongosOptions {Object}: same as the mongos property above.
  *          Can be used to specify options that are common all mongos.
+ *       enableBalancer  {boolean} : if true, enable the balancer
  * 
  *       // replica Set only:
  *       rsOptions {Object}: same as the rs property above. Can be used to
@@ -377,6 +378,11 @@ ShardingTest = function( testName , numShards , verboseLevel , numMongos , other
 
     var admin = this.admin = this.s.getDB( "admin" );
     this.config = this.s.getDB( "config" );
+
+    // Disable the balancer unless it is explicitly turned on
+    if ( !otherParams.enableBalancer ) {
+        this.stopBalancer();
+    }
 
     if ( ! otherParams.manualAddShard ){
         this._shardNames = []
@@ -896,8 +902,8 @@ ShardingTest.prototype.isSharded = function( collName ){
     
 }
 
-ShardingTest.prototype.shardGo = function( collName , key , split , move , dbName ){
-    
+ShardingTest.prototype.shardGo = function( collName , key , split , move , dbName, waitForDelete ){
+
     split = ( split != false ? ( split || key ) : split )
     move = ( split != false && move != false ? ( move || split ) : false )
     
@@ -932,7 +938,7 @@ ShardingTest.prototype.shardGo = function( collName , key , split , move , dbNam
     
     var result = null
     for( var i = 0; i < 5; i++ ){
-        result = this.s.adminCommand( { movechunk : c , find : move , to : this.getOther( this.getServer( dbName ) ).name } );
+        result = this.s.adminCommand( { movechunk : c , find : move , to : this.getOther( this.getServer( dbName ) ).name, _waitForDelete: waitForDelete } );
         if( result.ok ) break;
         sleep( 5 * 1000 );
     }

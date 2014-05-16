@@ -50,7 +50,6 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/lite_parsed_query.h"
-#include "mongo/db/queryutil.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/config.h"
@@ -120,7 +119,7 @@ namespace mongo {
             virtual bool passOptions() const { return false; }
 
             // all grid commands are designed not to lock
-            virtual LockType locktype() const { return NONE; }
+            virtual bool isWriteCommandForConfigServer() const { return false; }
 
         protected:
 
@@ -156,14 +155,18 @@ namespace mongo {
 
         class RunOnAllShardsCommand : public Command {
         public:
-            RunOnAllShardsCommand(const char* n, const char* oldname=NULL) : Command(n, false, oldname) {}
+            RunOnAllShardsCommand(const char* n,
+                                  const char* oldname=NULL,
+                                  bool useShardConn = false):
+                                      Command(n, false, oldname),
+                                      _useShardConn(useShardConn) {
+            }
 
             virtual bool slaveOk() const { return true; }
             virtual bool adminOnly() const { return false; }
 
             // all grid commands are designed not to lock
-            virtual LockType locktype() const { return NONE; }
-
+            virtual bool isWriteCommandForConfigServer() const { return false; }
 
             // default impl uses all shards for DB
             virtual void getShards(const string& dbName , BSONObj& cmdObj, set<Shard>& shards) {
@@ -181,7 +184,7 @@ namespace mongo {
             }
 
             // don't override
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& output, bool) {
+            virtual bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& output, bool) {
                 LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj << endl;
                 set<Shard> shards;
                 getShards(dbName, cmdObj, shards);
@@ -190,7 +193,12 @@ namespace mongo {
 
                 list< shared_ptr<Future::CommandResult> > futures;
                 for ( set<Shard>::const_iterator i=shards.begin(), end=shards.end() ; i != end ; i++ ) {
-                    futures.push_back( Future::spawnCommand( i->getConnString() , dbName , cmdObj, 0 ) );
+                    futures.push_back( Future::spawnCommand( i->getConnString(),
+                                                             dbName,
+                                                             cmdObj,
+                                                             0,
+                                                             NULL,
+                                                             _useShardConn ));
                 }
 
                 vector<BSONObj> results;
@@ -266,11 +274,17 @@ namespace mongo {
                 return true;
             }
 
+        private:
+            bool _useShardConn; // use ShardConnection as opposed to ScopedDbConnection
         };
 
         class AllShardsCollectionCommand : public RunOnAllShardsCommand {
         public:
-            AllShardsCollectionCommand(const char* n, const char* oldname=NULL) : RunOnAllShardsCommand(n, oldname) {}
+            AllShardsCollectionCommand(const char* n,
+                                       const char* oldname = NULL,
+                                       bool useShardConn = false):
+                                           RunOnAllShardsCommand(n, oldname, useShardConn) {
+            }
 
             virtual void getShards(const string& dbName , BSONObj& cmdObj, set<Shard>& shards) {
                 string fullns = dbName + '.' + cmdObj.firstElement().valuestrsafe();
@@ -294,7 +308,7 @@ namespace mongo {
             // TODO(spencer): remove this in favor of using parseNs
             virtual string getFullNS( const string& dbName , const BSONObj& cmdObj ) = 0;
 
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
+            virtual bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
                 string fullns = getFullNS( dbName , cmdObj );
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
@@ -323,7 +337,13 @@ namespace mongo {
 
         class CreateIndexesCmd : public AllShardsCollectionCommand {
         public:
-            CreateIndexesCmd() :  AllShardsCollectionCommand("createIndexes") {}
+            CreateIndexesCmd():
+                AllShardsCollectionCommand("createIndexes",
+                                           NULL, /* oldName */
+                                           true /* use ShardConnection */) {
+                // createIndexes command should use ShardConnection so the getLastError would
+                // be able to properly enforce the write concern (via the saveGLEStats callback).
+            }
 
             /**
              * the createIndexes command doesn't require the 'ns' field to be populated
@@ -453,7 +473,7 @@ namespace mongo {
         class ProfileCmd : public PublicGridCommand {
         public:
             ProfileCmd() :  PublicGridCommand("profile") {}
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
+            virtual bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
                 errmsg = "profile currently not supported via mongos";
                 return false;
             }
@@ -600,7 +620,7 @@ namespace mongo {
 
                 return Status(ErrorCodes::Unauthorized, "unauthorized");
             }
-            bool run(const string& dbName,
+            bool run(OperationContext* txn, const string& dbName,
                      BSONObj& cmdObj,
                      int,
                      string&,
@@ -621,7 +641,7 @@ namespace mongo {
                 actions.addAction(ActionType::dropCollection);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
-            bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string collection = cmdObj.firstElement().valuestrsafe();
                 string fullns = dbName + "." + collection;
 
@@ -669,7 +689,7 @@ namespace mongo {
                 actions.addAction(ActionType::dropDatabase);
                 out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
             }
-            bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 // disallow dropping the config database from mongos
                 if( dbName == "config" ) {
                     errmsg = "Cannot drop 'config' database via mongos";
@@ -740,7 +760,7 @@ namespace mongo {
             virtual bool adminOnly() const {
                 return true;
             }
-            bool run(const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string fullnsFrom = cmdObj.firstElement().valuestrsafe();
                 string dbNameFrom = nsToDatabase( fullnsFrom );
                 DBConfigPtr confFrom = grid.getDBConfig( dbNameFrom , false );
@@ -773,7 +793,7 @@ namespace mongo {
                                                const BSONObj& cmdObj) {
                 return copydb::checkAuthForCopydbCommand(client, dbname, cmdObj);
             }
-            bool run(const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string todb = cmdObj.getStringField("todb");
                 uassert(13402, "need a todb argument", !todb.empty());
 
@@ -823,7 +843,31 @@ namespace mongo {
                 actions.addAction(ActionType::find);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
-            bool run( const string& dbName,
+            long long applySkipLimit( long long num , const BSONObj& cmd ) {
+                BSONElement s = cmd["skip"];
+                BSONElement l = cmd["limit"];
+
+                if ( s.isNumber() ) {
+                    num = num - s.numberLong();
+                    if ( num < 0 ) {
+                        num = 0;
+                    }
+                }
+
+                if ( l.isNumber() ) {
+                    long long limit = l.numberLong();
+                    if( limit < 0 ){
+                        limit = -limit;
+                    }
+
+                    if ( limit < num && limit != 0 ) { // 0 limit means no limit
+                        num = limit;
+                    }
+                }
+
+                return num;
+            }
+            bool run(OperationContext* txn, const string& dbName,
                     BSONObj& cmdObj,
                     int options,
                     string& errmsg,
@@ -934,7 +978,7 @@ namespace mongo {
                 actions.addAction(ActionType::collStats);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
-            bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string collection = cmdObj.firstElement().valuestrsafe();
                 string fullns = dbName + "." + collection;
 
@@ -1002,7 +1046,17 @@ namespace mongo {
                                 indexSizes[temp.fieldName()] += temp.numberLong();
                             }
                         }
+                        // no longer used since 2.2
                         else if ( str::equals( e.fieldName() , "flags" ) ) {
+                            if ( ! result.hasField( e.fieldName() ) )
+                                result.append( e );
+                        }
+                        // flags broken out in 2.4+
+                        else if ( str::equals( e.fieldName() , "systemFlags" ) ) {
+                            if ( ! result.hasField( e.fieldName() ) )
+                                result.append( e );
+                        }
+                        else if ( str::equals( e.fieldName() , "userFlags" ) ) {
                             if ( ! result.hasField( e.fieldName() ) )
                                 result.append( e );
                         }
@@ -1069,7 +1123,7 @@ namespace mongo {
                                                std::vector<Privilege>* out) {
                 find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
             }
-            bool run(const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string collection = cmdObj.firstElement().valuestrsafe();
                 string fullns = dbName + "." + collection;
 
@@ -1120,7 +1174,7 @@ namespace mongo {
                 actions.addAction(ActionType::find);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
-            bool run(const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string fullns = cmdObj.firstElement().String();
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
@@ -1225,13 +1279,13 @@ namespace mongo {
                 }
                 return Status::OK();
             }
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
+            virtual bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
                 string x = parseNs(dbName, cmdObj);
                 if ( ! str::startsWith( x , dbName ) ) {
                     errmsg = str::stream() << "doing a splitVector across dbs isn't supported via mongos";
                     return false;
                 }
-                return NotAllowedOnShardedCollectionCmd::run( dbName , cmdObj , options , errmsg, result, false );
+                return NotAllowedOnShardedCollectionCmd::run( txn, dbName , cmdObj , options , errmsg, result, false );
             }
             virtual std::string parseNs(const string& dbname, const BSONObj& cmdObj) const {
                 return parseNsFullyQualified(dbname, cmdObj);
@@ -1257,7 +1311,7 @@ namespace mongo {
                 actions.addAction(ActionType::find);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
-            bool run(const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
                 string collection = cmdObj.firstElement().valuestrsafe();
                 string fullns = dbName + "." + collection;
 
@@ -1330,7 +1384,7 @@ namespace mongo {
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::find));
             }
 
-            bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 const std::string fullns = parseNs(dbName, cmdObj);
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
 
@@ -1443,7 +1497,7 @@ namespace mongo {
                 actions.addAction(ActionType::find);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
-            bool run(const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int options, string& errmsg, BSONObjBuilder& result, bool) {
                 string collection = cmdObj.firstElement().valuestrsafe();
                 string fullns = dbName + "." + collection;
 
@@ -1642,11 +1696,11 @@ namespace mongo {
                 }
             }
 
-            bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-                return run( dbName, cmdObj, errmsg, result, 0 );
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+                return run( txn, dbName, cmdObj, errmsg, result, 0 );
             }
 
-            bool run(const string& dbName , BSONObj& cmdObj, string& errmsg, BSONObjBuilder& result, int retry ) {
+            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, string& errmsg, BSONObjBuilder& result, int retry ) {
                 Timer t;
 
                 string collection = cmdObj.firstElement().valuestrsafe();
@@ -2015,7 +2069,7 @@ namespace mongo {
                 // applyOps can do pretty much anything, so require all privileges.
                 RoleGraph::generateUniversalPrivileges(out);
             }
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            virtual bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 errmsg = "applyOps not allowed through mongos";
                 return false;
             }
@@ -2032,7 +2086,7 @@ namespace mongo {
                 actions.addAction(ActionType::compact);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            virtual bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 errmsg = "compact not allowed through mongos";
                 return false;
             }
@@ -2047,7 +2101,7 @@ namespace mongo {
                 // $eval can do pretty much anything, so require all privileges.
                 RoleGraph::generateUniversalPrivileges(out);
             }
-            virtual bool run(const string& dbName,
+            virtual bool run(OperationContext* txn, const string& dbName,
                              BSONObj& cmdObj,
                              int,
                              string&,
@@ -2072,7 +2126,7 @@ namespace mongo {
             virtual void addRequiredPrivileges(const std::string& dbname,
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out);
-            virtual bool run(const string &dbName , BSONObj &cmdObj,
+            virtual bool run(OperationContext* txn, const string &dbName , BSONObj &cmdObj,
                              int options, string &errmsg,
                              BSONObjBuilder &result, bool fromRepl);
 
@@ -2128,7 +2182,7 @@ namespace mongo {
             Pipeline::addRequiredPrivileges(this, dbname, cmdObj, out);
         }
 
-        bool PipelineCommand::run(const string &dbName , BSONObj &cmdObj,
+        bool PipelineCommand::run(OperationContext* txn, const string &dbName , BSONObj &cmdObj,
                                   int options, string &errmsg,
                                   BSONObjBuilder &result, bool fromRepl) {
             const string fullns = parseNs(dbName, cmdObj);
@@ -2489,7 +2543,8 @@ namespace mongo {
         }
         ClientInfo *client = ClientInfo::get();
 
-        execCommandClientBasic(c, *client, queryOptions, ns, jsobj, anObjBuilder, false);
+        OperationContext* noTxn = NULL; // mongos doesn't use transactions SERVER-13931
+        execCommandClientBasic(noTxn, c, *client, queryOptions, ns, jsobj, anObjBuilder, false);
     }
 
 } // namespace mongo

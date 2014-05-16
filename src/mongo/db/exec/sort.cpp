@@ -30,11 +30,13 @@
 
 #include <algorithm>
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_key_generator.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_planner.h"
 
 namespace mongo {
@@ -43,7 +45,10 @@ namespace mongo {
 
     const size_t kMaxBytes = 32 * 1024 * 1024;
 
-    SortStageKeyGenerator::SortStageKeyGenerator(const BSONObj& sortSpec, const BSONObj& queryObj) {
+    SortStageKeyGenerator::SortStageKeyGenerator(const Collection* collection,
+                                                 const BSONObj& sortSpec,
+                                                 const BSONObj& queryObj) {
+        _collection = collection;
         _hasBounds = false;
         _sortHasMeta = false;
         _rawSortSpec = sortSpec;
@@ -167,21 +172,9 @@ namespace mongo {
         BSONObjCmp patternCmp(_btreeObj);
         BSONObjSet keys(patternCmp);
 
-        try {
-            _keyGen->getKeys(memberObj, &keys);
-        }
-        catch (const UserException& e) {
-            // Probably a parallel array.
-            if (BtreeKeyGenerator::ParallelArraysCode == e.getCode()) {
-                return Status(ErrorCodes::BadValue,
-                              "cannot sort with keys that are parallel arrays");
-            }
-            else {
-                return e.toStatus();
-            }
-        }
-        catch (...) {
-            return Status(ErrorCodes::InternalError, "unknown error during sort key generation");
+        Status keygenStatus = _keyGen->getKeys(memberObj, &keys);
+        if (!keygenStatus.isOK()) {
+            return keygenStatus;
         }
 
         // Key generator isn't sparse so we should at least get an all-null key.
@@ -223,12 +216,12 @@ namespace mongo {
         params.indices.push_back(sortOrder);
 
         CanonicalQuery* rawQueryForSort;
-        verify(CanonicalQuery::canonicalize("fake_ns",
-                                            queryObj,
-                                            &rawQueryForSort).isOK());
+        verify(CanonicalQuery::canonicalize(
+                "fake_ns", queryObj, &rawQueryForSort, WhereCallbackNoop()).isOK());
         auto_ptr<CanonicalQuery> queryForSort(rawQueryForSort);
 
         vector<QuerySolution*> solns;
+        QLOG() << "Sort stage: Planning to obtain bounds for sort." << endl;
         QueryPlanner::plan(*queryForSort, params, &solns);
 
         // TODO: are there ever > 1 solns?  If so, do we look for a specific soln?
@@ -273,7 +266,8 @@ namespace mongo {
     }
 
     SortStage::SortStage(const SortStageParams& params, WorkingSet* ws, PlanStage* child)
-        : _ws(ws),
+        : _collection(params.collection),
+          _ws(ws),
           _child(child),
           _pattern(params.pattern),
           _query(params.query),
@@ -281,7 +275,6 @@ namespace mongo {
           _sorted(false),
           _resultIterator(_data.end()),
           _memUsage(0) {
-        dassert(_limit >= 0);
     }
 
     SortStage::~SortStage() { }
@@ -297,7 +290,7 @@ namespace mongo {
 
         if (NULL == _sortKeyGen) {
             // This is heavy and should be done as part of work().
-            _sortKeyGen.reset(new SortStageKeyGenerator(_pattern, _query));
+            _sortKeyGen.reset(new SortStageKeyGenerator(_collection, _pattern, _query));
             _sortKeyComparator.reset(new WorkingSetComparator(_sortKeyGen->getSortComparator()));
             // If limit > 1, we need to initialize _dataSet here to maintain ordered
             // set of data items while fetching from the child stage.
@@ -436,7 +429,7 @@ namespace mongo {
             WorkingSetMember* member = _ws->get(it->second);
             verify(member->loc == dl);
 
-            WorkingSetCommon::fetchAndInvalidateLoc(member);
+            WorkingSetCommon::fetchAndInvalidateLoc(member, _collection);
 
             // Remove the DiskLoc from our set of active DLs.
             _wsidByDiskLoc.erase(it);
@@ -515,8 +508,8 @@ namespace mongo {
             const SortableDataItem& lastItem = *lastItemIt;
             const WorkingSetComparator& cmp = *_sortKeyComparator;
             if (cmp(item, lastItem)) {
-                _memUsage += _ws->get(item.wsid)->getMemUsage() -
-                             _ws->get(lastItem.wsid)->getMemUsage();
+                _memUsage -= _ws->get(lastItem.wsid)->getMemUsage();
+                _memUsage += _ws->get(item.wsid)->getMemUsage();
                 wsidToFree = lastItem.wsid;
                 // According to std::set iterator validity rules,
                 // it does not matter which of erase()/insert() happens first.
