@@ -42,6 +42,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/md5.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
 
 
@@ -766,7 +767,7 @@ namespace mongo {
              before = before.getOwned();
          }
 
-         // Start threads
+         // Start threads  qqq
          for ( unsigned i = 0; i < _config->parallel; i++ ) {
              BenchRunWorker *worker = new BenchRunWorker(i, _config.get(), &_brState);
              worker->start();
@@ -894,7 +895,19 @@ namespace mongo {
 
          OID oid = OID( start.firstElement().String() );
          BenchRunner* runner = BenchRunner::get( oid );
+
+         // qqq
+         long long t1 = curTimeMillis64();
          sleepmillis( (int)(1000.0 * runner->config().seconds) );
+         long long t2 = curTimeMillis64();
+
+         long long elapsed = t2 - t1;
+         log() << elapsed << " msec elapsed";
+
+         long long desired = (long)(1000.0 * runner->config().seconds);
+         log() << desired << " desired msec";
+
+         verify(elapsed >= desired);  // identify any interrupted sleep() system calls?
 
          return benchFinish( start, data );
      }
@@ -921,7 +934,7 @@ namespace mongo {
 
         OID oid = OID( argsFake.firstElement().String() );
 
-        // Get new BenchRunner object
+        // Get old BenchRunner object
         BenchRunner* runner = BenchRunner::get( oid );
 
         BSONObj finalObj = BenchRunner::finish( runner );
