@@ -422,6 +422,7 @@ namespace mongo {
 
         OID _oid;
         BenchRunState _brState;
+        double _elapsed;  // elapsed seconds (measured) for last test
         boost::scoped_ptr<BenchRunConfig> _config;
         vector<BenchRunWorker *> _workers;
 

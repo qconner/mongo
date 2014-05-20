@@ -873,7 +873,7 @@ namespace mongo {
                  BSONElement e = i.next();
                  double x = e.number();
                  x -= before[e.fieldName()].number();
-                 buf.append( e.fieldName() , x / runner->_config->seconds );
+                 buf.append( e.fieldName() , x / runner->_elapsed );
              }
          }
 
@@ -908,6 +908,7 @@ namespace mongo {
          log() << desired << " desired msec";
 
          verify(elapsed >= desired);  // identify any interrupted sleep() system calls?
+         runner->_elapsed = elapsed * 1000;
 
          return benchFinish( start, data );
      }
