@@ -908,7 +908,7 @@ namespace mongo {
          log() << desired << " desired msec";
 
          verify(elapsed >= desired);  // identify any interrupted sleep() system calls?
-         runner->_elapsed = elapsed * 1000;
+         runner->_elapsed = elapsed / 1000.0;
 
          return benchFinish( start, data );
      }
