@@ -767,7 +767,7 @@ namespace mongo {
              before = before.getOwned();
          }
 
-         // Start threads  qqq
+         // Start threads
          for ( unsigned i = 0; i < _config->parallel; i++ ) {
              BenchRunWorker *worker = new BenchRunWorker(i, _config.get(), &_brState);
              worker->start();
@@ -775,11 +775,13 @@ namespace mongo {
          }
 
          _brState.waitForState(BenchRunState::BRS_RUNNING);
+         _brTimer = new mongo::Timer();
      }
 
      void BenchRunner::stop() {
          _brState.tellWorkersToFinish();
          _brState.waitForState(BenchRunState::BRS_FINISHED);
+         _microsElapsed = _brTimer->micros();
 
          {
              boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
@@ -873,7 +875,7 @@ namespace mongo {
                  BSONElement e = i.next();
                  double x = e.number();
                  x -= before[e.fieldName()].number();
-                 buf.append( e.fieldName() , x / runner->_elapsed );
+                 buf.append( e.fieldName() , x / (runner->_microsElapsed / 1000000.0) );
              }
          }
 
@@ -896,19 +898,21 @@ namespace mongo {
          OID oid = OID( start.firstElement().String() );
          BenchRunner* runner = BenchRunner::get( oid );
 
-         // qqq
-         long long t1 = curTimeMillis64();
+         //long long t1 = curTimeMillis64();
+         //Timer myTimer;
          sleepmillis( (int)(1000.0 * runner->config().seconds) );
-         long long t2 = curTimeMillis64();
+         //long long e = myTimer.micros();
+         //long long t2 = curTimeMillis64();
 
-         long long elapsed = t2 - t1;
-         log() << elapsed << " msec elapsed";
+         //long long elapsed = t2 - t1;
+         //log() << elapsed << " msec elapsed";
+         //log() << e << " usec elapsed";
 
-         long long desired = (long)(1000.0 * runner->config().seconds);
-         log() << desired << " desired msec";
+         //long long desired = (long)(1000.0 * runner->config().seconds);
+         //log() << desired << " desired msec";
 
-         verify(elapsed >= desired);  // identify any interrupted sleep() system calls?
-         runner->_elapsed = elapsed / 1000.0;
+         //verify(elapsed >= desired);  // identify any interrupted sleep() system calls?
+         //runner->_elapsed = elapsed / 1000.0;
 
          return benchFinish( start, data );
      }
