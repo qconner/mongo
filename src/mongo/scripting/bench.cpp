@@ -876,7 +876,10 @@ namespace mongo {
                  BSONElement e = i.next();
                  double x = e.number();
                  x -= before[e.fieldName()].number();
-                 buf.append( e.fieldName() , x / (runner->_microsElapsed / 1000000.0) );
+                 std::string s = e.fieldName();
+                 buf.append( s, x / (runner->_microsElapsed / 1000000.0) );
+                 s += "_old";
+                 buf.append( s, x / runner->config().seconds );
              }
          }
 
