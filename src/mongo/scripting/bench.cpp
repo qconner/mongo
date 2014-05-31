@@ -782,7 +782,7 @@ namespace mongo {
          _brState.tellWorkersToFinish();
          _brState.waitForState(BenchRunState::BRS_FINISHED);
          _microsElapsed = _brTimer->micros();
-         delete(_brTimer);
+         delete _brTimer;
 
          {
              boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
