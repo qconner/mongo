@@ -76,7 +76,7 @@ namespace mongo {
                 return false;
             }
 
-            Client::ReadContext ctx(ns);
+            Client::ReadContext ctx(txn, ns);
 
             Database* db = ctx.ctx().db();
             if ( !db ) {
@@ -84,7 +84,7 @@ namespace mongo {
                 return false;
             }
 
-            Collection* collection = db->getCollection( ns );
+            Collection* collection = db->getCollection( txn, ns );
             if ( !collection ) {
                 errmsg = "can't find ns";
                 return false;
@@ -257,7 +257,7 @@ namespace mongo {
 
             stats.append("avgDistance", totalDistance / results);
             stats.append("maxDistance", farthestDist);
-            stats.append("time", cc().curop()->elapsedMillis());
+            stats.append("time", txn->getCurOp()->elapsedMillis());
             stats.done();
 
             return true;

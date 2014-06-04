@@ -41,8 +41,8 @@ namespace mongo {
             unsigned _intervalMicros;
             struct S {
                 BSONObj _asObj();
-                string _asCSV();
-                string _CSVHeader();
+                std::string _asCSV();
+                std::string _CSVHeader();
                 void reset();
 
                 unsigned _commits;
@@ -51,10 +51,10 @@ namespace mongo {
                 unsigned long long _uncompressedBytes;
                 unsigned long long _writeToDataFilesBytes;
 
-                unsigned long long _prepLogBufferMicros;
-                unsigned long long _writeToJournalMicros;
-                unsigned long long _writeToDataFilesMicros;
-                unsigned long long _remapPrivateViewMicros;
+                long long _prepLogBufferMicros;
+                long long _writeToJournalMicros;
+                long long _writeToDataFilesMicros;
+                long long _remapPrivateViewMicros;
 
                 // undesirable to be in write lock for the group commit (it can be done in a read lock), so good if we
                 // have visibility when this happens.  can happen for a couple reasons
@@ -63,7 +63,7 @@ namespace mongo {
                 // - data being written faster than the normal group commit interval
                 unsigned _commitsInWriteLock;
 
-                unsigned _dtMillis;
+                int _dtMillis;
             };
             S *curr;
         private:

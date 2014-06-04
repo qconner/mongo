@@ -57,6 +57,7 @@ namespace mongo {
         int64_t asInt64() const {
             return static_cast<int64_t>(millis);
         }
+        bool isFormatable() const;
     };
 
     // uses ISO 8601 dates without trailing Z
@@ -95,7 +96,7 @@ namespace mongo {
     std::string dateToCtimeString(Date_t date);
 
     /**
-     * Parses a Date_t from an ISO 8601 string representation.
+     * Parses a Date_t from an ISO 8601 std::string representation.
      *
      * Sample formats: "2013-07-23T18:42:14.072-05:00"
      *                 "2013-07-23T18:42:14.072Z"

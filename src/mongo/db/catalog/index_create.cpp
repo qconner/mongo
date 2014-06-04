@@ -37,7 +37,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/extsort.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile_private.h"
 #include "mongo/db/query/internal_plans.h"
@@ -45,8 +44,6 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/structure/catalog/index_details.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/progress_meter.h"
 
@@ -66,7 +63,7 @@ namespace mongo {
         options.dupsAllowed = true;
 
         if ( descriptor->isIdIndex() || descriptor->unique() ) {
-            if ( !ignoreUniqueIndex( descriptor ) ) {
+            if (!repl::ignoreUniqueIndex(descriptor)) {
                 options.dupsAllowed = false;
             }
         }
@@ -96,10 +93,9 @@ namespace mongo {
             curopMessage = ss.str();
         }
 
-        ProgressMeter& progress =
-            cc().curop()->setMessage( curopMessage.c_str(),
-                                      curopMessage,
-                                      collection->numRecords() );
+        ProgressMeter* progress = txn->setMessage(curopMessage.c_str(),
+                                                  curopMessage,
+                                                  collection->numRecords());
 
         unsigned long long n = 0;
         unsigned long long numDropped = 0;
@@ -135,9 +131,9 @@ namespace mongo {
                     runner->saveState();
                     BSONObj toDelete;
                     collection->deleteDocument( txn, loc, false, true, &toDelete );
-                    logOp( txn, "d", ns.c_str(), toDelete );
+                    repl::logOp(txn, "d", ns.c_str(), toDelete);
 
-                    if (!runner->restoreState()) {
+                    if (!runner->restoreState(txn)) {
                         // Runner got killed somehow.  This probably shouldn't happen.
                         if (runnerEOF) {
                             // Quote: "We were already at the end.  Normal.
@@ -160,7 +156,7 @@ namespace mongo {
             }
 
             n++;
-            progress.hit();
+            progress->hit();
 
             txn->recoveryUnit()->commitIfNeeded();
 
@@ -173,10 +169,10 @@ namespace mongo {
                 txn->checkForInterrupt();
             }
 
-            progress.setTotalWhileRunning( collection->numRecords() );
+            progress->setTotalWhileRunning( collection->numRecords() );
         }
 
-        progress.finished();
+        progress->finished();
         if ( dropDups && numDropped )
             log() << "\t index build dropped: " << numDropped << " dups";
         return n;
@@ -190,17 +186,18 @@ namespace mongo {
                        IndexCatalogEntry* btreeState,
                        bool mayInterrupt ) {
 
-        string ns = collection->ns().ns(); // our copy
+        const string ns = collection->ns().ns(); // our copy
+        verify(txn->lockState()->isWriteLocked(ns));
+
         const IndexDescriptor* idx = btreeState->descriptor();
         const BSONObj& idxInfo = idx->infoObj();
 
-        MONGO_TLOG(0) << "build index on: " << ns
-                      << " properties: " << idx->toString() << endl;
+        LOG(0) << "build index on: " << ns
+               << " properties: " << idx->toString() << endl;
         audit::logCreateIndex( currentClient.get(), &idxInfo, idx->indexName(), ns );
 
         Timer t;
 
-        verify( Lock::isWriteLocked( ns ) );
         // this is so that people know there are more keys to look at when doing
         // things like in place updates, etc...
         collection->infoCache()->addedIndex();
@@ -210,7 +207,7 @@ namespace mongo {
             massert( 17343,
                      str::stream() << "IndexAccessMethod::initializeAsEmpty failed" << status.toString(),
                      status.isOK() );
-            MONGO_TLOG(0) << "\t added index to empty collection";
+            LOG(0) << "\t added index to empty collection";
             return;
         }
 
@@ -233,7 +230,8 @@ namespace mongo {
                  << status.toString(),
                  status.isOK() );
 
-        IndexAccessMethod* bulk = doInBackground ? NULL : btreeState->accessMethod()->initiateBulk(txn);
+        IndexAccessMethod* bulk = doInBackground ?
+            NULL : btreeState->accessMethod()->initiateBulk(txn);
         scoped_ptr<IndexAccessMethod> bulkHolder(bulk);
         IndexAccessMethod* iam = bulk ? bulk : btreeState->accessMethod();
 
@@ -274,8 +272,8 @@ namespace mongo {
                                             false /* cappedOk */,
                                             true /* noWarn */,
                                             &toDelete );
-                if (isMasterNs(ns.c_str())) {
-                    logOp( txn, "d", ns.c_str(), toDelete );
+                if (repl::isMasterNs(ns.c_str())) {
+                    repl::logOp(txn, "d", ns.c_str(), toDelete);
                 }
                 
                 txn->recoveryUnit()->commitIfNeeded();
@@ -287,8 +285,8 @@ namespace mongo {
         }
 
         verify( !btreeState->head().isNull() );
-        MONGO_TLOG(0) << "build index done.  scanned " << n << " total records. "
-                      << t.millis() / 1000.0 << " secs" << endl;
+        LOG(0) << "build index done.  scanned " << n << " total records. "
+               << t.millis() / 1000.0 << " secs" << endl;
 
         // this one is so people know that the index is finished
         collection->infoCache()->addedIndex();
@@ -324,7 +322,7 @@ namespace mongo {
         for ( size_t i = 0; i < indexSpecs.size(); i++ ) {
             BSONObj info = indexSpecs[i];
             StatusWith<BSONObj> statusWithInfo =
-                _collection->getIndexCatalog()->prepareSpecForCreate( info );
+                _collection->getIndexCatalog()->prepareSpecForCreate( _txn, info );
             Status status = statusWithInfo.getStatus();
             if ( !status.isOK() )
                 return status;

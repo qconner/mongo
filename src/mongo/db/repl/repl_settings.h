@@ -36,6 +36,7 @@
 
 
 namespace mongo {
+namespace repl {
 
     bool anyReplEnabled();
 
@@ -96,4 +97,5 @@ namespace mongo {
     };
 
     extern ReplSettings replSettings;
-}
+} // namespace repl
+} // namespace mongo

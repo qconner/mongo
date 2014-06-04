@@ -34,7 +34,10 @@
 #include "mongo/db/repl/sync.h"
 
 namespace mongo {
-namespace replset {
+
+    class OperationContext;
+
+namespace repl {
 
     class BackgroundSyncInterface;
 
@@ -46,7 +49,9 @@ namespace replset {
     public:
         SyncTail(BackgroundSyncInterface *q);
         virtual ~SyncTail();
-        virtual bool syncApply(const BSONObj &o, bool convertUpdateToUpsert = false);
+        virtual bool syncApply(OperationContext* txn,
+                               const BSONObj &o,
+                               bool convertUpdateToUpsert = false);
 
         /**
          * Apply ops from applyGTEObj's ts to at least minValidObj's ts.  Note that, due to
@@ -134,5 +139,9 @@ namespace replset {
         void setOplogVersion(const BSONObj& op);
     };
 
-} // namespace replset
+    // These free functions are used by the thread pool workers to write ops to the db.
+    void multiSyncApply(const std::vector<BSONObj>& ops, SyncTail* st);
+    void multiInitialSyncApply(const std::vector<BSONObj>& ops, SyncTail* st);
+
+} // namespace repl
 } // namespace mongo

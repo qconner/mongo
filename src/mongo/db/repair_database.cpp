@@ -41,6 +41,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/util/file.h"
 #include "mongo/util/file_allocator.h"
+#include "mongo/util/mmap.h"
 
 namespace mongo {
 
@@ -275,6 +276,9 @@ namespace mongo {
                            string dbName,
                            bool preserveClonedFilesOnFailure,
                            bool backupOriginalFiles ) {
+        // We must hold some form of lock here
+        invariant(txn->lockState()->threadState());
+
         scoped_ptr<RepairFileDeleter> repairFileDeleter;
         doingRepair dr;
         dbName = nsToDatabase( dbName );
@@ -310,14 +314,17 @@ namespace mongo {
                                                             reservedPath ) );
 
         {
-            Database* originalDatabase = dbHolder().get( dbName, storageGlobalParams.dbpath );
-            if ( originalDatabase == NULL )
-                return Status( ErrorCodes::NamespaceNotFound, "database does not exist to repair" );
+            Database* originalDatabase = 
+                            dbHolder().get(dbName, storageGlobalParams.dbpath);
+            if (originalDatabase == NULL) {
+                return Status(ErrorCodes::NamespaceNotFound, "database does not exist to repair");
+            }
 
             Database* tempDatabase = NULL;
             {
                 bool justCreated = false;
-                tempDatabase = dbHolderW().getOrCreate( dbName, reservedPathString, justCreated );
+                tempDatabase = 
+                    dbHolder().getOrCreate(txn, dbName, reservedPathString, justCreated);
                 invariant( justCreated );
             }
 
@@ -325,7 +332,7 @@ namespace mongo {
             {
                 string ns = dbName + ".system.namespaces";
                 Client::Context ctx( ns );
-                Collection* coll = originalDatabase->getCollection( ns );
+                Collection* coll = originalDatabase->getCollection( txn, ns );
                 if ( coll ) {
                     scoped_ptr<RecordIterator> it( coll->getIterator( DiskLoc(),
                                                                           false,

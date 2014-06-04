@@ -32,6 +32,7 @@
 
 #include "mongo/base/counter.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/storage/extent.h"
 #include "mongo/db/storage/extent_manager.h"
@@ -139,7 +140,7 @@ namespace mongo {
                 }
                 if ( bestmatchlen < INT_MAX && --extra <= 0 )
                     break;
-                if ( ++chain > 30 && b < MaxBucket ) {
+                if ( ++chain > 30 && b <= MaxBucket ) {
                     // too slow, force move to next bucket to grab a big chunk
                     //b++;
                     freelistIterations.increment( chain );

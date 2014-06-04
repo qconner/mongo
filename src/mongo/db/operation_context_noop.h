@@ -27,8 +27,11 @@
  */
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
 
 #include "mongo/db/storage/recovery_unit_noop.h"
+#pragma once
 
 namespace mongo {
 
@@ -40,12 +43,23 @@ namespace mongo {
 
         virtual ~OperationContextNoop() { }
 
+        CurOp* getCurOp() const {
+            invariant(false);
+            return NULL;
+        }
+
         virtual RecoveryUnit* recoveryUnit() const {
             return _recoveryUnit.get();
         }
 
-        virtual ProgressMeter* setMessage(const char* msg,
-                                          const std::string& name ,
+        virtual LockState* lockState() const {
+            // TODO: Eventually, this should return an actual LockState object. For now,
+            //       LockState depends on the whole world and is not necessary for testing.
+            return NULL;
+        }
+
+        virtual ProgressMeter* setMessage(const char * msg,
+                                          const std::string &name,
                                           unsigned long long progressMeterTotal,
                                           int secondsBetween) {
             invariant(false);
@@ -57,6 +71,14 @@ namespace mongo {
         virtual Status checkForInterruptNoAssert() const {
             return Status::OK();
         }
+
+        virtual bool isPrimaryFor( const StringData& ns ) {
+            return true;
+        }
+
+        virtual const char * getNS() const {
+            return NULL;
+        };
 
     private:
         boost::scoped_ptr<RecoveryUnitNoop> _recoveryUnit;

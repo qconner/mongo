@@ -67,7 +67,7 @@ namespace mongo {
         
         void doTTLForDB( const string& dbName ) {
 
-            if ( !isMasterNs( dbName.c_str() ) )
+            if (!repl::isMasterNs(dbName.c_str()))
                 return;
 
             vector<BSONObj> indexes;
@@ -113,16 +113,17 @@ namespace mongo {
 
                 long long n = 0;
                 {
-                    string ns = idx["ns"].String();
-                    Client::WriteContext ctx( ns );
+                    const string ns = idx["ns"].String();
+
                     OperationContextImpl txn;
-                    Collection* collection = ctx.ctx().db()->getCollection( ns );
+                    Client::WriteContext ctx(&txn,  ns );
+                    Collection* collection = ctx.ctx().db()->getCollection( &txn, ns );
                     if ( !collection ) {
                         // collection was dropped
                         continue;
                     }
 
-                    if ( !isMasterNs( dbName.c_str() ) ) {
+                    if (!repl::isMasterNs(dbName.c_str())) {
                         // we've stepped down since we started this function,
                         // so we should stop working as we only do deletes on the primary
                         break;
@@ -166,12 +167,13 @@ namespace mongo {
                 }
 
                 // if part of replSet but not in a readable state (e.g. during initial sync), skip.
-                if ( theReplSet && !theReplSet->state().readable() )
+                if (repl::theReplSet && !repl::theReplSet->state().readable())
                     continue;
 
                 set<string> dbs;
                 {
-                    Lock::DBRead lk( "local" );
+                    OperationContextImpl txn;   // XXX?
+                    Lock::DBRead lk(txn.lockState(), "local");
                     dbHolder().getAllShortNames( dbs );
                 }
                 

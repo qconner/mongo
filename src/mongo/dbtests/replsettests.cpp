@@ -45,18 +45,14 @@
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/time_support.h"
 
-
-namespace mongo {
-    void createOplog();
-}
-
+using namespace mongo::repl;
 namespace ReplSetTests {
     const int replWriterThreadCount(32);
     const int replPrefetcherThreadCount(32);
     class ReplSetTest : public ReplSet {
         ReplSetConfig *_config;
         ReplSetConfig::MemberCfg *_myConfig;
-        replset::BackgroundSyncInterface *_syncTail;
+        BackgroundSyncInterface *_syncTail;
     public:
         static const int replWriterThreadCount;
         static const int replPrefetcherThreadCount;
@@ -65,7 +61,7 @@ namespace ReplSetTests {
             ret->init();
             // we need to get() the BackgroundSync so that it has its s_instance initialized
             // since applyOps() eventually calls notify() which makes use of the s_instance
-            replset::BackgroundSync::get();
+            BackgroundSync::get();
             return ret.release();
         }
         virtual ~ReplSetTest() {
@@ -78,7 +74,7 @@ namespace ReplSetTests {
         virtual bool isPrimary() {
             return false;
         }
-        virtual bool tryToGoLiveAsASecondary(OpTime& minvalid) {
+        virtual bool tryToGoLiveAsASecondary(OperationContext* txn, OpTime& minvalid) {
             return false;
         }
         virtual const ReplSetConfig& config() {
@@ -90,7 +86,7 @@ namespace ReplSetTests {
         virtual bool buildIndexes() const {
             return true;
         }
-        void setSyncTail(replset::BackgroundSyncInterface *syncTail) {
+        void setSyncTail(repl::BackgroundSyncInterface *syncTail) {
             _syncTail = syncTail;
         }
     private:
@@ -105,7 +101,7 @@ namespace ReplSetTests {
         }
     };
 
-    class BackgroundSyncTest : public replset::BackgroundSyncInterface {
+    class BackgroundSyncTest : public repl::BackgroundSyncInterface {
         std::queue<BSONObj> _queue;
     public:
         BackgroundSyncTest() {}
@@ -134,13 +130,16 @@ namespace ReplSetTests {
 
     class Base {
     private:
-        static DBDirectClient client_;
+        DBDirectClient _client;
+
     protected:
         static BackgroundSyncTest* _bgsync;
-        static replset::SyncTail* _tailer;
+        static repl::SyncTail* _tailer;
+
     public:
         Base() {
         }
+
         ~Base() {
         }
 
@@ -148,14 +147,15 @@ namespace ReplSetTests {
             return "unittests.repltests";
         }
 
-        DBDirectClient *client() const { return &client_; }
+        DBDirectClient *client() { return &_client; }
 
         static void insert( const BSONObj &o, bool god = false ) {
-            Lock::DBWrite lk(ns());
-            Client::Context ctx(ns());
             OperationContextImpl txn;
+            Lock::DBWrite lk(txn.lockState(), ns());
+            Client::Context ctx(ns());
+            
             Database* db = ctx.db();
-            Collection* coll = db->getCollection(ns());
+            Collection* coll = db->getCollection(&txn, ns());
             if (!coll) {
                 coll = db->createCollection(&txn, ns());
             }
@@ -173,17 +173,17 @@ namespace ReplSetTests {
             coll->insertDocument(&txn, b.obj(), true);
         }
 
-        BSONObj findOne( const BSONObj &query = BSONObj() ) const {
+        BSONObj findOne( const BSONObj &query = BSONObj() ) {
             return client()->findOne( ns(), query );
         }
 
         void drop() {
-            Client::WriteContext c(ns());
             OperationContextImpl txn;
+            Client::WriteContext c(&txn, ns());
 
             Database* db = c.ctx().db();
 
-            if ( db->getCollection( ns() ) == NULL ) {
+            if ( db->getCollection( &txn, ns() ) == NULL ) {
                 return;
             }
 
@@ -198,22 +198,21 @@ namespace ReplSetTests {
             _bgsync = new BackgroundSyncTest();
 
             // setup tail
-            _tailer = new replset::SyncTail(_bgsync);
+            _tailer = new repl::SyncTail(_bgsync);
 
             // setup theReplSet
             ReplSetTest *rst = ReplSetTest::make();
             rst->setSyncTail(_bgsync);
 
-            delete theReplSet;
-            theReplSet = rst;
+            delete repl::theReplSet;
+            repl::theReplSet = rst;
         }
     };
 
-    DBDirectClient Base::client_;
     BackgroundSyncTest* Base::_bgsync = NULL;
-    replset::SyncTail* Base::_tailer = NULL;
+    repl::SyncTail* Base::_tailer = NULL;
 
-    class MockInitialSync : public replset::InitialSync {
+    class MockInitialSync : public repl::InitialSync {
         int step;
     public:
         MockInitialSync() : InitialSync(0), step(0), failOnStep(SUCCEED), retry(true) {}
@@ -224,7 +223,7 @@ namespace ReplSetTests {
         bool retry;
 
         // instead of actually applying operations, we return success or failure
-        virtual bool syncApply(const BSONObj& o, bool convertUpdateToUpsert) {
+        virtual bool syncApply(OperationContext* txn, const BSONObj& o, bool convertUpdateToUpsert) {
             step++;
 
             if ((failOnStep == FAIL_FIRST_APPLY && step == 1) ||
@@ -235,7 +234,7 @@ namespace ReplSetTests {
             return true;
         }
 
-        virtual bool shouldRetry(const BSONObj& o) {
+        virtual bool shouldRetry(OperationContext* txn, const BSONObj& o) {
             return retry;
         }
     };
@@ -254,24 +253,24 @@ namespace ReplSetTests {
             // all three should succeed
             std::vector<BSONObj> ops;
             ops.push_back(obj);
-            replset::multiInitialSyncApply(ops, &mock);
+            repl::multiInitialSyncApply(ops, &mock);
 
             mock.failOnStep = MockInitialSync::FAIL_FIRST_APPLY;
-            replset::multiInitialSyncApply(ops, &mock);
+            repl::multiInitialSyncApply(ops, &mock);
 
             mock.retry = false;
-            replset::multiInitialSyncApply(ops, &mock);
+            repl::multiInitialSyncApply(ops, &mock);
 
             drop();
         }
     };
 
-    class SyncTest2 : public replset::InitialSync {
+    class SyncTest2 : public repl::InitialSync {
     public:
         bool insertOnRetry;
         SyncTest2() : InitialSync(0), insertOnRetry(false) {}
         virtual ~SyncTest2() {}
-        virtual bool shouldRetry(const BSONObj& o) {
+        virtual bool shouldRetry(OperationContext* txn, const BSONObj& o) {
             if (!insertOnRetry) {
                 return true;
             }
@@ -310,6 +309,8 @@ namespace ReplSetTests {
 
     class CappedInitialSync : public Base {
         string _cappedNs;
+
+        OperationContextImpl _txn;
         Lock::DBWrite _lk;
 
         string spec() const {
@@ -346,7 +347,8 @@ namespace ReplSetTests {
             return o;
         }
     public:
-        CappedInitialSync() : _cappedNs("unittests.foo.bar"), _lk(_cappedNs) {
+        CappedInitialSync() : 
+                _cappedNs("unittests.foo.bar"), _lk(_txn.lockState(), _cappedNs) {
             dropCapped();
             create();
         }
@@ -367,12 +369,13 @@ namespace ReplSetTests {
         }
 
         void run() {
-            Lock::DBWrite lk(_cappedNs);
+            OperationContextImpl txn;
+            Lock::DBWrite lk(txn.lockState(), _cappedNs);
 
             BSONObj op = updateFail();
 
             Sync s("");
-            verify(!s.shouldRetry(op));
+            verify(!s.shouldRetry(&txn, op));
         }
     };
 
@@ -390,35 +393,36 @@ namespace ReplSetTests {
             verify(apply(b.obj()));
         }
 
-        void insert() {
+        void insert(OperationContext* txn) {
             Client::Context ctx(cappedNs());
-            OperationContextImpl txn;
             Database* db = ctx.db();
-            Collection* coll = db->getCollection(&txn, cappedNs());
+            Collection* coll = db->getCollection(txn, cappedNs());
             if (!coll) {
-                coll = db->createCollection(&txn, cappedNs());
+                coll = db->createCollection(txn, cappedNs());
             }
 
             BSONObj o = BSON(GENOID << "x" << 456);
-            DiskLoc loc = coll->insertDocument(&txn, o, true).getValue();
+            DiskLoc loc = coll->insertDocument(txn, o, true).getValue();
             verify(!loc.isNull());
         }
     public:
         virtual ~CappedUpdate() {}
         void run() {
+            OperationContextImpl txn;
+
             // RARELY shoud be once/128x
             for (int i=0; i<150; i++) {
-                insert();
+                insert(&txn);
                 updateSucceed();
             }
 
-            DBDirectClient client;
+            DBDirectClient client(&txn);
             int count = (int) client.count(cappedNs(), BSONObj());
             verify(count > 1);
 
             // check _id index created
             Client::Context ctx(cappedNs());
-            Collection* collection = ctx.db()->getCollection( cappedNs() );
+            Collection* collection = ctx.db()->getCollection( &txn, cappedNs() );
             verify(collection->getIndexCatalog()->findIdIndex());
         }
     };
@@ -437,6 +441,7 @@ namespace ReplSetTests {
     public:
         virtual ~CappedInsert() {}
         void run() {
+            OperationContextImpl txn;
             // This will succeed, but not insert anything because they are changed to upserts
             for (int i=0; i<150; i++) {
                 insertSucceed();
@@ -445,7 +450,7 @@ namespace ReplSetTests {
             // this changed in 2.1.2
             // we now have indexes on capped collections
             Client::Context ctx(cappedNs());
-            Collection* collection = ctx.db()->getCollection( cappedNs() );
+            Collection* collection = ctx.db()->getCollection( &txn, cappedNs() );
             verify(collection->getIndexCatalog()->findIdIndex());
         }
     };
@@ -531,7 +536,7 @@ namespace ReplSetTests {
         void run() {
             const int expected = 100;
 
-            theReplSet->syncSourceFeedback.ensureMe();
+            repl::theReplSet->syncSourceFeedback.ensureMe();
 
             drop();
             addInserts(100);

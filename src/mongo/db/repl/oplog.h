@@ -29,11 +29,12 @@
 #pragma once
 
 namespace mongo {
-
     class BSONObj;
     class Database;
     class OperationContext;
     class OpTime;
+
+namespace repl {
 
     // These functions redefine the function for logOp(),
     // for either master/slave or replica sets.
@@ -77,13 +78,13 @@ namespace mongo {
                 bool fromMigrate = false);
 
     // Log an empty no-op operation to the local oplog
-    void logKeepalive();
+    void logKeepalive(OperationContext* txn);
 
     /** puts obj in the oplog as a comment (a no-op).  Just for diags.
         convention is
           { msg : "text", ... }
     */
-    void logOpComment(const BSONObj& obj);
+    void logOpComment(OperationContext* txn, const BSONObj& obj);
 
     // Flush out the cached pointers to the local database and oplog.
     // Used by the closeDatabase command to ensure we don't cache closed things.
@@ -111,5 +112,6 @@ namespace mongo {
     /**
      * Initializes the global OpTime with the value from the timestamp of the last oplog entry.
      */
-    void initOpTimeFromOplog(const std::string& oplogNS);
-}
+    void initOpTimeFromOplog(OperationContext* txn, const std::string& oplogNS);
+} // namespace repl
+} // namespace mongo

@@ -39,6 +39,7 @@
 
 namespace mongo {
 
+    class OperationContext;
     class PseudoRandom;
     class Runner;
 
@@ -72,7 +73,7 @@ namespace mongo {
          * note: must have a readlock on the collection
          * @return number timed out
          */
-        std::size_t timeoutCursors( unsigned millisSinceLastCall );
+        std::size_t timeoutCursors( int millisSinceLastCall );
 
         // -----------------
 
@@ -109,15 +110,15 @@ namespace mongo {
 
         // ----------------------
 
-        static int eraseCursorGlobalIfAuthorized( int n, long long* ids );
-        static bool eraseCursorGlobalIfAuthorized( CursorId id );
+        static int eraseCursorGlobalIfAuthorized(OperationContext* txn, int n, long long* ids);
+        static bool eraseCursorGlobalIfAuthorized(OperationContext* txn, CursorId id);
 
-        static bool eraseCursorGlobal( CursorId id );
+        static bool eraseCursorGlobal(OperationContext* txn, CursorId id);
 
         /**
          * @return number timed out
          */
-        static std::size_t timeoutCursorsGlobal( unsigned millisSinceLastCall );
+        static std::size_t timeoutCursorsGlobal(OperationContext* txn, int millisSinceLastCall);
 
     private:
         CursorId _allocateCursorId_inlock();

@@ -40,9 +40,14 @@
 */
 
 namespace mongo {
+    namespace threadpool {
+        class ThreadPool;
+    }
 
     class Database;
     class OperationContext;
+
+namespace repl {
 
     // Main entry point for master/slave at startup time.
     void startMasterSlave();
@@ -51,18 +56,16 @@ namespace mongo {
     extern volatile int relinquishSyncingSome;
     extern volatile int syncing;
 
-    // Global variable that contains a string telling why master/slave halted
+    // Global variable that contains a std::string telling why master/slave halted
     extern const char *replAllDead;
+
+    extern const char *replInfo;
 
     /* A replication exception */
     class SyncException : public DBException {
     public:
         SyncException() : DBException( "sync exception" , 10001 ) {}
     };
-
-    namespace threadpool {
-        class ThreadPool;
-    }
 
     /* A Source is a source from which we can pull (replicate) data.
        stored in collection local.sources.
@@ -80,30 +83,30 @@ namespace mongo {
         void resync(OperationContext* txn, const std::string& dbName);
 
         /** @param alreadyLocked caller already put us in write lock if true */
-        void sync_pullOpLog_applyOperation(BSONObj& op, bool alreadyLocked);
+        void _sync_pullOpLog_applyOperation(OperationContext* txn, BSONObj& op, bool alreadyLocked);
 
         /* pull some operations from the master's oplog, and apply them.
            calls sync_pullOpLog_applyOperation
         */
-        int sync_pullOpLog(int& nApplied);
+        int _sync_pullOpLog(OperationContext* txn, int& nApplied);
 
         /* we only clone one database per pass, even if a lot need done.  This helps us
            avoid overflowing the master's transaction log by doing too much work before going
            back to read more transactions. (Imagine a scenario of slave startup where we try to
            clone 100 databases in one pass.)
         */
-        set<string> addDbNextPass;
+        std::set<std::string> addDbNextPass;
 
-        set<string> incompleteCloneDbs;
+        std::set<std::string> incompleteCloneDbs;
 
         BSONObj _me;
 
         ReplSource();
 
-        void resyncDrop( OperationContext* txn, const string& db );
+        void resyncDrop( OperationContext* txn, const std::string& db );
         // call without the db mutex
         void syncToTailOfRemoteLog();
-        string ns() const { return string( "local.oplog.$" ) + sourceName(); }
+        std::string ns() const { return std::string( "local.oplog.$" ) + sourceName(); }
         unsigned _sleepAdviceTime;
 
         /**
@@ -124,18 +127,18 @@ namespace mongo {
         OplogReader oplogReader;
 
         void applyOperation(OperationContext* txn, Database* db, const BSONObj& op);
-        string hostName;    // ip addr or hostname plus optionally, ":<port>"
-        string _sourceName;  // a logical source name.
-        string sourceName() const { return _sourceName.empty() ? "main" : _sourceName; }
-        string only; // only a certain db. note that in the sources collection, this may not be changed once you start replicating.
+        std::string hostName;    // ip addr or hostname plus optionally, ":<port>"
+        std::string _sourceName;  // a logical source name.
+        std::string sourceName() const { return _sourceName.empty() ? "main" : _sourceName; }
+        std::string only; // only a certain db. note that in the sources collection, this may not be changed once you start replicating.
 
         /* the last time point we have already synced up to (in the remote/master's oplog). */
         OpTime syncedTo;
 
         int nClonedThisPass;
 
-        typedef vector< shared_ptr< ReplSource > > SourceVector;
-        static void loadAll(SourceVector&);
+        typedef std::vector< shared_ptr< ReplSource > > SourceVector;
+        static void loadAll(OperationContext* txn, SourceVector&);
         explicit ReplSource(BSONObj);
 
         /* -1 = error */
@@ -150,7 +153,7 @@ namespace mongo {
         bool operator==(const ReplSource&r) const {
             return hostName == r.hostName && sourceName() == r.sourceName();
         }
-        string toString() const { return sourceName() + "@" + hostName; }
+        std::string toString() const { return sourceName() + "@" + hostName; }
 
         bool haveMoreDbsToSync() const { return !addDbNextPass.empty(); }
         int sleepAdvice() const {
@@ -172,14 +175,15 @@ namespace mongo {
     class DatabaseIgnorer {
     public:
         /** Indicate that operations for 'db' should be ignored until after 'futureOplogTime' */
-        void doIgnoreUntilAfter( const string &db, const OpTime &futureOplogTime );
+        void doIgnoreUntilAfter( const std::string &db, const OpTime &futureOplogTime );
         /**
          * Query ignore state of 'db'; if 'currentOplogTime' is after the ignore
          * limit, the ignore state will be cleared.
          */
-        bool ignoreAt( const string &db, const OpTime &currentOplogTime );
+        bool ignoreAt( const std::string &db, const OpTime &currentOplogTime );
     private:
-        map< string, OpTime > _ignores;
+        std::map< std::string, OpTime > _ignores;
     };
 
-}
+} // namespace repl
+} // namespace mongo

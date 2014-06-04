@@ -172,9 +172,21 @@ namespace mongo {
         BSONObjCmp patternCmp(_btreeObj);
         BSONObjSet keys(patternCmp);
 
-        Status keygenStatus = _keyGen->getKeys(memberObj, &keys);
-        if (!keygenStatus.isOK()) {
-            return keygenStatus;
+        try {
+            _keyGen->getKeys(memberObj, &keys);
+        }
+        catch (const UserException& e) {
+            // Probably a parallel array.
+            if (BtreeKeyGenerator::ParallelArraysCode == e.getCode()) {
+                return Status(ErrorCodes::BadValue,
+                              "cannot sort with keys that are parallel arrays");
+            }
+            else {
+                return e.toStatus();
+            }
+        }
+        catch (...) {
+            return Status(ErrorCodes::InternalError, "unknown error during sort key generation");
         }
 
         // Key generator isn't sparse so we should at least get an all-null key.
@@ -372,11 +384,7 @@ namespace mongo {
                 return code;
             }
             else {
-                if (PlanStage::NEED_FETCH == code) {
-                    *out = id;
-                    ++_commonStats.needFetch;
-                }
-                else if (PlanStage::NEED_TIME == code) {
+                if (PlanStage::NEED_TIME == code) {
                     ++_commonStats.needTime;
                 }
                 return code;

@@ -30,28 +30,30 @@
 
 #include "mongo/db/repl/rs.h"
 
+#include "mongo/bson/optime.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/pdfile.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/initial_sync.h"
+#include "mongo/db/repl/initial_sync.h"
 #include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/bson/optime.h"
 #include "mongo/db/repl/repl_settings.h"  // replSettings
-#include "mongo/db/repl/initial_sync.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/structure/catalog/namespace_details.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+namespace repl {
 
     using namespace mongoutils;
     using namespace bson;
-
-    void dropAllDatabasesExceptLocal();
 
     // add try/catch with sleep
 
@@ -97,8 +99,8 @@ namespace mongo {
             else
                 sethbmsg( str::stream() << "initial sync cloning indexes for : " << db , 0);
 
-            Client::WriteContext ctx(db);
             OperationContextImpl txn;
+            Client::WriteContext ctx(&txn, db);
 
             string err;
             int errCode;
@@ -128,9 +130,10 @@ namespace mongo {
     void _logOpObjRS(const BSONObj& op);
 
     static void emptyOplog() {
-        Client::WriteContext ctx(rsoplog);
         OperationContextImpl txn;
-        Collection* collection = ctx.ctx().db()->getCollection(rsoplog);
+        Client::WriteContext ctx(&txn, rsoplog);
+
+        Collection* collection = ctx.ctx().db()->getCollection(&txn, rsoplog);
 
         // temp
         if( collection->numRecords() == 0 )
@@ -266,14 +269,14 @@ namespace mongo {
      * @param syncer either initial sync (can reclone missing docs) or "normal" sync (no recloning)
      * @param r      the oplog reader
      * @param source the sync target
-     * @param lastOp the op to start syncing at.  replset::InitialSync writes this and then moves to
-     *               the queue.  replset::SyncTail does not write this, it moves directly to the
+     * @param lastOp the op to start syncing at.  repl::InitialSync writes this and then moves to
+     *               the queue.  repl::SyncTail does not write this, it moves directly to the
      *               queue.
      * @param minValid populated by this function. The most recent op on the sync target's oplog,
      *                 this function syncs to this value (inclusive)
      * @return if applying the oplog succeeded
      */
-    bool ReplSetImpl::_syncDoInitialSync_applyToHead( replset::SyncTail& syncer, OplogReader* r,
+    bool ReplSetImpl::_syncDoInitialSync_applyToHead( SyncTail& syncer, OplogReader* r,
                                                       const Member* source, const BSONObj& lastOp ,
                                                       BSONObj& minValid ) {
         /* our cloned copy will be strange until we apply oplog events that occurred
@@ -319,7 +322,8 @@ namespace mongo {
 
                 log() << "replSet cleaning up [1]" << rsLog;
                 {
-                    Client::WriteContext cx( "local." );
+                    OperationContextImpl txn; // XXX?
+                    Client::WriteContext cx(&txn, "local.");
                     cx.ctx().db()->flushFiles(true);
                 }
                 log() << "replSet cleaning up [2]" << rsLog;
@@ -356,8 +360,8 @@ namespace mongo {
      * closer to the latest op time before it can transition to secondary state.
      */
     void ReplSetImpl::_syncDoInitialSync() {
-        replset::InitialSync init(replset::BackgroundSync::get());
-        replset::SyncTail tail(replset::BackgroundSync::get());
+        InitialSync init(BackgroundSync::get());
+        SyncTail tail(BackgroundSync::get());
         sethbmsg("initial sync pending",0);
 
         // if this is the first node, it may have already become primary
@@ -389,6 +393,8 @@ namespace mongo {
             return;
         }
 
+        OperationContextImpl txn;
+
         // written by applyToHead calls
         BSONObj minValid;
 
@@ -404,7 +410,7 @@ namespace mongo {
             theReplSet->setInitialSyncFlag();
 
             sethbmsg("initial sync drop all databases", 0);
-            dropAllDatabasesExceptLocal();
+            dropAllDatabasesExceptLocal(&txn);
 
             sethbmsg("initial sync clone all databases", 0);
 
@@ -463,7 +469,8 @@ namespace mongo {
         verify( !box.getState().primary() ); // wouldn't make sense if we were.
 
         {
-            Client::WriteContext cx( "local." );
+            Client::WriteContext cx(&txn, "local.");
+
             cx.ctx().db()->flushFiles(true);
             try {
                 log() << "replSet set minValid=" << minValid["ts"]._opTime().toString() << rsLog;
@@ -486,10 +493,11 @@ namespace mongo {
 
         // If we just cloned & there were no ops applied, we still want the primary to know where
         // we're up to
-        replset::BackgroundSync::notify();
+        BackgroundSync::notify();
 
         changeState(MemberState::RS_RECOVERING);
         sethbmsg("initial sync done",0);
     }
 
-}
+} // namespace repl
+} // namespace mongo

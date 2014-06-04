@@ -69,7 +69,7 @@ namespace mongo {
         //
 
         CursorId cursorid() const { return _cursorid; }
-        string ns() const { return _ns; }
+        std::string ns() const { return _ns; }
         const Collection* collection() const { return _collection; }
 
         /**
@@ -89,9 +89,9 @@ namespace mongo {
          * @param millis amount of idle passed time since last call
          * note called outside of locks (other than ccmutex) so care must be exercised
          */
-        bool shouldTimeout( unsigned millis );
-        void setIdleTime( unsigned millis );
-        unsigned idleTime() const { return _idleAgeMillis; }
+        bool shouldTimeout( int millis );
+        void setIdleTime( int millis );
+        int idleTime() const { return _idleAgeMillis; }
 
         uint64_t getLeftoverMaxTimeMicros() const { return _leftoverMaxTimeMicros; }
         void setLeftoverMaxTimeMicros( uint64_t leftoverMaxTimeMicros ) {
@@ -164,7 +164,7 @@ namespace mongo {
         unsigned _pinValue;
 
         // The namespace we're operating on.
-        string _ns;
+        std::string _ns;
 
         const Collection* _collection;
 
@@ -184,7 +184,7 @@ namespace mongo {
         OpTime _slaveReadTill;
 
         // How long has the cursor been idle?
-        unsigned _idleAgeMillis;
+        int _idleAgeMillis;
 
         // TODO: Document.
         uint64_t _leftoverMaxTimeMicros;
@@ -227,7 +227,7 @@ namespace mongo {
     /** thread for timing out old cursors */
     class ClientCursorMonitor : public BackgroundJob {
     public:
-        string name() const { return "ClientCursorMonitor"; }
+        std::string name() const { return "ClientCursorMonitor"; }
         void run();
     };
 

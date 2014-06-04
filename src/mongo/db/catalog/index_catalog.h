@@ -42,10 +42,8 @@ namespace mongo {
 
     class Client;
     class Collection;
-    class NamespaceDetails;
 
     class IndexDescriptor;
-    struct IndexDetails;
     class IndexAccessMethod;
 
     /**
@@ -54,7 +52,7 @@ namespace mongo {
      */
     class IndexCatalog {
     public:
-        IndexCatalog( Collection* collection, NamespaceDetails* details );
+        IndexCatalog( Collection* collection );
         ~IndexCatalog();
 
         // must be called before used
@@ -96,8 +94,8 @@ namespace mongo {
         IndexDescriptor* findIndexByPrefix( const BSONObj &keyPattern,
                                             bool requireSingleKey ) const;
 
-        void findIndexByType( const string& type,
-                              vector<IndexDescriptor*>& matches,
+        void findIndexByType( const std::string& type,
+                              std::vector<IndexDescriptor*>& matches,
                               bool includeUnfinishedIndexes = false ) const;
 
         // never returns NULL
@@ -148,7 +146,8 @@ namespace mongo {
                             bool mayInterrupt,
                             ShutdownBehavior shutdownBehavior = SHUTDOWN_CLEANUP );
 
-        StatusWith<BSONObj> prepareSpecForCreate( const BSONObj& original ) const;
+        StatusWith<BSONObj> prepareSpecForCreate( OperationContext* txn,
+                                                  const BSONObj& original ) const;
 
         Status dropAllIndexes(OperationContext* txn,
                               bool includingIdIndex );
@@ -160,7 +159,7 @@ namespace mongo {
          * will drop all incompleted indexes and return specs
          * after this, the indexes can be rebuilt
          */
-        vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* txn);
+        std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* txn);
 
 
         struct IndexKillCriteria {
@@ -177,14 +176,6 @@ namespace mongo {
         std::vector<BSONObj> killMatchingIndexBuilds(const IndexKillCriteria& criteria);
 
         // ---- modify single index
-
-        /* Updates the expireAfterSeconds field of the given index to the value in newExpireSecs.
-         * The specified index must already contain an expireAfterSeconds field, and the value in
-         * that field and newExpireSecs must both be numeric.
-         */
-        void updateTTLSetting( OperationContext* txn,
-                               const IndexDescriptor* idx,
-                               long long newExpireSeconds );
 
         bool isMultikey( const IndexDescriptor* idex );
 
@@ -229,12 +220,12 @@ namespace mongo {
 
             Collection* _collection;
             IndexCatalog* _catalog;
-            string _ns;
+            std::string _ns;
 
             BSONObj _spec;
 
-            string _indexName;
-            string _indexNamespace;
+            std::string _indexName;
+            std::string _indexNamespace;
 
             IndexCatalogEntry* _entry;
             bool _inProgress;
@@ -260,12 +251,12 @@ namespace mongo {
 
         // ------- temp internal -------
 
-        string getAccessMethodName(const BSONObj& keyPattern) {
-            return _getAccessMethodName( keyPattern );
+        std::string getAccessMethodName(OperationContext* txn, const BSONObj& keyPattern) {
+            return _getAccessMethodName( txn, keyPattern );
         }
 
         Status _upgradeDatabaseMinorVersionIfNeeded( OperationContext* txn,
-                                                     const string& newPluginName );
+                                                     const std::string& newPluginName );
 
         // public static helpers
 
@@ -274,23 +265,14 @@ namespace mongo {
     private:
         typedef unordered_map<IndexDescriptor*, Client*> InProgressIndexesMap;
 
-        // creates a new thing, no caching
-        IndexAccessMethod* _createAccessMethod( const IndexDescriptor* desc,
-                                                IndexCatalogEntry* entry );
-
-        int _removeFromSystemIndexes(OperationContext* txn,
-                                     const StringData& indexName );
-
-        bool _shouldOverridePlugin( const BSONObj& keyPattern ) const;
+        bool _shouldOverridePlugin( OperationContext* txn, const BSONObj& keyPattern ) const;
 
         /**
          * This differs from IndexNames::findPluginName in that returns the plugin name we *should*
          * use, not the plugin name inside of the provided key pattern.  To understand when these
          * differ, see shouldOverridePlugin.
          */
-        string _getAccessMethodName(const BSONObj& keyPattern) const;
-
-        IndexDetails* _getIndexDetails( const IndexDescriptor* descriptor ) const;
+        std::string _getAccessMethodName(OperationContext* txn, const BSONObj& keyPattern) const;
 
         void _checkMagic() const;
 
@@ -319,9 +301,8 @@ namespace mongo {
         // just does disk hanges
         // doesn't change memory state, etc...
         void _deleteIndexFromDisk( OperationContext* txn,
-                                   const string& indexName,
-                                   const string& indexNamespace,
-                                   int idxNo );
+                                   const std::string& indexName,
+                                   const std::string& indexNamespace );
 
         // descriptor ownership passes to _setupInMemoryStructures
         IndexCatalogEntry* _setupInMemoryStructures(OperationContext* txn,
@@ -331,11 +312,10 @@ namespace mongo {
 
         Status _isSpecOk( const BSONObj& spec ) const;
 
-        Status _doesSpecConflictWithExisting( const BSONObj& spec ) const;
+        Status _doesSpecConflictWithExisting( OperationContext* txn, const BSONObj& spec ) const;
 
         int _magic;
         Collection* _collection;
-        NamespaceDetails* _details;
 
         IndexCatalogEntryContainer _entries;
 

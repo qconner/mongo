@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#include "mongo/db/commands/get_last_error.h"
+
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/commands.h"
@@ -210,7 +212,7 @@ namespace mongo {
 
             // If we got an electionId, make sure it matches
             if (electionIdPresent) {
-                if (!theReplSet) {
+                if (!repl::theReplSet) {
                     // Ignore electionIds of 0 from mongos.
                     if (electionId != OID()) {
                         errmsg = "wElectionId passed but no replication active";
@@ -219,9 +221,9 @@ namespace mongo {
                     }
                 } 
                 else {
-                    if (electionId != theReplSet->getElectionId()) {
+                    if (electionId != repl::theReplSet->getElectionId()) {
                         LOG(3) << "oid passed in is " << electionId
-                               << ", but our id is " << theReplSet->getElectionId();
+                               << ", but our id is " << repl::theReplSet->getElectionId();
                         errmsg = "election occurred after write";
                         result.append("code", ErrorCodes::WriteConcernFailed);
                         return false;
@@ -229,7 +231,7 @@ namespace mongo {
                 }
             }
 
-            cc().curop()->setMessage( "waiting for write concern" );
+            txn->setMessage( "waiting for write concern" );
 
             WriteConcernResult wcResult;
             status = waitForWriteConcern( txn, writeConcern, lastOpTime, &wcResult );

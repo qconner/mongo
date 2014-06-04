@@ -47,12 +47,10 @@
 #include "mongo/util/ramlog.h"
 
 namespace mongo {
+namespace repl {
     /* decls for connections.h */
     ScopedConn::M& ScopedConn::_map = *(new ScopedConn::M());
     mutex ScopedConn::mapMutex("ScopedConn::mapMutex");
-}
-
-namespace mongo {
 
     using namespace mongoutils::html;
     using namespace bson;
@@ -219,7 +217,7 @@ namespace mongo {
         }
     }
 
-    void ReplSetImpl::_summarizeAsHtml(stringstream& s) const {
+    void ReplSetImpl::_summarizeAsHtml(OperationContext* txn, stringstream& s) const {
         s << table(0, false);
         s << tr("Set name:", _name);
         s << tr("Majority up:", elect.aMajoritySeemsToBeUp()?"yes":"no" );
@@ -251,10 +249,10 @@ namespace mongo {
 
         string myMinValid;
         try {
-            readlocktry lk(/*"local.replset.minvalid", */300);
+            readlocktry lk(txn->lockState(), /*"local.replset.minvalid", */300);
             if( lk.got() ) {
                 BSONObj mv;
-                if( Helpers::getSingleton("local.replset.minvalid", mv) ) {
+                if( Helpers::getSingleton(txn, "local.replset.minvalid", mv) ) {
                     myMinValid = "minvalid:" + mv["ts"]._opTime().toString();
                 }
             }
@@ -458,7 +456,7 @@ namespace mongo {
         b.append("set", name());
         b.appendTimeT("date", time(0));
         b.append("myState", myState.s);
-        const Member *syncTarget = replset::BackgroundSync::get()->getSyncTarget();
+        const Member *syncTarget = BackgroundSync::get()->getSyncTarget();
         if ( syncTarget &&
             (myState != MemberState::RS_PRIMARY) &&
             (myState != MemberState::RS_SHUNNED) ) {
@@ -468,4 +466,5 @@ namespace mongo {
         if( replSetBlind )
             b.append("blind",true); // to avoid confusion if set...normally never set except for testing.
     }
-}
+} // namespace repl
+} // namespace mongo

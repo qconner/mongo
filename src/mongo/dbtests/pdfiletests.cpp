@@ -48,24 +48,29 @@ namespace PdfileTests {
     namespace Insert {
         class Base {
         public:
-            Base() : _context( ns() ) {
+            Base() : _lk(_txn.lockState()),
+                     _context(ns()) {
+
             }
+
             virtual ~Base() {
                 if ( !collection() )
                     return;
                 _context.db()->dropCollection( &_txn, ns() );
             }
+
         protected:
             const char *ns() {
                 return "unittests.pdfiletests.Insert";
             }
             Collection* collection() {
-                return _context.db()->getCollection( ns() );
+                return _context.db()->getCollection( &_txn, ns() );
             }
 
-            Lock::GlobalWrite lk_;
-            Client::Context _context;
             OperationContextImpl _txn;
+            Lock::GlobalWrite _lk;
+
+            Client::Context _context;
         };
 
         class InsertNoId : public Base {
@@ -164,7 +169,8 @@ namespace PdfileTests {
         void run() {
             SmallFilesControl c;
 
-            Client::ReadContext ctx( "local" );
+            OperationContextImpl txn;
+            Client::ReadContext ctx(&txn, "local");
             Database* db = ctx.ctx().db();
             ExtentManager* em = db->getExtentManager();
 
@@ -208,31 +214,6 @@ namespace PdfileTests {
         }
     };
 
-    class CollectionOptionsRoundTrip {
-    public:
-
-        void check( const CollectionOptions& options1 ) {
-            CollectionOptions options2;
-            options2.parse( options1.toBSON() );
-            ASSERT_EQUALS( options1.toBSON(), options2.toBSON() );
-        }
-
-        void run() {
-            CollectionOptions options;
-            check( options );
-
-            options.capped = true;
-            options.cappedSize = 10240;
-            options.cappedMaxDocs = 1111;
-            check( options );
-
-            options.setNoIdIndex();
-            options.flags = 5;
-            check( options );
-
-        }
-    };
-
     class All : public Suite {
     public:
         All() : Suite( "pdfile" ) {}
@@ -243,7 +224,6 @@ namespace PdfileTests {
             add< Insert::UpdateDate2 >();
             add< Insert::ValidId >();
             add< ExtentSizing >();
-            add< CollectionOptionsRoundTrip >();
         }
     } myall;
 

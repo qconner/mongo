@@ -58,8 +58,15 @@ namespace mongo {
     class User {
         MONGO_DISALLOW_COPYING(User);
     public:
+        struct SCRAMCredentials {
+            int iterationCount;
+            std::string salt;
+            std::string serverKey;
+            std::string storedKey;
+        }; 
         struct CredentialData {
             std::string password;
+            SCRAMCredentials scram;
             bool isExternal;
         };
 
@@ -97,19 +104,6 @@ namespace mongo {
          * Gets the set of actions this user is allowed to perform on the given resource.
          */
         const ActionSet getActionsForResource(const ResourcePattern& resource) const;
-
-        /**
-         * Gets the schema version of user documents used to build this user.  See comment on
-         * _schemaVersion field, below.
-         */
-        int getSchemaVersion() const { return _schemaVersion; }
-
-        /**
-         * Returns true if this user object, generated from V1-schema user documents,
-         * has been probed for privileges on database "dbname", according to the V1
-         * implicit privilge acquisition rules.
-         */
-        bool hasProbedV1(const StringData& dbname) const;
 
         /**
          * Returns true if this copy of information about this user is still valid. If this returns
@@ -167,19 +161,6 @@ namespace mongo {
         void addPrivileges(const PrivilegeVector& privileges);
 
         /**
-         * Sets the schema version of documents used for building this user to 1, for V1 and V0
-         * documents.  The default value is 2, for V2 documents.
-         */
-        void setSchemaVersion1();
-
-        /**
-         * Marks that this user object, generated from V1-schema user documents,
-         * has been probed for privileges on database "dbname", according to the V1
-         * implicit privilge acquisition rules.
-         */
-        void markProbedV1(const StringData& dbname);
-
-        /**
          * Marks this instance of the User object as invalid, most likely because information about
          * the user has been updated and needs to be reloaded from the AuthorizationManager.
          *
@@ -214,16 +195,8 @@ namespace mongo {
         // Roles the user has privileges from
         unordered_set<RoleName> _roles;
 
-        // List of databases already probed for privilege information for this user.  Only
-        // meaningful for V2.4-schema users.
-        std::vector<std::string> _probedDatabases;
-
         // Credential information.
         CredentialData _credentials;
-
-        // Schema version of user documents used to build this user.  Valid values are
-        // AuthorizationManager::schemaVersion24 and schemaVersion26Final.
-        int _schemaVersion;
 
         // _refCount and _isInvalidated are modified exclusively by the AuthorizationManager
         // _isInvalidated can be read by any consumer of User, but _refCount can only be

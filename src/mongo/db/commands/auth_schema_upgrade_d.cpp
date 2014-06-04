@@ -43,20 +43,20 @@ namespace mongo {
 namespace {
 
     Status checkReplicaMemberVersions() {
-        if (!theReplSet)
+        if (!repl::theReplSet)
             return Status::OK();
 
 
-        std::list<Target> rsMembers;
+        std::list<repl::Target> rsMembers;
         try {
-            const unsigned rsSelfId = theReplSet->selfId();
-            const std::vector<ReplSetConfig::MemberCfg>& rsMemberConfigs =
-                theReplSet->config().members;
+            const unsigned rsSelfId = repl::theReplSet->selfId();
+            const std::vector<repl::ReplSetConfig::MemberCfg>& rsMemberConfigs =
+                repl::theReplSet->config().members;
             for (size_t i = 0; i < rsMemberConfigs.size(); ++i) {
                 const unsigned otherId = rsMemberConfigs[i]._id;
                 if (rsSelfId == otherId)
                     continue;
-                const Member* other = theReplSet->findById(otherId);
+                const repl::Member* other = repl::theReplSet->findById(otherId);
                 if (!other) {
                     log() << "During authSchemaUpgrade, no information about replica set member "
                         "with id " << otherId << "; ignoring.";
@@ -67,7 +67,7 @@ namespace {
                         " is down; ignoring.";
                     continue;
                 }
-                rsMembers.push_back(Target(other->fullName()));
+                rsMembers.push_back(repl::Target(other->fullName()));
             }
 
             multiCommand(BSON("buildInfo" << 1), rsMembers);
@@ -76,8 +76,8 @@ namespace {
             return ex.toStatus();
         }
 
-        for (std::list<Target>::const_iterator iter = rsMembers.begin(), end = rsMembers.end();
-             iter != end;
+        for (std::list<repl::Target>::const_iterator iter = rsMembers.begin();
+             iter != rsMembers.end();
              ++iter) {
 
             if (!iter->ok) {
@@ -147,7 +147,7 @@ namespace {
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 
-            status = authzManager->upgradeSchema(maxSteps, writeConcern);
+            status = authzManager->upgradeSchema(txn, maxSteps, writeConcern);
             if (status.isOK())
                 result.append("done", true);
             return appendCommandStatus(result, status);

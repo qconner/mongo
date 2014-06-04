@@ -48,13 +48,12 @@
 #include "mongo/util/ramlog.h"
 
 namespace mongo {
+namespace repl {
 
     using namespace bson;
 
     MONGO_FP_DECLARE(rsDelayHeartbeatResponse);
     MONGO_FP_DECLARE(rsStopHeartbeatRequest);
-
-    unsigned int HeartbeatInfo::numPings;
 
     /* { replSetHeartbeat : <setname> } */
     class CmdReplSetHeartbeat : public ReplSetCommand {
@@ -113,7 +112,7 @@ namespace mongo {
 
             result.append("rs", true);
             if( cmdObj["checkEmpty"].trueValue() ) {
-                result.append("hasData", replHasDatabases());
+                result.append("hasData", replHasDatabases(txn));
             }
             if( (theReplSet == 0) || (theReplSet->startupStatus == ReplSetImpl::LOADINGCONFIG) ) {
                 string from( cmdObj.getStringField("from") );
@@ -142,7 +141,7 @@ namespace mongo {
             result.append("hbmsg", theReplSet->hbmsg());
             result.append("time", (long long) time(0));
             result.appendDate("opTime", theReplSet->lastOpTimeWritten.asDate());
-            const Member *syncTarget = replset::BackgroundSync::get()->getSyncTarget();
+            const Member *syncTarget = BackgroundSync::get()->getSyncTarget();
             if (syncTarget) {
                 result.append("syncingTo", syncTarget->fullName());
             }
@@ -249,17 +248,18 @@ namespace mongo {
 
         // this ensures that will have bgsync's s_instance at all points where it is needed
         // so that we needn't check for its existence
-        replset::BackgroundSync* sync = replset::BackgroundSync::get();
+        BackgroundSync* sync = BackgroundSync::get();
 
         boost::thread t(startSyncThread);
 
-        boost::thread producer(stdx::bind(&replset::BackgroundSync::producerThread, sync));
+        boost::thread producer(stdx::bind(&BackgroundSync::producerThread, sync));
         theReplSet->syncSourceFeedback.go();
 
         // member heartbeats are started in ReplSetImpl::initFromConfig
     }
 
-}
+} // namespace repl
+} // namespace mongo
 
 /* todo:
    stop bg job and delete on removefromset

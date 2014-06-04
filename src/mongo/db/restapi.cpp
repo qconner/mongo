@@ -50,7 +50,6 @@
 
 namespace mongo {
 
-    extern const char *replInfo;
     bool getInitialSyncCompleted();
 
     using namespace bson;
@@ -261,9 +260,9 @@ namespace mongo {
 
     } restHandler;
 
-    bool RestAdminAccess::haveAdminUsers() const {
+    bool RestAdminAccess::haveAdminUsers(OperationContext* txn) const {
         AuthorizationSession* authzSession = cc().getAuthorizationSession();
-        return authzSession->getAuthorizationManager().hasAnyPrivilegeDocuments();
+        return authzSession->getAuthorizationManager().hasAnyPrivilegeDocuments(txn);
     }
 
     class LowLevelMongodStatus : public WebStatusPlugin {
@@ -278,16 +277,17 @@ namespace mongo {
             ss << "# databases: " << dbHolder().sizeInfo() << '\n';
             ss << "# Cursors: " << ClientCursor::totalOpen() << '\n';
             ss << "replication: ";
-            if( *replInfo )
-                ss << "\nreplInfo:  " << replInfo << "\n\n";
-            if( replSet ) {
-                ss << a("", "see replSetGetStatus link top of page") << "--replSet </a>" << replSettings.replSet;
+            if (*repl::replInfo)
+                ss << "\nreplInfo:  " << repl::replInfo << "\n\n";
+            if (repl::replSet) {
+                ss << a("", "see replSetGetStatus link top of page") << "--replSet </a>"
+                   << repl::replSettings.replSet;
             }
-            if ( replAllDead )
-                ss << "\n<b>replication replAllDead=" << replAllDead << "</b>\n";
+            if (repl::replAllDead)
+                ss << "\n<b>replication replAllDead=" << repl::replAllDead << "</b>\n";
             else {
-                ss << "\nmaster: " << replSettings.master << '\n';
-                ss << "slave:  " << replSettings.slave << '\n';
+                ss << "\nmaster: " << repl::replSettings.master << '\n';
+                ss << "slave:  " << repl::replSettings.slave << '\n';
                 ss << '\n';
             }
 
@@ -297,7 +297,8 @@ namespace mongo {
 
         virtual void run( stringstream& ss ) {
             Timer t;
-            readlocktry lk( 300 );
+            LockState lockState;
+            readlocktry lk(&lockState, 300);
             if ( lk.got() ) {
                 _gotLock( t.millis() , ss );
             }

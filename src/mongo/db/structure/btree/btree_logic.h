@@ -42,6 +42,11 @@
 namespace mongo {
 
     class BucketDeletionNotification;
+    class RecordStore;
+
+    // Used for unit-testing only
+    template <class BtreeLayout> class BtreeLogicTestBase;
+    template <class BtreeLayout> class ArtificialTreeBuilder;
 
     /**
      * This is the logic for manipulating the Btree.  It is (mostly) independent of the on-disk
@@ -201,11 +206,6 @@ namespace mongo {
                              DiskLoc* bucketInOut,
                              int* keyOffsetInOut) const;
 
-        bool keyIsAt(const BSONObj& savedKey,
-                     const DiskLoc& savedLoc,
-                     BucketType* bucket,
-                     int keyPos) const;
-
         //
         // Creation and deletion
         //
@@ -215,8 +215,18 @@ namespace mongo {
          */
         Status initAsEmpty(OperationContext* txn);
 
+        //
+        // Size constants
+        //
+
+        static int lowWaterMark();
+
     private:
         friend class BtreeLogic::Builder;
+
+        // Used for unit-testing only
+        friend class BtreeLogicTestBase<BtreeLayout>;
+        friend class ArtificialTreeBuilder<BtreeLayout>;
 
         /**
          * This is an in memory wrapper for the variable length data associated with a
@@ -248,12 +258,6 @@ namespace mongo {
         // Functions that depend on the templated type info but nothing in 'this'.
         //
 
-        static int headerSize();
-
-        static int bodySize();
-
-        static int lowWaterMark();
-
         static LocType& childLocForPos(BucketType* bucket, int pos);
 
         static FullKey getFullKey(const BucketType* bucket, int i);
@@ -280,7 +284,7 @@ namespace mongo {
 
         static bool mayDropKey(BucketType* bucket, int index, int refPos);
 
-        static int packedDataSize(BucketType* bucket, int refPos);
+        static int _packedDataSize(BucketType* bucket, int refPos);
 
         static void setPacked(BucketType* bucket);
 
@@ -300,7 +304,7 @@ namespace mongo {
 
         static bool isHead(BucketType* bucket);
 
-        static void dump(BucketType* bucket, int depth = 0);
+        static void dumpBucket(const BucketType* bucket, int indentLength = 0);
 
         static void assertValid(const std::string& ns, 
                                 BucketType* bucket, 
@@ -377,22 +381,20 @@ namespace mongo {
                        const DiskLoc& recordLoc,
                        const int direction) const;
 
-        long long fullValidate(const DiskLoc bucketLoc,
+        long long _fullValidate(const DiskLoc bucketLoc,
                                long long *unusedCount,
                                bool strict,
                                bool dumpBuckets,
                                unsigned depth);
 
-        DiskLoc addBucket(OperationContext* txn);
+        DiskLoc _addBucket(OperationContext* txn);
 
         bool canMergeChildren(BucketType* bucket,
                               const DiskLoc bucketLoc,
                               const int leftIndex);
 
         // has to look in children of 'bucket' and requires record store
-        int rebalancedSeparatorPos(BucketType* bucket,
-                                   const DiskLoc bucketLoc,
-                                   int leftIndex);
+        int _rebalancedSeparatorPos(BucketType* bucket, int leftIndex);
 
         void _packReadyForMod(BucketType* bucket, int &refPos);
 
@@ -425,7 +427,7 @@ namespace mongo {
                         const DiskLoc leftChild,
                         const DiskLoc rightChild);
 
-        string dupKeyError(const KeyDataType& key) const;
+        std::string dupKeyError(const KeyDataType& key) const;
 
         void setInternalKey(OperationContext* txn,
                             BucketType* bucket,
@@ -436,9 +438,7 @@ namespace mongo {
                             const DiskLoc lchild,
                             const DiskLoc rchild);
 
-        void fix(OperationContext* txn, const DiskLoc bucketLoc, const DiskLoc child);
-
-        void fixParentPtrs(OperationContext* txn,
+        void fixParentPtrs(OperationContext* trans,
                            BucketType* bucket,
                            const DiskLoc bucketLoc,
                            int firstIndex = 0,
@@ -505,13 +505,18 @@ namespace mongo {
                            BucketType* bucket,
                            const DiskLoc bucketLoc);
 
+        bool _keyIsAt(const BSONObj& savedKey,
+                     const DiskLoc& savedLoc,
+                     BucketType* bucket,
+                     int keyPos) const;
+
         // TODO 'this' for _ordering(?)
         int customBSONCmp(const BSONObj& l,
                           const BSONObj& rBegin,
                           int rBeginLen,
                           bool rSup,
-                          const vector<const BSONElement*>& rEnd,
-                          const vector<bool>& rEndInclusive,
+                          const std::vector<const BSONElement*>& rEnd,
+                          const std::vector<bool>& rEndInclusive,
                           const Ordering& o,
                           int direction) const;
 

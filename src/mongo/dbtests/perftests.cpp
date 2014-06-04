@@ -41,6 +41,7 @@
 #include <fstream>
 
 #include "mongo/db/db.h"
+#include "mongo/db/storage/durable_mapped_file.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
@@ -52,6 +53,7 @@
 #include "mongo/util/compress.h"
 #include "mongo/util/concurrency/qlock.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/mmap.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/version.h"
 #include "mongo/util/version_reporting.h"
@@ -194,7 +196,7 @@ namespace PerfTests {
     public:
         virtual unsigned batchSize() { return 50; }
 
-        void say(unsigned long long n, int us, string s) {
+        void say(unsigned long long n, long long us, string s) {
             unsigned long long rps = (n*1000*1000)/(us > 0 ? us : 1);
             cout << "stats " << setw(42) << left << s << ' ' << right << setw(9) << rps << ' ' << right << setw(5) << us/1000 << "ms ";
             if( showDurStats() )
@@ -314,7 +316,7 @@ namespace PerfTests {
                     for( i = 0; i < Batch; i++ )
                         timed();
                     n += i;
-                } while( t.micros() < (unsigned) hlm * 1000 );
+                } while( t.micros() < (hlm * 1000) );
             }
 
             client().getLastError(); // block until all ops are finished

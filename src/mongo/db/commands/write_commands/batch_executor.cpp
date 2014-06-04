@@ -353,10 +353,10 @@ namespace mongo {
                 response->setWriteConcernError( wcError.release() );
             }
 
-            if ( anyReplEnabled() ) {
+            if (repl::anyReplEnabled()) {
                 response->setLastOp( _client->getLastOp() );
-                if (theReplSet) {
-                    response->setElectionId( theReplSet->getElectionId() );
+                if (repl::theReplSet) {
+                    response->setElectionId(repl::theReplSet->getElectionId());
                 }
             }
 
@@ -434,7 +434,7 @@ namespace mongo {
     }
 
     static bool checkIsMasterForCollection(const std::string& ns, WriteOpResult* result) {
-        if (!isMasterNs(ns.c_str())) {
+        if (!repl::isMasterNs(ns.c_str())) {
             WriteErrorDetail* errorDetail = new WriteErrorDetail;
             result->setError(errorDetail);
             errorDetail->setErrCode(ErrorCodes::NotMaster);
@@ -592,8 +592,8 @@ namespace mongo {
             currentOp->debug().exceptionInfo = ExceptionInfo( opError->getErrMessage(),
                                                               opError->getErrCode() );
 
-            MONGO_TLOG(3) << " Caught Assertion in " << opToString( currentOp->getOp() )
-                          << ", continuing " << causedBy( opError->getErrMessage() ) << endl;
+            LOG(3) << " Caught Assertion in " << opToString( currentOp->getOp() )
+                   << ", continuing " << causedBy( opError->getErrMessage() ) << endl;
         }
 
         bool logAll = logger::globalLogDomain()->shouldLog( logger::LogSeverity::Debug( 1 ) );
@@ -601,7 +601,7 @@ namespace mongo {
                        > ( serverGlobalParams.slowMS + currentOp->getExpectedLatencyMs() );
 
         if ( logAll || logSlow ) {
-            MONGO_TLOG(0) << currentOp->debug().report( *currentOp ) << endl;
+            LOG(0) << currentOp->debug().report( *currentOp ) << endl;
         }
 
         if ( currentOp->shouldDBProfile( executionTime ) ) {
@@ -897,12 +897,12 @@ namespace mongo {
 
     bool WriteBatchExecutor::ExecInsertsState::_lockAndCheckImpl(WriteOpResult* result) {
         if (hasLock()) {
-            cc().curop()->enter(_context.get());
+            txn->getCurOp()->enter(_context.get());
             return true;
         }
 
         invariant(!_context.get());
-        _writeLock.reset(new Lock::DBWrite(request->getNS()));
+        _writeLock.reset(new Lock::DBWrite(txn->lockState(), request->getNS()));
         if (!checkIsMasterForCollection(request->getNS(), result)) {
             return false;
         }
@@ -917,7 +917,7 @@ namespace mongo {
                                            false /* don't check version */));
         Database* database = _context->db();
         dassert(database);
-        _collection = database->getCollection(request->getTargetingNS());
+        _collection = database->getCollection(txn, request->getTargetingNS());
         if (!_collection) {
             // Implicitly create if it doesn't exist
             _collection = database->createCollection(txn, request->getTargetingNS());
@@ -1030,7 +1030,7 @@ namespace mongo {
             result->setError(toWriteError(status.getStatus()));
         }
         else {
-            logOp( txn, "i", insertNS.c_str(), docToInsert );
+            repl::logOp( txn, "i", insertNS.c_str(), docToInsert );
             txn->recoveryUnit()->commitIfNeeded();
             result->getStats().n = 1;
         }
@@ -1060,7 +1060,7 @@ namespace mongo {
             result->setError(toWriteError(status));
         }
         else {
-            logOp( txn, "i", indexNS.c_str(), indexDesc );
+            repl::logOp( txn, "i", indexNS.c_str(), indexDesc );
             result->getStats().n = 1;
         }
     }
@@ -1079,7 +1079,7 @@ namespace mongo {
         UpdateLifecycleImpl updateLifecycle(true, request.getNamespaceString());
         request.setLifecycle(&updateLifecycle);
 
-        UpdateExecutor executor(&request, &cc().curop()->debug());
+        UpdateExecutor executor(&request, &txn->getCurOp()->debug());
         Status status = executor.prepare();
         if (!status.isOK()) {
             result->setError(toWriteError(status));
@@ -1087,7 +1087,7 @@ namespace mongo {
         }
 
         ///////////////////////////////////////////
-        Lock::DBWrite writeLock( nsString.ns() );
+        Lock::DBWrite writeLock(txn->lockState(), nsString.ns());
         ///////////////////////////////////////////
 
         if ( !checkShardVersion( &shardingState, *updateItem.getRequest(), result ) )
@@ -1144,7 +1144,7 @@ namespace mongo {
         }
 
         ///////////////////////////////////////////
-        Lock::DBWrite writeLock( nss.ns() );
+        Lock::DBWrite writeLock(txn->lockState(), nss.ns());
         ///////////////////////////////////////////
 
         // Check version once we're locked

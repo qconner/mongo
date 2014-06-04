@@ -44,7 +44,7 @@
 #include "mongo/util/fail_point_service.h"
 
 namespace mongo {
-namespace replset {
+namespace repl {
 
     static Counter64 opsAppliedStats;
 
@@ -78,7 +78,8 @@ namespace replset {
     /* apply the log op that is in param o
        @return bool success (true) or failure (false)
     */
-    bool SyncTail::syncApply(const BSONObj &op, bool convertUpdateToUpsert) {
+    bool SyncTail::syncApply(
+                        OperationContext* txn, const BSONObj &op, bool convertUpdateToUpsert) {
         const char *ns = op.getStringField("ns");
         verify(ns);
 
@@ -99,20 +100,19 @@ namespace replset {
         if(isCommand) {
             // a command may need a global write lock. so we will conservatively go 
             // ahead and grab one here. suboptimal. :-(
-            lk.reset(new Lock::GlobalWrite());
+            lk.reset(new Lock::GlobalWrite(txn->lockState()));
         } else {
             // DB level lock for this operation
-            lk.reset(new Lock::DBWrite(ns)); 
+            lk.reset(new Lock::DBWrite(txn->lockState(), ns)); 
         }
 
-        Client::Context ctx(ns, storageGlobalParams.dbpath);
-        OperationContextImpl txn;
+        Client::Context ctx(ns);
         ctx.getClient()->curop()->reset();
         // For non-initial-sync, we convert updates to upserts
         // to suppress errors when replaying oplog entries.
-        bool ok = !applyOperation_inlock(&txn, ctx.db(), op, true, convertUpdateToUpsert);
+        bool ok = !applyOperation_inlock(txn, ctx.db(), op, true, convertUpdateToUpsert);
         opsAppliedStats.increment();
-        txn.recoveryUnit()->commitIfNeeded();
+        txn->recoveryUnit()->commitIfNeeded();
 
         return ok;
     }
@@ -126,8 +126,9 @@ namespace replset {
             try {
                 // one possible tweak here would be to stay in the read lock for this database 
                 // for multiple prefetches if they are for the same database.
-                Client::ReadContext ctx(ns);
-                prefetchPagesForReplicatedOp(ctx.ctx().db(), op);
+                OperationContextImpl txn;
+                Client::ReadContext ctx(&txn, ns);
+                prefetchPagesForReplicatedOp(&txn, ctx.ctx().db(), op);
             }
             catch (const DBException& e) {
                 LOG(2) << "ignoring exception in prefetchOp(): " << e.what() << endl;
@@ -324,7 +325,9 @@ namespace replset {
                     // become primary
                     if (!theReplSet->isSecondary()) {
                         OpTime minvalid;
-                        theReplSet->tryToGoLiveAsASecondary(minvalid);
+
+                        OperationContextImpl txn;
+                        theReplSet->tryToGoLiveAsASecondary(&txn, minvalid);
                     }
 
                     // normally msgCheckNewState gets called periodically, but in a single node
@@ -475,7 +478,9 @@ namespace replset {
 
     void SyncTail::applyOpsToOplog(std::deque<BSONObj>* ops) {
         {
-            Lock::DBWrite lk("local");
+            OperationContextImpl txn; // XXX?
+            Lock::DBWrite lk(txn.lockState(), "local");
+
             while (!ops->empty()) {
                 const BSONObj& op = ops->front();
                 // this updates theReplSet->lastOpTimeWritten
@@ -526,5 +531,77 @@ namespace replset {
         } // endif slaveDelay
     }
 
-} // namespace replset
+    static AtomicUInt32 replWriterWorkerId;
+
+    void initializeWriterThread() {
+        // Only do this once per thread
+        if (!ClientBasic::getCurrent()) {
+            string threadName = str::stream() << "repl writer worker "
+                                              << replWriterWorkerId.addAndFetch(1);
+            Client::initThread( threadName.c_str() );
+            // allow us to get through the magic barrier
+            Lock::ParallelBatchWriterMode::iAmABatchParticipant();
+            replLocalAuth();
+        }
+    }
+
+    // This free function is used by the writer threads to apply each op
+    void multiSyncApply(const std::vector<BSONObj>& ops, SyncTail* st) {
+        initializeWriterThread();
+
+        // convert update operations only for 2.2.1 or greater, because we need guaranteed
+        // idempotent operations for this to work.  See SERVER-6825
+        bool convertUpdatesToUpserts = theReplSet->oplogVersion > 1 ? true : false;
+
+        for (std::vector<BSONObj>::const_iterator it = ops.begin();
+             it != ops.end();
+             ++it) {
+            try {
+                OperationContextImpl txn;
+                if (!st->syncApply(&txn, *it, convertUpdatesToUpserts)) {
+                    fassertFailedNoTrace(16359);
+                }
+            } catch (const DBException& e) {
+                error() << "writer worker caught exception: " << causedBy(e)
+                        << " on: " << it->toString() << endl;
+                fassertFailedNoTrace(16360);
+            }
+        }
+    }
+
+    // This free function is used by the initial sync writer threads to apply each op
+    void multiInitialSyncApply(const std::vector<BSONObj>& ops, SyncTail* st) {
+        initializeWriterThread();
+        for (std::vector<BSONObj>::const_iterator it = ops.begin();
+             it != ops.end();
+             ++it) {
+            try {
+                OperationContextImpl txn;
+
+                if (!st->syncApply(&txn, *it)) {
+                    bool status;
+                    {
+                        Lock::GlobalWrite lk(txn.lockState());
+                        status = st->shouldRetry(&txn, *it);
+                    }
+
+                    if (status) {
+                        // retry
+                        if (!st->syncApply(&txn, *it)) {
+                            fassertFailedNoTrace(15915);
+                        }
+                    }
+                    // If shouldRetry() returns false, fall through.
+                    // This can happen if the document that was moved and missed by Cloner
+                    // subsequently got deleted and no longer exists on the Sync Target at all
+                }
+            }
+            catch (const DBException& e) {
+                error() << "exception: " << causedBy(e) << " on: " << it->toString() << endl;
+                fassertFailedNoTrace(16361);
+            }
+        }
+    }
+
+} // namespace repl
 } // namespace mongo

@@ -55,8 +55,12 @@ namespace mongo {
                                                     "repl.preload.docs",
                                                     &prefetchDocStats );
 
+    void prefetchIndexPages(Collection* collection, const BSONObj& obj);
+    void prefetchRecordPages(OperationContext* txn, const char* ns, const BSONObj& obj);
+
+
     // prefetch for an oplog operation
-    void prefetchPagesForReplicatedOp(Database* db, const BSONObj& op) {
+    void prefetchPagesForReplicatedOp(OperationContext* txn, Database* db, const BSONObj& op) {
         const char *opField;
         const char *opType = op.getStringField("op");
         switch (*opType) {
@@ -75,7 +79,7 @@ namespace mongo {
         BSONObj obj = op.getObjectField(opField);
         const char *ns = op.getStringField("ns");
 
-        Collection* collection = db->getCollection( ns );
+        Collection* collection = db->getCollection( txn, ns );
         if ( !collection )
             return;
 
@@ -110,22 +114,24 @@ namespace mongo {
             // do not prefetch the data for capped collections because
             // they typically do not have an _id index for findById() to use.
             !collection->isCapped()) {
-            prefetchRecordPages(ns, obj);
+            prefetchRecordPages(txn, ns, obj);
         }
     }
 
+    // page in pages needed for all index lookups on a given object
     void prefetchIndexPages(Collection* collection, const BSONObj& obj) {
         DiskLoc unusedDl; // unused
         BSONObjSet unusedKeys;
-        ReplSetImpl::IndexPrefetchConfig prefetchConfig = theReplSet->getIndexPrefetchConfig();
+        repl::ReplSetImpl::IndexPrefetchConfig prefetchConfig =
+                                                    repl::theReplSet->getIndexPrefetchConfig();
 
         // do we want prefetchConfig to be (1) as-is, (2) for update ops only, or (3) configured per op type?  
         // One might want PREFETCH_NONE for updates, but it's more rare that it is a bad idea for inserts.  
         // #3 (per op), a big issue would be "too many knobs".
         switch (prefetchConfig) {
-        case ReplSetImpl::PREFETCH_NONE:
+        case repl::ReplSetImpl::PREFETCH_NONE:
             return;
-        case ReplSetImpl::PREFETCH_ID_ONLY:
+        case repl::ReplSetImpl::PREFETCH_ID_ONLY:
         {
             TimerHolder timer( &prefetchIndexStats);
             // on the update op case, the call to prefetchRecordPages will touch the _id index.
@@ -143,7 +149,7 @@ namespace mongo {
             }
             break;
         }
-        case ReplSetImpl::PREFETCH_ALL:
+        case repl::ReplSetImpl::PREFETCH_ALL:
         {
             // indexCount includes all indexes, including ones
             // in the process of being built
@@ -169,8 +175,8 @@ namespace mongo {
         }
     }
 
-
-    void prefetchRecordPages(const char* ns, const BSONObj& obj) {
+    // page in the data pages for a record associated with an object
+    void prefetchRecordPages(OperationContext* txn, const char* ns, const BSONObj& obj) {
         BSONElement _id;
         if( obj.getObjectID(_id) ) {
             TimerHolder timer(&prefetchDocStats);
@@ -180,8 +186,8 @@ namespace mongo {
             try {
                 // we can probably use Client::Context here instead of ReadContext as we
                 // have locked higher up the call stack already
-                Client::ReadContext ctx( ns );
-                if( Helpers::findById(ctx.ctx().db(), ns, builder.done(), result) ) {
+                Client::ReadContext ctx(txn, ns);
+                if( Helpers::findById(txn, ctx.ctx().db(), ns, builder.done(), result) ) {
                     // do we want to use Record::touch() here?  it's pretty similar.
                     volatile char _dummy_char = '\0';
                     // Touch the first word on every page in order to fault it into memory

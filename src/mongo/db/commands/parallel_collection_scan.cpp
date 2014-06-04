@@ -90,7 +90,7 @@ namespace mongo {
                     _iterators[i]->prepareToYield();
                 }
             }
-            virtual bool restoreState() {
+            virtual bool restoreState(OperationContext* opCtx) {
                 for (size_t i = 0; i < _iterators.size(); i++) {
                     if (!_iterators[i]->recoverFromYield()) {
                         kill();
@@ -165,10 +165,10 @@ namespace mongo {
 
             NamespaceString ns( dbname, cmdObj[name].String() );
 
-            Client::ReadContext ctx(ns.ns());
+            Client::ReadContext ctx(txn, ns.ns());
 
             Database* db = ctx.ctx().db();
-            Collection* collection = db->getCollection( ns );
+            Collection* collection = db->getCollection( txn, ns );
 
             if ( !collection )
                 return appendCommandStatus( result,

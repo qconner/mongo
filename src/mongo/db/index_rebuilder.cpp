@@ -32,6 +32,7 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pdfile.h"
@@ -62,18 +63,20 @@ namespace mongo {
             for (std::vector<std::string>::const_iterator dbName = dbNames.begin();
                  dbName < dbNames.end();
                  dbName++) {
-                Client::ReadContext ctx(*dbName);
+                OperationContextImpl txn;
+                Client::ReadContext ctx(&txn, *dbName);
+
                 Database* db = ctx.ctx().db();
-                db->namespaceIndex().getNamespaces(collNames, /* onlyCollections */ true);
+                db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collNames);
             }
             checkNS(collNames);
         }
         catch (const DBException& e) {
             warning() << "Index rebuilding did not complete: " << e.what() << endl;
         }
-        boost::unique_lock<boost::mutex> lk(ReplSet::rss.mtx);
-        ReplSet::rss.indexRebuildDone = true;
-        ReplSet::rss.cond.notify_all();
+        boost::unique_lock<boost::mutex> lk(repl::ReplSet::rss.mtx);
+        repl::ReplSet::rss.indexRebuildDone = true;
+        repl::ReplSet::rss.cond.notify_all();
         LOG(1) << "checking complete" << endl;
     }
 
@@ -87,12 +90,13 @@ namespace mongo {
 
             LOG(3) << "IndexRebuilder::checkNS: " << ns;
 
-            // This write lock is held throughout the index building process
-            // for this namespace.
-            Client::WriteContext ctx(ns);
             OperationContextImpl txn;  // XXX???
 
-            Collection* collection = ctx.ctx().db()->getCollection( ns );
+            // This write lock is held throughout the index building process
+            // for this namespace.
+            Client::WriteContext ctx(&txn, ns);
+
+            Collection* collection = ctx.ctx().db()->getCollection( &txn, ns );
             if ( collection == NULL )
                 continue;
 

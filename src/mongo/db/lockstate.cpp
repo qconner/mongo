@@ -28,15 +28,11 @@
 *    it in the license file.
 */
 
-
-#include "mongo/pch.h"
-
 #include "mongo/db/lockstate.h"
 
-#include "mongo/db/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/client.h"
 #include "mongo/util/mongoutils/str.h"
+
 
 namespace mongo {
 
@@ -70,7 +66,7 @@ namespace mongo {
         return _threadState == 'w' || _threadState == 'W';
     }
 
-    bool LockState::isLocked( const StringData& ns ) {
+    bool LockState::isLocked( const StringData& ns ) const {
         char db[MaxDatabaseNameLen];
         nsToDatabase(ns, db);
         
@@ -86,6 +82,26 @@ namespace mongo {
         }
 
         return false;
+    }
+
+    bool LockState::isWriteLocked(const StringData& ns) {
+        if (threadState() == 'W')
+            return true;
+        if (threadState() != 'w')
+            return false;
+        return isLocked(ns);
+    }
+
+    bool LockState::isAtLeastReadLocked(const StringData& ns) const {
+        if (threadState() == 'R' || threadState() == 'W')
+            return true; // global
+        if (threadState() == 0)
+            return false;
+        return isLocked(ns);
+    }
+
+    bool LockState::isNested() const {
+        return recursiveCount() > 1;
     }
 
     void LockState::lockedStart( char newState ) {
@@ -148,9 +164,6 @@ namespace mongo {
         res.append( "waitingForLock" , _lockPending );
     }
 
-    void LockState::Dump() {
-        cc().lockState().dump();
-    }
     void LockState::dump() {
         char s = _threadState;
         stringstream ss;

@@ -28,18 +28,28 @@
 
 #pragma once
 
+#include "mongo/db/repl/consensus.h"
+#include "mongo/db/repl/heartbeat_info.h"
+#include "mongo/db/repl/manager.h"
+#include "mongo/db/repl/member.h"
 #include "mongo/db/repl/rs_base.h"
-#include "mongo/db/repl/repl_set_health_poll_task.h"
+#include "mongo/db/repl/rs_config.h"
 #include "mongo/db/repl/state_box.h"
 #include "mongo/db/repl/sync_source_feedback.h"
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/value.h"
 
 namespace mongo {
 
     class Cloner;
+    class OperationContext;
+
+namespace repl {
+
     struct FixUpInfo;
     class ReplSetCmdline;
+    class ReplSetHealthPollTask;
 
     class ReplicationStartSynchronizer {
     public:
@@ -110,7 +120,7 @@ namespace mongo {
         bool _stepDown(int secs);
         bool _freeze(int secs);
     private:
-        void assumePrimary();
+        void _assumePrimary();
         void loadLastOpTimeWritten(bool quiet=false);
         void changeState(MemberState s);
 
@@ -190,7 +200,7 @@ namespace mongo {
         MemberState state() const { return box.getState(); }
         void _fatal();
         void _getOplogDiagsAsHtml(unsigned server_id, stringstream& ss) const;
-        void _summarizeAsHtml(stringstream&) const;
+        void _summarizeAsHtml(OperationContext* txn, stringstream&) const;
         void _summarizeStatus(BSONObjBuilder&) const; // for replSetGetStatus command
 
         /* call afer constructing to start - returns fairly quickly after launching its threads */
@@ -273,14 +283,14 @@ namespace mongo {
     private:
         bool _syncDoInitialSync_clone(Cloner &cloner, const char *master,
                                       const list<string>& dbs, bool dataPass);
-        bool _syncDoInitialSync_applyToHead( replset::SyncTail& syncer, OplogReader* r ,
+        bool _syncDoInitialSync_applyToHead( SyncTail& syncer, OplogReader* r ,
                                              const Member* source, const BSONObj& lastOp,
                                              BSONObj& minValidOut);
         void _syncDoInitialSync();
         void syncDoInitialSync();
         void _syncThread();
         void syncTail();
-        unsigned _syncRollback(OplogReader& r);
+        unsigned _syncRollback(OperationContext* txn, OplogReader& r);
         void syncFixUp(FixUpInfo& h, OplogReader& r);
 
         // keep a list of hosts that we've tried recently that didn't work
@@ -309,7 +319,7 @@ namespace mongo {
         threadpool::ThreadPool& getWriterPool() { return _writerPool; }
 
         const ReplSetConfig::MemberCfg& myConfig() const { return _config; }
-        bool tryToGoLiveAsASecondary(OpTime&); // readlocks
+        bool tryToGoLiveAsASecondary(OperationContext* txn, OpTime&); // readlocks
         void syncRollback(OplogReader& r);
         void syncThread();
         const OpTime lastOtherOpTime() const;
@@ -344,4 +354,5 @@ namespace mongo {
         static const char* _initialSyncFlagString;
         static const BSONObj _initialSyncFlag;
     };
+} // namespace repl
 } // namespace mongo

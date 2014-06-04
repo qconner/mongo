@@ -72,7 +72,7 @@ namespace mongo {
             Helpers::RemoveSaver removeSaver("moveChunk", ns.toString(), "post-cleanup");
 
             // log the opId so the user can use it to cancel the delete using killOp.
-            unsigned int opId = cc().curop()->opNum();
+            unsigned int opId = txn->getCurOp()->opNum();
             log() << "Deleter starting delete for: " << ns
                   << " from " << inclusiveLower
                   << " -> " << exclusiveUpper
@@ -87,7 +87,7 @@ namespace mongo {
                                                       exclusiveUpper,
                                                       keyPattern),
                                              false, /*maxInclusive*/
-                                             replSet? secondaryThrottle : false,
+                                             repl::replSet ? secondaryThrottle : false,
                                              serverGlobalParams.moveParanoia ? &removeSaver : NULL,
                                              true, /*fromMigrate*/
                                              true); /*onlyRemoveOrphans*/
@@ -124,10 +124,10 @@ namespace mongo {
             }
         }
 
-        if (replSet) {
+        if (repl::replSet) {
             Timer elapsedTime;
             ReplTime lastOpApplied = cc().getLastOp().asDate();
-            while (!opReplicatedEnough(lastOpApplied,
+            while (!repl::opReplicatedEnough(lastOpApplied,
                                        BSON("w" << "majority").firstElement())) {
                 if (elapsedTime.seconds() >= 3600) {
                     *errMsg = str::stream() << "rangeDeleter timed out after "
@@ -156,10 +156,11 @@ namespace mongo {
         return true;
     }
 
-    void RangeDeleterDBEnv::getCursorIds(const StringData& ns,
+    void RangeDeleterDBEnv::getCursorIds(OperationContext* txn,
+                                         const StringData& ns,
                                          std::set<CursorId>* openCursors) {
-        Client::ReadContext ctx(ns.toString());
-        Collection* collection = ctx.ctx().db()->getCollection( ns );
+        Client::ReadContext ctx(txn, ns.toString());
+        Collection* collection = ctx.ctx().db()->getCollection( txn, ns );
         if ( !collection )
             return;
 

@@ -1,5 +1,8 @@
 // Test that interrupting a count returns an error code.
 
+
+if (0) {// SERVER-14143
+
 t = db.count10;
 t.drop();
 
@@ -52,8 +55,8 @@ jsTest.log("count10.js: killed count output start");
 printjson(res);
 jsTest.log("count10.js: killed count output end");
 assert(res);
-assert(res.match(/count failed/) !== null);
-assert(res.match(/\"code\"/) !== null);
+assert(res.message.match(/count failed/) !== null);
+assert(res.message.match(/\"code\"/) !== null);
 
 s();
-
+}

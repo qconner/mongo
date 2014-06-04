@@ -88,14 +88,14 @@ namespace mongo {
                     _ht->kill(txn, extra);
                 }
                 catch(DBException&) {
-                    MONGO_DLOG(3) << "caught exception in kill_ns" << endl;
+                    LOG(3) << "caught exception in kill_ns" << endl;
                 }
             }
         }
     }
 
-    bool NamespaceIndex::exists() const {
-        return !boost::filesystem::exists(path());
+    bool NamespaceIndex::pathExists() const {
+        return boost::filesystem::exists(path());
     }
 
     boost::filesystem::path NamespaceIndex::path() const {
@@ -115,12 +115,9 @@ namespace mongo {
         }
     }
 
-    void NamespaceIndex::getNamespaces( list<string>& tofill , bool onlyCollections ) const {
-        verify( onlyCollections ); // TODO: need to implement this
-        //                                  need stdx::bind or something to make this less ugly
-
+    void NamespaceIndex::getCollectionNamespaces( list<string>* tofill ) const {
         if ( _ht.get() )
-            _ht->iterAll( namespaceGetNamespacesCallback , (void*)&tofill );
+            _ht->iterAll( namespaceGetNamespacesCallback , (void*)tofill );
     }
 
     void NamespaceIndex::maybeMkdir() const {

@@ -45,6 +45,7 @@ namespace auth {
 
     struct CreateOrUpdateUserArgs {
         UserName userName;
+        std::string mechanism;
         bool hasHashedPassword;
         std::string hashedPassword;
         bool hasCustomData;
@@ -52,8 +53,9 @@ namespace auth {
         bool hasRoles;
         std::vector<RoleName> roles;
         BSONObj writeConcern;
+        
         CreateOrUpdateUserArgs() :
-            hasHashedPassword(false), hasCustomData(false),  hasRoles(false) {}
+            hasHashedPassword(false), hasCustomData(false), hasRoles(false) {}
     };
 
     /**
@@ -78,7 +80,7 @@ namespace auth {
                                                    const StringData& cmdName,
                                                    const std::string& dbname,
                                                    std::string* parsedName,
-                                                   vector<RoleName>* parsedRoleNames,
+                                                   std::vector<RoleName>* parsedRoleNames,
                                                    BSONObj* parsedWriteConcern);
 
     /**

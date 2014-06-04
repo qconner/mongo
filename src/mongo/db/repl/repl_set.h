@@ -32,6 +32,7 @@
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
+namespace repl {
 
     class ReplSet : public ReplSetImpl {
     public:
@@ -62,7 +63,7 @@ namespace mongo {
         string name() const { return ReplSetImpl::name(); }
         virtual const ReplSetConfig& config() { return ReplSetImpl::config(); }
         void getOplogDiagsAsHtml(unsigned server_id, stringstream& ss) const { _getOplogDiagsAsHtml(server_id,ss); }
-        void summarizeAsHtml(stringstream& ss) const { _summarizeAsHtml(ss); }
+        void summarizeAsHtml(OperationContext* txn, stringstream& ss) const { _summarizeAsHtml(txn, ss); }
         void summarizeStatus(BSONObjBuilder& b) const  { _summarizeStatus(b); }
         void fillIsMaster(BSONObjBuilder& b) { _fillIsMaster(b); }
         threadpool::ThreadPool& getPrefetchPool() { return ReplSetImpl::getPrefetchPool(); }
@@ -96,4 +97,5 @@ namespace mongo {
         ReplSet();
     };
 
+} // namespace repl
 } // namespace mongo

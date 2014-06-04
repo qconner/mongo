@@ -39,65 +39,34 @@ namespace mongo {
     struct CloneOptions;
     class DBClientBase;
     class DBClientCursor;
-    class Query;
     class OperationContext;
+    class Query;
 
     class Cloner: boost::noncopyable {
     public:
         Cloner();
-        /**
-         *  slaveOk     - if true it is ok if the source of the data is !ismaster.
-         *  useReplAuth - use the credentials we normally use as a replication slave for the cloning
-         *  snapshot    - use $snapshot mode for copying collections.  note this should not be used
-         *                when it isn't required, as it will be slower.  for example,
-         *                repairDatabase need not use it.
-         */
-        void setConnection( DBClientBase *c ) { _conn.reset( c ); }
+
+        void setConnection(DBClientBase* c) {
+            _conn.reset(c);
+        }
 
         /** copy the entire database */
         bool go(OperationContext* txn,
                 Client::Context& ctx,
-                const string& masterHost,
+                const std::string& masterHost,
                 const CloneOptions& opts,
-                set<string>* clonedColls,
-                string& errmsg, int *errCode = 0);
+                std::set<std::string>* clonedColls,
+                std::string& errmsg,
+                int *errCode = 0);
 
         bool copyCollection(OperationContext* txn,
-                            const string& ns,
+                            const std::string& ns,
                             const BSONObj& query,
-                            string& errmsg,
+                            std::string& errmsg,
                             bool mayYield,
                             bool mayBeInterrupted,
                             bool copyIndexes = true,
                             bool logForRepl = true );
-        /**
-         * validate the cloner query was successful
-         * @param cur   Cursor the query was executed on
-         * @param errCode out  Error code encountered during the query
-         * @param errmsg out  Error message encountered during the query
-         */
-        static bool validateQueryResults(const auto_ptr<DBClientCursor>& cur, int32_t* errCode,
-                                         string& errmsg);
-
-        /**
-         * @param errmsg out  - Error message (if encountered).
-         * @param errCode out - If provided, this will be set on error to the server's error code.
-         *                      Currently this will only be set if there is an error in the initial
-         *                      system.namespaces query.
-         */
-        static bool cloneFrom(OperationContext* txn,
-                              Client::Context& context,
-                              const string& masterHost,
-                              const CloneOptions& options,
-                              string& errmsg,
-                              int* errCode = 0,
-                              set<string>* clonedCollections = 0);
-
-        /**
-         * Copy a collection (and indexes) from a remote host
-         */
-        static bool copyCollectionFromRemote(OperationContext* txn,
-                                             const string& host, const string& ns, string& errmsg);
 
     private:
         void copy(OperationContext* txn,
@@ -113,11 +82,17 @@ namespace mongo {
                   Query q);
 
         struct Fun;
-        auto_ptr<DBClientBase> _conn;
+        std::auto_ptr<DBClientBase> _conn;
     };
 
+    /**
+     *  slaveOk     - if true it is ok if the source of the data is !ismaster.
+     *  useReplAuth - use the credentials we normally use as a replication slave for the cloning
+     *  snapshot    - use $snapshot mode for copying collections.  note this should not be used
+     *                when it isn't required, as it will be slower.  for example,
+     *                repairDatabase need not use it.
+     */
     struct CloneOptions {
-
         CloneOptions() {
             logForRepl = true;
             slaveOk = false;
@@ -130,8 +105,8 @@ namespace mongo {
             syncIndexes = true;
         }
 
-        string fromDB;
-        set<string> collsToIgnore;
+        std::string fromDB;
+        std::set<std::string> collsToIgnore;
 
         bool logForRepl;
         bool slaveOk;
