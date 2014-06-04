@@ -34,6 +34,8 @@
 
 #include <sstream>
 
+using namespace mongo::repl;
+
 namespace mongo {
     MockReplicaSet::MockReplicaSet(const string& setName, size_t nodes):
             _setName(setName) {

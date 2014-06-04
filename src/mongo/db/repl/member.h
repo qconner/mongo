@@ -33,6 +33,7 @@
 #include "mongo/util/concurrency/list.h"
 
 namespace mongo {
+namespace repl {
 
     /* member of a replica set */
     class Member : public List1<Member>::Base {
@@ -74,4 +75,5 @@ namespace mongo {
         HeartbeatInfo _hbinfo;
     };
 
+} // namespace repl
 } // namespace mongo

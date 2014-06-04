@@ -55,15 +55,16 @@ namespace mongo {
     void IndexBuilder::run() {
         LOG(2) << "IndexBuilder building index " << _index;
 
+        OperationContextImpl txn;
+
         Client::initThread(name().c_str());
         Lock::ParallelBatchWriterMode::iAmABatchParticipant();
 
-        replLocalAuth();
+        repl::replLocalAuth();
 
         cc().curop()->reset(HostAndPort(), dbInsert);
         NamespaceString ns(_index["ns"].String());
-        Client::WriteContext ctx(ns.getSystemIndexesCollection());
-        OperationContextImpl txn;
+        Client::WriteContext ctx(&txn, ns.getSystemIndexesCollection());
 
         Database* db = dbHolder().get(ns.db().toString(), storageGlobalParams.dbpath);
 
@@ -78,14 +79,14 @@ namespace mongo {
     Status IndexBuilder::build(OperationContext* txn, Database* db) const {
         const string ns = _index["ns"].String();
 
-        Collection* c = db->getCollection( ns );
+        Collection* c = db->getCollection( txn, ns );
         if ( !c ) {
-            c = db->getOrCreateCollection( ns );
+            c = db->getOrCreateCollection( txn, ns );
             verify(c);
         }
 
         // Show which index we're building in the curop display.
-        cc().curop()->setQuery(_index);
+        txn->getCurOp()->setQuery(_index);
 
         Status status = c->getIndexCatalog()->createIndex( txn,
                                                            _index, 

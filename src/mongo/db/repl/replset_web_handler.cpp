@@ -36,10 +36,7 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-    extern void fillRsLog(std::stringstream&);
-
-namespace {
+namespace repl {
 
     using namespace bson;
     using namespace mongoutils;
@@ -54,15 +51,19 @@ namespace {
         }
 
         virtual void handle( OperationContext* txn,
-                             const char *rq, const std::string& url, BSONObj params,
-                             string& responseMsg, int& responseCode,
-                             vector<string>& headers,  const SockAddr &from ) {
+                             const char *rq, 
+                             const std::string& url, 
+                             BSONObj params,
+                             string& responseMsg, 
+                             int& responseCode,
+                             vector<string>& headers,  
+                             const SockAddr &from ) {
 
             if( url == "/_replSetOplog" ) {
                 responseMsg = _replSetOplog(params);
             }
             else
-                responseMsg = _replSet();
+                responseMsg = _replSet(txn);
             responseCode = 200;
         }
 
@@ -96,7 +97,7 @@ namespace {
         }
 
         /* /_replSet show replica set status in html format */
-        string _replSet() {
+        string _replSet(OperationContext* txn) {
             stringstream s;
             s << start("Replica Set Status " + prettyHostName());
             s << p( a("/", "back", "Home") + " | " +
@@ -115,7 +116,7 @@ namespace {
             }
             else {
                 try {
-                    theReplSet->summarizeAsHtml(s);
+                    theReplSet->summarizeAsHtml(txn, s);
                 }
                 catch(...) { s << "error summarizing replset status\n"; }
             }
@@ -129,5 +130,5 @@ namespace {
 
     } replSetHandler;
 
-}  // namespace
-}  // namespace mongo
+} // namespace repl
+} // namespace mongo

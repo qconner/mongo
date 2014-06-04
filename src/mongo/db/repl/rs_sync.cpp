@@ -56,6 +56,7 @@
 #include "mongo/util/fail_point_service.h"
 
 namespace mongo {
+namespace repl {
 
     using namespace bson;
 
@@ -71,7 +72,7 @@ namespace mongo {
        readlocks
        @return true if transitioned to SECONDARY
     */
-    bool ReplSetImpl::tryToGoLiveAsASecondary(OpTime& /*out*/ minvalid) {
+    bool ReplSetImpl::tryToGoLiveAsASecondary(OperationContext* txn, OpTime& /*out*/ minvalid) {
         bool golive = false;
 
         lock rsLock( this );
@@ -86,7 +87,7 @@ namespace mongo {
             return false;
         }
 
-        Lock::GlobalWrite writeLock;
+        Lock::GlobalWrite writeLock(txn->lockState());
 
         // make sure we're not primary, secondary, rollback, or fatal already
         if (box.getState().primary() || box.getState().secondary() ||
@@ -170,7 +171,7 @@ namespace mongo {
         }
 
         // record the previous member we were syncing from
-        const Member *prev = replset::BackgroundSync::get()->getSyncTarget();
+        const Member *prev = BackgroundSync::get()->getSyncTarget();
         if (prev) {
             result.append("prevSyncTarget", prev->fullName());
         }
@@ -189,6 +190,10 @@ namespace mongo {
         for (Member *m = _members.head(); m; m = m->next()) {
             if (m->syncable() &&
                 targetOpTime.getSecs()+maxSyncSourceLagSecs < m->hbinfo().opTime.getSecs()) {
+                log() << "changing sync target because current sync target's most recent OpTime is "
+                      << targetOpTime.toStringPretty() << " which is more than "
+                      << maxSyncSourceLagSecs << " seconds behind member " << m->fullName()
+                      << " whose most recent OpTime is " << m->hbinfo().opTime.getSecs();
                 return true;
             }
         }
@@ -222,7 +227,7 @@ namespace mongo {
         }
 
         /* we have some data.  continue tailing. */
-        replset::SyncTail tail(replset::BackgroundSync::get());
+        SyncTail tail(BackgroundSync::get());
         tail.oplogApplication();
     }
 
@@ -296,4 +301,5 @@ namespace mongo {
             changeState(MemberState::RS_RECOVERING);
         }
     }
-}
+} // namespace repl
+} // namespace mongo

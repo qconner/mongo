@@ -90,25 +90,11 @@ namespace logger {
      */
     inline LogstreamBuilder out() { return log(); }
 
-    /**
-     * For logging which we may not want during unit tests (dbtests) runs.  Set tlogLevel to -1 to
-     * suppress MONGO_TLOG() output in a test program.
-     */
-    extern int tlogLevel;
-
 #define MONGO_LOG(DLEVEL) \
     if (!(::mongo::logger::globalLogDomain())->shouldLog(::mongo::LogstreamBuilder::severityCast(DLEVEL))) {} \
     else LogstreamBuilder(::mongo::logger::globalLogDomain(), getThreadName(), ::mongo::LogstreamBuilder::severityCast(DLEVEL))
 
 #define LOG MONGO_LOG
-
-#define MONGO_DLOG(DLEVEL) \
-    if (!(DEBUG_BUILD) && !::mongo::logger::globalLogDomain()->shouldLog(::mongo::LogstreamBuilder::severityCast(DLEVEL))) {} \
-    else LogstreamBuilder(::mongo::logger::globalLogDomain(), getThreadName(), ::mongo::LogstreamBuilder::severityCast(DLEVEL))
-
-#define MONGO_TLOG(DLEVEL) \
-    if ((!::mongo::debug && ((DLEVEL) > tlogLevel)) || !::mongo::logger::globalLogDomain()->shouldLog(::mongo::LogstreamBuilder::severityCast(DLEVEL))) {} \
-    else LogstreamBuilder(::mongo::logger::globalLogDomain(), getThreadName(), ::mongo::LogstreamBuilder::severityCast(DLEVEL))
 
     inline LogstreamBuilder problem() {
         return log();
@@ -122,7 +108,7 @@ namespace logger {
     /** output the error # and error message with prefix.
         handy for use as parm in uassert/massert.
         */
-    string errnoWithPrefix( const char * prefix );
+    std::string errnoWithPrefix( const char * prefix );
 
     // Guard that alters the indentation level used by log messages on the current thread.
     // Used only by mongodump (mongo/tools/dump.cpp).  Do not introduce new uses.
@@ -134,7 +120,7 @@ namespace logger {
     extern Tee* const warnings; // Things put here go in serverStatus
     extern Tee* const startupWarningsLog; // Things put here get reported in MMS
 
-    string errnoWithDescription(int errorcode = -1);
+    std::string errnoWithDescription(int errorcode = -1);
 
     /**
      * Write the current context (backtrace), along with the optional "msg".

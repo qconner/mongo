@@ -182,6 +182,7 @@ namespace mongo {
         DbMessage d(m);
         QueryMessage q(d);
         BSONObj obj;
+
         const bool isAuthorized = cc().getAuthorizationSession()->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::killop);
         audit::logKillOpAuthzCheck(&cc(),
@@ -210,6 +211,7 @@ namespace mongo {
     bool _unlockFsync();
     void unlockFsync(const char *ns, Message& m, DbResponse &dbresponse) {
         BSONObj obj;
+
         const bool isAuthorized = cc().getAuthorizationSession()->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::unlock);
         audit::logFsyncUnlockAuthzCheck(
@@ -341,7 +343,7 @@ namespace mongo {
 
         Client& c = cc();
         if (!c.isGod())
-            c.getAuthorizationSession()->startRequest();
+            c.getAuthorizationSession()->startRequest(txn);
 
         if ( op == dbQuery ) {
             if( strstr(ns, ".$cmd") ) {
@@ -476,13 +478,13 @@ namespace mongo {
                 }
             }
             catch ( UserException& ue ) {
-                MONGO_TLOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
-                        << ue.toString() << endl;
+                LOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
+                       << ue.toString() << endl;
                 debug.exceptionInfo = ue.getInfo();
             }
             catch ( AssertionException& e ) {
-                MONGO_TLOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
-                        << e.toString() << endl;
+                LOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
+                       << e.toString() << endl;
                 debug.exceptionInfo = e.getInfo();
                 shouldLog = true;
             }
@@ -494,12 +496,12 @@ namespace mongo {
         logThreshold += currentOp.getExpectedLatencyMs();
 
         if ( shouldLog || debug.executionTime > logThreshold ) {
-            MONGO_TLOG(0) << debug.report( currentOp ) << endl;
+            LOG(0) << debug.report( currentOp ) << endl;
         }
 
         if ( currentOp.shouldDBProfile( debug.executionTime ) ) {
             // performance profiling is on
-            if ( Lock::isReadLocked() ) {
+            if (txn->lockState()->hasAnyReadLock()) {
                 LOG(1) << "note: not profiling because recursive read lock" << endl;
             }
             else if ( lockedForWriting() ) {
@@ -528,7 +530,7 @@ namespace mongo {
             verify( n < 30000 );
         }
 
-        int found = CollectionCursorCache::eraseCursorGlobalIfAuthorized(n, (long long *) x);
+        int found = CollectionCursorCache::eraseCursorGlobalIfAuthorized(txn, n, (long long *) x);
 
         if ( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1)) || found != n ) {
             LOG( found == n ? 1 : 0 ) << "killcursors: found " << found << " of " << n << endl;
@@ -548,7 +550,7 @@ namespace mongo {
         Database *database = ctx->db();
         verify( database->name() == db );
 
-        oplogCheckCloseDatabase( database ); // oplog caches some things, dirty its caches
+        repl::oplogCheckCloseDatabase(database); // oplog caches some things, dirty its caches
 
         if( BackgroundOperation::inProgForDb(db) ) {
             log() << "warning: bg op in prog during close db? " << db << endl;
@@ -558,7 +560,7 @@ namespace mongo {
         string prefix(db);
         prefix += '.';
 
-        dbHolderW().erase( db, path );
+        dbHolder().erase(db, path);
         ctx->_clear();
         delete database; // closes files
     }
@@ -603,7 +605,7 @@ namespace mongo {
         UpdateExecutor executor(&request, &op.debug());
         uassertStatusOK(executor.prepare());
 
-        Lock::DBWrite lk(ns.ns());
+        Lock::DBWrite lk(txn->lockState(), ns.ns());
 
         // if this ever moves to outside of lock, need to adjust check
         // Client::Context::_finishInit
@@ -643,7 +645,7 @@ namespace mongo {
         request.setUpdateOpLog(true);
         DeleteExecutor executor(&request);
         uassertStatusOK(executor.prepare());
-        Lock::DBWrite lk(ns.ns());
+        Lock::DBWrite lk(txn->lockState(), ns.ns());
 
         // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
         if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
@@ -697,7 +699,7 @@ namespace mongo {
                         last = getLastSetOptime();
                     }
                     else {
-                        waitForOptimeChange(last, 1000/*ms*/);
+                        repl::waitForOptimeChange(last, 1000/*ms*/);
                     }
                 }
 
@@ -717,7 +719,7 @@ namespace mongo {
                     // because it may now be out of sync with the client's iteration state.
                     // SERVER-7952
                     // TODO Temporary code, see SERVER-4563 for a cleanup overview.
-                    CollectionCursorCache::eraseCursorGlobal( cursorid );
+                    CollectionCursorCache::eraseCursorGlobal(txn, cursorid );
                 }
                 ex.reset( new AssertionException( e.getInfo().msg, e.getCode() ) );
                 ok = false;
@@ -791,7 +793,7 @@ namespace mongo {
             string targetNS = js["ns"].String();
             uassertStatusOK( userAllowedWriteNS( targetNS ) );
 
-            Collection* collection = ctx.db()->getCollection( targetNS );
+            Collection* collection = ctx.db()->getCollection( txn, targetNS );
             if ( !collection ) {
                 // implicitly create
                 collection = ctx.db()->createCollection( txn, targetNS );
@@ -802,16 +804,16 @@ namespace mongo {
             // insert comes from a socket client request rather than a
             // parent operation using the client interface.  The parent
             // operation might not support interrupts.
-            bool mayInterrupt = cc().curop()->parent() == NULL;
+            bool mayInterrupt = txn->getCurOp()->parent() == NULL;
 
-            cc().curop()->setQuery(js);
+            txn->getCurOp()->setQuery(js);
             Status status = collection->getIndexCatalog()->createIndex(txn, js, mayInterrupt);
 
             if ( status.code() == ErrorCodes::IndexAlreadyExists )
                 return;
 
             uassertStatusOK( status );
-            logOp( txn, "i", ns, js );
+            repl::logOp(txn, "i", ns, js);
             return;
         }
 
@@ -820,7 +822,7 @@ namespace mongo {
         if ( !fixed.getValue().isEmpty() )
             js = fixed.getValue();
 
-        Collection* collection = ctx.db()->getCollection( ns );
+        Collection* collection = ctx.db()->getCollection( txn, ns );
         if ( !collection ) {
             collection = ctx.db()->createCollection( txn, ns );
             verify( collection );
@@ -828,7 +830,7 @@ namespace mongo {
 
         StatusWith<DiskLoc> status = collection->insertDocument( txn, js, true );
         uassertStatusOK( status.getStatus() );
-        logOp(txn, "i", ns, js);
+        repl::logOp(txn, "i", ns, js);
     }
 
     NOINLINE_DECL void insertMulti(OperationContext* txn,
@@ -880,11 +882,11 @@ namespace mongo {
             uassertStatusOK(status);
         }
 
-        Lock::DBWrite lk(ns);
+        Lock::DBWrite lk(txn->lockState(), ns);
 
         // CONCURRENCY TODO: is being read locked in big log sufficient here?
         // writelock is used to synchronize stepdowns w/ writes
-        uassert( 10058 , "not master", isMasterNs(ns) );
+        uassert(10058 , "not master", repl::isMasterNs(ns));
 
         if ( handlePossibleShardedMessage( m , 0 ) )
             return;
@@ -924,7 +926,7 @@ namespace mongo {
        local database does NOT count except for rsoplog collection.
        used to set the hasData field on replset heartbeat command response
     */
-    bool replHasDatabases() {
+    bool replHasDatabases(OperationContext* txn) {
         vector<string> names;
         getDatabaseNames(names);
         if( names.size() >= 2 ) return true;
@@ -933,9 +935,9 @@ namespace mongo {
                 return true;
             // we have a local database.  return true if oplog isn't empty
             {
-                Lock::DBRead lk(rsoplog);
+                Lock::DBRead lk(txn->lockState(), repl::rsoplog);
                 BSONObj o;
-                if( Helpers::getFirst(rsoplog, o) )
+                if( Helpers::getFirst(txn, repl::rsoplog, o) )
                     return true;
             }
         }
@@ -1002,7 +1004,9 @@ namespace {
     }
 
     void DBDirectClient::killCursor( long long id ) {
-        CollectionCursorCache::eraseCursorGlobal( id );
+        // The killCursor command on the DB client is only used by sharding,
+        // so no need to have it for MongoD.
+        verify(!"killCursor should not be used in MongoD");
     }
 
     HostAndPort DBDirectClient::_clientHost = HostAndPort( "0.0.0.0" , 0 );
@@ -1013,10 +1017,11 @@ namespace {
                 << " to zero in query: " << query << endl;
             skip = 0;
         }
-        Lock::DBRead lk( ns );
+
+        Lock::DBRead lk(_txn->lockState(), ns);
         string errmsg;
         int errCode;
-        long long res = runCount( ns, _countCmd( ns , query , options , limit , skip ) , errmsg, errCode );
+        long long res = runCount( _txn, ns, _countCmd( ns , query , options , limit , skip ) , errmsg, errCode );
         if ( res == -1 ) {
             // namespace doesn't exist
             return 0;
@@ -1069,7 +1074,7 @@ namespace {
                 while( 1 ) {
                     // we may already be in a read lock from earlier in the call stack, so do read lock here 
                     // to be consistent with that.
-                    readlocktry w(20000);
+                    readlocktry w(&cc().lockState(), 20000);
                     if( w.got() ) { 
                         log() << "shutdown: final commit..." << endl;
                         getDur().commitNow();
@@ -1115,12 +1120,12 @@ namespace {
 
     void exitCleanly( ExitCode code ) {
         killCurrentOp.killAll();
-        if (theReplSet) {
-            theReplSet->shutdown();
+        if (repl::theReplSet) {
+            repl::theReplSet->shutdown();
         }
 
         {
-            Lock::GlobalWrite lk;
+            Lock::GlobalWrite lk(&cc().lockState());
             log() << "now exiting" << endl;
             dbexit( code );
         }

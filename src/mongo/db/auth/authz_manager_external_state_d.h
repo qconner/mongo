@@ -50,9 +50,11 @@ namespace mongo {
         AuthzManagerExternalStateMongod();
         virtual ~AuthzManagerExternalStateMongod();
 
-        virtual Status getAllDatabaseNames(std::vector<std::string>* dbnames);
+        virtual Status getAllDatabaseNames(
+                            OperationContext* txn, std::vector<std::string>* dbnames);
 
-        virtual Status findOne(const NamespaceString& collectionName,
+        virtual Status findOne(OperationContext* txn,
+                               const NamespaceString& collectionName,
                                const BSONObj& query,
                                BSONObj* result);
         virtual Status query(const NamespaceString& collectionName,
@@ -83,7 +85,8 @@ namespace mongo {
         virtual void releaseAuthzUpdateLock();
 
     private:
-        virtual Status _getUserDocument(const UserName& userName, BSONObj* userDoc);
+        virtual Status _getUserDocument(
+                            OperationContext* txn, const UserName& userName, BSONObj* userDoc);
 
         boost::timed_mutex _authzDataUpdateLock;
     };

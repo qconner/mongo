@@ -40,13 +40,11 @@
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
-namespace replset {
-
-    class BackgroundSyncInterface;
-
-
+namespace repl {
     // TODO: move hbmsg into an error-keeping class (SERVER-4444)
-    void sethbmsg(const string& s, const int logLevel=0);
+    void sethbmsg(const std::string& s, const int logLevel=0);
 
-} // namespace replset
+    extern int maxSyncSourceLagSecs;
+
+} // namespace repl
 } // namespace mongo

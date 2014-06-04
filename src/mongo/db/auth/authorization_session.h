@@ -71,13 +71,13 @@ namespace mongo {
         // Should be called at the beginning of every new request.  This performs the checks
         // necessary to determine if localhost connections should be given full access.
         // TODO: try to eliminate the need for this call.
-        void startRequest();
+        void startRequest(OperationContext* txn);
 
         /**
          * Adds the User identified by "UserName" to the authorization session, acquiring privileges
          * for it in the process.
          */
-        Status addAndAuthorizeUser(const UserName& userName);
+        Status addAndAuthorizeUser(OperationContext* txn, const UserName& userName);
 
         // Returns the authenticated user with the given name.  Returns NULL
         // if no such user is found.
@@ -88,8 +88,8 @@ namespace mongo {
         // Gets an iterator over the names of all authenticated users stored in this manager.
         UserNameIterator getAuthenticatedUserNames();
 
-        // Returns a string representing all logged-in users on the current session.
-        // WARNING: this string will contain NUL bytes so don't call c_str()!
+        // Returns a std::string representing all logged-in users on the current session.
+        // WARNING: this std::string will contain NUL bytes so don't call c_str()!
         std::string getAuthenticatedUserNamesToken();
 
         // Removes any authenticated principals whose authorization credentials came from the given
@@ -99,6 +99,13 @@ namespace mongo {
         // Adds the internalSecurity user to the set of authenticated users.
         // Used to grant internal threads full access.
         void grantInternalAuthorization();
+
+        // Generates a vector of default privileges that are granted to any user,
+        // regardless of which roles that user does or does not possess.
+        // If localhost exception is active, the permissions include the ability to create
+        // the first user and the ability to run the commands needed to bootstrap the system
+        // into a state where the first user can be created.
+        PrivilegeVector getDefaultPrivileges();
 
         // Checks if this connection has the privileges necessary to perform the given query on the
         // given namespace.
@@ -160,7 +167,7 @@ namespace mongo {
 
         // Like isAuthorizedForPrivilege, above, except returns true if the session is authorized
         // for all of the listed privileges.
-        bool isAuthorizedForPrivileges(const vector<Privilege>& privileges);
+        bool isAuthorizedForPrivileges(const std::vector<Privilege>& privileges);
 
         // Utility function for isAuthorizedForPrivilege(Privilege(resource, action)).
         bool isAuthorizedForActionsOnResource(const ResourcePattern& resource, ActionType action);
@@ -175,7 +182,8 @@ namespace mongo {
 
         // Utility function for
         // isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns), actions).
-        bool isAuthorizedForActionsOnNamespace(const NamespaceString& ns, const ActionSet& actions);
+        bool isAuthorizedForActionsOnNamespace(const NamespaceString& ns,
+                                               const ActionSet& actions);
 
         // Replaces the vector of UserNames that a system user is impersonating with a new vector.
         // The auditing system adds these to each audit record in the log.
@@ -196,7 +204,7 @@ namespace mongo {
 
         // If any users authenticated on this session are marked as invalid this updates them with
         // up-to-date information. May require a read lock on the "admin" db to read the user data.
-        void _refreshUserInfoAsNeeded();
+        void _refreshUserInfoAsNeeded(OperationContext* txn);
 
         // Checks if this connection is authorized for the given Privilege, ignoring whether or not
         // we should even be doing authorization checks in general.  Note: this may acquire a read

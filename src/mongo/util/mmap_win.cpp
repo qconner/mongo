@@ -33,6 +33,7 @@
 #include "mongo/db/storage/durable_mapped_file.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/mmap.h"
+#include "mongo/util/processinfo.h"
 #include "mongo/util/text.h"
 #include "mongo/util/timer.h"
 
@@ -297,6 +298,20 @@ namespace mongo {
                         continue;
                     }
 
+#ifndef _WIN64
+                    // Warn user that if they are running a 32-bit app on 64-bit Windows
+                    if (dosError == ERROR_NOT_ENOUGH_MEMORY) {
+                        BOOL wow64Process;
+                        BOOL retWow64 = IsWow64Process(GetCurrentProcess(), &wow64Process);
+                        if (retWow64 && wow64Process) {
+                            log() << "This is a 32-bit MongoDB binary running on a 64-bit"
+                                " operating system that has run out of virtual memory for"
+                                " databases. Switch to a 64-bit build of MongoDB to open"
+                                " the databases.";
+                        }
+                    }
+#endif
+
                     log() << "MapViewOfFileEx for " << filename
                         << " at address " << thisAddress
                         << " failed with " << errnoWithDescription(dosError)
@@ -356,6 +371,18 @@ namespace mongo {
                                       &oldProtection );
             if ( !ok ) {
                 DWORD dosError = GetLastError();
+
+                if (dosError == ERROR_COMMITMENT_LIMIT) {
+                    // System has run out of memory between physical RAM & page file, tell the user
+                    BSONObjBuilder bb;
+
+                    ProcessInfo p;
+                    p.getExtraInfo(bb);
+
+                    log() << "MongoDB has exhausted the system memory capacity.";
+                    log() << "Current Memory Status: " << bb.obj().toString();
+                }
+
                 log() << "VirtualProtect for " << mmf->filename()
                         << " chunk " << chunkno
                         << " failed with " << errnoWithDescription( dosError )

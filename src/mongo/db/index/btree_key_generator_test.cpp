@@ -87,8 +87,7 @@ namespace {
         // Step 2: ask 'keyGen' to generate index keys for the object 'obj'.
         //
         BSONObjSet actualKeys;
-        Status s = keyGen->getKeys(obj, &actualKeys);
-        ASSERT_OK(s);
+        keyGen->getKeys(obj, &actualKeys);
 
         //
         // Step 3: check that the results match the expected result.
@@ -100,39 +99,6 @@ namespace {
         }
 
         return match;
-    }
-
-    void assertKeygenFails(const BSONObj& kp, const BSONObj& obj,
-                           const BSONObjSet& expectedKeys, bool sparse = false) {
-        //
-        // Step 1: construct the btree key generator object, using the
-        // index key pattern.
-        //
-        vector<const char*> fieldNames;
-        vector<BSONElement> fixed;
-
-        BSONObjIterator it(kp);
-        while (it.more()) {
-            BSONElement elt = it.next();
-            fieldNames.push_back(elt.fieldName());
-            fixed.push_back(BSONElement());
-        }
-
-        scoped_ptr<BtreeKeyGenerator> keyGen(
-            new BtreeKeyGeneratorV1(fieldNames, fixed, sparse));
-
-        //
-        // Step 2: ask 'keyGen' to generate index keys for the object 'obj'.
-        //
-        BSONObjSet actualKeys;
-        Status s = keyGen->getKeys(obj, &actualKeys);
-
-        //
-        // Step 3: assert that we got an error status, and then no keys were
-        // added to the output set.
-        //
-        ASSERT_NOT_OK(s);
-        ASSERT_EQUALS(0U, actualKeys.size());
     }
 
     //
@@ -162,14 +128,6 @@ namespace {
         expectedKeys.insert(fromjson("{'': 1}"));
         expectedKeys.insert(fromjson("{'': 2}"));
         expectedKeys.insert(fromjson("{'': 3}"));
-        ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys));
-    }
-
-    TEST(BtreeKeyGeneratorTest, GetKeysFromArrayRepeatedEl) {
-        BSONObj keyPattern = fromjson("{a: 1}");
-        BSONObj genKeysFrom = fromjson("{a: [2, 2, 2]}");
-        BSONObjSet expectedKeys;
-        expectedKeys.insert(fromjson("{'': 2}"));
         ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys));
     }
 
@@ -207,7 +165,7 @@ namespace {
         BSONObj keyPattern = fromjson("{'a': 1, 'b': 1}");
         BSONObj genKeysFrom = fromjson("{a: [1, 2, 3], b: [1, 2, 3]}}");
         BSONObjSet expectedKeys;
-        assertKeygenFails(keyPattern, genKeysFrom, expectedKeys);
+        ASSERT_THROWS(testKeygen(keyPattern, genKeysFrom, expectedKeys), UserException);
     }
 
     TEST(BtreeKeyGeneratorTest, GetKeysFromArraySubobjectBasic) {
@@ -293,7 +251,7 @@ namespace {
         BSONObj keyPattern = fromjson("{'a.b': 1, 'a.c': 1}");
         BSONObj genKeysFrom = fromjson("{a:[{b:[1],c:[2]}]}");
         BSONObjSet expectedKeys;
-        assertKeygenFails(keyPattern, genKeysFrom, expectedKeys);
+        ASSERT_THROWS(testKeygen(keyPattern, genKeysFrom, expectedKeys), UserException);
     }
 
     TEST(BtreeKeyGeneratorTest, GetKeysAlternateMissing) {
@@ -505,10 +463,10 @@ namespace {
 
         genKeysFrom = fromjson("{a:[{'0':1}]}");
         expectedKeys.clear();
-        assertKeygenFails(keyPattern, genKeysFrom, expectedKeys);
+        ASSERT_THROWS(testKeygen(keyPattern, genKeysFrom, expectedKeys), UserException);
 
         genKeysFrom = fromjson("{a:[1,{'0':2}]}");
-        assertKeygenFails(keyPattern, genKeysFrom, expectedKeys);
+        ASSERT_THROWS(testKeygen(keyPattern, genKeysFrom, expectedKeys), UserException);
     }
 
     TEST(BtreeKeyGeneratorTest, GetKeysFromDoubleIndexedArrayIndex) {
@@ -577,6 +535,54 @@ namespace {
         BSONObj genKeysFrom = fromjson("{a:[{b:[1]}]}");
         BSONObjSet expectedKeys;
         expectedKeys.insert(fromjson("{'': 1}"));
+        ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys));
+    }
+
+    TEST(BtreeKeyGeneratorTest, ParallelArraysInNestedObjects) {
+        BSONObj keyPattern = fromjson("{'a.a': 1, 'b.a': 1}");
+        BSONObj genKeysFrom = fromjson("{a:{a:[1]}, b:{a:[1]}}");
+        BSONObjSet expectedKeys;
+        ASSERT_THROWS(testKeygen(keyPattern, genKeysFrom, expectedKeys), UserException);
+    }
+
+    TEST(BtreeKeyGeneratorTest, ParallelArraysUneven) {
+        BSONObj keyPattern = fromjson("{'b.a': 1, 'a': 1}");
+        BSONObj genKeysFrom = fromjson("{b:{a:[1]}, a:[1,2]}");
+        BSONObjSet expectedKeys;
+        ASSERT_THROWS(testKeygen(keyPattern, genKeysFrom, expectedKeys), UserException);
+    }
+
+    TEST(BtreeKeyGeneratorTest, MultipleArraysNotParallel) {
+        BSONObj keyPattern = fromjson("{'a.b.c': 1}");
+        BSONObj genKeysFrom = fromjson("{a: [1, 2, {b: {c: [3, 4]}}]}");
+        BSONObjSet expectedKeys;
+        expectedKeys.insert(fromjson("{'': null}"));
+        expectedKeys.insert(fromjson("{'': 3}"));
+        expectedKeys.insert(fromjson("{'': 4}"));
+        ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys));
+    }
+
+    TEST(BtreeKeyGeneratorTest, MultipleArraysNotParallelCompound) {
+        BSONObj keyPattern = fromjson("{'a.b.c': 1, 'a.b.d': 1}");
+        BSONObj genKeysFrom = fromjson("{a: [1, 2, {b: {c: [3, 4], d: 5}}]}");
+        BSONObjSet expectedKeys;
+        expectedKeys.insert(fromjson("{'': null, '': null}"));
+        expectedKeys.insert(fromjson("{'': 3, '': 5}"));
+        expectedKeys.insert(fromjson("{'': 4, '': 5}"));
+        ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys));
+    }
+
+    TEST(BtreeKeyGeneratorTest, GetKeysComplexNestedArrays) {
+        BSONObj keyPattern = fromjson(
+            "{'a.b.c.d': 1, 'a.g': 1, 'a.b.f': 1, 'a.b.c': 1, 'a.b.e': 1}");
+        BSONObj genKeysFrom = fromjson(
+            "{a: [1, {b: [2, {c: [3, {d: 1}], e: 4}, 5, {f: 6}], g: 7}]}");
+        BSONObjSet expectedKeys;
+        expectedKeys.insert(fromjson("{'':null, '':null, '':null, '':null, '':null}"));
+        expectedKeys.insert(fromjson("{'':null, '':7, '':null, '':null, '':null}"));
+        expectedKeys.insert(fromjson("{'':null, '':7, '':null, '':3, '':4}"));
+        expectedKeys.insert(fromjson("{'':null, '':7, '':6, '':null, '':null}"));
+        expectedKeys.insert(fromjson("{'':1, '':7, '':null, '':{d: 1}, '':4}"));
         ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys));
     }
 

@@ -65,6 +65,7 @@
 #include "mongo/util/startup_test.h"
 
 namespace mongo {
+namespace repl {
 
     // cached copies of these...so don't rename them, drop them, etc.!!!
     static Database* localDB = NULL;
@@ -112,8 +113,8 @@ namespace mongo {
         todo : make _logOpRS() call this so we don't repeat ourself?
         */
     void _logOpObjRS(const BSONObj& op) {
-        Lock::DBWrite lk("local");
         OperationContextImpl txn;
+        Lock::DBWrite lk(txn.lockState(), "local");
 
         const OpTime ts = op["ts"]._opTime();
         long long h = op["h"].numberLong();
@@ -150,7 +151,7 @@ namespace mongo {
                 theReplSet->lastH = h;
                 ctx.getClient()->setLastOp( ts );
 
-                replset::BackgroundSync::notify();
+                BackgroundSync::notify();
             }
         }
 
@@ -230,7 +231,7 @@ namespace mongo {
                          BSONObj *o2,
                          bool *bb,
                          bool fromMigrate ) {
-        Lock::DBWrite lk1("local");
+        Lock::DBWrite lk1(txn->lockState(), "local");
 
         if ( strncmp(ns, "local.", 6) == 0 ) {
             if ( strncmp(ns, "local.slaves", 12) == 0 )
@@ -320,7 +321,7 @@ namespace mongo {
                           BSONObj *o2,
                           bool *bb,
                           bool fromMigrate ) {
-        Lock::DBWrite lk("local");
+        Lock::DBWrite lk(txn->lockState(), "local");
         static BufBuilder bufbuilder(8*1024); // todo there is likely a mutex on this constructor
 
         if ( strncmp(ns, "local.", 6) == 0 ) {
@@ -391,13 +392,11 @@ namespace mongo {
     }
     void oldRepl() { _logOp = _logOpOld; }
 
-    void logKeepalive() {
-        OperationContextImpl txn;
-        _logOp(&txn, "n", "", 0, BSONObj(), 0, 0, false);
+    void logKeepalive(OperationContext* txn) {
+        _logOp(txn, "n", "", 0, BSONObj(), 0, 0, false);
     }
-    void logOpComment(const BSONObj& obj) {
-        OperationContextImpl txn;
-        _logOp(&txn, "n", "", 0, obj, 0, 0, false);
+    void logOpComment(OperationContext* txn, const BSONObj& obj) {
+        _logOp(txn, "n", "", 0, obj, 0, 0, false);
     }
     void logOpInitiate(OperationContext* txn, const BSONObj& obj) {
         _logOpRS(txn, "n", "", 0, obj, 0, 0, false);
@@ -421,7 +420,7 @@ namespace mongo {
             _logOp(txn, opstr, ns, 0, obj, patt, b, fromMigrate);
         }
 
-        logOpForSharding(opstr, ns, obj, patt, fromMigrate);
+        logOpForSharding(txn, opstr, ns, obj, patt, fromMigrate);
         logOpForDbHash(ns);
         getGlobalAuthorizationManager()->logOp(opstr, ns, obj, patt, b);
 
@@ -432,7 +431,8 @@ namespace mongo {
     }
 
     void createOplog() {
-        Lock::GlobalWrite lk;
+        OperationContextImpl txn;
+        Lock::GlobalWrite lk(txn.lockState());
 
         const char * ns = "local.oplog.$main";
 
@@ -441,7 +441,6 @@ namespace mongo {
             ns = rsoplog;
 
         Client::Context ctx(ns);
-        OperationContextImpl txn;
         Collection* collection = ctx.db()->getCollection( &txn, ns );
 
         if ( collection ) {
@@ -459,7 +458,7 @@ namespace mongo {
 
             if( rs ) return;
 
-            initOpTimeFromOplog(ns);
+            initOpTimeFromOplog(&txn, ns);
             return;
         }
 
@@ -671,9 +670,9 @@ namespace mongo {
                     // thus this is not ideal.
                     else {
                         if (collection == NULL ||
-                            (indexCatalog->haveIdIndex() && Helpers::findById(collection, updateCriteria).isNull()) ||
+                            (indexCatalog->haveIdIndex() && Helpers::findById(txn, collection, updateCriteria).isNull()) ||
                             // capped collections won't have an _id index
-                            (!indexCatalog->haveIdIndex() && Helpers::findOne(collection, updateCriteria, false).isNull())) {
+                            (!indexCatalog->haveIdIndex() && Helpers::findOne(txn, collection, updateCriteria, false).isNull())) {
                             failedUpdate = true;
                             log() << "replication couldn't find doc: " << op.toString() << endl;
                         }
@@ -710,12 +709,12 @@ namespace mongo {
                 Status status = Command::getStatusFromCommandResult(ob.done());
                 switch (status.code()) {
                 case ErrorCodes::BackgroundOperationInProgressForDatabase: {
-                    dbtemprelease release;
+                    dbtemprelease release(txn->lockState());
                     BackgroundOperation::awaitNoBgOpInProgForDb(nsToDatabaseSubstring(ns));
                     break;
                 }
                 case ErrorCodes::BackgroundOperationInProgressForNamespace: {
-                    dbtemprelease release;
+                    dbtemprelease release(txn->lockState());;
                     Command* cmd = Command::findCommand(o.firstElement().fieldName());
                     invariant(cmd);
                     BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nsToDatabase(ns), o));
@@ -760,8 +759,8 @@ namespace mongo {
 
     }
 
-    void initOpTimeFromOplog(const std::string& oplogNS) {
-        DBDirectClient c;
+    void initOpTimeFromOplog(OperationContext* txn, const std::string& oplogNS) {
+        DBDirectClient c(txn);
         BSONObj lastOp = c.findOne(oplogNS,
                                    Query().sort(reverseNaturalObj),
                                    NULL,
@@ -772,4 +771,5 @@ namespace mongo {
             setNewOptime(lastOp[ "ts" ].date());
         }
     }
-}
+} // namespace repl
+} // namespace mongo

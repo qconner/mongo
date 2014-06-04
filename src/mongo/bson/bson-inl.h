@@ -117,7 +117,7 @@ dodouble:
                 int res = memcmp(l.valuestr(), r.valuestr(), common);
                 if( res ) 
                     return res;
-                // longer string is the greater one
+                // longer std::string is the greater one
                 return lsz-rsz;
             }
         case Object:
@@ -749,11 +749,16 @@ dodouble:
             s << __oid() << "')";
             break;
         case BinData:
-            s << "BinData";
-            if (full) {
+            s << "BinData(" << binDataType() << ", ";
+            {
                 int len;
-                const char* data = binDataClean(len);
-                s << '(' << binDataType() << ", " << toHex(data, len) << ')';
+                const char *data = binDataClean(len);
+                if ( !full && len > 80 ) {
+                    s << toHex(data, 70) << "...)";
+                }
+                else {
+                    s << toHex(data, len) << ")";
+                }
             }
             break;
         case Timestamp:
@@ -772,7 +777,7 @@ dodouble:
         BSONElement e = getField(name);
         if (e.eoo()) {
             size_t dot_offset = name.find('.');
-            if (dot_offset != string::npos) {
+            if (dot_offset != std::string::npos) {
                 StringData left = name.substr(0, dot_offset);
                 StringData right = name.substr(dot_offset + 1);
                 BSONObj sub = getObjectField(left);

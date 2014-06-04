@@ -33,7 +33,6 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/extsort.h"
 #include "mongo/db/index/btree_based_bulk_access_method.h"
 #include "mongo/db/index/btree_index_cursor.h"
 #include "mongo/db/jsobj.h"
@@ -41,8 +40,6 @@
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/pdfile_private.h"
-#include "mongo/db/repl/is_master.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/structure/btree/btree_interface.h"
@@ -66,12 +63,15 @@ namespace mongo {
 
     static InvalidateCursorsNotification invalidateCursors;
 
-    BtreeBasedAccessMethod::BtreeBasedAccessMethod(IndexCatalogEntry* btreeState)
-        : _btreeState(btreeState), _descriptor(btreeState->descriptor()) {
+    BtreeBasedAccessMethod::BtreeBasedAccessMethod(IndexCatalogEntry* btreeState,
+                                                   RecordStore* recordStore)
+        : _btreeState(btreeState),
+          _recordStore( recordStore ),
+          _descriptor(btreeState->descriptor()) {
 
         verify(0 == _descriptor->version() || 1 == _descriptor->version());
         _newInterface.reset(BtreeInterface::getInterface(btreeState->headManager(),
-                                                         btreeState->recordStore(),
+                                                         recordStore,
                                                          btreeState->ordering(),
                                                          _descriptor->indexNamespace(),
                                                          _descriptor->version(),
@@ -104,7 +104,7 @@ namespace mongo {
 
             if (ErrorCodes::KeyTooLong == status.code()) {
                 // Ignore this error if we're on a secondary.
-                if (!isMasterNs(collection()->ns().ns().c_str())) {
+                if (!txn->isPrimaryFor(_btreeState->ns())) {
                     continue;
                 }
 
@@ -149,7 +149,6 @@ namespace mongo {
             problem() << "Assertion failure: _unindex failed "
                 << _descriptor->indexNamespace() << endl;
             out() << "Assertion failure: _unindex failed: " << e.what() << '\n';
-            out() << "  obj:" << _btreeState->collection()->docFor(loc).toString() << '\n';
             out() << "  key:" << key.toString() << '\n';
             out() << "  dl:" << loc.toString() << endl;
             logContext();
@@ -182,8 +181,7 @@ namespace mongo {
                 ++*numDeleted;
             } else if (options.logIfError) {
                 log() << "unindex failed (key too big?) " << _descriptor->indexNamespace()
-                      << " key: " << *i << " " 
-                      << _btreeState->collection()->docFor(loc)["_id"] << endl;
+                      << " key: " << *i;
             }
         }
 
@@ -227,8 +225,9 @@ namespace mongo {
         return Status::OK();
     }
 
+
     Status BtreeBasedAccessMethod::touch( OperationContext* txn ) const {
-        return _btreeState->recordStore()->touch( txn, NULL );
+        return _recordStore->touch( txn, NULL );
     }
 
     DiskLoc BtreeBasedAccessMethod::findSingle(const BSONObj& key) const {
@@ -332,8 +331,7 @@ namespace mongo {
         return new BtreeBasedBulkAccessMethod(txn,
                                               this,
                                               _newInterface.get(),
-                                              _descriptor,
-                                              _btreeState->collection()->numRecords());
+                                              _descriptor);
     }
 
     Status BtreeBasedAccessMethod::commitBulk(IndexAccessMethod* bulkRaw,
@@ -344,7 +342,7 @@ namespace mongo {
         }
 
         BtreeBasedBulkAccessMethod* bulk = static_cast<BtreeBasedBulkAccessMethod*>(bulkRaw);
-        return bulk->commit(dupsToDrop, cc().curop(), mayInterrupt);
+        return bulk->commit(dupsToDrop, mayInterrupt);
     }
 
 }  // namespace mongo

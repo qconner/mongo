@@ -152,8 +152,8 @@ namespace mongo {
         exhaust = false;
 
         // This is a read lock.
-        scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(ns));
-        Collection* collection = ctx->ctx().db()->getCollection(ns);
+        scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(txn, ns));
+        Collection* collection = ctx->ctx().db()->getCollection(txn, ns);
         uassert( 17356, "collection dropped between getMore calls", collection );
 
         QLOG() << "Running getMore, cursorid: " << cursorid << endl;
@@ -162,7 +162,7 @@ namespace mongo {
         // passing in a query object (necessary to check SlaveOK query option), the only state where
         // reads are allowed is PRIMARY (or master in master/slave).  This function uasserts if
         // reads are not okay.
-        replVerifyReadsOk(ns, NULL);
+        repl::replVerifyReadsOk(ns, NULL);
 
         // A pin performs a CC lookup and if there is a CC, increments the CC's pin value so it
         // doesn't time out.  Also informs ClientCursor that there is somebody actively holding the
@@ -222,7 +222,7 @@ namespace mongo {
             const int queryOptions = cc->queryOptions();
 
             // Get results out of the runner.
-            runner->restoreState();
+            runner->restoreState(txn);
 
             BSONObj obj;
             Runner::RunnerState state;
@@ -459,8 +459,8 @@ namespace mongo {
         // This is a read lock.  We require this because if we're parsing a $where, the
         // where-specific parsing code assumes we have a lock and creates execution machinery that
         // requires it.
-        Client::ReadContext ctx(q.ns);
-        Collection* collection = ctx.ctx().db()->getCollection( ns );
+        Client::ReadContext ctx(txn, q.ns);
+        Collection* collection = ctx.ctx().db()->getCollection( txn, ns );
 
         // Parse the qm into a CanonicalQuery.
         CanonicalQuery* cq;
@@ -525,7 +525,7 @@ namespace mongo {
         txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
         // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-        replVerifyReadsOk(cq->ns(), &pq);
+        repl::replVerifyReadsOk(cq->ns(), &pq);
 
         // If this exists, the collection is sharded.
         // If it doesn't exist, we can assume we're not sharded.
@@ -675,7 +675,7 @@ namespace mongo {
             // If we're tailing a capped collection, we don't bother saving the cursor if the
             // collection is empty. Otherwise, the semantics of the tailable cursor is that the
             // client will keep trying to read from it. So we'll keep it around.
-            Collection* collection = ctx.ctx().db()->getCollection(cq->ns());
+            Collection* collection = ctx.ctx().db()->getCollection(txn, cq->ns());
             if (collection && collection->numRecords() != 0 && pq.getNumToReturn() != 1) {
                 saveClientCursor = true;
             }

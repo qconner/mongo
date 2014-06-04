@@ -37,11 +37,11 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 
 namespace mongo {
 
-    Database* DatabaseHolder::getOrCreate( const string& ns, const string& path, bool& justCreated ) {
-        OperationContextImpl txn; // TODO get rid of this once reads require transactions
+    Database* DatabaseHolder::getOrCreate(OperationContext* txn, const string& ns, const string& path, bool& justCreated) {
         string dbname = _todb( ns );
         {
             SimpleMutex::scoped_lock lk(_m);
@@ -58,7 +58,7 @@ namespace mongo {
             // todo: protect against getting sprayed with requests for different db names that DNE -
             //       that would make the DBs map very large.  not clear what to do to handle though,
             //       perhaps just log it, which is what we do here with the "> 40" :
-            bool cant = !Lock::isWriteLocked(ns);
+            bool cant = !txn->lockState()->isWriteLocked(ns);
             if( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1)) ||
                 m.size() > 40 || cant || DEBUG_BUILD ) {
                 log() << "opening db: "
@@ -73,7 +73,7 @@ namespace mongo {
         cc().writeHappened();
 
         // this locks _m for defensive checks, so we don't want to be locked right here :
-        Database *db = new Database( &txn, dbname.c_str() , justCreated , path );
+        Database *db = new Database(txn, dbname.c_str(), justCreated, path);
 
         {
             SimpleMutex::scoped_lock lk(_m);

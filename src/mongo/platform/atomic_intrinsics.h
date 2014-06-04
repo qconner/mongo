@@ -26,7 +26,7 @@
  */
 
 /**
- * WARNING(schwerin): Use with extreme caution.  Prefer the AtomicWord<> types from atomic_word.h.
+ * NOTE: Not for direct use by any code other than AtomicWord.
  *
  * The atomic_intrinsics module provides low-level atomic operations for manipulating memory.
  * Implementations are platform specific, so this file describes the interface and includes
@@ -52,16 +52,18 @@
 
 #pragma once
 
+#if defined(MONGO_HAVE_CXX11_ATOMICS)
+#error "Use of atomic_intrinsics.h is not supported when C++11 <atomic> is available"
+#endif
+
 #if defined(_WIN32)
 #include "mongo/platform/atomic_intrinsics_win32.h"
-#elif defined(__GNUC__)
-#if defined(HAVE_GCC_ATOMIC_BUILTINS)
-#include "mongo/platform/atomic_intrinsics_gcc_generic.h"
+#elif defined(MONGO_HAVE_GCC_ATOMIC_BUILTINS)
+#include "mongo/platform/atomic_intrinsics_gcc_atomic.h"
+#elif defined(MONGO_HAVE_GCC_SYNC_BUILTINS)
+#include "mongo/platform/atomic_intrinsics_gcc_sync.h"
 #elif defined(__i386__) || defined(__x86_64__)
 #include "mongo/platform/atomic_intrinsics_gcc_intel.h"
-#else
-#error "Unsupported platform: no gcc atomic builtins or port available"
-#endif
 #else
 #error "Unsupported os/compiler family"
 #endif

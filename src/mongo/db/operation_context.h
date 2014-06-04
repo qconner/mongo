@@ -32,10 +32,14 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/lockstate.h"
+
 
 namespace mongo {
 
+    class CurOp;
     class ProgressMeter;
 
     /**
@@ -55,6 +59,11 @@ namespace mongo {
          */
         virtual RecoveryUnit* recoveryUnit() const = 0;
 
+        /**
+         * Interface for locking.  Caller DOES NOT own pointer.
+         */
+        virtual LockState* lockState() const = 0;
+
         // --- operation level info? ---
 
         /**
@@ -72,12 +81,32 @@ namespace mongo {
         virtual Status checkForInterruptNoAssert() const = 0;
 
         /**
-         * TODO(ERH): this should move to some CurOp like context.
+         * Delegates to CurOp, but is included here to break dependencies.
+         * Caller does not own the pointer.
          */
         virtual ProgressMeter* setMessage(const char* msg,
                                           const std::string& name = "Progress",
                                           unsigned long long progressMeterTotal = 0,
                                           int secondsBetween = 3) = 0;
+
+        /**
+         * Delegates to CurOp, but is included here to break dependencies
+         */
+        virtual const char * getNS() const = 0;
+
+        //
+        // CurOp
+        //
+
+        /**
+         * Returns CurOp. Caller does not own pointer
+         */
+        virtual CurOp* getCurOp() const = 0;
+
+        /**
+         * @return true if this instance is primary for this namespace
+         */
+        virtual bool isPrimaryFor( const StringData& ns ) = 0;
 
         /**
          * Returns a OperationContext. Caller takes ownership.

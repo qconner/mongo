@@ -38,9 +38,10 @@
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/auth_index_d.h"
-#include "mongo/db/auth/authz_manager_external_state_d.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authz_manager_external_state_d.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
@@ -52,7 +53,6 @@
 #include "mongo/db/db.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/dbwebserver.h"
-#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -62,12 +62,13 @@
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/mongod_options.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/pdfile_version.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repair_database.h"
-#include "mongo/db/repl/repl_start.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/repl_start.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/restapi.h"
 #include "mongo/db/startup_warnings.h"
@@ -75,7 +76,7 @@
 #include "mongo/db/stats/snapshots.h"
 #include "mongo/db/storage/data_file.h"
 #include "mongo/db/storage/extent_manager.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/ttl.h"
@@ -238,7 +239,7 @@ namespace mongo {
 
     };
 
-    void logStartup() {
+    static void logStartup() {
         BSONObjBuilder toLog;
         stringstream id;
         id << getHostNameCached() << "-" << jsTime();
@@ -258,14 +259,17 @@ namespace mongo {
 
         BSONObj o = toLog.obj();
 
-        Lock::GlobalWrite lk;
-        DBDirectClient c;
-        const char* name = "local.startup_log";
+        OperationContextImpl txn;
+
+        Lock::GlobalWrite lk(txn.lockState());
+        DBDirectClient c(&txn);
+
+        static const char* name = "local.startup_log";
         c.createCollection( name, 10 * 1024 * 1024, true );
         c.insert( name, o);
     }
 
-    void listen(int port) {
+    static void listen(int port) {
         //testTheDb();
         MessageServer::Options options;
         options.port = port;
@@ -278,7 +282,7 @@ namespace mongo {
         server->setupSockets();
 
         logStartup();
-        startReplication();
+        repl::startReplication();
         if (serverGlobalParams.isHttpInterfaceEnabled)
             boost::thread web( stdx::bind(&webServerThread,
                                            new RestAdminAccess(), // takes ownership
@@ -319,7 +323,7 @@ namespace mongo {
         fassert( 17401, repairDatabase( &txn, dbName ) );
     }
 
-    void checkForIdIndexes( Database* db ) {
+    void checkForIdIndexes( OperationContext* txn, Database* db ) {
 
         if ( db->name() == "local") {
             // we do not need an _id index on anything in the local database
@@ -327,7 +331,7 @@ namespace mongo {
         }
 
         list<string> collections;
-        db->namespaceIndex().getNamespaces( collections );
+        db->getDatabaseCatalogEntry()->getCollectionNamespaces( &collections );
 
         // for each collection, ensure there is a $_id_ index
         for (list<string>::iterator i = collections.begin(); i != collections.end(); ++i) {
@@ -336,7 +340,7 @@ namespace mongo {
             if ( ns.isSystem() )
                 continue;
 
-            Collection* coll = db->getCollection( collectionName );
+            Collection* coll = db->getCollection( txn, collectionName );
             if ( !coll )
                 continue;
 
@@ -355,11 +359,12 @@ namespace mongo {
 
     // ran at startup.
     static void repairDatabasesAndCheckVersion(bool shouldClearNonLocalTmpCollections) {
-        //        LastError * le = lastError.get( true );
         LOG(1) << "enter repairDatabases (to check pdfile version #)" << endl;
 
-        Lock::GlobalWrite lk;
         OperationContextImpl txn;
+
+        Lock::GlobalWrite lk(txn.lockState());
+
         vector< string > dbNames;
         getDatabaseNames( dbNames );
         for ( vector< string >::iterator i = dbNames.begin(); i != dbNames.end(); ++i ) {
@@ -367,12 +372,12 @@ namespace mongo {
             LOG(1) << "\t" << dbName << endl;
 
             Client::Context ctx( dbName );
-            DataFile *p = ctx.db()->getExtentManager()->getFile( &txn, 0 );
+            DataFile *p = ctx.db()->getExtentManager()->getFile(&txn, 0);
             DataFileHeader *h = p->getHeader();
 
-            if ( replSettings.usingReplSets() ) {
+            if (repl::replSettings.usingReplSets()) {
                 // we only care about the _id index if we are in a replset
-                checkForIdIndexes(ctx.db());
+                checkForIdIndexes(&txn, ctx.db());
             }
 
             if (shouldClearNonLocalTmpCollections || dbName == "local")
@@ -411,7 +416,7 @@ namespace mongo {
             }
             else {
                 const string systemIndexes = ctx.db()->name() + ".system.indexes";
-                Collection* coll = ctx.db()->getCollection( systemIndexes );
+                Collection* coll = ctx.db()->getCollection( &txn, systemIndexes );
                 auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemIndexes,coll));
                 BSONObj index;
                 Runner::RunnerState state;
@@ -475,10 +480,13 @@ namespace mongo {
      * @returns the number of documents in local.system.replset or 0 if this was started with
      *          --replset.
      */
-    unsigned long long checkIfReplMissingFromCommandLine() {
-        Lock::GlobalWrite lk; // this is helpful for the query below to work as you can't open files when readlocked
-        if (!replSettings.usingReplSets()) {
-            DBDirectClient c;
+    static unsigned long long checkIfReplMissingFromCommandLine() {
+        OperationContextImpl txn;
+
+        // This is helpful for the query below to work as you can't open files when readlocked
+        Lock::GlobalWrite lk(txn.lockState());
+        if (!repl::replSettings.usingReplSets()) {
+            DBDirectClient c(&txn);
             return c.count("local.system.replset");
         }
         return 0;
@@ -584,6 +592,7 @@ namespace mongo {
     }
 
 
+#if 0 // TODO SERVER-14143 figure out something better. For now just disabling js interruption.
     const char * jsInterruptCallback() {
         // should be safe to interrupt in js code, even if we have a write lock
         return killCurrentOp.checkForInterruptNoAssert();
@@ -592,6 +601,7 @@ namespace mongo {
     unsigned jsGetCurrentOpIdCallback() {
         return cc().curop()->opNum();
     }
+#endif
 
     /// warn if readahead > 256KB (gridfs chunk size)
     static void checkReadAhead(const string& dir) {
@@ -652,8 +662,8 @@ namespace mongo {
             l << "MongoDB starting : pid=" << pid
               << " port=" << serverGlobalParams.port
               << " dbpath=" << storageGlobalParams.dbpath;
-            if( replSettings.master ) l << " master=" << replSettings.master;
-            if( replSettings.slave )  l << " slave=" << (int) replSettings.slave;
+            if( repl::replSettings.master ) l << " master=" << repl::replSettings.master;
+            if( repl::replSettings.slave )  l << " slave=" << (int) repl::replSettings.slave;
             l << ( is32bit ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() << endl;
         }
         DEV log() << "_DEBUG build (which is slower)" << endl;
@@ -714,16 +724,18 @@ namespace mongo {
 
         if (mongodGlobalParams.scriptingEnabled) {
             ScriptEngine::setup();
+#if 0 // TODO SERVER-14143 figure out something better. For now just disabling js interruption.
             globalScriptEngine->setCheckInterruptCallback( jsInterruptCallback );
             globalScriptEngine->setGetCurrentOpIdCallback( jsGetCurrentOpIdCallback );
+#endif
         }
 
         // On replica set members we only clear temp collections on DBs other than "local" during
         // promotion to primary. On pure slaves, they are only cleared when the oplog tells them to.
         // The local DB is special because it is not replicated.  See SERVER-10927 for more details.
-        const bool shouldClearNonLocalTmpCollections = !(missingRepl
-                                                         || replSettings.usingReplSets()
-                                                         || replSettings.slave == SimpleSlave);
+        const bool shouldClearNonLocalTmpCollections =!(missingRepl
+                                         || repl::replSettings.usingReplSets()
+                                         || repl::replSettings.slave == repl::SimpleSlave);
         repairDatabasesAndCheckVersion(shouldClearNonLocalTmpCollections);
 
         if (mongodGlobalParams.upgrade)
@@ -751,14 +763,17 @@ namespace mongo {
 #ifndef _WIN32
         mongo::signalForkSuccess();
 #endif
+        {
+            OperationContextImpl txn;
 
-        if(getGlobalAuthorizationManager()->isAuthEnabled()) {
-            // open admin db in case we need to use it later. TODO this is not the right way to
-            // resolve this.
-            Client::WriteContext c("admin", storageGlobalParams.dbpath);
+            if (getGlobalAuthorizationManager()->isAuthEnabled()) {
+                // open admin db in case we need to use it later. TODO this is not the right way to
+                // resolve this.
+                Client::WriteContext ctx(&txn, "admin");
+            }
+
+            authindex::configureSystemIndexes(&txn, "admin");
         }
-
-        authindex::configureSystemIndexes("admin");
 
         getDeleter()->startWorkers();
 

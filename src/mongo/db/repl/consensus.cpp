@@ -33,6 +33,7 @@
 #include "mongo/db/repl/replset_commands.h"
 
 namespace mongo {
+namespace repl {
 
     /** the first cmd called by a node seeking election and it's a basic sanity 
         test: do any of the nodes it can reach know that it can't be the primary?
@@ -222,7 +223,8 @@ namespace mongo {
         for( Member *m = rs.head(); m; m=m->next() )
             vTot += m->config().votes;
         if( vTot % 2 == 0 && vTot && complain++ == 0 )
-            log() << "replSet " /*buildbot! warning */ "total number of votes is even - add arbiter or give one member an extra vote" << rsLog;
+            log() << "replSet warning: even number of voting members in replica set config - "
+                     "add an arbiter or set votes to 0 on one of the existing members" << rsLog;
         return vTot;
     }
 
@@ -247,7 +249,7 @@ namespace mongo {
         return !( vUp * 2 > _totalVotes() );
     }
 
-    const time_t LeaseTime = 30;
+    const time_t LeaseTime = 3;
 
     SimpleMutex Consensus::lyMutex("ly");
 
@@ -357,7 +359,7 @@ namespace mongo {
 
     void Consensus::_multiCommand(BSONObj cmd, list<Target>& L) {
         verify( !rs.lockedByMe() );
-        mongo::multiCommand(cmd, L);
+        multiCommand(cmd, L);
     }
 
     void Consensus::_electSelf() {
@@ -455,7 +457,7 @@ namespace mongo {
 
                     setElectionTime(getNextGlobalOptime());
 
-                    rs.assumePrimary();
+                    rs._assumePrimary();
                 }
             }
         }
@@ -487,4 +489,5 @@ namespace mongo {
         }
     }
 
-}
+} // namespace repl
+} // namespace mongo

@@ -38,7 +38,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/interrupt_status_mongod.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -116,9 +115,16 @@ namespace {
             }
         }
 
-        // These are all no-ops for PipelineRunners
-        virtual void saveState() {}
-        virtual bool restoreState() { return true; }
+        // Manage our OperationContext. We intentionally don't propagate to child Runner as that is
+        // handled by DocumentSourceCursor as it needs to.
+        virtual void saveState() {
+            _pipeline->getContext()->opCtx = NULL;
+        }
+        virtual bool restoreState(OperationContext* opCtx) {
+            _pipeline->getContext()->opCtx = opCtx;
+            return true;
+        }
+
         virtual const Collection* collection() { return NULL; }
 
         /**
@@ -176,7 +182,8 @@ namespace {
         return true;
     }
 
-    static void handleCursorCommand(const string& ns,
+    static void handleCursorCommand(OperationContext* txn,
+                                    const string& ns,
                                     ClientCursorPin* pin,
                                     PipelineRunner* runner,
                                     const BSONObj& cmdObj,
@@ -236,7 +243,7 @@ namespace {
         if (cursor) {
             // If a time limit was set on the pipeline, remaining time is "rolled over" to the
             // cursor (for use by future getmore ops).
-            cursor->setLeftoverMaxTimeMicros( cc().curop()->getRemainingMaxTimeMicros() );
+            cursor->setLeftoverMaxTimeMicros( txn->getCurOp()->getRemainingMaxTimeMicros() );
         }
 
         BSONObjBuilder cursorObj(result.subobjStart("cursor"));
@@ -278,8 +285,7 @@ namespace {
 
             string ns = parseNs(db, cmdObj);
 
-            intrusive_ptr<ExpressionContext> pCtx =
-                new ExpressionContext(InterruptStatusMongod::status, NamespaceString(ns));
+            intrusive_ptr<ExpressionContext> pCtx = new ExpressionContext(txn, NamespaceString(ns));
             pCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
 
             /* try to parse the command; if this fails, then we didn't run */
@@ -312,9 +318,9 @@ namespace {
                 // sharding version that we synchronize on here. This is also why we always need to
                 // create a ClientCursor even when we aren't outputting to a cursor. See the comment
                 // on ShardFilterStage for more details.
-                Client::ReadContext ctx(ns);
+                Client::ReadContext ctx(txn, ns);
 
-                Collection* collection = ctx.ctx().db()->getCollection(ns);
+                Collection* collection = ctx.ctx().db()->getCollection(txn, ns);
 
                 // This does mongod-specific stuff like creating the input Runner and adding to the
                 // front of the pipeline if needed.
@@ -350,7 +356,7 @@ namespace {
                     result << "stages" << Value(pPipeline->writeExplainOps());
                 }
                 else if (isCursorCommand(cmdObj)) {
-                    handleCursorCommand(ns, pin.get(), runner, cmdObj, result);
+                    handleCursorCommand(txn, ns, pin.get(), runner, cmdObj, result);
                     keepCursor = true;
                 }
                 else {

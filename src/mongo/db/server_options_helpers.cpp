@@ -35,6 +35,7 @@
 #include <syslog.h>
 #endif
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/operations.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
@@ -103,10 +104,13 @@ namespace {
     Status addGeneralServerOptions(moe::OptionSection* options) {
         StringBuilder portInfoBuilder;
         StringBuilder maxConnInfoBuilder;
+        StringBuilder unixSockPermsBuilder;
 
         portInfoBuilder << "specify port number - " << ServerGlobalParams::DefaultDBPort << " by default";
         maxConnInfoBuilder << "max number of simultaneous connections - "
                            << DEFAULT_MAX_CONN << " by default";
+        unixSockPermsBuilder << "permissions to set on UNIX domain socket file - " 
+                             << DEFAULT_UNIX_PERMS << " by default";
 
         options->addOptionChaining("help", "help,h", moe::Switch, "show this usage information")
                                   .setSources(moe::SourceAllLegacy);
@@ -238,6 +242,9 @@ namespace {
 
         options->addOptionChaining("net.unixDomainSocket.pathPrefix", "unixSocketPrefix",
                 moe::String, "alternative directory for UNIX domain sockets (defaults to /tmp)");
+
+        options->addOptionChaining("net.unixDomainSocket.filePermissions", "filePermissions", 
+                moe::Int, unixSockPermsBuilder.str().c_str() );
 
         options->addOptionChaining("processManagement.fork", "fork", moe::Switch,
                 "fork server process");
@@ -399,6 +406,43 @@ namespace {
                 }
             }
         }
+
+#ifdef _WIN32
+        if (params.count("install") || params.count("reinstall")) {
+            if (params.count("logpath") &&
+                !boost::filesystem::path(params["logpath"].as<string>()).is_absolute()) {
+                return Status(ErrorCodes::BadValue,
+                    "logpath requires an absolute file path with Windows services");
+            }
+
+            if (params.count("config") &&
+                !boost::filesystem::path(params["config"].as<string>()).is_absolute()) {
+                return Status(ErrorCodes::BadValue,
+                    "config requires an absolute file path with Windows services");
+            }
+
+            if (params.count("processManagement.pidFilePath") &&
+                !boost::filesystem::path(
+                    params["processManagement.pidFilePath"].as<string>()).is_absolute()) {
+                return Status(ErrorCodes::BadValue,
+                    "pidFilePath requires an absolute file path with Windows services");
+            }
+
+            if (params.count("security.keyFile") &&
+                !boost::filesystem::path(params["security.keyFile"].as<string>()).is_absolute()) {
+                return Status(ErrorCodes::BadValue,
+                    "keyFile requires an absolute file path with Windows services");
+            }
+
+        }
+#endif
+
+#ifdef MONGO_SSL
+        Status ret = validateSSLServerOptions(params);
+        if (!ret.isOK()) {
+            return ret;
+        }
+#endif
 
         return Status::OK();
     }
@@ -673,6 +717,10 @@ namespace {
 
         if (params.count("net.unixDomainSocket.enabled")) {
             serverGlobalParams.noUnixSocket = !params["net.unixDomainSocket.enabled"].as<bool>();
+        }
+        if (params.count("net.unixDomainSocket.filePermissions")) {
+            serverGlobalParams.unixSocketPermissions = 
+                params["net.unixDomainSocket.filePermissions"].as<int>();
         }
 
         if ((params.count("processManagement.fork") &&

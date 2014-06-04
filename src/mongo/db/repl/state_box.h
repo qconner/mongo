@@ -29,9 +29,13 @@
 #pragma once
 
 #include "mongo/db/repl/health.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/util/concurrency/rwlock.h"
 
 namespace mongo {
+namespace repl {
+
+    class Member;
 
     /* safe container for our state that keeps member pointer and state variables always aligned */
     class StateBox : boost::noncopyable {
@@ -88,4 +92,5 @@ namespace mongo {
         RWLock m;
         SP sp;
     };
+} // namespace repl
 } // namespace mongo

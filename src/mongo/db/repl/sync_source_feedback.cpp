@@ -40,6 +40,7 @@
 #include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
+namespace repl {
 
     // used in replAuthenticate
     static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
@@ -65,10 +66,11 @@ namespace mongo {
     void SyncSourceFeedback::ensureMe() {
         string myname = getHostName();
         {
-            Client::WriteContext ctx("local");
             OperationContextImpl txn;
+            Client::WriteContext ctx(&txn, "local");
+
             // local.me is an identifier for a server for getLastError w:2+
-            if (!Helpers::getSingleton("local.me", _me) ||
+            if (!Helpers::getSingleton(&txn, "local.me", _me) ||
                 !_me.hasField("host") ||
                 _me["host"].String() != myname) {
 
@@ -254,7 +256,7 @@ namespace mongo {
             if (state.primary() || state.fatal() || state.startup()) {
                 continue;
             }
-            const Member* target = replset::BackgroundSync::get()->getSyncTarget();
+            const Member* target = BackgroundSync::get()->getSyncTarget();
             if (_syncTarget != target) {
                 _resetConnection();
                 _syncTarget = target;
@@ -286,4 +288,5 @@ namespace mongo {
         }
         cc().shutdown();
     }
-}
+} // namespace repl
+} // namespace mongo

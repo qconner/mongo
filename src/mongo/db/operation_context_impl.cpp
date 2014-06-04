@@ -31,7 +31,9 @@
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/kill_current_op.h"
+#include "mongo/db/repl/is_master.h"
 #include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
+
 
 namespace mongo {
 
@@ -43,11 +45,24 @@ namespace mongo {
         return _recovery.get();
     }
 
-    ProgressMeter* OperationContextImpl::setMessage(const char* msg,
-                                              const std::string& name,
-                                              unsigned long long progressMeterTotal,
-                                              int secondsBetween) {
-        return &cc().curop()->setMessage( msg, name, progressMeterTotal, secondsBetween );
+    LockState* OperationContextImpl::lockState() const {
+        // TODO: This will eventually become member of OperationContextImpl
+        return &cc().lockState();
+    }
+
+    ProgressMeter* OperationContextImpl::setMessage(const char * msg,
+                                                    const std::string &name,
+                                                    unsigned long long progressMeterTotal,
+                                                    int secondsBetween) {
+        return &getCurOp()->setMessage(msg, name, progressMeterTotal, secondsBetween);
+    }
+
+    const char* OperationContextImpl::getNS() const {
+        return getCurOp()->getNS();
+    }
+
+    CurOp* OperationContextImpl::getCurOp() const {
+        return cc().curop();
     }
 
     void OperationContextImpl::checkForInterrupt(bool heedMutex) const {
@@ -60,6 +75,11 @@ namespace mongo {
             return Status::OK();
 
         return Status( ErrorCodes::Interrupted, killed );
+    }
+
+    bool OperationContextImpl::isPrimaryFor( const StringData& ns ) {
+        string s = ns.toString(); // TODO: fix copy
+        return repl::isMasterNs(s.c_str());
     }
 
     OperationContext* OperationContextImpl::factory() {

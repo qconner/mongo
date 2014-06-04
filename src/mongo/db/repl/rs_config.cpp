@@ -28,8 +28,6 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
-
 #include <boost/algorithm/string.hpp>
 
 #include "mongo/db/dbhelpers.h"
@@ -46,6 +44,7 @@
 using namespace bson;
 
 namespace mongo {
+namespace repl {
 
     mongo::mutex ReplSetConfig::groupMx("RS tag group");
     const int ReplSetConfig::DEFAULT_HB_TIMEOUT = 10;
@@ -81,8 +80,8 @@ namespace mongo {
         log() << "replSet info saving a newer config version to local.system.replset: "
               << newConfigBSON << rsLog;
         {
-            Client::WriteContext cx( rsConfigNs );
             OperationContextImpl txn;
+            Client::WriteContext cx(&txn, rsConfigNs);
 
             //theReplSet->lastOpTimeWritten = ??;
             //rather than above, do a logOp()? probably
@@ -187,6 +186,7 @@ namespace mongo {
         uassert(13438, "bad slaveDelay value", slaveDelay >= 0 && slaveDelay <= 3600 * 24 * 366);
         uassert(13439, "priority must be 0 when hidden=true", priority == 0 || !hidden);
         uassert(13477, "priority must be 0 when buildIndexes=false", buildIndexes || priority == 0);
+        uassert(17492, "arbiter must vote (cannot have 0 votes)", !arbiterOnly || votes > 0);
     }
 /*
     string ReplSetConfig::TagSubgroup::toString() const {
@@ -362,6 +362,11 @@ namespace mongo {
         uassert(13308, "replSet bad config version #", version > 0);
         uassert(13133, "replSet bad config no members", members.size() >= 1);
         uassert(13309, "replSet bad config maximum number of members is 12", members.size() <= 12);
+        if (!getLastErrorDefaults.isEmpty() && getLastErrorDefaults.hasField("w")
+                && getLastErrorDefaults["w"].isNumber()) {
+            uassert(17505, "replSet illegal config: getLastErrorDefaults w:0",
+                    getLastErrorDefaults["w"].safeNumberLong() != 0);
+        }
         {
             unsigned voters = 0;
             for( vector<MemberCfg>::const_iterator i = members.begin(); i != members.end(); ++i ) {
@@ -495,7 +500,6 @@ namespace mongo {
         static const set<string> legals(legal, legal + 4);
         assertOnlyHas(o, legals);
 
-        md5 = o.md5();
         _id = o["_id"].String();
         if( o["version"].ok() ) {
             version = o["version"].numberInt();
@@ -650,7 +654,6 @@ namespace mongo {
     }
 
     void ReplSetConfig::init(BSONObj cfg, bool force) {
-        _constructed = false;
         clear();
         from(cfg);
         if( force ) {
@@ -660,7 +663,6 @@ namespace mongo {
         if( version < 1 )
             version = 1;
         _ok = true;
-        _constructed = true;
     }
 
     ReplSetConfig* ReplSetConfig::make(const HostAndPort& h) {
@@ -684,7 +686,6 @@ namespace mongo {
     void ReplSetConfig::init(const HostAndPort& h) {
         LOG(2) << "ReplSetConfig load " << h.toString() << rsLog;
 
-        _constructed = false;
         clear();
         int level = 2;
         DEV level = 0;
@@ -760,7 +761,7 @@ namespace mongo {
         checkRsConfig();
         _ok = true;
         LOG(level) << "replSet load config ok from " << (h.isSelf() ? "self" : h.toString()) << rsLog;
-        _constructed = true;
     }
 
-}
+} // namespace repl
+} // namespace mongo

@@ -28,11 +28,9 @@
 
 #pragma once
 
-// TODO: Remove
-#include "mongo/pch.h"
-
 #include "mongo/db/client.h"
 #include "mongo/db/db.h"
+#include "mongo/db/diskloc.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/s/range_arithmetic.h"
 
@@ -81,29 +79,30 @@ namespace mongo {
 
            @return true if object found
         */
-        static bool findOne(Collection* collection,
+        static bool findOne(OperationContext* txn,
+                            Collection* collection,
                             const BSONObj &query,
                             BSONObj& result, 
                             bool requireIndex = false);
 
-        static DiskLoc findOne(Collection* collection, const BSONObj &query, bool requireIndex);
-
-        /**
-         * have to be locked already
-         */
-        static vector<BSONObj> findAll( const string& ns , const BSONObj& query );
+        static DiskLoc findOne(OperationContext* txn,
+                               Collection* collection,
+                               const BSONObj &query,
+                               bool requireIndex);
 
         /**
          * @param foundIndex if passed in will be set to 1 if ns and index found
          * @return true if object found
          */
-        static bool findById(Database* db, const char *ns, BSONObj query, BSONObj& result,
+        static bool findById(OperationContext* txn,
+                             Database* db, const char *ns, BSONObj query, BSONObj& result,
                              bool* nsFound = 0, bool* indexFound = 0 );
 
         /* TODO: should this move into Collection?
          * uasserts if no _id index.
          * @return null loc if not found */
-        static DiskLoc findById(Collection* collection, const BSONObj& query);
+        static DiskLoc findById(OperationContext* txn,
+                                Collection* collection, const BSONObj& query);
 
         /** Get/put the first (or last) object from a collection.  Generally only useful if the collection
             only ever has a single object -- which is a "singleton collection".
@@ -112,11 +111,17 @@ namespace mongo {
 
             @return true if object exists.
         */
-        static bool getSingleton(const char *ns, BSONObj& result);
+        static bool getSingleton(OperationContext* txn, const char *ns, BSONObj& result);
         static void putSingleton(OperationContext* txn, const char *ns, BSONObj obj);
         static void putSingletonGod(OperationContext* txn, const char *ns, BSONObj obj, bool logTheOp);
-        static bool getFirst(const char *ns, BSONObj& result) { return getSingleton(ns, result); }
-        static bool getLast(const char *ns, BSONObj& result); // get last object int he collection; e.g. {$natural : -1}
+        static bool getFirst(OperationContext* txn, const char *ns, BSONObj& result) {
+            return getSingleton(txn, ns, result);
+        }
+
+        /**
+         * get last object int he collection; e.g. {$natural : -1}
+         */
+        static bool getLast(OperationContext* txn, const char *ns, BSONObj& result);
 
         /**
          * you have to lock
@@ -124,14 +129,9 @@ namespace mongo {
          * o has to have an _id field or will assert
          */
         static void upsert( OperationContext* txn,
-                            const string& ns,
+                            const std::string& ns,
                             const BSONObj& o,
                             bool fromMigrate = false );
-
-        /** You do not need to set the database before calling.
-            @return true if collection is empty.
-        */
-        static bool isEmpty(const char *ns);
 
         // TODO: this should be somewhere else probably
         /* Takes object o, and returns a new object with the
@@ -190,9 +190,10 @@ namespace mongo {
          * @return IndexNotFound if the index pattern doesn't match any indexes
          * @return InvalidLength if the estimated size exceeds maxChunkSizeBytes
          */
-        static Status getLocsInRange( const KeyRange& range,
+        static Status getLocsInRange( OperationContext* txn,
+                                      const KeyRange& range,
                                       long long maxChunkSizeBytes,
-                                      set<DiskLoc>* locs,
+                                      std::set<DiskLoc>* locs,
                                       long long* numDocs,
                                       long long* estChunkSizeBytes );
 
@@ -208,7 +209,7 @@ namespace mongo {
          */
         class RemoveSaver : public boost::noncopyable {
         public:
-            RemoveSaver(const string& type, const string& ns, const string& why);
+            RemoveSaver(const std::string& type, const std::string& ns, const std::string& why);
             ~RemoveSaver();
 
             void goingToDelete( const BSONObj& o );
@@ -216,7 +217,7 @@ namespace mongo {
         private:
             boost::filesystem::path _root;
             boost::filesystem::path _file;
-            ofstream* _out;
+            std::ofstream* _out;
         };
 
     };

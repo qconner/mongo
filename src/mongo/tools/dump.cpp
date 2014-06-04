@@ -38,8 +38,10 @@
 #include "mongo/client/auth_helpers.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/db.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/tools/mongodump_options.h"
 #include "mongo/tools/tool.h"
@@ -127,7 +129,9 @@ public:
 
         doCollection(coll, q, f, &m);
 
-        toolInfoLog() << "\t\t " << m.done() << " documents" << std::endl;
+        toolInfoLog() << "\t\t " << m.done()
+                      << ((m.done() == 1) ? " document" : " documents")
+                      << std::endl;
     }
 
     void writeMetadataFile( const string coll, boost::filesystem::path outputFile, 
@@ -249,7 +253,7 @@ public:
 
     int repair() {
         toolInfoLog() << "going to try and recover data from: " << toolGlobalParams.db << std::endl;
-        return _repair(toolGlobalParams.db);
+        return _repairByName(toolGlobalParams.db);
     }
     
     void _repairExtents(Collection* coll, Writer& writer) {
@@ -297,8 +301,11 @@ public:
      * NOTE: The "outfile" parameter passed in should actually represent a directory, but it is
      * called "outfile" because we append the filename and use it as our output file.
      */
-    void _repair( Database* db , string ns , boost::filesystem::path outfile ){
-        Collection* collection = db->getCollection( ns );
+    void _repair(OperationContext* opCtx,
+                 Database* db,
+                 string ns,
+                 boost::filesystem::path outfile) {
+        Collection* collection = db->getCollection(opCtx, ns);
         toolInfoLog() << "nrecords: " << collection->numRecords()
                       << " datasize: " << collection->dataSize()
                       << std::endl;
@@ -322,15 +329,19 @@ public:
             toolError() << "Repair scan failed: " << e.toString() << std::endl;
         }
 
-        toolInfoLog() << "\t\t " << m.done() << " documents" << std::endl;
+        toolInfoLog() << "\t\t " << m.done()
+                      << ((m.done() == 1) ? " document" : " documents")
+                      << std::endl;
     }
     
-    int _repair( string dbname ) {
-        Client::WriteContext cx( dbname );
-        Database * db = cx.ctx().db();
+    int _repairByName(string dbname) {
+        OperationContextImpl txn;
+        Client::WriteContext cx(&txn, dbname);
+
+        Database* db = dbHolder().get(dbname, storageGlobalParams.dbpath);
 
         list<string> namespaces;
-        db->namespaceIndex().getNamespaces( namespaces );
+        db->getDatabaseCatalogEntry()->getCollectionNamespaces( &namespaces );
 
         boost::filesystem::path root = mongoDumpGlobalParams.outputDirectory;
         root /= dbname;
@@ -355,7 +366,7 @@ public:
             
             LogIndentLevel lil1;
             try {
-                _repair( db , ns , root );
+                _repair( &txn, db , ns , root );
             }
             catch ( DBException& e ){
                 toolError() << "ERROR recovering: " << ns << " " << e.toString() << std::endl;

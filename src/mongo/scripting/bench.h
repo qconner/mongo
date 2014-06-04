@@ -64,7 +64,7 @@ namespace mongo {
         DBClientBase *createConnection() const;
 
         /**
-         * Connection string describing the host to which to connect.
+         * Connection std::string describing the host to which to connect.
          */
         std::string host;
 
@@ -151,7 +151,7 @@ namespace mongo {
         /**
          * Count one instance of the event, which took "timeMicros" microseconds.
          */
-        void countOne(unsigned long long timeMicros) {
+        void countOne(long long timeMicros) {
             ++_numEvents;
             _totalTimeMicros += timeMicros;
         }
@@ -168,7 +168,7 @@ namespace mongo {
 
     private:
         unsigned long long _numEvents;
-        unsigned long long _totalTimeMicros;
+        long long _totalTimeMicros;
     };
 
     /**
@@ -418,7 +418,7 @@ namespace mongo {
     private:
         // TODO: Same as for createWithConfig.
         static boost::mutex _staticMutex;
-        static map< OID, BenchRunner* > _activeRuns;
+        static std::map< OID, BenchRunner* > _activeRuns;
 
         OID _oid;
         BenchRunState _brState;
@@ -426,7 +426,7 @@ namespace mongo {
         long long _microsElapsed;
         //double _elapsed;  // elapsed run time (measured in seconds) for this test
         boost::scoped_ptr<BenchRunConfig> _config;
-        vector<BenchRunWorker *> _workers;
+        std::vector<BenchRunWorker *> _workers;
 
         BSONObj before;
         BSONObj after;

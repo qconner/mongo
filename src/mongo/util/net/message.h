@@ -31,7 +31,8 @@
 
 #include <vector>
 
-#include "mongo/bson/util/atomic_int.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/cstdint.h"
 #include "mongo/util/goodies.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sock.h"
@@ -47,11 +48,11 @@ namespace mongo {
     class MessagingPort;
     class PiggyBackData;
 
-    typedef AtomicUInt MSGID;
+    typedef uint32_t MSGID;
 
     enum Operations {
         opReply = 1,     /* reply. responseTo is set. */
-        dbMsg = 1000,    /* generic msg command followed by a string */
+        dbMsg = 1000,    /* generic msg command followed by a std::string */
         dbUpdate = 2001, /* update object */
         dbInsert = 2002,
         //dbGetByOID = 2003,
@@ -305,7 +306,7 @@ namespace mongo {
 
         void send( MessagingPort &p, const char *context );
         
-        string toString() const;
+        std::string toString() const;
 
     private:
         void _setData( MsgData *d, bool freeIt ) {

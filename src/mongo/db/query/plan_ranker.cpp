@@ -27,6 +27,7 @@
  */
 
 #include <algorithm>
+#include <math.h>
 #include <vector>
 #include <utility>
 
@@ -107,6 +108,14 @@ namespace mongo {
         std::stable_sort(scoresAndCandidateindices.begin(), scoresAndCandidateindices.end(),
                          scoreComparator);
 
+        // Determine whether plans tied for the win.
+        if (scoresAndCandidateindices.size() > 1) {
+            double bestScore = scoresAndCandidateindices[0].first;
+            double runnerUpScore = scoresAndCandidateindices[1].first;
+            static const double epsilon = 1e-10;
+            why->tieForBest = fabs(bestScore - runnerUpScore) < epsilon;
+        }
+
         // Update results in 'why'
         // Stats and scores in 'why' are sorted in descending order by score.
         why->stats.clear();
@@ -183,8 +192,8 @@ namespace mongo {
         double baseScore = 1;
 
         // How many "units of work" did the plan perform. Each call to work(...)
-        // counts as one unit, and each NEED_FETCH is penalized as an additional work unit.
-        size_t workUnits = stats->common.works + stats->common.needFetch;
+        // counts as one unit.
+        size_t workUnits = stats->common.works;
 
         // How much did a plan produce?
         // Range: [0, 1]
@@ -233,9 +242,7 @@ namespace mongo {
                                 <<  " + productivity((" << stats->common.advanced
                                                         << " advanced)/("
                                                         << stats->common.works
-                                                        << " works + "
-                                                        << stats->common.needFetch
-                                                        << " needFetch) = "
+                                                        << " works) = "
                                                         << productivity << ")"
                                 <<  " + tieBreakers(" << noFetchBonus
                                                       << " noFetchBonus + "

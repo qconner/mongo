@@ -45,6 +45,7 @@
 #include "mongo/db/db.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_current_op.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/write_concern.h"
 
@@ -152,19 +153,19 @@ namespace mongo {
     // Timing and timeouts
     //
 
-    bool ClientCursor::shouldTimeout(unsigned millis) {
+    bool ClientCursor::shouldTimeout(int millis) {
         _idleAgeMillis += millis;
         return _idleAgeMillis > 600000 && _pinValue == 0;
     }
 
-    void ClientCursor::setIdleTime( unsigned millis ) {
+    void ClientCursor::setIdleTime( int millis ) {
         _idleAgeMillis = millis;
     }
 
     void ClientCursor::updateSlaveLocation( CurOp& curop ) {
         if ( _slaveReadTill.isNull() )
             return;
-        mongo::updateSlaveLocation( curop , _ns.c_str() , _slaveReadTill );
+        mongo::repl::updateSlaveLocation(curop, _ns.c_str(), _slaveReadTill);
     }
 
     //
@@ -219,8 +220,10 @@ namespace mongo {
         Client& client = cc();
         Timer t;
         const int Secs = 4;
-        while ( ! inShutdown() ) {
-            cursorStatsTimedOut.increment( CollectionCursorCache::timeoutCursorsGlobal( t.millisReset() ) );
+        while (!inShutdown()) {
+            OperationContextImpl txn;
+            cursorStatsTimedOut.increment(
+                        CollectionCursorCache::timeoutCursorsGlobal(&txn, t.millisReset()));
             sleepsecs(Secs);
         }
         client.shutdown();

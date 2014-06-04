@@ -56,7 +56,6 @@ _ disallow system* manipulations from the database.
 #include "mongo/db/curop.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/extsort.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -87,7 +86,7 @@ namespace mongo {
 
     DatabaseHolder _dbHolder;
 
-    DatabaseHolder& dbHolderUnchecked() {
+    DatabaseHolder& dbHolder() {
         return _dbHolder;
     }
 
@@ -112,7 +111,7 @@ namespace mongo {
             return Status( ErrorCodes::InvalidNamespace,
                            str::stream() << "invalid ns: " << ns );
 
-        Collection* collection = db->getCollection( ns );
+        Collection* collection = db->getCollection( txn, ns );
 
         if ( collection )
             return Status( ErrorCodes::NamespaceExists,
@@ -133,15 +132,14 @@ namespace mongo {
                 options = b.obj();
             }
             string logNs = nsToDatabase(ns) + ".$cmd";
-            logOp(txn, "c", logNs.c_str(), options);
+            repl::logOp(txn, "c", logNs.c_str(), options);
         }
 
         return Status::OK();
     }
 
-    void dropAllDatabasesExceptLocal() {
-        Lock::GlobalWrite lk;
-        OperationContextImpl txn;
+    void dropAllDatabasesExceptLocal(OperationContext* txn) {
+        Lock::GlobalWrite lk(txn->lockState());
 
         vector<string> n;
         getDatabaseNames(n);
@@ -150,7 +148,7 @@ namespace mongo {
         for( vector<string>::iterator i = n.begin(); i != n.end(); i++ ) {
             if( *i != "local" ) {
                 Client::Context ctx(*i);
-                dropDatabase(&txn, ctx.db());
+                dropDatabase(txn, ctx.db());
             }
         }
     }

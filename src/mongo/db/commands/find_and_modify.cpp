@@ -88,12 +88,12 @@ namespace mongo {
                     return false;
                 }
             }
-            else if ( update.isEmpty() ) {
+            else if ( !cmdObj.hasField("update") ) {
                 errmsg = "need remove or update";
                 return false;
             }
 
-            Lock::DBWrite dbXLock(dbname);
+            Lock::DBWrite dbXLock(txn->lockState(), dbname);
             Client::Context ctx(ns);
             
             return runNoDirectClient( txn, ns , 
@@ -133,7 +133,7 @@ namespace mongo {
                                       BSONObjBuilder& result,
                                       string& errmsg) {
 
-            Lock::DBWrite lk( ns );
+            Lock::DBWrite lk(txn->lockState(), ns);
             Client::Context cx( ns );
             Collection* collection = cx.db()->getCollection( txn, ns );
 
@@ -252,10 +252,14 @@ namespace mongo {
                     // the shard version below, but for now no
                     UpdateLifecycleImpl updateLifecycle(false, requestNs);
                     request.setLifecycle(&updateLifecycle);
-                    UpdateResult res = mongo::update(txn, cx.db(), request, &cc().curop()->debug());
+                    UpdateResult res = mongo::update(txn,
+                                                     cx.db(),
+                                                     request,
+                                                     &txn->getCurOp()->debug());
+
                     if ( !collection ) {
                         // collection created by an upsert
-                        collection = cx.db()->getCollection( ns );
+                        collection = cx.db()->getCollection( txn, ns );
                     }
 
                     LOG(3) << "update result: "  << res ;
@@ -272,7 +276,7 @@ namespace mongo {
                         }
 
                         LOG(3) << "using modified query to return the new doc: " << queryModified;
-                        if ( ! Helpers::findOne( collection, queryModified, doc ) ) {
+                        if ( ! Helpers::findOne( txn, collection, queryModified, doc ) ) {
                             errmsg = str::stream() << "can't find object after modification  " 
                                                    << " ns: " << ns 
                                                    << " queryModified: " << queryModified 
@@ -325,7 +329,7 @@ namespace mongo {
                 }
             }
 
-            Lock::DBWrite dbXLock(dbname);
+            Lock::DBWrite dbXLock(txn->lockState(), dbname);
             Client::Context ctx(ns);
 
             BSONObj out = db.findOne(ns, q, fields);
@@ -347,16 +351,19 @@ namespace mongo {
                     return false;
                 }
 
-                if (cmdObj["new"].trueValue()) {
-                    BSONObjBuilder bob;
-                    BSONElement _id = gle[kUpsertedFieldName];
-                    if (!_id.eoo())
-                        bob.appendAs(_id, "_id");
-                    else
-                        bob.appendAs(origQuery["_id"], "_id");
-
-                    out = db.findOne(ns, bob.done(), fields);
+                if (!cmdObj["new"].trueValue()) {
+                    result.appendNull("value");
+                    return true;
                 }
+
+                BSONObjBuilder bob;
+                BSONElement _id = gle[kUpsertedFieldName];
+                if (!_id.eoo())
+                    bob.appendAs(_id, "_id");
+                else
+                    bob.appendAs(origQuery["_id"], "_id");
+
+                out = db.findOne(ns, bob.done(), fields);
 
             }
             else {

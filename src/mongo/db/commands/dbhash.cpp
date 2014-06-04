@@ -33,6 +33,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/timer.h"
@@ -61,7 +62,7 @@ namespace mongo {
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
     }
 
-    string DBHashCmd::hashCollection( Database* db, const string& fullCollectionName, bool* fromCache ) {
+    string DBHashCmd::hashCollection( OperationContext* opCtx, Database* db, const string& fullCollectionName, bool* fromCache ) {
 
         scoped_ptr<scoped_lock> cachedHashedLock;
 
@@ -75,7 +76,7 @@ namespace mongo {
         }
 
         *fromCache = false;
-        Collection* collection = db->getCollection( fullCollectionName );
+        Collection* collection = db->getCollection( opCtx, fullCollectionName );
         if ( !collection )
             return "";
 
@@ -144,10 +145,10 @@ namespace mongo {
         list<string> colls;
         const string ns = parseNs(dbname, cmdObj);
 
-        Client::ReadContext ctx(ns);
+        Client::ReadContext ctx(txn, ns);
         Database* db = ctx.ctx().db();
         if ( db )
-            db->namespaceIndex().getNamespaces( colls );
+            db->getDatabaseCatalogEntry()->getCollectionNamespaces( &colls );
         colls.sort();
 
         result.appendNumber( "numCollections" , (long long)colls.size() );
@@ -175,7 +176,7 @@ namespace mongo {
                 continue;
 
             bool fromCache = false;
-            string hash = hashCollection( db, fullCollectionName, &fromCache );
+            string hash = hashCollection( txn, db, fullCollectionName, &fromCache );
 
             bb.append( shortCollectionName, hash );
 

@@ -43,14 +43,22 @@ namespace mongo {
 
         virtual RecoveryUnit* recoveryUnit() const;
 
+        virtual LockState* lockState() const;
+
         virtual ProgressMeter* setMessage(const char* msg,
-                                          const std::string& name ,
+                                          const std::string& name,
                                           unsigned long long progressMeterTotal,
                                           int secondsBetween);
+
+        virtual const char * getNS() const;
+
+        virtual CurOp* getCurOp() const;
 
         virtual void checkForInterrupt(bool heedMutex = true) const;
 
         virtual Status checkForInterruptNoAssert() const;
+
+        virtual bool isPrimaryFor( const StringData& ns );
 
         /**
          * Returns an OperationContext. Caller takes ownership.

@@ -33,6 +33,7 @@
 #include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
+namespace repl {
 
     // operator requested resynchronization of replication (on a slave or secondary). {resync: 1}
     class CmdResync : public Command {
@@ -66,10 +67,13 @@ namespace mongo {
                          bool fromRepl) {
 
             const std::string ns = parseNs(dbname, cmdObj);
-            Lock::GlobalWrite globalWriteLock;
+            Lock::GlobalWrite globalWriteLock(txn->lockState());
             Client::Context ctx(ns);
-
             if (replSettings.usingReplSets()) {
+                if (!theReplSet) {
+                    errmsg = "no replication yet active";
+                    return false;
+                }
                 if (theReplSet->isPrimary()) {
                     errmsg = "primaries cannot resync";
                     return false;
@@ -79,7 +83,7 @@ namespace mongo {
 
             // below this comment pertains only to master/slave replication
             if ( cmdObj.getBoolField( "force" ) ) {
-                if ( !waitForSyncToFinish( errmsg ) )
+                if ( !waitForSyncToFinish(txn, errmsg ) )
                     return false;
                 replAllDead = "resync forced";
             }
@@ -87,14 +91,15 @@ namespace mongo {
                 errmsg = "not dead, no need to resync";
                 return false;
             }
-            if ( !waitForSyncToFinish( errmsg ) )
+            if ( !waitForSyncToFinish(txn, errmsg ) )
                 return false;
 
             ReplSource::forceResyncDead( txn, "client" );
             result.append( "info", "triggered resync for all sources" );
             return true;
         }
-        bool waitForSyncToFinish( string &errmsg ) const {
+
+        bool waitForSyncToFinish(OperationContext* txn, string &errmsg) const {
             // Wait for slave thread to finish syncing, so sources will be be
             // reloaded with new saved state on next pass.
             Timer t;
@@ -102,7 +107,7 @@ namespace mongo {
                 if ( syncing == 0 || t.millis() > 30000 )
                     break;
                 {
-                    Lock::TempRelease t;
+                    Lock::TempRelease t(txn->lockState());
                     relinquishSyncingSome = 1;
                     sleepmillis(1);
                 }
@@ -114,4 +119,5 @@ namespace mongo {
             return true;
         }
     } cmdResync;
-}
+} // namespace repl
+} // namespace mongo

@@ -28,6 +28,7 @@
 
 #include "mongo/db/commands/authentication_commands.h"
 
+#include <boost/algorithm/string.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <string>
 #include <vector>
@@ -52,6 +53,7 @@
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/text.h"
 
 namespace mongo {
 
@@ -158,7 +160,7 @@ namespace mongo {
         if (mechanism.empty()) {
             mechanism = "MONGODB-CR";
         }
-        Status status = _authenticate(mechanism, user, cmdObj);
+        Status status = _authenticate(txn, mechanism, user, cmdObj);
         audit::logAuthentication(ClientBasic::getCurrent(),
                                  mechanism,
                                  user,
@@ -182,22 +184,24 @@ namespace mongo {
         return true;
     }
 
-    Status CmdAuthenticate::_authenticate(const std::string& mechanism,
+    Status CmdAuthenticate::_authenticate(OperationContext* txn,
+                                          const std::string& mechanism,
                                           const UserName& user,
                                           const BSONObj& cmdObj) {
 
         if (mechanism == "MONGODB-CR") {
-            return _authenticateCR(user, cmdObj);
+            return _authenticateCR(txn, user, cmdObj);
         }
 #ifdef MONGO_SSL
         if (mechanism == "MONGODB-X509") {
-            return _authenticateX509(user, cmdObj);
+            return _authenticateX509(txn, user, cmdObj);
         }
 #endif
         return Status(ErrorCodes::BadValue, "Unsupported mechanism: " + mechanism);
     }
 
-    Status CmdAuthenticate::_authenticateCR(const UserName& user, const BSONObj& cmdObj) {
+    Status CmdAuthenticate::_authenticateCR(
+                OperationContext* txn, const UserName& user, const BSONObj& cmdObj) {
 
         if (user == internalSecurity.user->getName() &&
             serverGlobalParams.clusterAuthMode.load() == 
@@ -244,7 +248,7 @@ namespace mongo {
         }
 
         User* userObj;
-        Status status = getGlobalAuthorizationManager()->acquireUser(user, &userObj);
+        Status status = getGlobalAuthorizationManager()->acquireUser(txn, user, &userObj);
         if (!status.isOK()) {
             // Failure to find the privilege document indicates no-such-user, a fact that we do not
             // wish to reveal to the client.  So, we return AuthenticationFailed rather than passing
@@ -273,7 +277,7 @@ namespace mongo {
 
         AuthorizationSession* authorizationSession =
             ClientBasic::getCurrent()->getAuthorizationSession();
-        status = authorizationSession->addAndAuthorizeUser(user);
+        status = authorizationSession->addAndAuthorizeUser(txn, user);
         if (!status.isOK()) {
             return status;
         }
@@ -282,7 +286,41 @@ namespace mongo {
     }
 
 #ifdef MONGO_SSL
-    Status CmdAuthenticate::_authenticateX509(const UserName& user, const BSONObj& cmdObj) {
+    void canonicalizeClusterDN(std::vector<std::string>* dn) {
+        // remove all RDNs we don't care about
+        for (std::vector<string>::iterator it=dn->begin(); it != dn->end(); it++) {
+            boost::algorithm::trim(*it);
+            if (!mongoutils::str::startsWith(it->c_str(), "DC=") &&
+                !mongoutils::str::startsWith(it->c_str(), "O=") && 
+                !mongoutils::str::startsWith(it->c_str(), "OU=")) { 
+                dn->erase(it--);
+            }
+        }
+        std::stable_sort(dn->begin(), dn->end());
+    }
+
+    bool CmdAuthenticate::_clusterIdMatch(const std::string& subjectName, 
+                                          const std::string& srvSubjectName) {
+        std::vector<string> clientRDN = StringSplitter::split(subjectName, ",");
+        std::vector<string> serverRDN = StringSplitter::split(srvSubjectName, ",");
+
+        canonicalizeClusterDN(&clientRDN);
+        canonicalizeClusterDN(&serverRDN);
+
+        if (clientRDN.size() == 0 || clientRDN.size() != serverRDN.size()) {
+            return false;
+        }
+
+        for (size_t i=0; i < serverRDN.size(); i++) {
+            if(clientRDN[i] != serverRDN[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+ 
+    Status CmdAuthenticate::_authenticateX509(
+                    OperationContext* txn, const UserName& user, const BSONObj& cmdObj) {
         if (!getSSLManager()) {
             return Status(ErrorCodes::ProtocolError,
                           "SSL support is required for the MONGODB-X509 mechanism.");
@@ -302,18 +340,10 @@ namespace mongo {
         }
         else {
             std::string srvSubjectName = getSSLManager()->getServerSubjectName();
-            
-            size_t srvClusterIdPos = srvSubjectName.find(",OU=");
-            size_t peerClusterIdPos = subjectName.find(",OU=");
-
-            std::string srvClusterId = srvClusterIdPos != std::string::npos ? 
-                srvSubjectName.substr(srvClusterIdPos) : "";
-            std::string peerClusterId = peerClusterIdPos != std::string::npos ? 
-                subjectName.substr(peerClusterIdPos) : "";
-
+ 
             // Handle internal cluster member auth, only applies to server-server connections
-            int clusterAuthMode = serverGlobalParams.clusterAuthMode.load(); 
-            if (srvClusterId == peerClusterId && !srvClusterId.empty()) {
+            if (_clusterIdMatch(subjectName, srvSubjectName)) {
+                int clusterAuthMode = serverGlobalParams.clusterAuthMode.load(); 
                 if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_undefined ||
                     clusterAuthMode == ServerGlobalParams::ClusterAuthMode_keyFile) {
                     return Status(ErrorCodes::AuthenticationFailed, "The provided certificate " 
@@ -329,7 +359,7 @@ namespace mongo {
                     return Status(ErrorCodes::BadValue,
                                   _x509AuthenticationDisabledMessage);
                 }
-                Status status = authorizationSession->addAndAuthorizeUser(user);
+                Status status = authorizationSession->addAndAuthorizeUser(txn, user);
                 if (!status.isOK()) {
                     return status;
                 }
@@ -360,6 +390,14 @@ namespace mongo {
             AuthorizationSession* authSession =
                     ClientBasic::getCurrent()->getAuthorizationSession();
             authSession->logoutDatabase(dbname);
+            if (Command::testCommandsEnabled && dbname == "admin") {
+                // Allows logging out as the internal user against the admin database, however
+                // this actually logs out of the local database as well. This is to
+                // support the auth passthrough test framework on mongos (since you can't use the
+                // local database on a mongos, so you can't logout as the internal user
+                // without this).
+                authSession->logoutDatabase("local");
+            }
             return true;
         }
     } cmdLogout;

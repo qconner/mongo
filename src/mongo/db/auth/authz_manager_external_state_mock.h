@@ -58,9 +58,11 @@ namespace mongo {
         void setAuthorizationManager(AuthorizationManager* authzManager);
         void setAuthzVersion(int version);
 
-        virtual Status getAllDatabaseNames(std::vector<std::string>* dbnames);
+        virtual Status getAllDatabaseNames(
+                            OperationContext* txn, std::vector<std::string>* dbnames);
 
-        virtual Status findOne(const NamespaceString& collectionName,
+        virtual Status findOne(OperationContext* txn,
+                               const NamespaceString& collectionName,
                                const BSONObj& query,
                                BSONObj* result);
 
@@ -101,16 +103,14 @@ namespace mongo {
         virtual bool tryAcquireAuthzUpdateLock(const StringData& why);
         virtual void releaseAuthzUpdateLock();
 
-        Status _findUser(const std::string& usersNamespace,
-                                 const BSONObj& query,
-                                 BSONObj* result);
         std::vector<BSONObj> getCollectionContents(const NamespaceString& collectionName);
 
     private:
         typedef std::vector<BSONObj> BSONObjCollection;
         typedef std::map<NamespaceString, BSONObjCollection> NamespaceDocumentMap;
 
-        virtual Status _getUserDocument(const UserName& userName, BSONObj* userDoc);
+        virtual Status _getUserDocument(
+                            OperationContext* txn, const UserName& userName, BSONObj* userDoc);
 
         Status _findOneIter(const NamespaceString& collectionName,
                             const BSONObj& query,

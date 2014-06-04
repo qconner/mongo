@@ -99,7 +99,7 @@ namespace mongo {
             }
         }
 
-        Collection* collection = db->getCollection(ns.ns());
+        Collection* collection = db->getCollection(txn, ns.ns());
         if (NULL == collection) {
             return 0;
         }
@@ -110,7 +110,7 @@ namespace mongo {
 
         uassert(ErrorCodes::NotMaster,
                 str::stream() << "Not primary while removing from " << ns.ns(),
-                !logop || isMasterNs(ns.ns().c_str()));
+                !logop || repl::isMasterNs(ns.ns().c_str()));
 
         long long nDeleted = 0;
 
@@ -132,13 +132,13 @@ namespace mongo {
 
         DiskLoc rloc;
         Runner::RunnerState state;
-        CurOp* curOp = cc().curop();
+        CurOp* curOp = txn->getCurOp();
         int oldYieldCount = curOp->numYields();
         while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &rloc))) {
             if (oldYieldCount != curOp->numYields()) {
                 uassert(ErrorCodes::NotMaster,
                         str::stream() << "No longer primary while removing from " << ns.ns(),
-                        !logop || isMasterNs(ns.ns().c_str()));
+                        !logop || repl::isMasterNs(ns.ns().c_str()));
                 oldYieldCount = curOp->numYields();
             }
             BSONObj toDelete;
@@ -147,7 +147,7 @@ namespace mongo {
             // saving/restoring state repeatedly?
             runner->saveState();
             collection->deleteDocument(txn, rloc, false, false, logop ? &toDelete : NULL );
-            runner->restoreState();
+            runner->restoreState(txn);
 
             nDeleted++;
 
@@ -158,7 +158,7 @@ namespace mongo {
                 }
                 else {
                     bool replJustOne = true;
-                    logOp(txn, "d", ns.ns().c_str(), toDelete, 0, &replJustOne);
+                    repl::logOp(txn, "d", ns.ns().c_str(), toDelete, 0, &replJustOne);
                 }
             }
 

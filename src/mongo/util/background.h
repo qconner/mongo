@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/scoped_ptr.hpp>
+#include <boost/utility.hpp>
 #include <string>
 #include <vector>
 
@@ -137,7 +138,7 @@ namespace mongo {
      * class MyTask : public PeriodicTask {
      * public:
      *   virtual std::string name() const { return "MyTask; " }
-     *   virtual void doWork() { log() << "hi" << endl; }
+     *   virtual void doWork() { log() << "hi" << std::endl; }
      * } myTask;
      */
     class PeriodicTask {

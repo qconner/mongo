@@ -42,7 +42,6 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
 
 /* Scenarios
  *
@@ -83,6 +82,7 @@
  */
 
 namespace mongo {
+namespace repl {
 
     using namespace bson;
 
@@ -194,9 +194,6 @@ namespace mongo {
                     fixUpInfo.collectionsToResync.insert(to);
                     return;
                 }
-                else if (cmdname == "reIndex") {
-                    return;
-                }
                 else if (cmdname == "dropDatabase") {
                     log() << "replSet error rollback : can't rollback drop database full resync "
                           << "will be required" << rsLog;
@@ -234,12 +231,13 @@ namespace mongo {
     int getRBID(DBClientConnection*);
 
     static void syncRollbackFindCommonPoint(DBClientConnection* them, FixUpInfo& fixUpInfo) {
+        OperationContextImpl txn; // XXX
         verify(Lock::isLocked());
         Client::Context ctx(rsoplog);
 
         boost::scoped_ptr<Runner> runner(
                 InternalPlanner::collectionScan(rsoplog,
-                                                ctx.db()->getCollection(rsoplog),
+                                                ctx.db()->getCollection(&txn, rsoplog),
                                                 InternalPlanner::BACKWARD));
 
         BSONObj ourObj;
@@ -347,6 +345,21 @@ namespace mongo {
         }
     }
 
+    bool copyCollectionFromRemote(OperationContext* txn,
+                                          const string& host,
+                                          const string& ns,
+                                          string& errmsg) {
+        Cloner cloner;
+
+        DBClientConnection *tmpConn = new DBClientConnection();
+        // cloner owns _conn in auto_ptr
+        cloner.setConnection(tmpConn);
+        uassert(15908, errmsg,
+                tmpConn->connect(host, errmsg) && repl::replAuthenticate(tmpConn));
+
+        return cloner.copyCollection(txn, ns, BSONObj(), errmsg, true, false, true, false);
+    }
+
     void ReplSetImpl::syncFixUp(FixUpInfo& fixUpInfo, OplogReader& oplogreader) {
         DBClientConnection* them = oplogreader.conn();
         OperationContextImpl txn;
@@ -430,9 +443,8 @@ namespace mongo {
                 ctx.db()->dropCollection(&txn, ns);
                 {
                     string errmsg;
-                    dbtemprelease release;
-                    bool ok = Cloner::copyCollectionFromRemote(&txn, them->getServerAddress(),
-                                                               ns, errmsg);
+                    dbtemprelease release(txn.lockState());
+                    bool ok = copyCollectionFromRemote(&txn, them->getServerAddress(), ns, errmsg);
                     uassert(15909, str::stream() << "replSet rollback error resyncing collection "
                                                  << ns << ' ' << errmsg, ok);
                 }
@@ -487,7 +499,7 @@ namespace mongo {
 
         sethbmsg("rollback 4.7");
         Client::Context ctx(rsoplog);
-        Collection* oplogCollection = ctx.db()->getCollection(rsoplog);
+        Collection* oplogCollection = ctx.db()->getCollection(&txn, rsoplog);
         uassert(13423,
                 str::stream() << "replSet error in rollback can't find " << rsoplog,
                 oplogCollection);
@@ -495,9 +507,18 @@ namespace mongo {
         map<string,shared_ptr<Helpers::RemoveSaver> > removeSavers;
 
         unsigned deletes = 0, updates = 0;
+        time_t lastProgressUpdate = time(0);
+        time_t progressUpdateGap = 10;
         for (list<pair<DocID, BSONObj> >::iterator it = goodVersions.begin();
                 it != goodVersions.end();
                 it++) {
+            time_t now = time(0);
+            if (now - lastProgressUpdate > progressUpdateGap) {
+                log() << "replSet " << deletes << " delete and "
+                      << updates << " update operations processed out of "
+                      << goodVersions.size() << " total operations";
+                lastProgressUpdate = now;
+            }
             const DocID& doc = it->first;
             BSONObj pattern = doc._id.wrap(); // { _id : ... }
             try {
@@ -519,7 +540,7 @@ namespace mongo {
 
                 // Add the doc to our rollback file
                 BSONObj obj;
-                bool found = Helpers::findOne(ctx.db()->getCollection(doc.ns), pattern, obj, false);
+                bool found = Helpers::findOne(&txn, ctx.db()->getCollection(&txn, doc.ns), pattern, obj, false);
                 if (found) {
                     removeSaver->goingToDelete(obj);
                 }
@@ -532,7 +553,7 @@ namespace mongo {
                     // TODO 1.6 : can't delete from a capped collection.  need to handle that here.
                     deletes++;
 
-                    Collection* collection = ctx.db()->getCollection(doc.ns);
+                    Collection* collection = ctx.db()->getCollection(&txn, doc.ns);
                     if (collection) {
                         if (collection->isCapped()) {
                             // can't delete from a capped collection - so we truncate instead. if
@@ -541,7 +562,7 @@ namespace mongo {
                                 // TODO: IIRC cappedTruncateAfter does not handle completely empty.
                                 // this will crazy slow if no _id index.
                                 long long start = Listener::getElapsedTimeMillis();
-                                DiskLoc loc = Helpers::findOne(collection, pattern, false);
+                                DiskLoc loc = Helpers::findOne(&txn, collection, pattern, false);
                                 if (Listener::getElapsedTimeMillis() - start > 200)
                                     log() << "replSet warning roll back slow no _id index for "
                                           << doc.ns << " perhaps?" << rsLog;
@@ -568,7 +589,6 @@ namespace mongo {
                             }
                         }
                         else {
-                            deletes++;
                             deleteObjects(&txn, 
                                           ctx.db(),
                                           doc.ns,
@@ -656,10 +676,12 @@ namespace mongo {
     void ReplSetImpl::syncRollback(OplogReader& oplogreader) {
         // check that we are at minvalid, otherwise we cannot rollback as we may be in an
         // inconsistent state
+        OperationContextImpl txn;
+
         {
-            Lock::DBRead lk("local.replset.minvalid");
+            Lock::DBRead lk(txn.lockState(), "local.replset.minvalid");
             BSONObj mv;
-            if (Helpers::getSingleton("local.replset.minvalid", mv)) {
+            if (Helpers::getSingleton(&txn, "local.replset.minvalid", mv)) {
                 OpTime minvalid = mv["ts"]._opTime();
                 if (minvalid > lastOpTimeWritten) {
                     log() << "replSet need to rollback, but in inconsistent state";
@@ -671,18 +693,18 @@ namespace mongo {
             }
         }
 
-        unsigned s = _syncRollback(oplogreader);
+        unsigned s = _syncRollback(&txn, oplogreader);
         if (s)
             sleepsecs(s);
     }
 
-    unsigned ReplSetImpl::_syncRollback(OplogReader& oplogreader) {
+    unsigned ReplSetImpl::_syncRollback(OperationContext* txn, OplogReader& oplogreader) {
         verify(!lockedByMe());
         verify(!Lock::isLocked());
 
         sethbmsg("rollback 0");
 
-        writelocktry lk(20000);
+        writelocktry lk(txn->lockState(), 20000);
         if (!lk.got()) {
             sethbmsg("rollback couldn't get write lock in a reasonable time");
             return 2;
@@ -714,7 +736,7 @@ namespace mongo {
             }
             catch (DBException& e) {
                 sethbmsg(string("rollback 2 exception ") + e.toString() + "; sleeping 1 min");
-                dbtemprelease release;
+                dbtemprelease release(txn->lockState());
                 sleepsecs(60);
                 throw;
             }
@@ -745,4 +767,5 @@ namespace mongo {
         return 0;
     }
 
-}
+} // namespace repl
+} // namespace mongo

@@ -58,8 +58,9 @@
 #include "mongo/util/exit.h"
 
 namespace mongo {
+namespace repl {
 
-    void pretouchOperation(const BSONObj& op);
+    void pretouchOperation(OperationContext* txn, const BSONObj& op);
     void pretouchN(vector<BSONObj>&, unsigned a, unsigned b);
 
     /* if 1 sync() is running */
@@ -161,10 +162,10 @@ namespace mongo {
     void ReplSource::ensureMe() {
         string myname = getHostName();
         {
-            Client::WriteContext ctx("local");
             OperationContextImpl txn;
+            Client::WriteContext ctx(&txn, "local");
             // local.me is an identifier for a server for getLastError w:2+
-            if (!Helpers::getSingleton("local.me", _me) ||
+            if (!Helpers::getSingleton(&txn, "local.me", _me) ||
                 !_me.hasField("host") ||
                 _me["host"].String() != myname) {
 
@@ -230,7 +231,7 @@ namespace mongo {
     /* we reuse our existing objects so that we can keep our existing connection
        and cursor in effect.
     */
-    void ReplSource::loadAll(SourceVector &v) {
+    void ReplSource::loadAll(OperationContext* txn, SourceVector &v) {
         const char* localSources = "local.sources";
         Client::Context ctx(localSources);
         SourceVector old = v;
@@ -241,8 +242,9 @@ namespace mongo {
             // check that no items are in sources other than that
             // add if missing
             int n = 0;
-            auto_ptr<Runner> runner(InternalPlanner::collectionScan(localSources,
-                                                                    ctx.db()->getCollection(localSources)));
+            auto_ptr<Runner> runner(
+                InternalPlanner::collectionScan(localSources,
+                                                ctx.db()->getCollection(txn, localSources)));
             BSONObj obj;
             Runner::RunnerState state;
             while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
@@ -284,8 +286,9 @@ namespace mongo {
             }
         }
 
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(localSources,
-                                                                ctx.db()->getCollection(localSources)));
+        auto_ptr<Runner> runner(
+            InternalPlanner::collectionScan(localSources,
+                                            ctx.db()->getCollection(txn, localSources)));
         BSONObj obj;
         Runner::RunnerState state;
         while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
@@ -317,7 +320,7 @@ namespace mongo {
         if ( !replAllDead )
             return;
         SourceVector sources;
-        ReplSource::loadAll(sources);
+        ReplSource::loadAll(txn, sources);
         for( SourceVector::iterator i = sources.begin(); i != sources.end(); ++i ) {
             log() << requester << " forcing resync from "  << (*i)->hostName << endl;
             (*i)->forceResync( txn, requester );
@@ -328,7 +331,7 @@ namespace mongo {
     void ReplSource::forceResync( OperationContext* txn, const char *requester ) {
         BSONObj info;
         {
-            dbtemprelease t;
+            dbtemprelease t(txn->lockState());
             if (!oplogReader.connect(hostName, _me)) {
                 msgassertedNoTrace( 14051 , "unable to connect to resync");
             }
@@ -361,6 +364,29 @@ namespace mongo {
         dropDatabase(txn, ctx.db());
     }
 
+    /**
+     * @param errmsg out  - Error message (if encountered).
+     * @param errCode out - If provided, this will be set on error to the server's error code.
+     *                      Currently this will only be set if there is an error in the initial
+     *                      system.namespaces query.
+     */
+    bool cloneFrom(OperationContext* txn,
+                           Client::Context& context,
+                           const string& masterHost,
+                           const CloneOptions& options,
+                           string& errmsg,
+                           int* errCode) {
+
+        Cloner cloner;
+        return cloner.go(txn,
+                         context,
+                         masterHost.c_str(),
+                         options,
+                         NULL,
+                         errmsg,
+                         errCode);
+    }
+
     /* grab initial copy of a database from the master */
     void ReplSource::resync(OperationContext* txn, const std::string& dbName) {
         const std::string db(dbName);   // need local copy of the name, we're dropping the original
@@ -379,7 +405,7 @@ namespace mongo {
             cloneOptions.snapshot = true;
             cloneOptions.mayYield = true;
             cloneOptions.mayBeInterrupted = false;
-            bool ok = Cloner::cloneFrom(txn, ctx,hostName, cloneOptions, errmsg, &errCode);
+            bool ok = cloneFrom(txn, ctx,hostName, cloneOptions, errmsg, &errCode);
 
             if ( !ok ) {
                 if ( errCode == DatabaseDifferCaseCode ) {
@@ -424,6 +450,7 @@ namespace mongo {
                                             const BSONObj &op,
                                             const char* ns,
                                             const char* db ) {
+        // We are already locked at this point
         if (dbHolder()._isLoaded(ns, storageGlobalParams.dbpath)) {
             // Database is already present.
             return true;   
@@ -434,7 +461,7 @@ namespace mongo {
             // missing from master after optime "ts".
             return false;   
         }
-        if (Database::duplicateUncasedName(false, db, storageGlobalParams.dbpath).empty()) {
+        if (Database::duplicateUncasedName(db, storageGlobalParams.dbpath).empty()) {
             // No duplicate database names are present.
             return true;
         }
@@ -442,8 +469,8 @@ namespace mongo {
         OpTime lastTime;
         bool dbOk = false;
         {
-            dbtemprelease release;
-        
+            dbtemprelease release(txn->lockState());
+
             // We always log an operation after executing it (never before), so
             // a database list will always be valid as of an oplog entry generated
             // before it was retrieved.
@@ -487,7 +514,7 @@ namespace mongo {
         
         // Check for duplicates again, since we released the lock above.
         set< string > duplicates;
-        Database::duplicateUncasedName(false, db, storageGlobalParams.dbpath, &duplicates);
+        Database::duplicateUncasedName(db, storageGlobalParams.dbpath, &duplicates);
         
         // The database is present on the master and no conflicting databases
         // are present on the master.  Drop any local conflicts.
@@ -499,8 +526,8 @@ namespace mongo {
             dropDatabase(txn, ctx.db());
         }
         
-        massert( 14034, "Duplicate database names present after attempting to delete duplicates",
-                Database::duplicateUncasedName(false, db, storageGlobalParams.dbpath).empty() );
+        massert(14034, "Duplicate database names present after attempting to delete duplicates",
+                Database::duplicateUncasedName(db, storageGlobalParams.dbpath).empty());
         return true;
     }
 
@@ -509,7 +536,7 @@ namespace mongo {
             bool failedUpdate = applyOperation_inlock( txn, db, op );
             if (failedUpdate) {
                 Sync sync(hostName);
-                if (sync.shouldRetry(op)) {
+                if (sync.shouldRetry(txn, op)) {
                     uassert(15914,
                             "Failure retrying initial sync update",
                             !applyOperation_inlock(txn, db, op));
@@ -532,7 +559,7 @@ namespace mongo {
 
        @param alreadyLocked caller already put us in write lock if true
     */
-    void ReplSource::sync_pullOpLog_applyOperation(BSONObj& op, bool alreadyLocked) {
+    void ReplSource::_sync_pullOpLog_applyOperation(OperationContext* txn, BSONObj& op, bool alreadyLocked) {
         LOG(6) << "processing op: " << op << endl;
 
         if( op.getStringField("op")[0] == 'n' )
@@ -587,18 +614,17 @@ namespace mongo {
                         a += m;
                     }
                     // we do one too...
-                    pretouchOperation(op);
+                    pretouchOperation(txn, op);
                     tp->join();
                     countdown = v.size();
                 }
             }
             else {
-                pretouchOperation(op);
+                pretouchOperation(txn, op);
             }
         }
 
-        scoped_ptr<Lock::GlobalWrite> lk( alreadyLocked ? 0 : new Lock::GlobalWrite() );
-        OperationContextImpl txn; // XXX?
+        scoped_ptr<Lock::GlobalWrite> lk(alreadyLocked ? 0 : new Lock::GlobalWrite(txn->lockState()));
 
         if ( replAllDead ) {
             // hmmm why is this check here and not at top of this function? does it get set between top and here?
@@ -606,7 +632,7 @@ namespace mongo {
             throw SyncException();
         }
 
-        if ( !handleDuplicateDbName( &txn, op, ns, clientName ) ) {
+        if (!handleDuplicateDbName(txn, op, ns, clientName)) {
             return;   
         }
                 
@@ -621,7 +647,7 @@ namespace mongo {
         // always apply admin command command
         // this is a bit hacky -- the semantics of replication/commands aren't well specified
         if ( strcmp( clientName, "admin" ) == 0 && *op.getStringField( "op" ) == 'c' ) {
-            applyOperation( &txn, ctx.db(), op );
+            applyOperation(txn, ctx.db(), op);
             return;
         }
 
@@ -643,14 +669,14 @@ namespace mongo {
                 save();
                 Client::Context ctx(ns);
                 nClonedThisPass++;
-                resync(&txn, ctx.db()->name());
+                resync(txn, ctx.db()->name());
                 addDbNextPass.erase(clientName);
                 incompleteCloneDbs.erase( clientName );
             }
             save();
         }
         else {
-            applyOperation( &txn, ctx.db(), op );
+            applyOperation(txn, ctx.db(), op);
             addDbNextPass.erase( clientName );
         }
     }
@@ -678,7 +704,7 @@ namespace mongo {
 
         int get() const { return _value; }
 
-        virtual void append( BSONObjBuilder& b, const string& name ) {
+        virtual void append(OperationContext* txn, BSONObjBuilder& b, const string& name) {
             b.append( name, _value );
         }
 
@@ -719,7 +745,7 @@ namespace mongo {
                0 ok, don't sleep
                1 ok, sleep
     */
-    int ReplSource::sync_pullOpLog(int& nApplied) {
+    int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
         int okResultCode = 1;
         string ns = string("local.oplog.$") + sourceName();
         LOG(2) << "repl: sync_pullOpLog " << ns << " syncedTo:" << syncedTo.toStringLong() << '\n';
@@ -753,7 +779,7 @@ namespace mongo {
                 }
                 // obviously global isn't ideal, but non-repl set is old so 
                 // keeping it simple
-                Lock::GlobalWrite lk;
+                Lock::GlobalWrite lk(txn->lockState());
                 save();
             }
 
@@ -790,7 +816,7 @@ namespace mongo {
                 b.append("ns", *i + '.');
                 b.append("op", "db");
                 BSONObj op = b.done();
-                sync_pullOpLog_applyOperation(op, false);
+                _sync_pullOpLog_applyOperation(txn, op, false);
             }
         }
 
@@ -805,7 +831,7 @@ namespace mongo {
                 log() << "repl:   " << ns << " oplog is empty" << endl;
             }
             {
-                Lock::GlobalWrite lk;
+                Lock::GlobalWrite lk(txn->lockState());
                 save();
             }
             return okResultCode;
@@ -876,11 +902,11 @@ namespace mongo {
                 bool moreInitialSyncsPending = !addDbNextPass.empty() && n; // we need "&& n" to assure we actually process at least one op to get a sync point recorded in the first place.
 
                 if ( moreInitialSyncsPending || !oplogReader.more() ) {
-                    Lock::GlobalWrite lk;
+                    Lock::GlobalWrite lk(txn->lockState());
 
                     // NOTE aaron 2011-03-29 This block may be unnecessary, but I'm leaving it in place to avoid changing timing behavior.
                     {
-                        dbtemprelease t;
+                        dbtemprelease t(txn->lockState());
                         if ( !moreInitialSyncsPending && oplogReader.more() ) {
                             continue;
                         }
@@ -901,7 +927,7 @@ namespace mongo {
 
                 OCCASIONALLY if( n > 0 && ( n > 100000 || time(0) - saveLast > 60 ) ) {
                     // periodically note our progress, in case we are doing a lot of work and crash
-                    Lock::GlobalWrite lk;
+                    Lock::GlobalWrite lk(txn->lockState());
                     syncedTo = nextOpTime;
                     // can't update local log ts since there are pending operations from our peer
                     save();
@@ -915,7 +941,7 @@ namespace mongo {
 
                 int b = replApplyBatchSize.get();
                 bool justOne = b == 1;
-                scoped_ptr<Lock::GlobalWrite> lk( justOne ? 0 : new Lock::GlobalWrite() );
+                scoped_ptr<Lock::GlobalWrite> lk(justOne ? 0 : new Lock::GlobalWrite(txn->lockState()));
                 while( 1 ) {
 
                     BSONElement ts = op.getField("ts");
@@ -940,7 +966,7 @@ namespace mongo {
                         verify( justOne );
                         oplogReader.putBack( op );
                         _sleepAdviceTime = nextOpTime.getSecs() + replSettings.slavedelay + 1;
-                        Lock::GlobalWrite lk;
+                        Lock::GlobalWrite lk(txn->lockState());
                         if ( n > 0 ) {
                             syncedTo = last;
                             save();
@@ -951,7 +977,7 @@ namespace mongo {
                         return okResultCode;
                     }
 
-                    sync_pullOpLog_applyOperation(op, !justOne);
+                    _sync_pullOpLog_applyOperation(txn, op, !justOne);
                     n++;
 
                     if( --b == 0 )
@@ -1002,7 +1028,8 @@ namespace mongo {
             return -1;
         }
 
-        return sync_pullOpLog(nApplied);
+        OperationContextImpl txn; // XXX?
+        return _sync_pullOpLog(&txn, nApplied);
     }
 
     /* --------------------------------------------------------------*/
@@ -1018,10 +1045,12 @@ namespace mongo {
                 1 = special sentinel indicating adaptive sleep recommended
     */
     int _replMain(ReplSource::SourceVector& sources, int& nApplied) {
+        OperationContextImpl txn;
         {
             ReplInfo r("replMain load sources");
-            Lock::GlobalWrite lk;
-            ReplSource::loadAll(sources);
+            Lock::GlobalWrite lk(txn.lockState());
+            ReplSource::loadAll(&txn, sources);
+
             replSettings.fastsync = false; // only need this param for initial reset
         }
 
@@ -1084,13 +1113,13 @@ namespace mongo {
         return sleepAdvice;
     }
 
-    void replMain() {
+    static void replMain() {
         ReplSource::SourceVector sources;
         while ( 1 ) {
             int s = 0;
             {
-                Lock::GlobalWrite lk;
                 OperationContextImpl txn;
+                Lock::GlobalWrite lk(txn.lockState());
                 if ( replAllDead ) {
                     // throttledForceResyncDead can throw
                     if ( !replSettings.autoresync || !ReplSource::throttledForceResyncDead( &txn, "auto" ) ) {
@@ -1101,6 +1130,7 @@ namespace mongo {
                 verify( syncing == 0 ); // i.e., there is only one sync thread running. we will want to change/fix this.
                 syncing++;
             }
+
             try {
                 int nApplied = 0;
                 s = _replMain(sources, nApplied);
@@ -1117,8 +1147,10 @@ namespace mongo {
                 out() << "caught exception in _replMain" << endl;
                 s = 4;
             }
+
             {
-                Lock::GlobalWrite lk;
+                LockState lockState;
+                Lock::GlobalWrite lk(&lockState);
                 verify( syncing == 1 );
                 syncing--;
             }
@@ -1152,14 +1184,15 @@ namespace mongo {
                even when things are idle.
             */
             {
-                writelocktry lk(1);
+                OperationContextImpl txn;
+                writelocktry lk(txn.lockState(), 1);
                 if ( lk.got() ) {
                     toSleep = 10;
 
                     replLocalAuth();
 
                     try {
-                        logKeepalive();
+                        logKeepalive(&txn);
                     }
                     catch(...) {
                         log() << "caught exception in replMasterThread()" << endl;
@@ -1173,12 +1206,13 @@ namespace mongo {
         }
     }
 
-    void replSlaveThread() {
+    static void replSlaveThread() {
         sleepsecs(1);
         Client::initThread("replslave");
 
         {
-            Lock::GlobalWrite lk;
+            LockState lockState;
+            Lock::GlobalWrite lk(&lockState);
             replLocalAuth();
         }
 
@@ -1212,7 +1246,8 @@ namespace mongo {
             return;
 
         {
-            Lock::GlobalWrite lk;
+            LockState lockState;
+            Lock::GlobalWrite lk(&lockState);
             replLocalAuth();
         }
 
@@ -1243,7 +1278,9 @@ namespace mongo {
             c = &cc();
         }
 
-        Lock::GlobalRead lk;
+        OperationContextImpl txn; // XXX
+        Lock::GlobalRead lk(txn.lockState());
+
         for( unsigned i = a; i <= b; i++ ) {
             const BSONObj& op = v[i];
             const char *which = "o";
@@ -1265,7 +1302,7 @@ namespace mongo {
                     b.append(_id);
                     BSONObj result;
                     Client::Context ctx( ns );
-                    if( Helpers::findById(ctx.db(), ns, b.done(), result) )
+                    if( Helpers::findById(&txn, ctx.db(), ns, b.done(), result) )
                         _dummy_z += result.objsize(); // touch
                 }
             }
@@ -1275,7 +1312,7 @@ namespace mongo {
         }
     }
 
-    void pretouchOperation(const BSONObj& op) {
+    void pretouchOperation(OperationContext* txn, const BSONObj& op) {
 
         if( Lock::somethingWriteLocked() )
             return; // no point pretouching if write locked. not sure if this will ever fire, but just in case.
@@ -1298,8 +1335,8 @@ namespace mongo {
                 BSONObjBuilder b;
                 b.append(_id);
                 BSONObj result;
-                Client::ReadContext ctx( ns );
-                if( Helpers::findById(ctx.ctx().db(), ns, b.done(), result) )
+                Client::ReadContext ctx(txn, ns );
+                if( Helpers::findById(txn, ctx.ctx().db(), ns, b.done(), result) )
                     _dummy_z += result.objsize(); // touch
             }
         }
@@ -1308,5 +1345,5 @@ namespace mongo {
         }
     }
 
+} // namespace repl
 } // namespace mongo
-

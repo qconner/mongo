@@ -37,13 +37,14 @@ namespace OplogStartTests {
 
     class Base {
     public:
-        Base() : _context(ns()) {
-            OperationContextImpl txn;
-            Collection* c = _context.db()->getCollection(&txn, ns());
+        Base() : _lk(_txn.lockState()),
+                 _context(ns()) {
+
+            Collection* c = _context.db()->getCollection(&_txn, ns());
             if (!c) {
-                c = _context.db()->createCollection(&txn, ns());
+                c = _context.db()->createCollection(&_txn, ns());
             }
-            c->getIndexCatalog()->ensureHaveIdIndex(&txn);
+            c->getIndexCatalog()->ensureHaveIdIndex(&_txn);
         }
 
         ~Base() {
@@ -62,10 +63,10 @@ namespace OplogStartTests {
         }
 
         Collection* collection() {
-            return _context.db()->getCollection( ns() );
+            return _context.db()->getCollection( &_txn, ns() );
         }
 
-        DBDirectClient *client() const { return &_client; }
+        DBDirectClient* client() { return &_client; }
 
         void setupFromQuery(const BSONObj& query) {
             CanonicalQuery* cq;
@@ -89,14 +90,14 @@ namespace OplogStartTests {
         scoped_ptr<OplogStart> _stage;
 
     private:
-        Lock::GlobalWrite lk;
+        // The order of these is important in order to ensure order of destruction
+        OperationContextImpl _txn;
+        Lock::GlobalWrite _lk;
         Client::Context _context;
 
-        static DBDirectClient _client;
+        DBDirectClient _client;
     };
 
-    // static
-    DBDirectClient Base::_client;
 
     /**
      * When the ts is newer than the oldest document, the OplogStart

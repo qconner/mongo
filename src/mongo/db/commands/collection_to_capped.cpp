@@ -56,7 +56,7 @@ namespace mongo {
             return Status( ErrorCodes::NamespaceNotFound,
                            str::stream() << "source collection " << fromNs <<  " does not exist" );
 
-        if ( db->getCollection( toNs ) )
+        if ( db->getCollection( txn, toNs ) )
             return Status( ErrorCodes::NamespaceExists, "to collection already exists" );
 
         // create new collection
@@ -107,7 +107,7 @@ namespace mongo {
 
                 toCollection->insertDocument( txn, obj, true );
                 if ( logForReplication )
-                    logOp( txn, "i", toNs.c_str(), obj );
+                    repl::logOp(txn, "i", toNs.c_str(), obj);
                 txn->recoveryUnit()->commitIfNeeded();
             }
         }
@@ -153,7 +153,7 @@ namespace mongo {
                 return false;
             }
 
-            Lock::DBWrite dbXLock(dbname);
+            Lock::DBWrite dbXLock(txn->lockState(), dbname);
             Client::Context ctx(dbname);
 
             Status status = cloneCollectionAsCapped( txn, ctx.db(), from, to, size, temp, true );
@@ -182,14 +182,15 @@ namespace mongo {
             out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(Database* db,
+        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
+                                                     Database* db,
                                                      const BSONObj& cmdObj) {
             std::string collName = cmdObj.firstElement().valuestr();
             std::string ns = db->name() + "." + collName;
 
             IndexCatalog::IndexKillCriteria criteria;
             criteria.ns = ns;
-            Collection* coll = db->getCollection(ns);
+            Collection* coll = db->getCollection(opCtx, ns);
             if (coll) {
                 return IndexBuilder::killMatchingIndexBuilds(coll, criteria);
             }
@@ -199,12 +200,12 @@ namespace mongo {
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             // calls renamecollection which does a global lock, so we must too:
             //
-            Lock::GlobalWrite globalWriteLock;
+            Lock::GlobalWrite globalWriteLock(txn->lockState());
             Client::Context ctx(dbname);
 
             Database* db = ctx.db();
 
-            stopIndexBuilds(db, jsobj);
+            stopIndexBuilds(txn, db, jsobj);
             BackgroundOperation::assertNoBgOpInProgForDb(dbname.c_str());
 
             string shortSource = jsobj.getStringField( "convertToCapped" );
@@ -219,7 +220,7 @@ namespace mongo {
             string shortTmpName = str::stream() << "tmp.convertToCapped." << shortSource;
             string longTmpName = str::stream() << dbname << "." << shortTmpName;
 
-            if ( db->getCollection( longTmpName ) ) {
+            if ( db->getCollection( txn, longTmpName ) ) {
                 Status status = db->dropCollection( txn, longTmpName );
                 if ( !status.isOK() )
                     return appendCommandStatus( result, status );
@@ -230,7 +231,7 @@ namespace mongo {
             if ( !status.isOK() )
                 return appendCommandStatus( result, status );
 
-            verify( db->getCollection( longTmpName ) );
+            verify( db->getCollection( txn, longTmpName ) );
 
             status = db->dropCollection( txn, longSource );
             if ( !status.isOK() )
@@ -241,7 +242,7 @@ namespace mongo {
                 return appendCommandStatus( result, status );
 
             if (!fromRepl)
-                logOp(txn, "c",(dbname + ".$cmd").c_str(), jsobj);
+                repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), jsobj);
             return true;
         }
     } cmdConvertToCapped;

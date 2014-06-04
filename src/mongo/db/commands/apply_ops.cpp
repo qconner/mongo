@@ -83,7 +83,7 @@ namespace mongo {
 
             // SERVER-4328 todo : is global ok or does this take a long time? i believe multiple 
             // ns used so locking individually requires more analysis
-            Lock::GlobalWrite globalWriteLock;
+            Lock::GlobalWrite globalWriteLock(txn->lockState());
 
             // Preconditions check reads the database state, so needs to be done locked
             if ( cmdObj["preCondition"].type() == Array ) {
@@ -127,11 +127,15 @@ namespace mongo {
                 // operations are applied.  We are already locked globally at this point, so taking
                 // a DBWrite on the namespace creates a nested lock, and yields are disallowed for
                 // operations that hold a nested lock.
-                Lock::DBWrite lk(ns);
+                Lock::DBWrite lk(txn->lockState(), ns);
                 invariant(Lock::nested());
 
                 Client::Context ctx(ns);
-                bool failed = applyOperation_inlock(txn, ctx.db(), temp, false, alwaysUpsert);
+                bool failed = repl::applyOperation_inlock(txn,
+                                                             ctx.db(),
+                                                             temp,
+                                                             false,
+                                                             alwaysUpsert);
                 ab.append(!failed);
                 if ( failed )
                     errors++;
@@ -162,7 +166,7 @@ namespace mongo {
                     }
                 }
 
-                logOp(txn, "c", tempNS.c_str(), cmdBuilder.done());
+                repl::logOp(txn, "c", tempNS.c_str(), cmdBuilder.done());
             }
 
             return errors == 0;

@@ -439,7 +439,7 @@ namespace mongo {
         const NamespaceString& nsString = request.getNamespaceString();
         UpdateLifecycle* lifecycle = request.getLifecycle();
 
-        Collection* collection = db->getCollection(nsString.ns());
+        Collection* collection = db->getCollection(txn, nsString.ns());
 
         validateUpdate(nsString.ns().c_str(), request.getUpdates(), request.getQuery());
 
@@ -511,7 +511,7 @@ namespace mongo {
 
         uassert(ErrorCodes::NotMaster,
                 mongoutils::str::stream() << "Not primary while updating " << nsString.ns(),
-                !request.shouldCallLogOp() || isMasterNs(nsString.ns().c_str()));
+                !request.shouldCallLogOp() || repl::isMasterNs(nsString.ns().c_str()));
 
         while (true) {
             // Get next doc, and location
@@ -663,12 +663,12 @@ namespace mongo {
             // Restore state after modification
             uassert(17278,
                     "Update could not restore runner state after updating a document.",
-                    runner->restoreState());
+                    runner->restoreState(txn));
 
             // Call logOp if requested.
             if (request.shouldCallLogOp() && !logObj.isEmpty()) {
                 BSONObj idQuery = driver->makeOplogEntryQuery(newObj, request.isMulti());
-                logOp(txn, "u", nsString.ns().c_str(), logObj , &idQuery,
+                repl::logOp(txn, "u", nsString.ns().c_str(), logObj , &idQuery,
                       NULL, request.isFromMigration());
             }
 
@@ -765,7 +765,7 @@ namespace mongo {
 
         // Only create the collection if the doc will be inserted.
         if (!collection) {
-            collection = db->getCollection(request.getNamespaceString().ns());
+            collection = db->getCollection(txn, request.getNamespaceString().ns());
             if (!collection) {
                 collection = db->createCollection(txn, request.getNamespaceString().ns());
             }
@@ -782,8 +782,8 @@ namespace mongo {
                                                                 !request.isGod() /*enforceQuota*/);
         uassertStatusOK(newLoc.getStatus());
         if (request.shouldCallLogOp()) {
-            logOp(txn, "i", nsString.ns().c_str(), newObj,
-                   NULL, NULL, request.isFromMigration());
+            repl::logOp(txn, "i", nsString.ns().c_str(), newObj,
+                           NULL, NULL, request.isFromMigration());
         }
 
         opDebug->nMatched = 1;
