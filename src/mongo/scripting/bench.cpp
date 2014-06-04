@@ -387,7 +387,10 @@ namespace mongo {
                 }
 
                 try {
-                    if ( op == "findOne" ) {
+                    if ( op == "nop") {
+                        // do nothing
+                    }
+                    else if ( op == "findOne" ) {
 
                         BSONObj result;
                         {
