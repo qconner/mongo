@@ -751,22 +751,16 @@ namespace mongo {
 
      void BenchRunner::start( ) {
 
-
-         {
-             boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
-             // Must authenticate to admin db in order to run serverStatus command
-             if (_config->username != "") {
-                 string errmsg;
-                 if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                     uasserted(16704, 
-                               str::stream() << "User " << _config->username 
-                               << " could not authenticate to admin db; admin db access is "
-                               "required to use benchRun with auth enabled");
-                 }
+         boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
+         // Must authenticate to admin db in order to run serverStatus command
+         if (_config->username != "") {
+             string errmsg;
+             if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
+                 uasserted(16704, 
+                           str::stream() << "User " << _config->username 
+                           << " could not authenticate to admin db; admin db access is "
+                           "required to use benchRun with auth enabled");
              }
-             // Get initial stats
-             conn->simpleCommand( "admin" , &before , "serverStatus" );
-             before = before.getOwned();
          }
 
          // Start threads
@@ -776,14 +770,18 @@ namespace mongo {
              _workers.push_back(worker);
          }
 
+         // initial stats
+         conn->simpleCommand( "admin" , &before , "serverStatus" );
+         before = before.getOwned();
+
          _brState.waitForState(BenchRunState::BRS_RUNNING);
          _brTimer = new mongo::Timer();
      }
 
      void BenchRunner::stop() {
+         _microsElapsed = _brTimer->micros();
          _brState.tellWorkersToFinish();
          _brState.waitForState(BenchRunState::BRS_FINISHED);
-         _microsElapsed = _brTimer->micros();
          delete _brTimer;
 
          {
@@ -904,21 +902,13 @@ namespace mongo {
          OID oid = OID( start.firstElement().String() );
          BenchRunner* runner = BenchRunner::get( oid );
 
-         //long long t1 = curTimeMillis64();
-         //Timer myTimer;
+         Timer assertTimer;
          sleepmillis( (int)(1000.0 * runner->config().seconds) );
-         //long long e = myTimer.micros();
-         //long long t2 = curTimeMillis64();
+         unsigned long long e = assertTimer.micros();
 
-         //long long elapsed = t2 - t1;
-         //log() << elapsed << " msec elapsed";
-         //log() << e << " usec elapsed";
-
-         //long long desired = (long)(1000.0 * runner->config().seconds);
-         //log() << desired << " desired msec";
-
-         //verify(elapsed >= desired);  // identify any interrupted sleep() system calls?
-         //runner->_elapsed = elapsed / 1000.0;
+         int elapsed = (int)round(e / 1000.0);
+         int desired = (int)(1000.0 * runner->config().seconds);
+         verify(elapsed >= desired);  // identify any short/interrupted sleep()
 
          return benchFinish( start, data );
      }
