@@ -686,8 +686,13 @@ namespace mongo {
                 if (++count % 100 == 0 && !useWriteCmd) {
                     conn->getLastError();
                 }
-
+#define EXTRA_VARIANCE false
+#ifdef EXTRA_VARIANCE
+                if (delay > 0)
+                    sleepmillis( delay );
+#else
                 sleepmillis( delay );
+#endif
             }
         }
 
@@ -769,19 +774,18 @@ namespace mongo {
              worker->start();
              _workers.push_back(worker);
          }
+         _brState.waitForState(BenchRunState::BRS_RUNNING);
 
          // initial stats
          conn->simpleCommand( "admin" , &before , "serverStatus" );
          before = before.getOwned();
-
-         _brState.waitForState(BenchRunState::BRS_RUNNING);
          _brTimer = new mongo::Timer();
      }
 
      void BenchRunner::stop() {
-         _microsElapsed = _brTimer->micros();
          _brState.tellWorkersToFinish();
          _brState.waitForState(BenchRunState::BRS_FINISHED);
+         _microsElapsed = _brTimer->micros();
          delete _brTimer;
 
          {
