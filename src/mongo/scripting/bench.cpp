@@ -350,6 +350,13 @@ namespace mongo {
                 bool useWriteCmd = e["writeCmd"].eoo() ? false : 
                     e["writeCmd"].Bool();
 
+                // fsyncFlag, w, j, wtimeout
+                bool safe = e["safe"].trueValue();
+                bool fsyncFlag = false;
+                bool j = e["j"].trueValue();
+                int w = e["w"].eoo() ? 0 : e["w"].numberInt();
+                int wTimeout = 0;
+
                 BSONObj context = e["context"].eoo() ? BSONObj() : e["context"].Obj();
 
                 auto_ptr<Scope> scope;
@@ -487,7 +494,6 @@ namespace mongo {
                         BSONObj query = e["query"].eoo() ? BSONObj() : e["query"].Obj();
                         BSONObj update = e["update"].Obj();
                         BSONObj result;
-                        bool safe = e["safe"].trueValue();
 
                         {
                             BenchRunEventTrace _bret(&_stats.updateCounter);
@@ -513,7 +519,7 @@ namespace mongo {
                                             bsonTemplateEvaluator), update,
                                             upsert , multi);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -537,7 +543,6 @@ namespace mongo {
                         }
                     }
                     else if( op == "insert" ) {
-                        bool safe = e["safe"].trueValue();
                         BSONObj result;
 
                         {
@@ -561,7 +566,7 @@ namespace mongo {
                             else {
                                 conn->insert(ns, insertDoc);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -588,7 +593,6 @@ namespace mongo {
 
                         bool multi = e["multi"].eoo() ? true : e["multi"].trueValue();
                         BSONObj query = e["query"].eoo() ? BSONObj() : e["query"].Obj();
-                        bool safe = e["safe"].trueValue();
                         BSONObj result;
 
                         {
@@ -614,7 +618,7 @@ namespace mongo {
                                 conn->remove(ns, fixQuery(query,
                                     bsonTemplateEvaluator), !multi);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -684,18 +688,12 @@ namespace mongo {
                 }
 
                 if (++count % 100 == 0 && !useWriteCmd) {
-                    conn->getLastError();
+                    conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                 }
-#define EXTRA_VARIANCE false
-#ifdef EXTRA_VARIANCE
                 if (delay > 0)
                     sleepmillis( delay );
-#else
-                sleepmillis( delay );
-#endif
             }
         }
-
         conn->getLastError();
     }
 
@@ -882,8 +880,6 @@ namespace mongo {
                  x -= before[e.fieldName()].number();
                  std::string s = e.fieldName();
                  buf.append( s, x / (runner->_microsElapsed / 1000000.0) );
-                 s += "_old";
-                 buf.append( s, x / runner->config().seconds );
              }
          }
 

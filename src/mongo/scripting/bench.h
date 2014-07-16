@@ -424,7 +424,6 @@ namespace mongo {
         BenchRunState _brState;
         Timer *_brTimer;
         long long _microsElapsed;
-        //double _elapsed;  // elapsed run time (measured in seconds) for this test
         boost::scoped_ptr<BenchRunConfig> _config;
         std::vector<BenchRunWorker *> _workers;
 
