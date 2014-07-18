@@ -690,10 +690,12 @@ namespace mongo {
                 if (++count % 100 == 0 && !useWriteCmd) {
                     conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                 }
+
                 if (delay > 0)
                     sleepmillis( delay );
             }
         }
+
         conn->getLastError();
     }
 
@@ -754,15 +756,17 @@ namespace mongo {
 
      void BenchRunner::start( ) {
 
-         boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
-         // Must authenticate to admin db in order to run serverStatus command
-         if (_config->username != "") {
-             string errmsg;
-             if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                 uasserted(16704, 
-                           str::stream() << "User " << _config->username 
-                           << " could not authenticate to admin db; admin db access is "
-                           "required to use benchRun with auth enabled");
+         {
+             boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
+             // Must authenticate to admin db in order to run serverStatus command
+             if (_config->username != "") {
+                 string errmsg;
+                 if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
+                     uasserted(16704, 
+                               str::stream() << "User " << _config->username 
+                               << " could not authenticate to admin db; admin db access is "
+                               "required to use benchRun with auth enabled");
+                 }
              }
          }
 
@@ -772,6 +776,7 @@ namespace mongo {
              worker->start();
              _workers.push_back(worker);
          }
+
          _brState.waitForState(BenchRunState::BRS_RUNNING);
 
          // initial stats
