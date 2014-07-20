@@ -42,6 +42,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/md5.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
 
 
@@ -349,6 +350,13 @@ namespace mongo {
                 bool useWriteCmd = e["writeCmd"].eoo() ? false : 
                     e["writeCmd"].Bool();
 
+                // fsyncFlag, w, j, wtimeout
+                bool safe = e["safe"].trueValue();
+                bool fsyncFlag = false;
+                bool j = e["j"].trueValue();
+                int w = e["w"].eoo() ? 0 : e["w"].numberInt();
+                int wTimeout = 0;
+
                 BSONObj context = e["context"].eoo() ? BSONObj() : e["context"].Obj();
 
                 auto_ptr<Scope> scope;
@@ -386,7 +394,10 @@ namespace mongo {
                 }
 
                 try {
-                    if ( op == "findOne" ) {
+                    if ( op == "nop") {
+                        // do nothing
+                    }
+                    else if ( op == "findOne" ) {
 
                         BSONObj result;
                         {
@@ -483,7 +494,6 @@ namespace mongo {
                         BSONObj query = e["query"].eoo() ? BSONObj() : e["query"].Obj();
                         BSONObj update = e["update"].Obj();
                         BSONObj result;
-                        bool safe = e["safe"].trueValue();
 
                         {
                             BenchRunEventTrace _bret(&_stats.updateCounter);
@@ -509,7 +519,7 @@ namespace mongo {
                                             bsonTemplateEvaluator), update,
                                             upsert , multi);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -533,7 +543,6 @@ namespace mongo {
                         }
                     }
                     else if( op == "insert" ) {
-                        bool safe = e["safe"].trueValue();
                         BSONObj result;
 
                         {
@@ -557,7 +566,7 @@ namespace mongo {
                             else {
                                 conn->insert(ns, insertDoc);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -584,7 +593,6 @@ namespace mongo {
 
                         bool multi = e["multi"].eoo() ? true : e["multi"].trueValue();
                         BSONObj query = e["query"].eoo() ? BSONObj() : e["query"].Obj();
-                        bool safe = e["safe"].trueValue();
                         BSONObj result;
 
                         {
@@ -610,7 +618,7 @@ namespace mongo {
                                 conn->remove(ns, fixQuery(query,
                                     bsonTemplateEvaluator), !multi);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -680,10 +688,11 @@ namespace mongo {
                 }
 
                 if (++count % 100 == 0 && !useWriteCmd) {
-                    conn->getLastError();
+                    conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                 }
 
-                sleepmillis( delay );
+                if (delay > 0)
+                    sleepmillis( delay );
             }
         }
 
@@ -747,7 +756,6 @@ namespace mongo {
 
      void BenchRunner::start( ) {
 
-
          {
              boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
              // Must authenticate to admin db in order to run serverStatus command
@@ -760,24 +768,28 @@ namespace mongo {
                                "required to use benchRun with auth enabled");
                  }
              }
-             // Get initial stats
+
+             // Start threads
+             for ( unsigned i = 0; i < _config->parallel; i++ ) {
+                 BenchRunWorker *worker = new BenchRunWorker(i, _config.get(), &_brState);
+                 worker->start();
+                 _workers.push_back(worker);
+             }
+
+             _brState.waitForState(BenchRunState::BRS_RUNNING);
+
+             // initial stats
              conn->simpleCommand( "admin" , &before , "serverStatus" );
              before = before.getOwned();
+             _brTimer = new mongo::Timer();
          }
-
-         // Start threads
-         for ( unsigned i = 0; i < _config->parallel; i++ ) {
-             BenchRunWorker *worker = new BenchRunWorker(i, _config.get(), &_brState);
-             worker->start();
-             _workers.push_back(worker);
-         }
-
-         _brState.waitForState(BenchRunState::BRS_RUNNING);
      }
 
      void BenchRunner::stop() {
          _brState.tellWorkersToFinish();
          _brState.waitForState(BenchRunState::BRS_FINISHED);
+         _microsElapsed = _brTimer->micros();
+         delete _brTimer;
 
          {
              boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
@@ -790,10 +802,10 @@ namespace mongo {
                                << " could not authenticate to admin db; admin db access is "
                                "still required to use benchRun with auth enabled");
                  }
+                 // Get final stats
+                 conn->simpleCommand( "admin" , &after , "serverStatus" );
+                 after = after.getOwned();
              }
-             // Get final stats
-             conn->simpleCommand( "admin" , &after , "serverStatus" );
-             after = after.getOwned();
          }
 
          {
@@ -871,7 +883,8 @@ namespace mongo {
                  BSONElement e = i.next();
                  double x = e.number();
                  x -= before[e.fieldName()].number();
-                 buf.append( e.fieldName() , x / runner->_config->seconds );
+                 std::string s = e.fieldName();
+                 buf.append( s, x / (runner->_microsElapsed / 1000000.0) );
              }
          }
 
@@ -893,7 +906,14 @@ namespace mongo {
 
          OID oid = OID( start.firstElement().String() );
          BenchRunner* runner = BenchRunner::get( oid );
+
+         Timer assertTimer;
          sleepmillis( (int)(1000.0 * runner->config().seconds) );
+         unsigned long long e = assertTimer.micros();
+
+         int elapsed = (int)round(e / 1000.0);
+         int desired = (int)(1000.0 * runner->config().seconds);
+         verify(elapsed >= desired);  // identify any short/interrupted sleep()
 
          return benchFinish( start, data );
      }
@@ -920,7 +940,7 @@ namespace mongo {
 
         OID oid = OID( argsFake.firstElement().String() );
 
-        // Get new BenchRunner object
+        // Get old BenchRunner object
         BenchRunner* runner = BenchRunner::get( oid );
 
         BSONObj finalObj = BenchRunner::finish( runner );
