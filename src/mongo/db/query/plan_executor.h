@@ -32,6 +32,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/query/runner.h"
+#include "mongo/db/query/query_solution.h"
 
 namespace mongo {
 
@@ -51,17 +52,55 @@ namespace mongo {
      */
     class PlanExecutor {
     public:
+        /**
+         * Used when there is no canonical query and no query solution.
+         *
+         * Right now this is only for idhack updates which neither canonicalize
+         * nor go through normal planning.
+         */
         PlanExecutor(WorkingSet* ws, PlanStage* rt, const Collection* collection);
+
+        /**
+         * Used when there is a canonical query but no query solution (e.g. idhack
+         * queries, queries against a NULL collection, queries using the subplan stage).
+         */
+        PlanExecutor(WorkingSet* ws, PlanStage* rt, CanonicalQuery* cq,
+                     const Collection* collection);
+
+        /**
+         * The constructor for the normal case, when you have both a canonical query
+         * and a query solution.
+         */
+        PlanExecutor(WorkingSet* ws, PlanStage* rt, QuerySolution* qs,
+                     CanonicalQuery* cq, const Collection* collection);
+
         ~PlanExecutor();
 
         //
         // Accessors
         //
 
-        /** TODO document me */
-        WorkingSet* getWorkingSet();
+        /**
+         * Get the working set used by this executor, withour transferring ownership.
+         */
+        WorkingSet* getWorkingSet() const;
 
-        /** This is OK even if we were killed */
+        /**
+         * Get the stage tree wrapped by this executor, without transferring ownership.
+         */
+        PlanStage* getStages() const;
+
+        /**
+         * Get the query that this executor is executing, without transferring ownership.
+         */
+        CanonicalQuery* getCanonicalQuery() const;
+
+        /**
+         * Generates a tree of stats objects with a separate lifetime from the execution
+         * stage tree wrapped by this PlanExecutor. The caller owns the returned pointer.
+         *
+         * This is OK even if we were killed.
+         */
         PlanStageStats* getStats() const;
 
         //
@@ -94,13 +133,22 @@ namespace mongo {
          */
         void kill();
 
+        /**
+         * Execute the plan to completion, throwing out the results.
+         *
+         * Used by explain.
+         */
+        Status executePlan();
+
     private:
         // Collection over which this plan executor runs. Used to resolve record ids retrieved by
         // the plan stages. The collection must not be destroyed while there are active plans.
         const Collection* _collection;
 
+        boost::scoped_ptr<CanonicalQuery> _cq;
         boost::scoped_ptr<WorkingSet> _workingSet;
-        boost::scoped_ptr<PlanStage> _root;
+        boost::scoped_ptr<QuerySolution> _qs;
+        std::auto_ptr<PlanStage> _root;
 
         // Did somebody drop an index we care about or the namespace we're looking at?  If so,
         // we'll be killed.

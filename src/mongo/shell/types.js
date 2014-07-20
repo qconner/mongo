@@ -353,6 +353,39 @@ ObjectId.prototype.equals = function(other){
     return this.str == other.str;
 }
 
+// Creates an ObjectId from a Date.
+// Based on solution discussed here:
+//     http://stackoverflow.com/questions/8749971/can-i-query-mongodb-objectid-by-date
+ObjectId.fromDate = function(source) {
+    if (!source) {
+        throw Error("date missing or undefined");
+    }
+
+    var sourceDate;
+
+    // Extract Date from input.
+    // If input is a string, assume ISO date string and
+    // create a Date from the string.
+    if (source instanceof Date) {
+        sourceDate = source;
+    } else {
+        throw Error("Cannot create ObjectId from " + typeof(source) + ": " + tojson(source));
+    }
+
+    // Convert date object to seconds since Unix epoch.
+    var seconds = Math.floor(sourceDate.getTime()/1000);
+
+    // Generate hex timestamp with padding.
+    var hexSeconds = seconds.toString(16);
+    var padding = "0000000000000000";
+    var hexTimestamp = hexSeconds + padding;
+
+    // Create an ObjectId with hex timestamp.
+    var objectId = ObjectId(hexTimestamp);
+
+    return objectId;
+}
+
 // DBPointer
 if (typeof(DBPointer) != "undefined"){
     DBPointer.prototype.fetch = function(){
@@ -386,11 +419,16 @@ if (typeof(DBRef) != "undefined"){
     DBRef.prototype.fetch = function(){
         assert(this.$ref, "need a ns");
         assert(this.$id, "need an id");
-        return db[ this.$ref ].findOne({ _id : this.$id });
+        var coll = this.$db ? db.getSiblingDB(this.$db).getCollection(this.$ref) : db[this.$ref];
+        return coll.findOne({ _id : this.$id });
     }
 
     DBRef.prototype.tojson = function(indent){
         return this.toString();
+    }
+
+    DBRef.prototype.getDb = function(){
+        return this.$db || undefined;
     }
 
     DBRef.prototype.getCollection = function(){
@@ -406,7 +444,7 @@ if (typeof(DBRef) != "undefined"){
     }
 
     DBRef.prototype.toString = function(){
-        return "DBRef(" + tojson(this.$ref) + ", " + tojson(this.$id) + ")";
+        return "DBRef(" + tojson(this.$ref) + ", " + tojson(this.$id) + (this.$db ? ", " + tojson(this.$db) : "") + ")";
     }
 }
 else {
@@ -657,6 +695,7 @@ isNumber = function(x){
     return typeof(x) == "number";
 }
 
+// This function returns true even if the argument is an array.  See SERVER-14220.
 isObject = function(x){
     return typeof(x) == "object";
 }

@@ -1,4 +1,4 @@
-// commands.cpp
+// dbeval.cpp
 
 /**
 *    Copyright (C) 2012 10gen Inc.
@@ -40,9 +40,7 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/lruishmap.h"
 
 namespace mongo {
 
@@ -90,8 +88,8 @@ namespace mongo {
             if ( argsElement.type() == Array ) {
                 args = argsElement.embeddedObject();
                 if ( edebug ) {
-                    out() << "args:" << args.toString() << endl;
-                    out() << "code:\n" << code << endl;
+                    log() << "args:" << args.toString() << endl;
+                    log() << "code:\n" << code << endl;
                 }
             }
         }
@@ -102,7 +100,7 @@ namespace mongo {
             res = s->invoke(f, &args, 0, storageGlobalParams.quota ? 10 * 60 * 1000 : 0);
             int m = t.millis();
             if (m > serverGlobalParams.slowMS) {
-                out() << "dbeval slow, time: " << dec << m << "ms " << dbName << endl;
+                log() << "dbeval slow, time: " << dec << m << "ms " << dbName << endl;
                 if ( m >= 1000 ) log() << code << endl;
                 else OCCASIONALLY log() << code << endl;
             }
@@ -145,7 +143,8 @@ namespace mongo {
             }
 
             Lock::GlobalWrite lk(txn->lockState());
-            Client::Context ctx( dbname );
+            // No WriteUnitOfWork necessary, as dbEval will create its own, see "nolock" case above
+            Client::Context ctx(txn,  dbname );
 
             return dbEval(dbname, cmdObj, result, errmsg);
         }

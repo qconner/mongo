@@ -84,19 +84,19 @@ namespace mongo {
         WebStatusPlugin( const std::string& secionName , double priority , const std::string& subheader = "" );
         virtual ~WebStatusPlugin() {}
 
-        virtual void run( std::stringstream& ss ) = 0;
+        virtual void run(OperationContext* txn, std::stringstream& ss) = 0;
         /** called when web server stats up */
         virtual void init() = 0;
 
         static void initAll();
-        static void runAll( std::stringstream& ss );
+        static void runAll(OperationContext* txn, std::stringstream& ss);
     private:
         std::string _name;
         std::string _subHeading;
         static std::vector<WebStatusPlugin*> * _plugins;
 
     };
-    void webServerThread( const AdminAccess* admins, OperationContext::Factory transactionFactory );
+    void webServerThread(const AdminAccess* admins);
     std::string prettyHostName();
 
 };

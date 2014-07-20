@@ -38,7 +38,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/diskloc.h"
-#include "mongo/db/storage/extent_manager.h"
+#include "mongo/db/storage/mmap_v1/extent_manager.h"
 
 namespace mongo {
 
@@ -85,7 +85,7 @@ namespace mongo {
          */
         Status init(OperationContext* txn);
 
-        size_t numFiles() const;
+        int numFiles() const;
         long long fileSize() const;
 
         // TODO: make private
@@ -94,13 +94,11 @@ namespace mongo {
                            int sizeNeeded = 0,
                            bool preallocateOnly = false );
 
-        void flushFiles( bool sync );
-
         // must call Extent::reuse on the returned extent
         DiskLoc allocateExtent( OperationContext* txn,
                                 bool capped,
                                 int size,
-                                int quotaMax );
+                                bool enforceQuota );
 
         /**
          * firstExt has to be == lastExt or a chain
@@ -143,6 +141,10 @@ namespace mongo {
          */
         Extent* getExtent( const DiskLoc& loc, bool doSanityCheck = true ) const;
 
+        void getFileFormat( OperationContext* txn, int* major, int* minor ) const;
+
+        const DataFile* getOpenFile( int n ) const { return _getOpenFile( n ); }
+
         virtual int maxSize() const;
 
 
@@ -156,9 +158,8 @@ namespace mongo {
         DiskLoc _allocFromFreeList( OperationContext* txn, int approxSize, bool capped );
 
         /* allocate a new Extent, does not check free list
-         * @param maxFileNoForQuota - 0 for unlimited
         */
-        DiskLoc _createExtent( OperationContext* txn, int approxSize, int maxFileNoForQuota );
+        DiskLoc _createExtent( OperationContext* txn, int approxSize, bool enforceQuota );
 
         DataFile* _addAFile( OperationContext* txn, int sizeNeeded, bool preallocateNextFile );
 
@@ -173,7 +174,7 @@ namespace mongo {
                                      int fileNo,
                                      DataFile* f,
                                      int size,
-                                     int maxFileNoForQuota );
+                                     bool enforceQuota );
 
         boost::filesystem::path fileName( int n ) const;
 

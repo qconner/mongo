@@ -1,7 +1,7 @@
 //@file update.cpp
 
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2008-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +28,7 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/update.h"
 
@@ -43,19 +43,23 @@
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_executor.h"
 #include "mongo/db/ops/update_lifecycle.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/db/repl/is_master.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/platform/unordered_set.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kQuery);
+
     namespace mb = mutablebson;
+
     namespace {
 
         const char idFieldName[] = "_id";
@@ -296,10 +300,11 @@ namespace mongo {
                 }
             }
 
-            const bool idChanged = updatedFields.findConflicts(&idFieldRef, NULL);
+            const bool checkIdField = (updatedFields.empty() && !original.isEmpty()) ||
+                                      updatedFields.findConflicts(&idFieldRef, NULL);
 
             // Add _id to fields to check since it too is immutable
-            if (idChanged)
+            if (checkIdField)
                 changedImmutableFields.keepShortest(&idFieldRef);
             else if (changedImmutableFields.empty()) {
                 // Return early if nothing changed which is immutable
@@ -452,19 +457,20 @@ namespace mongo {
             driver->refreshIndexKeys(lifecycle->getIndexKeys());
         }
 
-        Runner* rawRunner;
+        PlanExecutor* rawExec;
         Status status = cq ?
-            getRunner(collection, cqHolder.release(), &rawRunner) :
-            getRunner(collection, nsString.ns(), request.getQuery(), &rawRunner, &cq);
+            getExecutor(txn, collection, cqHolder.release(), &rawExec) :
+            getExecutor(txn, collection, nsString.ns(), request.getQuery(), &rawExec);
         uassert(17243,
-                "could not get runner " + request.getQuery().toString() + "; " + causedBy(status),
+                "could not get executor" + request.getQuery().toString() + "; " + causedBy(status),
                 status.isOK());
 
-        // Create the runner and setup all deps.
-        auto_ptr<Runner> runner(rawRunner);
+        // Create the plan executor and setup all deps.
+        auto_ptr<PlanExecutor> exec(rawExec);
 
-        // Register Runner with ClientCursor
-        const ScopedRunnerRegistration safety(runner.get());
+        // Get the canonical query which the underlying executor is using. This may be NULL in
+        // the case of idhack updates.
+        cq = exec->getCanonicalQuery();
 
         //
         // We'll start assuming we have one or more documents for this update. (Otherwise,
@@ -495,9 +501,12 @@ namespace mongo {
         // update if we throw a page fault exception below, and we rely on these counters
         // reflecting only the actions taken locally. In particlar, we must have the no-op
         // counter reset so that we can meaningfully comapre it with numMatched above.
-        opDebug->nscanned = 0;
-        opDebug->nscannedObjects = 0;
         opDebug->nModified = 0;
+
+        // -1 for these fields means that we don't have a value. Once the update completes
+        // we request these values from the plan executor.
+        opDebug->nscanned = -1;
+        opDebug->nscannedObjects = -1;
 
         // Get the cached document from the update driver.
         mutablebson::Document& doc = driver->getDocument();
@@ -511,12 +520,14 @@ namespace mongo {
 
         uassert(ErrorCodes::NotMaster,
                 mongoutils::str::stream() << "Not primary while updating " << nsString.ns(),
-                !request.shouldCallLogOp() || repl::isMasterNs(nsString.ns().c_str()));
+                !request.shouldCallLogOp()
+                || repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                        nsString.db()));
 
         while (true) {
             // Get next doc, and location
             DiskLoc loc;
-            state = runner->getNext(&oldObj, &loc);
+            state = exec->getNext(&oldObj, &loc);
 
             if (state != Runner::RUNNER_ADVANCED) {
                 if (state == Runner::RUNNER_EOF) {
@@ -535,14 +546,6 @@ namespace mongo {
                 continue;
             }
 
-            // We count how many documents we scanned even though we may skip those that are
-            // deemed duplicated. The final 'numMatched' and 'nscanned' numbers may differ for
-            // that reason.
-            // TODO: Do we want to pull this out of the underlying query plan?
-            opDebug->nscanned++;
-
-            // Found a matching document
-            opDebug->nscannedObjects++;
             numMatched++;
 
             // Ask the driver to apply the mods. It may be that the driver can apply those "in
@@ -619,10 +622,9 @@ namespace mongo {
             }
 
             // Save state before making changes
-            runner->saveState();
+            exec->saveState();
 
             if (inPlace && !driver->modsAffectIndices()) {
-
                 // If a set of modifiers were all no-ops, we are still 'in place', but there is
                 // no work to do, in which case we want to consider the object unchanged.
                 if (!damages.empty() ) {
@@ -634,8 +636,12 @@ namespace mongo {
                 newObj = oldObj;
             }
             else {
-
                 // The updates were not in place. Apply them through the file manager.
+
+                // XXX: With experimental document-level locking, we do not hold the sufficient
+                // locks, so this would cause corruption.
+                fassert(18516, !useExperimentalDocLocking);
+
                 newObj = doc.getObject();
                 uassert(17419,
                         str::stream() << "Resulting document after update is larger than "
@@ -662,8 +668,8 @@ namespace mongo {
 
             // Restore state after modification
             uassert(17278,
-                    "Update could not restore runner state after updating a document.",
-                    runner->restoreState(txn));
+                    "Update could not restore plan executor state after updating a document.",
+                    exec->restoreState());
 
             // Call logOp if requested.
             if (request.shouldCallLogOp() && !logObj.isEmpty()) {
@@ -683,6 +689,12 @@ namespace mongo {
             // Opportunity for journaling to write during the update.
             txn->recoveryUnit()->commitIfNeeded();
         }
+
+        // Get summary information about the plan.
+        PlanSummaryStats stats;
+        Explain::getSummaryStats(exec.get(), &stats);
+        opDebug->nscanned = stats.totalKeysExamined;
+        opDebug->nscannedObjects = stats.totalDocsExamined;
 
         // TODO: Can this be simplified?
         if ((numMatched > 0) || (numMatched == 0 && !request.isUpsert()) ) {
@@ -719,9 +731,6 @@ namespace mongo {
         // creates the base of the update for the inserterd doc (because upsert was true)
         if (cq) {
             uassertStatusOK(driver->populateDocumentWithQueryFields(cq, doc));
-            // Validate the base doc, as taken from the query -- no fields means validate all.
-            FieldRefSet noFields;
-            uassertStatusOK(validate(BSONObj(), noFields, doc, NULL, driver->modOptions()));
             if (!driver->isDocReplacement()) {
                 opDebug->fastmodinsert = true;
                 // We need all the fields from the query to compare against for validation below.
@@ -739,8 +748,7 @@ namespace mongo {
         }
 
         // Apply the update modifications and then log the update as an insert manually.
-        FieldRefSet updatedFields;
-        status = driver->update(StringData(), &doc, NULL, &updatedFields);
+        status = driver->update(StringData(), &doc);
         if (!status.isOK()) {
             uasserted(16836, status.reason());
         }
@@ -749,15 +757,17 @@ namespace mongo {
         uassertStatusOK(ensureIdAndFirst(doc));
 
         // Validate that the object replacement or modifiers resulted in a document
-        // that contains all the immutable keys and can be stored.
+        // that contains all the immutable keys and can be stored if it isn't coming
+        // from a migration or via replication.
         if (!(request.isFromReplication() || request.isFromMigration())){
             const std::vector<FieldRef*>* immutableFields = NULL;
             if (lifecycle)
                 immutableFields = lifecycle->getImmutableFields();
 
+            FieldRefSet noFields;
             // This will only validate the modified fields if not a replacement.
             uassertStatusOK(validate(original,
-                                     updatedFields,
+                                     noFields,
                                      doc,
                                      immutableFields,
                                      driver->modOptions()) );

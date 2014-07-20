@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -50,10 +50,14 @@ namespace mongo {
     class IDHackRunner : public Runner {
     public:
 
-        /** Takes ownership of all the arguments -collection. */
-        IDHackRunner(const Collection* collection, CanonicalQuery* query);
+        /** Takes ownership of all the arguments -txn, -collection. */
+        IDHackRunner(OperationContext* txn,
+                     const Collection* collection,
+                     CanonicalQuery* query);
 
-        IDHackRunner(Collection* collection, const BSONObj& key);
+        IDHackRunner(OperationContext* txn,
+                     Collection* collection,
+                     const BSONObj& key);
 
         virtual ~IDHackRunner();
 
@@ -76,11 +80,6 @@ namespace mongo {
         virtual Status getInfo(TypeExplain** explain,
                                PlanInfo** planInfo) const;
 
-        /**
-         * ID Hack has a very strict criteria for the queries it supports.
-         */
-        static bool supportsQuery(const CanonicalQuery& query);
-
     private:
         /**
          * ID Hack queries are only covered with the projection {_id: 1}.
@@ -88,12 +87,13 @@ namespace mongo {
         bool hasCoveredProjection() const;
 
         /**
-         * If '_query' has a projection, then apply it, returning the result in 'objOut'.
-         * The diskloc 'loc' contains the BSONObj to transform.
-         *
-         * Otherwise do nothing and return false.
+         * Apply the projection from '_query' to the given object and return the result.
+         * '_query->getProj()' must be non-NULL.
          */
-         bool applyProjection(const DiskLoc& loc, BSONObj* objOut) const;
+        BSONObj applyProjection(const BSONObj& docObj) const;
+
+        // transactional context for read locks. Not owned by us
+        OperationContext* _txn;
 
         // Not owned here.
         const Collection* _collection;

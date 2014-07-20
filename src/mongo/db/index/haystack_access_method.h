@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,6 +36,7 @@
 namespace mongo {
 
     class Collection;
+    class OperationContext;
 
     /**
      * Maps (lat, lng) to the bucketSize-sided square bucket that contains it.
@@ -57,12 +58,12 @@ namespace mongo {
     public:
         using BtreeBasedAccessMethod::_descriptor;
 
-        HaystackAccessMethod(IndexCatalogEntry* btreeState, RecordStore* rs);
+        HaystackAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
         virtual ~HaystackAccessMethod() { }
 
     protected:
         friend class GeoHaystackSearchCommand;
-        void searchCommand(Collection* collection,
+        void searchCommand(OperationContext* txn, Collection* collection,
                            const BSONObj& nearObj, double maxDistance, const BSONObj& search,
                            BSONObjBuilder* result, unsigned limit);
 

@@ -119,9 +119,13 @@ if ( typeof _threadInject != "undefined" ){
                                    "recstore.js",
                                    "extent.js",
                                    "indexb.js",
+
+                                   // tests turn on profiling
                                    "profile1.js",
                                    "profile3.js",
                                    "profile4.js",
+                                   "profile5.js",
+
                                    "mr_drop.js",
                                    "mr3.js",
                                    "indexh.js",
@@ -152,7 +156,13 @@ if ( typeof _threadInject != "undefined" ){
         
         // some tests can't be run in parallel with each other
         var serialTestsArr = [ parallelFilesDir + "/fsync.js",
-                               parallelFilesDir + "/auth1.js"
+                               parallelFilesDir + "/auth1.js",
+
+                               // These tests expect the profiler to be on or off at specific points
+                               // during the test run.
+                               parallelFilesDir + "/cursor6.js",
+                               parallelFilesDir + "/profile2.js",
+                               parallelFilesDir + "/updatee.js"
                               ];
         var serialTests = makeKeys( serialTestsArr );
         

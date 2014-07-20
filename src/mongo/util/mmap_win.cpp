@@ -30,7 +30,7 @@
 #include "mongo/pch.h"
 
 #include "mongo/db/d_concurrency.h"
-#include "mongo/db/storage/durable_mapped_file.h"
+#include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/mmap.h"
 #include "mongo/util/processinfo.h"
@@ -38,6 +38,10 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    namespace {
+        mongo::AtomicUInt64 mmfNextId(0);
+    }
 
     static size_t fetchMinOSPageSizeBytes() {
         SYSTEM_INFO si;
@@ -132,7 +136,7 @@ namespace mongo {
     }
 
     MemoryMappedFile::MemoryMappedFile()
-        : _flushMutex(new mutex("flushMutex")), _uniqueId(0) {
+        : _uniqueId(mmfNextId.fetchAndAdd(1)) {
         fd = 0;
         maphandle = 0;
         len = 0;
@@ -141,6 +145,10 @@ namespace mongo {
 
     void MemoryMappedFile::close() {
         LockMongoFilesShared::assertExclusivelyLocked();
+
+        // Prevent flush and close from concurrently running
+        boost::lock_guard<boost::mutex> lk(_flushMutex);
+
         for( vector<void*>::iterator i = views.begin(); i != views.end(); i++ ) {
             clearWritableBits(*i);
             UnmapViewOfFile(*i);
@@ -445,8 +453,6 @@ namespace mongo {
     }
 
     void* MemoryMappedFile::remapPrivateView(void *oldPrivateAddr) {
-        verify( Lock::isW() );
-
         LockMongoFilesExclusive lockMongoFiles;
 
         clearWritableBits(oldPrivateAddr);
@@ -477,69 +483,91 @@ namespace mongo {
         return newPrivateView;
     }
 
-    // prevent WRITETODATAFILES() from running at the same time as FlushViewOfFile()
-    SimpleMutex globalFlushMutex("globalFlushMutex");
-
     class WindowsFlushable : public MemoryMappedFile::Flushable {
     public:
         WindowsFlushable( MemoryMappedFile* theFile,
                           void * view,
                           HANDLE fd,
+                          const uint64_t id,
                           const std::string& filename,
-                          boost::shared_ptr<mutex> flushMutex )
-            : _theFile(theFile), _view(view), _fd(fd), _filename(filename), _flushMutex(flushMutex)
+                          boost::mutex& flushMutex )
+            : _theFile(theFile), _view(view), _fd(fd), _id(id), _filename(filename),
+              _flushMutex(flushMutex)
         {}
 
         void flush() {
             if (!_view || !_fd)
                 return;
 
-            LockMongoFilesShared mmfilesLock;
-            if ( MongoFile::getAllFiles().count( _theFile ) == 0 ) {
-                // this was deleted while we were unlocked
-                return;
-            }
+            {
+                LockMongoFilesShared mmfilesLock;
 
-            SimpleMutex::scoped_lock _globalFlushMutex(globalFlushMutex);
-            scoped_lock lk(*_flushMutex);
-
-            int loopCount = 0;
-            bool success = false;
-            bool timeout = false;
-            int dosError = ERROR_SUCCESS;
-            const int maximumTimeInSeconds = 60 * 15;
-            Timer t;
-            while ( !success && !timeout ) {
-                ++loopCount;
-                success = FALSE != FlushViewOfFile( _view, 0 );
-                if ( !success ) {
-                    dosError = GetLastError();
-                    if ( dosError != ERROR_LOCK_VIOLATION ) {
-                        break;
-                    }
-                    timeout = t.seconds() > maximumTimeInSeconds;
+                std::set<MongoFile*> mmfs = MongoFile::getAllFiles();
+                std::set<MongoFile*>::const_iterator it = mmfs.find(_theFile);
+                if ( it == mmfs.end() || (*it)->getUniqueId() != _id ) {
+                    // this was deleted while we were unlocked
+                    return;
                 }
+
+                // Hold the flush mutex to ensure the file is not closed during flush
+                _flushMutex.lock();
             }
-            if ( success && loopCount > 1 ) {
-                log() << "FlushViewOfFile for " << _filename
+
+            boost::lock_guard<boost::mutex> lk(_flushMutex, boost::adopt_lock_t());
+
+            const int maximumTimeInSeconds = 60 * 15;
+            const unsigned long long chunkSize = 2 * 1024 * 1024;
+
+            for ( unsigned long long i = 0; i < _theFile->length(); i += chunkSize )
+            {
+                bool success = false;
+                int loopCount = 0;
+                bool timeout = false;
+                int dosError = ERROR_SUCCESS;
+
+                unsigned long long flushSize = min(chunkSize, _theFile->length() - i);
+                LPCVOID flushAddress = reinterpret_cast<LPCVOID>(
+                    reinterpret_cast<unsigned long long>(_view) + i);
+                Timer t;
+                while ( !success && !timeout ) {
+                    ++loopCount;
+
+                    // We flush the file in 2MB chunks to avoid a bug in Windows Azure Drives
+                    // that are attached with caching set to none or read-only, see SERVER-13681
+                    success = FlushViewOfFile(flushAddress, flushSize);
+                    if ( !success ) {
+                        dosError = GetLastError();
+                        if ( dosError != ERROR_LOCK_VIOLATION ) {
+                            break;
+                        }
+                        timeout = t.seconds() > maximumTimeInSeconds;
+                    }
+                }
+
+                if ( success && loopCount > 1 ) {
+                    log() << "FlushViewOfFile for " << _filename
+                        << " for address " << flushAddress
+                        << " of size " << flushSize
                         << " succeeded after " << loopCount
                         << " attempts taking " << t.millis()
                         << "ms" << endl;
-            }
-            else if ( !success ) {
-                log() << "FlushViewOfFile for " << _filename
+                }
+                else if ( !success ) {
+                    log() << "FlushViewOfFile for " << _filename
                         << " failed with error " << dosError
+                        << " for address " << flushAddress
+                        << " of size " << flushSize
                         << " after " << loopCount
                         << " attempts taking " << t.millis()
                         << "ms" << endl;
-                // Abort here to avoid data corruption
-                fassert(16387, false);
+                    // Abort here to avoid data corruption
+                    fassert(16387, false);
+                }
             }
 
-            success = FALSE != FlushFileBuffers(_fd);
-            if (!success) {
+            if (!FlushFileBuffers(_fd)) {
                 int err = GetLastError();
-                out() << "FlushFileBuffers failed: " << errnoWithDescription( err )
+                log() << "FlushFileBuffers failed: " << errnoWithDescription( err )
                       << " file: " << _filename << endl;
                 dataSyncFailedHandler();
             }
@@ -548,20 +576,22 @@ namespace mongo {
         MemoryMappedFile* _theFile; // this may be deleted while we are running
         void * _view;
         HANDLE _fd;
+        const uint64_t _id;
         string _filename;
-        boost::shared_ptr<mutex> _flushMutex;
+        boost::mutex& _flushMutex;
     };
 
     void MemoryMappedFile::flush(bool sync) {
         uassert(13056, "Async flushing not supported on windows", sync);
         if( !views.empty() ) {
-            WindowsFlushable f( this, viewForFlushing() , fd , filename() , _flushMutex);
+            WindowsFlushable f(this, viewForFlushing(), fd, _uniqueId, filename(), _flushMutex);
             f.flush();
         }
     }
 
     MemoryMappedFile::Flushable * MemoryMappedFile::prepareFlush() {
-        return new WindowsFlushable( this, viewForFlushing() , fd , filename() , _flushMutex );
+        return new WindowsFlushable(this, viewForFlushing(), fd, _uniqueId,
+                                    filename(), _flushMutex);
     }
 
 }

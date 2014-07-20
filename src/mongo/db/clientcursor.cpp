@@ -44,8 +44,8 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/db.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/write_concern.h"
 
@@ -100,8 +100,6 @@ namespace mongo {
         _leftoverMaxTimeMicros = 0;
         _pinValue = 0;
         _pos = 0;
-
-        Lock::assertAtLeastReadLocked(_ns);
 
         if (_queryOptions & QueryOption_NoCursorTimeout) {
             // cursors normally timeout after an inactivity period to prevent excess memory use
@@ -162,10 +160,19 @@ namespace mongo {
         _idleAgeMillis = millis;
     }
 
-    void ClientCursor::updateSlaveLocation( CurOp& curop ) {
-        if ( _slaveReadTill.isNull() )
+    void ClientCursor::updateSlaveLocation(CurOp& curop) {
+        if (_slaveReadTill.isNull())
             return;
-        mongo::repl::updateSlaveLocation(curop, _ns.c_str(), _slaveReadTill);
+
+        verify(str::startsWith(_ns.c_str(), "local.oplog."));
+
+        Client* c = curop.getClient();
+        verify(c);
+        OID rid = c->getRemoteID();
+        if (!rid.isSet())
+            return;
+
+        repl::getGlobalReplicationCoordinator()->setLastOptime(rid, _slaveReadTill);
     }
 
     //

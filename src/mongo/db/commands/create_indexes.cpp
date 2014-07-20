@@ -178,7 +178,7 @@ namespace mongo {
                 BSONObj spec = specs[i];
 
                 if ( spec["unique"].trueValue() ) {
-                    status = checkUniqueIndexConstraints( ns.ns(), spec["key"].Obj() );
+                    status = checkUniqueIndexConstraints(txn, ns.ns(), spec["key"].Obj());
 
                     if ( !status.isOK() ) {
                         appendCommandStatus( result, status );
@@ -206,13 +206,15 @@ namespace mongo {
 
             result.append( "numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal() );
 
+            writeContext.commit();
             return true;
         }
 
     private:
-        static Status checkUniqueIndexConstraints(const StringData& ns,
+        static Status checkUniqueIndexConstraints(OperationContext* txn,
+                                                  const StringData& ns,
                                                   const BSONObj& newIdxKey) {
-            Lock::assertWriteLocked( ns );
+            txn->lockState()->assertWriteLocked( ns );
 
             if ( shardingState.enabled() ) {
                 CollectionMetadataPtr metadata(

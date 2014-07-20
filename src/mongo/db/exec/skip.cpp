@@ -32,8 +32,11 @@
 
 namespace mongo {
 
+    // static
+    const char* SkipStage::kStageType = "SKIP";
+
     SkipStage::SkipStage(int toSkip, WorkingSet* ws, PlanStage* child)
-        : _ws(ws), _child(child), _toSkip(toSkip) { }
+        : _ws(ws), _child(child), _toSkip(toSkip), _commonStats(kStageType) { }
 
     SkipStage::~SkipStage() { }
 
@@ -41,6 +44,9 @@ namespace mongo {
 
     PlanStage::StageState SkipStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         StageState status = _child->work(&id);
@@ -96,11 +102,27 @@ namespace mongo {
         _child->invalidate(dl, type);
     }
 
+    vector<PlanStage*> SkipStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
+    }
+
     PlanStageStats* SkipStage::getStats() {
         _commonStats.isEOF = isEOF();
+        _specificStats.skip = _toSkip;
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_SKIP));
+        ret->specific.reset(new SkipStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* SkipStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* SkipStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

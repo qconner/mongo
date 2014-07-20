@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -46,21 +46,26 @@ namespace QueryStageDistinct {
 
     class DistinctBase {
     public:
-        DistinctBase() { }
+        DistinctBase() : _client(&_txn) { 
+
+        }
 
         virtual ~DistinctBase() {
             Client::WriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
+            ctx.commit();
         }
 
         void addIndex(const BSONObj& obj) {
             Client::WriteContext ctx(&_txn, ns());
             _client.ensureIndex(ns(), obj);
+            ctx.commit();
         }
 
         void insert(const BSONObj& obj) {
             Client::WriteContext ctx(&_txn, ns());
             _client.insert(ns(), obj);
+            ctx.commit();
         }
 
         IndexDescriptor* getIndex(const BSONObj& obj) {
@@ -140,7 +145,7 @@ namespace QueryStageDistinct {
             params.bounds.fields.push_back(oil);
 
             WorkingSet ws;
-            DistinctScan* distinct = new DistinctScan(params, &ws);
+            DistinctScan* distinct = new DistinctScan(&_txn, params, &ws);
 
             WorkingSetID wsid;
             // Get our first result.
@@ -205,7 +210,7 @@ namespace QueryStageDistinct {
             params.bounds.fields.push_back(oil);
 
             WorkingSet ws;
-            DistinctScan* distinct = new DistinctScan(params, &ws);
+            DistinctScan* distinct = new DistinctScan(&_txn, params, &ws);
 
             // We should see each number in the range [1, 6] exactly once.
             std::set<int> seen;

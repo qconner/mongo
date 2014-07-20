@@ -28,8 +28,12 @@
 
 #pragma once
 
+#include "third_party/s2/s2regioncoverer.h"
+
 #include "mongo/db/jsobj.h"
+#include "mongo/db/geo/hash.h"
 #include "mongo/db/geo/geoquery.h"
+#include "mongo/db/geo/r2_region_coverer.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/query/index_bounds_builder.h"
 
@@ -48,17 +52,53 @@ namespace mongo {
             return bob.obj();
         }
 
+        // For debugging only
+        static std::string toCoveringString(const GeoHashConverter& hashConverter,
+                                            const set<GeoHash>& covering) {
+            string result = "[";
+            for (set<GeoHash>::const_iterator it = covering.begin(); it != covering.end();
+                ++it) {
+
+                if (it != covering.begin()) result += ", ";
+
+                const GeoHash& geoHash = *it;
+
+                result += hashConverter.unhashToBox(geoHash).toString();
+                result += " (" + geoHash.toStringHex1() + ")";
+            }
+
+            return result + "]";
+        }
+
         static void cover2d(const R2Region& region,
                             const BSONObj& indexInfoObj,
                             OrderedIntervalList* oil) {
 
-            BSONObjBuilder builder;
-            builder << "" << MINKEY;
-            builder << "" << MAXKEY;
+            GeoHashConverter::Parameters hashParams;
+            Status paramStatus = GeoHashConverter::parseParameters(indexInfoObj, &hashParams);
+            verify(paramStatus.isOK()); // We validated the parameters when creating the index
 
-            oil->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(builder.obj(),
-                                                                           true,
-                                                                           true));
+            GeoHashConverter hashConverter(hashParams);
+            R2RegionCoverer coverer(&hashConverter);
+            coverer.setMaxLevel(hashConverter.getBits());
+
+            // TODO: Maybe slightly optimize by returning results in order
+            vector<GeoHash> unorderedCovering;
+            coverer.getCovering(region, &unorderedCovering);
+            set<GeoHash> covering(unorderedCovering.begin(), unorderedCovering.end());
+
+            for (set<GeoHash>::const_iterator it = covering.begin(); it != covering.end();
+                ++it) {
+
+                const GeoHash& geoHash = *it;
+                BSONObjBuilder builder;
+                geoHash.appendHashMin(&builder, "");
+                geoHash.appendHashMax(&builder, "");
+
+                oil->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(builder.obj(),
+                                                                               true,
+                                                                               true));
+            }
         }
 
         // TODO: what should we really pass in for indexInfoObj?

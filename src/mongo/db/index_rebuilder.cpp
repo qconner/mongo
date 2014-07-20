@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/index_rebuilder.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -35,12 +37,14 @@
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kStorage);
 
     IndexRebuilder indexRebuilder;
 
@@ -56,7 +60,7 @@ namespace mongo {
         cc().getAuthorizationSession()->grantInternalAuthorization();
 
         std::vector<std::string> dbNames;
-        getDatabaseNames(dbNames);
+        globalStorageEngine->listDatabases( &dbNames );
 
         try {
             std::list<std::string> collNames;
@@ -74,9 +78,6 @@ namespace mongo {
         catch (const DBException& e) {
             warning() << "Index rebuilding did not complete: " << e.what() << endl;
         }
-        boost::unique_lock<boost::mutex> lk(repl::ReplSet::rss.mtx);
-        repl::ReplSet::rss.indexRebuildDone = true;
-        repl::ReplSet::rss.cond.notify_all();
         LOG(1) << "checking complete" << endl;
     }
 
@@ -145,6 +146,7 @@ namespace mongo {
                 }
 
             }
+            ctx.commit();
         }
     }
 

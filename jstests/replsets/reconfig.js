@@ -28,6 +28,7 @@ master = replTest.getMaster();
 config = master.getDB("local").system.replset.findOne();
 var oldVersion = config.version++;
 config.members[0].votes = 2;
+config.members[0].priority = 5;
 config.members[3].votes = 2;
 try {
     assert.commandWorked(master.getDB("admin").runCommand({replSetReconfig : config}));
@@ -57,10 +58,20 @@ replTest.awaitReplication();
 replTest.stop(1);
 replTest.stop(2);
 
+// wait for node 3 to be back so that we can reconfig
+assert.soon(function() {
+    try {
+        master = replTest.getMaster();
+        return master.getDB("admin").runCommand({replSetGetStatus: 1}).members[3].state === 2;
+    } catch (e) {
+        return false;
+    }
+}, "node 3 failed to come up prior to reconfig");
+
 print("try to reconfigure with a 'majority' down");
 oldVersion = config.version;
 config.version++;
-master = replTest.getMaster();
+
 try {
     assert.commandWorked(master.getDB("admin").runCommand({replSetReconfig : config}));
 }

@@ -36,12 +36,11 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/db.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
-#include "mongo/db/storage/record.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -155,19 +154,25 @@ namespace mongo {
 
         // Storage Options
 
+        general_options.addOptionChaining("storage.engine", "storageEngine", moe::String,
+                                          "what storage engine to use")
+            .setDefault(moe::Value(std::string("mmapv1")));
+
+
 #ifdef _WIN32
         boost::filesystem::path currentPath = boost::filesystem::current_path();
 
-        std::string defaultPath = currentPath.root_name().string() + "\\data\\db\\";
+        std::string defaultPath = currentPath.root_name().string()
+                                  + storageGlobalParams.kDefaultDbPath;
         general_options.addOptionChaining("storage.dbPath", "dbpath", moe::String,
-                "directory for datafiles - defaults to \\data\\db\\ which is " + defaultPath + 
-                " based on the current working drive")
-                                         .setDefault(moe::Value(defaultPath));
+                std::string("directory for datafiles - defaults to ")
+                + storageGlobalParams.kDefaultDbPath
+                + " which is " + defaultPath + " based on the current working drive");
 
 #else
         general_options.addOptionChaining("storage.dbPath", "dbpath", moe::String,
-                "directory for datafiles - defaults to /data/db/")
-                                         .setDefault(moe::Value(std::string("/data/db")));
+                std::string("directory for datafiles - defaults to ")
+                + storageGlobalParams.kDefaultDbPath);
 
 #endif
         general_options.addOptionChaining("storage.directoryPerDB", "directoryperdb", moe::Switch,
@@ -422,11 +427,6 @@ namespace mongo {
                                   .hidden()
                                   .setSources(moe::SourceAllLegacy);
 
-        // things we don't want people to use
-        options->addOptionChaining("nohints", "nohints", moe::Switch, "ignore query hints")
-                                  .hidden()
-                                  .setSources(moe::SourceAllLegacy);
-
         // deprecated pairing command line options
         options->addOptionChaining("pairwith", "pairwith", moe::Switch, "DEPRECATED")
                                   .hidden()
@@ -449,15 +449,15 @@ namespace mongo {
 
     namespace {
         void sysRuntimeInfo() {
-            out() << "sysinfo:" << endl;
+            log() << "sysinfo:" << endl;
 #if defined(_SC_PAGE_SIZE)
-            out() << "  page size: " << (int) sysconf(_SC_PAGE_SIZE) << endl;
+            log() << "  page size: " << (int) sysconf(_SC_PAGE_SIZE) << endl;
 #endif
 #if defined(_SC_PHYS_PAGES)
-            out() << "  _SC_PHYS_PAGES: " << sysconf(_SC_PHYS_PAGES) << endl;
+            log() << "  _SC_PHYS_PAGES: " << sysconf(_SC_PHYS_PAGES) << endl;
 #endif
 #if defined(_SC_AVPHYS_PAGES)
-            out() << "  _SC_AVPHYS_PAGES: " << sysconf(_SC_AVPHYS_PAGES) << endl;
+            log() << "  _SC_AVPHYS_PAGES: " << sysconf(_SC_AVPHYS_PAGES) << endl;
 #endif
         }
     } // namespace
@@ -864,6 +864,8 @@ namespace mongo {
                           "files");
         }
 
+        storageGlobalParams.engine = params["storage.engine"].as<string>();
+
         if (params.count("storage.dbPath")) {
             storageGlobalParams.dbpath = params["storage.dbPath"].as<string>();
             if (params.count("processManagement.fork") && storageGlobalParams.dbpath[0] != '/') {
@@ -952,9 +954,6 @@ namespace mongo {
         if (params.count("storage.journal.debugFlags")) {
             storageGlobalParams.durOptions = params["storage.journal.debugFlags"].as<int>();
         }
-        if (params.count("nohints")) {
-            storageGlobalParams.useHints = !params["nohints"].as<bool>();
-        }
         if (params.count("nopreallocj")) {
             storageGlobalParams.preallocj = !params["nopreallocj"].as<bool>();
         }
@@ -991,47 +990,49 @@ namespace mongo {
         }
 
         if (params.count("repair") && params["repair"].as<bool>() == true) {
-            mongodGlobalParams.upgrade = 1; // --repair implies --upgrade
-            mongodGlobalParams.repair = 1;
+            storageGlobalParams.upgrade = 1; // --repair implies --upgrade
+            storageGlobalParams.repair = 1;
             storageGlobalParams.dur = false;
         }
         if (params.count("upgrade") && params["upgrade"].as<bool>() == true) {
-            mongodGlobalParams.upgrade = 1;
+            storageGlobalParams.upgrade = 1;
         }
         if (params.count("notablescan")) {
             storageGlobalParams.noTableScan = params["notablescan"].as<bool>();
         }
+
+        repl::ReplSettings replSettings;
         if (params.count("master")) {
-            repl::replSettings.master = params["master"].as<bool>();
+            replSettings.master = params["master"].as<bool>();
         }
         if (params.count("slave") && params["slave"].as<bool>() == true) {
-            repl::replSettings.slave = repl::SimpleSlave;
+            replSettings.slave = repl::SimpleSlave;
         }
         if (params.count("slavedelay")) {
-            repl::replSettings.slavedelay = params["slavedelay"].as<int>();
+            replSettings.slavedelay = params["slavedelay"].as<int>();
         }
         if (params.count("fastsync")) {
-            repl::replSettings.fastsync = params["fastsync"].as<bool>();
+            replSettings.fastsync = params["fastsync"].as<bool>();
         }
         if (params.count("autoresync")) {
-            repl::replSettings.autoresync = params["autoresync"].as<bool>();
+            replSettings.autoresync = params["autoresync"].as<bool>();
         }
         if (params.count("source")) {
             /* specifies what the source in local.sources should be */
-            repl::replSettings.source = params["source"].as<string>().c_str();
+            replSettings.source = params["source"].as<string>().c_str();
         }
         if( params.count("pretouch") ) {
-            repl::replSettings.pretouch = params["pretouch"].as<int>();
+            replSettings.pretouch = params["pretouch"].as<int>();
         }
         if (params.count("replication.replSetName")) {
-            repl::replSettings.replSet = params["replication.replSetName"].as<string>().c_str();
+            replSettings.replSet = params["replication.replSetName"].as<string>().c_str();
         }
         if (params.count("replication.replSet")) {
             /* seed list of hosts for the repl set */
-            repl::replSettings.replSet = params["replication.replSet"].as<string>().c_str();
+            replSettings.replSet = params["replication.replSet"].as<string>().c_str();
         }
         if (params.count("replication.secondaryIndexPrefetch")) {
-            repl::replSettings.rsIndexPrefetch =
+            replSettings.rsIndexPrefetch =
                 params["replication.secondaryIndexPrefetch"].as<std::string>();
         }
 
@@ -1040,7 +1041,7 @@ namespace mongo {
         }
 
         if (params.count("only")) {
-            repl::replSettings.only = params["only"].as<string>().c_str();
+            replSettings.only = params["only"].as<string>().c_str();
         }
         if( params.count("storage.nsSize") ) {
             int x = params["storage.nsSize"].as<int>();
@@ -1053,7 +1054,9 @@ namespace mongo {
         if (params.count("replication.oplogSizeMB")) {
             long long x = params["replication.oplogSizeMB"].as<int>();
             if (x <= 0) {
-                return Status(ErrorCodes::BadValue, "bad --oplogSize arg");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "bad --oplogSize, arg must be greater than 0,"
+                                      "found: " << x);
             }
             // note a small size such as x==1 is ok for an arbiter.
             if( x > 1000 && sizeof(void*) == 4 ) {
@@ -1062,8 +1065,8 @@ namespace mongo {
                    << "MB is too big for 32 bit version. Use 64 bit build instead.";
                 return Status(ErrorCodes::BadValue, sb.str());
             }
-            repl::replSettings.oplogSize = x * 1024 * 1024;
-            verify(repl::replSettings.oplogSize > 0);
+            replSettings.oplogSize = x * 1024 * 1024;
+            invariant(replSettings.oplogSize > 0);
         }
         if (params.count("cacheSize")) {
             long x = params["cacheSize"].as<long>();
@@ -1098,9 +1101,9 @@ namespace mongo {
             params["sharding.clusterRole"].as<std::string>() == "configsvr") {
             serverGlobalParams.configsvr = true;
             storageGlobalParams.smallfiles = true; // config server implies small files
-            if (repl::replSettings.usingReplSets()
-                    || repl::replSettings.master
-                    || repl::replSettings.slave) {
+            if (replSettings.usingReplSets()
+                    || replSettings.master
+                    || replSettings.slave) {
                 return Status(ErrorCodes::BadValue,
                               "replication should not be enabled on a config server");
             }
@@ -1111,11 +1114,12 @@ namespace mongo {
                 storageGlobalParams.dur = true;
             }
 
-            if (!params.count("storage.dbPath"))
-                storageGlobalParams.dbpath = "/data/configdb";
-            repl::replSettings.master = true;
+            if (!params.count("storage.dbPath")) {
+                storageGlobalParams.dbpath = storageGlobalParams.kDefaultConfigDbPath;
+            }
+            replSettings.master = true;
             if (!params.count("replication.oplogSizeMB"))
-                repl::replSettings.oplogSize = 5 * 1024 * 1024;
+                replSettings.oplogSize = 5 * 1024 * 1024;
         }
 
         if (params.count("sharding.archiveMovedChunks")) {
@@ -1150,8 +1154,8 @@ namespace mongo {
             storageGlobalParams.repairpath = storageGlobalParams.dbpath;
         }
 
-        if (repl::replSettings.pretouch)
-            log() << "--pretouch " << repl::replSettings.pretouch;
+        if (replSettings.pretouch)
+            log() << "--pretouch " << replSettings.pretouch;
 
         // Check if we are 32 bit and have not explicitly specified any journaling options
         if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {
@@ -1162,6 +1166,17 @@ namespace mongo {
             log() << endl;
         }
 
+#ifdef _WIN32
+        // If dbPath is a default value, prepend with drive name so log entries are explicit
+        if (storageGlobalParams.dbpath == storageGlobalParams.kDefaultDbPath
+            || storageGlobalParams.dbpath == storageGlobalParams.kDefaultConfigDbPath) {
+            boost::filesystem::path currentPath = boost::filesystem::current_path();
+            storageGlobalParams.dbpath = currentPath.root_name().string()
+                                         + storageGlobalParams.dbpath;
+        }
+#endif
+
+        setGlobalReplSettings(replSettings);
         return Status::OK();
     }
 

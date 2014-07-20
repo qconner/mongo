@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/catalog/collection_info_cache.h"
 
 #include "mongo/db/d_concurrency.h"
@@ -35,9 +37,12 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/log.h"
 
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kStorage);
 
     CollectionInfoCache::CollectionInfoCache( Collection* collection )
         : _collection( collection ),
@@ -46,7 +51,6 @@ namespace mongo {
           _querySettings(new QuerySettings()) { }
 
     void CollectionInfoCache::reset() {
-        Lock::assertWriteLocked( _collection->ns().ns() );
         LOG(1) << _collection->ns().ns() << ": clearing plan cache - collection info cache reset";
         clearQueryCache();
         _keysComputed = false;
@@ -55,8 +59,6 @@ namespace mongo {
     }
 
     void CollectionInfoCache::computeIndexKeys() {
-        DEV Lock::assertWriteLocked( _collection->ns().ns() );
-
         _indexedPaths.clear();
 
         IndexCatalog::IndexIterator i = _collection->getIndexCatalog()->getIndexIterator( true );

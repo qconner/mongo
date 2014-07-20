@@ -232,7 +232,6 @@ namespace mongo {
 
     void* MemoryMappedFile::remapPrivateView(void *oldPrivateAddr) {
 #if defined(__sunos__) // SERVER-8795
-        verify( Lock::isW() );
         LockMongoFilesExclusive lockMongoFiles;
 #endif
 
@@ -254,8 +253,8 @@ namespace mongo {
             return;
         if ( msync(viewForFlushing(), len, sync ? MS_SYNC : MS_ASYNC) ) {
             // msync failed, this is very bad
-            problem() << "msync failed: " << errnoWithDescription()
-                      << " file: " << filename() << endl;
+            log() << "msync failed: " << errnoWithDescription()
+                  << " file: " << filename() << endl;
             dataSyncFailedHandler();
         }
     }
@@ -290,7 +289,7 @@ namespace mongo {
             }
 
             // we got an error, and we still exist, so this is bad, we fail
-            problem() << "msync " << errnoWithDescription() << endl;
+            log() << "msync " << errnoWithDescription() << endl;
             dataSyncFailedHandler();
         }
 

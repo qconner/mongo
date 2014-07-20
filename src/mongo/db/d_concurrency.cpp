@@ -1,7 +1,7 @@
 // @file d_concurrency.cpp 
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,20 +28,26 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/d_concurrency.h"
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/d_globals.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/lockstat.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/server_parameters.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/server.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mapsf.h"
 #include "mongo/util/concurrency/qlock.h"
 #include "mongo/util/concurrency/rwlock.h"
 #include "mongo/util/concurrency/threadlocal.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
 
 // oplog locking
@@ -50,11 +56,7 @@
 // oplog now
 // yielding
 
-namespace mongo { 
-
-    inline LockState& lockStateTempOnly() {
-        return cc().lockState();
-    }
+namespace mongo {
 
     class DBTryLockTimeoutException : public std::exception {
     public:
@@ -152,53 +154,11 @@ namespace mongo {
     LockStat* Lock::globalLockStat() {
         return &qlk.stats;
     }
-    
-    int Lock::isLocked() {
-        return lockStateTempOnly().threadState();
-    }
-    int Lock::somethingWriteLocked() {
-        return lockStateTempOnly().threadState() == 'W' || lockStateTempOnly().threadState() == 'w';
-    }
-    bool Lock::isRW() {
-        return lockStateTempOnly().threadState() == 'W' || lockStateTempOnly().threadState() == 'R';
-    }
-    bool Lock::isW() { 
-        return lockStateTempOnly().threadState() == 'W';
-    }
-    bool Lock::isR() { 
-        return lockStateTempOnly().threadState() == 'R';
-    }
-    bool Lock::nested() { 
-        // note this doesn't tell us much actually, it tells us if we are nesting locks but 
-        // they could be the a global lock twice or a global and a specific or two specifics 
-        // (such as including local) 
-        return lockStateTempOnly().recursiveCount() > 1;
-    }
 
-    bool Lock::isWriteLocked(const StringData& ns) { 
-        return lockStateTempOnly().isWriteLocked(ns);
-    }
-    bool Lock::atLeastReadLocked(const StringData& ns) { 
-        return lockStateTempOnly().isAtLeastReadLocked(ns);
-    }
-    void Lock::assertAtLeastReadLocked(const StringData& ns) { 
-        if( !atLeastReadLocked(ns) ) { 
-            LockState &ls = lockStateTempOnly();
-            log() << "error expected " << ns << " to be locked " << endl;
-            ls.dump();
-            msgasserted(16104, str::stream() << "expected to be read locked for " << ns);
-        }
-    }
-    void Lock::assertWriteLocked(const StringData& ns) { 
-        if( !Lock::isWriteLocked(ns) ) { 
-            lockStateTempOnly().dump();
-            msgasserted(16105, str::stream() << "expected to be write locked for " << ns);
-        }
-    }
 
     RWLockRecursive &Lock::ParallelBatchWriterMode::_batchLock = *(new RWLockRecursive("special"));
-    void Lock::ParallelBatchWriterMode::iAmABatchParticipant() {
-        lockStateTempOnly()._batchWriter = true;
+    void Lock::ParallelBatchWriterMode::iAmABatchParticipant(LockState* lockState) {
+        lockState->_batchWriter = true;
     }
 
     Lock::ScopedLock::ParallelBatchWriterSupport::ParallelBatchWriterSupport(LockState* lockState)
@@ -269,7 +229,7 @@ namespace mongo {
     }
 
     Lock::TempRelease::TempRelease(LockState* lockState)
-        : cant(lockState->isNested()), _lockState(lockState) {
+        : cant(lockState->isRecursive()), _lockState(lockState) {
 
         if( cant )
             return;
@@ -278,9 +238,10 @@ namespace mongo {
         fassert(16117, _lockState->threadState() != 0);
         
         scopedLk = _lockState->leaveScopedLock();
+        fassert(16118, scopedLk);
+
         invariant(_lockState == scopedLk->_lockState);
 
-        fassert(16118, scopedLk);
         scopedLk->tempRelease();
     }
     Lock::TempRelease::~TempRelease()
@@ -446,7 +407,46 @@ namespace mongo {
         }
     }
 
-    void Lock::DBWrite::lockOther(const StringData& db) {
+    void Lock::DBWrite::lockOtherRead(const StringData& db) {
+        fassert(18517, !db.empty());
+
+        // we do checks first, as on assert destructor won't be called so don't want to be half finished with our work.
+        if( _lockState->otherCount() ) { 
+            // nested. prev could be read or write. if/when we do temprelease with DBRead/DBWrite we will need to increment/decrement here
+            // (so we can not release or assert if nested).  temprelease we should avoid if we can though, it's a bit of an anti-pattern.
+            massert(18513,
+                    str::stream() << "internal error tried to lock two databases at the same time. old:" 
+                                  << _lockState->otherName() << " new:" << db,
+                    db == _lockState->otherName());
+            return;
+        }
+
+        // first lock for this db. check consistent order with local db lock so we never deadlock. local always comes last
+        massert(18514,
+                str::stream() << "can't dblock:" << db 
+                              << " when local or admin is already locked",
+                _lockState->nestableCount() == 0);
+
+        if (db != _lockState->otherName()) {
+            DBLocksMap::ref r(dblocks);
+            WrapperForRWLock*& lock = r[db];
+            if (lock == NULL) {
+                lock = new WrapperForRWLock(db);
+            }
+
+            _lockState->lockedOther(db, -1, lock);
+        }
+        else { 
+            DEV OCCASIONALLY{ dassert(dblocks.get(db) == _lockState->otherLock()); }
+            _lockState->lockedOther(-1);
+        }
+
+        fassert(18515, _weLocked == 0);
+        _lockState->otherLock()->lock_shared();
+        _weLocked = _lockState->otherLock();
+    }
+
+    void Lock::DBWrite::lockOtherWrite(const StringData& db) {
         fassert(16252, !db.empty());
 
         // we do checks first, as on assert destructor won't be called so don't want to be half finished with our work.
@@ -514,8 +514,16 @@ namespace mongo {
             _locked_W = true;
             return;
         } 
-        if( !nested )
-            lockOther(db);
+
+        if (!nested) {
+            if (_isIntentWrite) {
+                lockOtherRead(db);
+            }
+            else {
+                lockOtherWrite(db);
+            }
+        }
+
         lockTop();
         if( nested )
             lockNestable(nested);
@@ -540,9 +548,12 @@ namespace mongo {
             lockNestable(nested);
     }
 
-    Lock::DBWrite::DBWrite(LockState* lockState, const StringData& ns)
-        : ScopedLock(lockState, 'w' ), _what(ns.toString()), _nested(false) {
-        lockDB( _what );
+    Lock::DBWrite::DBWrite(LockState* lockState, const StringData& ns, bool intentWrite)
+        : ScopedLock(lockState, 'w'),
+          _isIntentWrite(intentWrite),
+          _what(ns.toString()),
+          _nested(false) {
+        lockDB(_what);
     }
 
     Lock::DBRead::DBRead(LockState* lockState, const StringData& ns)
@@ -734,6 +745,40 @@ namespace mongo {
 
     }
 
+    /**
+     * This is passed to the iterator for global environments and aggregates information about the
+     * locks which are currently being held or waited on.
+     */
+    class LockStateAggregator : public GlobalEnvironmentExperiment::ProcessOperationContext {
+    public:
+        LockStateAggregator(bool blockedOnly) 
+            : numWriteLocked(0),
+              numReadLocked(0),
+              _blockedOnly(blockedOnly) {
+
+        }
+
+        virtual void processOpContext(OperationContext* txn) {
+            if (_blockedOnly && !txn->lockState()->hasLockPending()) {
+                return;
+            }
+
+            if (txn->lockState()->isWriteLocked()) {
+                numWriteLocked++;
+            }
+            else {
+                numReadLocked++;
+            }
+        }
+
+        int numWriteLocked;
+        int numReadLocked;
+
+    private:
+        const bool _blockedOnly;
+    };
+
+
     class GlobalLockServerStatusSection : public ServerStatusSection {
     public:
         GlobalLockServerStatusSection() : ServerStatusSection( "globalLock" ){
@@ -748,23 +793,29 @@ namespace mongo {
             t.append( "totalTime" , (long long)(1000 * ( curTimeMillis64() - _started ) ) );
             t.append( "lockTime" , Lock::globalLockStat()->getTimeLocked( 'W' ) );
 
+            // This returns the blocked lock states
             {
                 BSONObjBuilder ttt( t.subobjStart( "currentQueue" ) );
-                int w=0, r=0;
-                Client::recommendedYieldMicros( &w , &r, true );
-                ttt.append( "total" , w + r );
-                ttt.append( "readers" , r );
-                ttt.append( "writers" , w );
+
+                LockStateAggregator blocked(true);
+                getGlobalEnvironment()->forEachOperationContext(&blocked);
+
+                ttt.append("total", blocked.numReadLocked + blocked.numWriteLocked);
+                ttt.append("readers", blocked.numReadLocked);
+                ttt.append("writers", blocked.numWriteLocked);
                 ttt.done();
             }
 
+            // This returns all the active clients (including those holding locks)
             {
                 BSONObjBuilder ttt( t.subobjStart( "activeClients" ) );
-                int w=0, r=0;
-                Client::getActiveClientCount( w , r );
-                ttt.append( "total" , w + r );
-                ttt.append( "readers" , r );
-                ttt.append( "writers" , w );
+
+                LockStateAggregator active(false);
+                getGlobalEnvironment()->forEachOperationContext(&active);
+
+                ttt.append("total", active.numReadLocked + active.numWriteLocked);
+                ttt.append("readers", active.numReadLocked);
+                ttt.append("writers", active.numWriteLocked);
                 ttt.done();
             }
 
@@ -796,5 +847,4 @@ namespace mongo {
         }
 
     } lockStatsServerStatusSection;
-
 }

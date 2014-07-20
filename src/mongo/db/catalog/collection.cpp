@@ -1,7 +1,7 @@
 // collection.cpp
 
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -37,11 +37,12 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/concurrency/lock_mgr.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/structure/record_store_v1_capped.h"
-#include "mongo/db/repl/rs.h"
+#include "mongo/db/storage/mmap_v1/record_store_v1_capped.h"  // XXX-HK/ERH
+#include "mongo/db/repl/repl_coordinator_global.h"
 
 #include "mongo/db/auth/user_document_parser.h" // XXX-ANDY
 
@@ -98,10 +99,13 @@ namespace mongo {
             return false;
         }
 
-        if ( _ns == _database->_namespacesName ||
-             _ns == _database->_indexesName ||
-             _ns == _database->_profileName ) {
-            return false;
+        if ( _ns.isSystem() ) {
+            StringData shortName = _ns.coll().substr( _ns.coll().find( '.' )  + 1 );
+            if ( shortName == "indexes" ||
+                 shortName == "namespaces" ||
+                 shortName == "profile" ) {
+                return false;
+            }
         }
 
         if ( _ns.db() == "local" ) {
@@ -118,20 +122,23 @@ namespace mongo {
         return true;
     }
 
-    RecordIterator* Collection::getIterator( const DiskLoc& start, bool tailable,
-                                                     const CollectionScanParams::Direction& dir) const {
+    RecordIterator* Collection::getIterator( OperationContext* txn,
+                                             const DiskLoc& start,
+                                             bool tailable,
+                                             const CollectionScanParams::Direction& dir) const {
         invariant( ok() );
-        return _recordStore->getIterator( start, tailable, dir );
+        return _recordStore->getIterator( txn, start, tailable, dir );
     }
 
-    vector<RecordIterator*> Collection::getManyIterators() const {
-        return _recordStore->getManyIterators();
+    vector<RecordIterator*> Collection::getManyIterators( OperationContext* txn ) const {
+        return _recordStore->getManyIterators(txn);
     }
 
-    int64_t Collection::countTableScan( const MatchExpression* expression ) {
-        scoped_ptr<RecordIterator> iterator( getIterator( DiskLoc(),
-                                                              false,
-                                                              CollectionScanParams::FORWARD ) );
+    int64_t Collection::countTableScan( OperationContext* txn, const MatchExpression* expression ) {
+        scoped_ptr<RecordIterator> iterator( getIterator( txn,
+                                                          DiskLoc(),
+                                                          false,
+                                                          CollectionScanParams::FORWARD ) );
         int64_t count = 0;
         while ( !iterator->isEOF() ) {
             DiskLoc loc = iterator->getNext();
@@ -144,8 +151,7 @@ namespace mongo {
     }
 
     BSONObj Collection::docFor(const DiskLoc& loc) const {
-        Record* rec = _recordStore->recordFor( loc );
-        return BSONObj( rec->data() );
+        return  _recordStore->dataFor( loc ).toBson();
     }
 
     StatusWith<DiskLoc> Collection::insertDocument( OperationContext* txn,
@@ -155,9 +161,7 @@ namespace mongo {
 
         StatusWith<DiskLoc> loc = _recordStore->insertRecord( txn,
                                                               doc,
-                                                              enforceQuota
-                                                                 ? largestFileNumberInQuota()
-                                                                 : 0 );
+                                                              _enforceQuota( enforceQuota ) );
         if ( !loc.isOK() )
             return loc;
 
@@ -177,7 +181,7 @@ namespace mongo {
 
         if ( isCapped() ) {
             // TOOD: old god not done
-            Status ret = _indexCatalog.checkNoIndexConflicts( docToInsert );
+            Status ret = _indexCatalog.checkNoIndexConflicts( txn, docToInsert );
             if ( !ret.isOK() )
                 return StatusWith<DiskLoc>( ret );
         }
@@ -219,7 +223,7 @@ namespace mongo {
         StatusWith<DiskLoc> loc = _recordStore->insertRecord( txn,
                                                               docToInsert.objdata(),
                                                               docToInsert.objsize(),
-                                                              enforceQuota ? largestFileNumberInQuota() : 0 );
+                                                              _enforceQuota( enforceQuota ) );
         if ( !loc.isOK() )
             return loc;
 
@@ -296,8 +300,7 @@ namespace mongo {
                                                     bool enforceQuota,
                                                     OpDebug* debug ) {
 
-        Record* oldRecord = _recordStore->recordFor( oldLocation );
-        BSONObj objOld( oldRecord->data() );
+        BSONObj objOld = _recordStore->dataFor( oldLocation ).toBson();
 
         if ( objOld.hasElement( "_id" ) ) {
             BSONElement oldId = objOld["_id"];
@@ -329,10 +332,10 @@ namespace mongo {
             options.logIfError = false;
             options.dupsAllowed =
                 !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique())
-                || repl::ignoreUniqueIndex(descriptor);
+                || repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor);
             UpdateTicket* updateTicket = new UpdateTicket();
             updateTickets.mutableMap()[descriptor] = updateTicket;
-            Status ret = iam->validateUpdate(objOld, objNew, oldLocation, options, updateTicket );
+            Status ret = iam->validateUpdate(txn, objOld, objNew, oldLocation, options, updateTicket );
             if ( !ret.isOK() ) {
                 return StatusWith<DiskLoc>( ret );
             }
@@ -343,7 +346,7 @@ namespace mongo {
                                                                       oldLocation,
                                                                       objNew.objdata(),
                                                                       objNew.objsize(),
-                                                                      enforceQuota ? largestFileNumberInQuota() : 0,
+                                                                      _enforceQuota( enforceQuota ),
                                                                       this );
 
         if ( !newLocation.isOK() ) {
@@ -406,20 +409,25 @@ namespace mongo {
 
         // Broadcast the mutation so that query results stay correct.
         _cursorCache.invalidateDocument(loc, INVALIDATION_MUTATION);
+
+        ExclusiveResourceLock lk(txn->getTransaction(), *(size_t*)&loc);
         return _recordStore->updateWithDamages( txn, loc, damangeSource, damages );
     }
 
-    int Collection::largestFileNumberInQuota() const {
+    bool Collection::_enforceQuota( bool userEnforeQuota ) const {
+        if ( !userEnforeQuota )
+            return false;
+
         if ( !storageGlobalParams.quota )
-            return 0;
+            return false;
 
         if ( _ns.db() == "local" )
-            return 0;
+            return false;
 
         if ( _ns.isSpecial() )
-            return 0;
+            return false;
 
-        return storageGlobalParams.quotaFiles;
+        return true;
     }
 
     bool Collection::isCapped() const {
@@ -481,7 +489,7 @@ namespace mongo {
                                               bool inclusive) {
         invariant( isCapped() );
         reinterpret_cast<CappedRecordStoreV1*>(
-            _recordStore.get())->temp_cappedTruncateAfter( txn, end, inclusive );
+                           _recordStore)->temp_cappedTruncateAfter( txn, end, inclusive );
     }
 
     namespace {
@@ -489,8 +497,8 @@ namespace mongo {
         public:
             virtual ~MyValidateAdaptor(){}
 
-            virtual Status validate( Record* record, size_t* dataSize ) {
-                BSONObj obj = BSONObj( record->data() );
+            virtual Status validate( const RecordData& record, size_t* dataSize ) {
+                BSONObj obj = record.toBson();
                 const Status status = validateBSON(obj.objdata(), obj.objsize());
                 if ( status.isOK() )
                     *dataSize = obj.objsize();
@@ -522,7 +530,7 @@ namespace mongo {
                     invariant( iam );
 
                     int64_t keys;
-                    iam->validate(&keys);
+                    iam->validate(txn, &keys);
                     indexes.appendNumber(descriptor->indexNamespace(),
                                          static_cast<long long>(keys));
                     idxn++;

@@ -32,8 +32,11 @@
 
 namespace mongo {
 
+    // static
+    const char* LimitStage::kStageType = "LIMIT";
+
     LimitStage::LimitStage(int limit, WorkingSet* ws, PlanStage* child)
-        : _ws(ws), _child(child), _numToReturn(limit) { }
+        : _ws(ws), _child(child), _numToReturn(limit), _commonStats(kStageType) { }
 
     LimitStage::~LimitStage() { }
 
@@ -41,6 +44,9 @@ namespace mongo {
 
     PlanStage::StageState LimitStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (0 == _numToReturn) {
             // We've returned as many results as we're limited to.
@@ -92,11 +98,27 @@ namespace mongo {
         _child->invalidate(dl, type);
     }
 
+    vector<PlanStage*> LimitStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
+    }
+
     PlanStageStats* LimitStage::getStats() {
         _commonStats.isEOF = isEOF();
+        _specificStats.limit = _numToReturn;
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_LIMIT));
+        ret->specific.reset(new LimitStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* LimitStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* LimitStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

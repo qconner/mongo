@@ -45,11 +45,9 @@
 #include "mongo/db/index_builder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
@@ -119,15 +117,17 @@ namespace mongo {
             set<string> clonedColls;
 
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context context( dbname );
+            //  SERVER-14085: This unit of work should go away and be put in the individual ops
+            WriteUnitOfWork wunit(txn->recoveryUnit());
 
             Cloner cloner;
-            bool rval = cloner.go(txn, context, from, opts, &clonedColls, errmsg);
+            bool rval = cloner.go(txn, dbname, from, opts, &clonedColls, errmsg);
 
             BSONArrayBuilder barr;
             barr.append( clonedColls );
 
             result.append( "clonedColls", barr.arr() );
+            wunit.commit();
 
             return rval;
 

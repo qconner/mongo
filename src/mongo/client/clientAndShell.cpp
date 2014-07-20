@@ -53,10 +53,10 @@ namespace mongo {
             mongo::mutex::scoped_lock lk( shell_utils::mongoProgramOutputMutex );
             dbexitCalled = true;
         }
-        out() << "dbexit called" << endl;
+        log() << "dbexit called" << endl;
         if ( whyMsg )
-            out() << " b/c " << whyMsg << endl;
-        out() << "exiting" << endl;
+            log() << " b/c " << whyMsg << endl;
+        log() << "exiting" << endl;
         ::_exit( returnCode );
     }
 
@@ -84,9 +84,5 @@ namespace mongo {
 
     ClientBasic* ClientBasic::getCurrent() {
         return 0;
-    }
-
-    bool ClientBasic::hasCurrent() {
-        return false;
     }
 }

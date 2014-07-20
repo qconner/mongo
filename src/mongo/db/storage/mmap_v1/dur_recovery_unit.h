@@ -27,21 +27,29 @@
  */
 
 #include <string>
+#include <vector>
 
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/platform/compiler.h"
 
 #pragma once
 
 namespace mongo {
+
+    class OperationContext;
 
     /**
      * Just pass through to getDur().
      */
     class DurRecoveryUnit : public RecoveryUnit {
     public:
-        DurRecoveryUnit();
+        DurRecoveryUnit(OperationContext* txn);
 
         virtual ~DurRecoveryUnit() { }
+
+        virtual void beginUnitOfWork();
+        virtual void commitUnitOfWork();
+        virtual void endUnitOfWork();
 
         virtual bool awaitCommit();
 
@@ -51,14 +59,51 @@ namespace mongo {
 
         virtual void* writingPtr(void* data, size_t len);
 
-        virtual void createdFile(const std::string& filename, unsigned long long len);
-
         virtual void syncDataAndTruncateJournal();
 
     private:
-        // XXX: this will be meaningful once killCurrentOp doesn't examine this bool's evil sibling
-        // in client.h.  This requires killCurrentOp to go through OperationContext...
-        bool _hasWrittenSinceCheckpoint;
+        void recordPreimage(char* data, size_t len);
+        void publishChanges();
+        void rollbackInnermostChanges();
+
+        bool inAUnitOfWork() const { return !_startOfUncommittedChangesForLevel.empty(); }
+
+        bool inOutermostUnitOfWork() const {
+            return _startOfUncommittedChangesForLevel.size() == 1;
+        }
+
+        bool haveUncommitedChangesAtCurrentLevel() const {
+            return _changes.size() > _startOfUncommittedChangesForLevel.back();
+        }
+
+        // The parent operation context. This pointer is not owned and it's lifetime must extend
+        // past that of the DurRecoveryUnit
+        OperationContext* _txn;
+
+        // State is only used for invariant checking today. It should be deleted once we get rid of
+        // nesting.
+        enum State {
+            NORMAL, // anything is allowed
+            MUST_COMMIT, // can't rollback (will go away once we have two-phase locking).
+        };
+        State _state;
+
+        struct Change {
+            char* base;
+            std::string preimage; // TODO consider storing out-of-line
+        };
+
+        // Changes are ordered from oldest to newest. Overlapping and duplicate regions are allowed,
+        // since rollback undoes changes in reverse order.
+        // TODO compare performance against a data-structure that coalesces overlapping/adjacent
+        // changes.
+        typedef std::vector<Change> Changes;
+        Changes _changes;
+
+        // Index of the first uncommited change in _changes for each nesting level. Index 0 in this
+        // vector is always the outermost transaction and back() is always the innermost. The size()
+        // is the current nesting level.
+        std::vector<size_t> _startOfUncommittedChangesForLevel;
     };
 
 }  // namespace mongo

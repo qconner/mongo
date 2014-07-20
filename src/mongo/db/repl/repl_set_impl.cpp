@@ -26,24 +26,32 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/repl_set_impl.h"
 
 #include "mongo/db/client.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/commands/get_last_error.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/index_rebuilder.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_settings.h"  // replSettings
-#include "mongo/db/repl/repl_start.h"
+#include "mongo/db/repl/repl_set_seed_list.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 #ifdef MONGO_PLATFORM_64
     const int ReplSetImpl::replWriterThreadCount = 16;
@@ -95,7 +103,8 @@ namespace repl {
 namespace {
     void dropAllTempCollections() {
         vector<string> dbNames;
-        getDatabaseNames(dbNames);
+        globalStorageEngine->listDatabases( &dbNames );
+
         OperationContextImpl txn;
         for (vector<string>::const_iterator it = dbNames.begin(); it != dbNames.end(); ++it) {
             // The local db is special because it isn't replicated. It is cleared at startup even on
@@ -103,7 +112,7 @@ namespace {
             if (*it == "local")
                 continue;
 
-            Client::Context ctx(*it);
+            Client::Context ctx(&txn, *it);
             ctx.db()->clearTmpCollections(&txn);
         }
     }
@@ -374,7 +383,7 @@ namespace {
         b.append("me", myConfig().h.toString());
     }
 
-    void ReplSetImpl::init(ReplSetCmdline& replSetCmdline) {
+    void ReplSetImpl::init(ReplSetSeedList& replSetSeedList) {
         mgr = new Manager(this);
 
         _cfg = 0;
@@ -383,20 +392,20 @@ namespace {
         lastH = 0;
         changeState(MemberState::RS_STARTUP);
 
-        _seeds = &replSetCmdline.seeds;
+        _seeds = &replSetSeedList.seeds;
 
         LOG(1) << "replSet beginning startup..." << rsLog;
 
         loadConfig();
 
-        unsigned sss = replSetCmdline.seedSet.size();
+        unsigned sss = replSetSeedList.seedSet.size();
         for (Member *m = head(); m; m = m->next()) {
-            replSetCmdline.seedSet.erase(m->h());
+            replSetSeedList.seedSet.erase(m->h());
         }
-        for (set<HostAndPort>::iterator i = replSetCmdline.seedSet.begin();
-                i != replSetCmdline.seedSet.end();
+        for (set<HostAndPort>::iterator i = replSetSeedList.seedSet.begin();
+                i != replSetSeedList.seedSet.end();
                 i++) {
-            if (i->isSelf()) {
+            if (isSelf(*i)) {
                 if (sss == 1) {
                     LOG(1) << "replSet warning self is listed in the seed list and there are no "
                               "other seeds listed did you intend that?" << rsLog;
@@ -409,7 +418,7 @@ namespace {
         }
 
         // Figure out indexPrefetch setting
-        std::string& prefetch = replSettings.rsIndexPrefetch;
+        std::string& prefetch = getGlobalReplicationCoordinator()->getSettings().rsIndexPrefetch;
         if (!prefetch.empty()) {
             IndexPrefetchConfig prefetchConfig = PREFETCH_ALL;
             if (prefetch == "none")
@@ -461,12 +470,7 @@ namespace {
 
     // call after constructing to start - returns fairly quickly after launching its threads
     void ReplSetImpl::_go() {
-        {
-            boost::unique_lock<boost::mutex> lk(rss.mtx);
-            while (!rss.indexRebuildDone) {
-                rss.cond.wait(lk);
-            }
-        }
+        indexRebuilder.wait();
         try {
             loadLastOpTimeWritten();
         }
@@ -533,7 +537,7 @@ namespace {
                     i++) {
                 
                 ReplSetConfig::MemberCfg& m = *i;
-                if (m.h.isSelf()) {
+                if (isSelf(m.h)) {
                     me++;
                 }
                 
@@ -618,7 +622,7 @@ namespace {
                     const ReplSetConfig::MemberCfg& m = *i;
                     Member *mi;
                     members += (members == "" ? "" : ", ") + m.h.toString();
-                    if (m.h.isSelf()) {
+                    if (isSelf(m.h)) {
                         verify(me++ == 0);
                         mi = new Member(m.h, m._id, &m, true);
                         setSelfTo(mi);
@@ -680,7 +684,7 @@ namespace {
             const ReplSetConfig::MemberCfg& m = *i;
             Member *mi;
             members += (members == "" ? "" : ", ") + m.h.toString();
-            if (m.h.isSelf()) {
+            if (isSelf(m.h)) {
                 verify(me++ == 0);
                 mi = new Member(m.h, m._id, &m, true);
                 if (!reconf) {
@@ -767,6 +771,7 @@ namespace {
                               << " : " << e.toString() << rsLog;
                     }
                 }
+                ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
                 {
                     scoped_lock lck(replSettings.discoveredSeeds_mx);
                     if (replSettings.discoveredSeeds.size() > 0) {
@@ -869,13 +874,17 @@ namespace {
     void ReplSetImpl::clearInitialSyncFlag() {
         OperationContextImpl txn; // XXX?
         Lock::DBWrite lk(txn.lockState(), "local");
+        WriteUnitOfWork wunit(txn.recoveryUnit());
         Helpers::putSingleton(&txn, "local.replset.minvalid", BSON("$unset" << _initialSyncFlag));
+        wunit.commit();
     }
 
     void ReplSetImpl::setInitialSyncFlag() {
         OperationContextImpl txn; // XXX?
         Lock::DBWrite lk(txn.lockState(), "local");
+        WriteUnitOfWork wunit(txn.recoveryUnit());
         Helpers::putSingleton(&txn, "local.replset.minvalid", BSON("$set" << _initialSyncFlag));
+        wunit.commit();
     }
 
     bool ReplSetImpl::getInitialSyncFlag() {
@@ -896,7 +905,9 @@ namespace {
 
         OperationContextImpl txn; // XXX?
         Lock::DBWrite lk(txn.lockState(), "local");
+        WriteUnitOfWork wunit(txn.recoveryUnit());
         Helpers::putSingleton(&txn, "local.replset.minvalid", builder.obj());
+        wunit.commit();
     }
 
     OpTime ReplSetImpl::getMinValid() {
@@ -909,7 +920,7 @@ namespace {
         return OpTime();
     }
 
-    bool ReplSetImpl::registerSlave(const BSONObj& rid, const int memberId) {
+    bool ReplSetImpl::registerSlave(const OID& rid, const int memberId) {
         Member* member = NULL;
         {
             lock lk(this);

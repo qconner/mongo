@@ -34,7 +34,7 @@
    mostly around shard management and checking
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <map>
 #include <string>
@@ -50,7 +50,7 @@
 #include "mongo/db/db.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/db/repl/is_master.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/client/connpool.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
@@ -60,9 +60,12 @@
 #include "mongo/util/queue.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/log.h"
 
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     // -----ShardingState START ----
 
@@ -84,6 +87,10 @@ namespace mongo {
     }
 
     void ShardingState::initialize(const string& server) {
+        uassert(18509,
+                "Unable to obtain host name during sharding initialization.",
+                !getHostName().empty());
+
         ShardedConnectionInfo::addHook();
         shardingState.enable(server);
         configServer.init(server);
@@ -180,13 +187,17 @@ namespace mongo {
             return p->getShardVersion();
         }
         else {
-            return ChunkVersion( 0, OID() );
+            return ChunkVersion( 0, 0, OID() );
         }
     }
 
-    void ShardingState::donateChunk( const string& ns , const BSONObj& min , const BSONObj& max , ChunkVersion version ) {
+    void ShardingState::donateChunk(OperationContext* txn,
+                                    const string& ns,
+                                    const BSONObj& min,
+                                    const BSONObj& max,
+                                    ChunkVersion version) {
         
-        Lock::assertWriteLocked( ns );
+        txn->lockState()->assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -212,9 +223,11 @@ namespace mongo {
         _collMetadata[ns] = cloned;
     }
 
-    void ShardingState::undoDonateChunk( const string& ns, CollectionMetadataPtr prevMetadata ) {
+    void ShardingState::undoDonateChunk(OperationContext* txn,
+                                        const string& ns,
+                                        CollectionMetadataPtr prevMetadata) {
         
-        Lock::assertWriteLocked( ns );        
+        txn->lockState()->assertWriteLocked( ns );        
         scoped_lock lk( _mutex );
         
         log() << "ShardingState::undoDonateChunk acquired _mutex" << endl;
@@ -224,13 +237,14 @@ namespace mongo {
         it->second = prevMetadata;
     }
 
-    bool ShardingState::notePending( const string& ns,
+    bool ShardingState::notePending(OperationContext* txn,
+                                     const string& ns,
                                      const BSONObj& min,
                                      const BSONObj& max,
                                      const OID& epoch,
                                      string* errMsg ) {
         
-        Lock::assertWriteLocked( ns );
+        txn->lockState()->assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -268,13 +282,14 @@ namespace mongo {
         return true;
     }
 
-    bool ShardingState::forgetPending( const string& ns,
+    bool ShardingState::forgetPending(OperationContext* txn,
+                                       const string& ns,
                                        const BSONObj& min,
                                        const BSONObj& max,
                                        const OID& epoch,
                                        string* errMsg ) {
         
-        Lock::assertWriteLocked( ns );
+        txn->lockState()->assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -312,13 +327,14 @@ namespace mongo {
         return true;
     }
 
-    void ShardingState::splitChunk( const string& ns,
+    void ShardingState::splitChunk(OperationContext* txn,
+                                    const string& ns,
                                     const BSONObj& min,
                                     const BSONObj& max,
                                     const vector<BSONObj>& splitKeys,
                                     ChunkVersion version ) {
         
-        Lock::assertWriteLocked( ns );
+        txn->lockState()->assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -336,12 +352,13 @@ namespace mongo {
         _collMetadata[ns] = cloned;
     }
 
-    void ShardingState::mergeChunks( const string& ns,
+    void ShardingState::mergeChunks(OperationContext* txn,
+                                     const string& ns,
                                      const BSONObj& minKey,
                                      const BSONObj& maxKey,
                                      ChunkVersion mergedVersion ) {
 
-        Lock::assertWriteLocked( ns );
+        txn->lockState()->assertWriteLocked( ns );
         scoped_lock lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
@@ -785,7 +802,7 @@ namespace mongo {
             return it->second;
         }
         else {
-            return ChunkVersion( 0, OID() );
+            return ChunkVersion( 0, 0, OID() );
         }
     }
 
@@ -989,21 +1006,22 @@ namespace mongo {
                 return true;
             }
 
-            // we can run on a slave up to here
-            if (!repl::_isMaster()) {
-                result.append( "errmsg" , "not master" );
-                result.append( "note" , "from post init in setShardVersion" );
-                return false;
-            }
-
-            // step 2
-            
             string ns = cmdObj["setShardVersion"].valuestrsafe();
             if ( ns.size() == 0 ) {
                 errmsg = "need to specify namespace";
                 return false;
             }
 
+
+            // we can run on a slave up to here
+            if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                        NamespaceString(ns).db())) {
+                result.append( "errmsg" , "not master" );
+                result.append( "note" , "from post init in setShardVersion" );
+                return false;
+            }
+
+            // step 2
             if( ! ChunkVersion::canParseBSON( cmdObj, "version" ) ){
                 errmsg = "need to specify version";
                 return false;
@@ -1017,56 +1035,51 @@ namespace mongo {
             const ChunkVersion globalVersion = shardingState.getVersion(ns);
 
             oldVersion.addToBSON( result, "oldVersion" );
-            
-            if ( globalVersion.isSet() && version.isSet() ) {
-                // this means there is no reset going on an either side
-                // so its safe to make some assumptions
 
-                if ( version.isWriteCompatibleWith( globalVersion ) ) {
-                    // mongos and mongod agree!
-                    if ( ! oldVersion.isWriteCompatibleWith( version ) ) {
-                        if ( oldVersion < globalVersion &&
-                             oldVersion.hasCompatibleEpoch(globalVersion) )
-                        {
-                            info->setVersion( ns , version );
-                        }
-                        else if ( authoritative ) {
-                            // this means there was a drop and our version is reset
-                            info->setVersion( ns , version );
-                        }
-                        else {
-                            result.append( "ns" , ns );
-                            result.appendBool( "need_authoritative" , true );
-                            errmsg = "verifying drop on '" + ns + "'";
-                            return false;
-                        }
+            if ( version.isWriteCompatibleWith( globalVersion )) {
+                // mongos and mongod agree!
+                if ( !oldVersion.isWriteCompatibleWith( version )) {
+                    if ( oldVersion < globalVersion &&
+                            oldVersion.hasEqualEpoch( globalVersion )) {
+                        info->setVersion( ns, version );
                     }
-                    return true;
+                    else if ( authoritative ) {
+                        // this means there was a drop and our version is reset
+                        info->setVersion( ns, version );
+                    }
+                    else {
+                        result.append( "ns", ns );
+                        result.appendBool( "need_authoritative", true );
+                        errmsg = "verifying drop on '" + ns + "'";
+                        return false;
+                    }
                 }
-                
-            }
 
-            // step 4
-
-            if ( oldVersion.isSet() && ! globalVersion.isSet() ) {
-                // this had been reset
-                info->setVersion( ns , ChunkVersion( 0, OID() ) );
-            }
-
-            if ( ! version.isSet() && ! globalVersion.isSet() ) {
-                // this connection is cleaning itself
-                info->setVersion( ns , ChunkVersion( 0, OID() ) );
                 return true;
             }
 
+            // step 4
             // Cases below all either return OR fall-through to remote metadata reload.
-            if ( version.isSet() || !globalVersion.isSet() ) {
+            const bool isDropRequested = !version.isSet() && globalVersion.isSet();
 
+            if (isDropRequested) {
+                if ( ! authoritative ) {
+                    result.appendBool( "need_authoritative" , true );
+                    result.append( "ns" , ns );
+                    globalVersion.addToBSON( result, "globalVersion" );
+                    errmsg = "dropping needs to be authoritative";
+                    return false;
+                }
+
+                // Fall through to metadata reload below
+            }
+            else {
                 // Not Dropping
 
                 // TODO: Refactor all of this
-                if ( version < oldVersion && version.hasCompatibleEpoch( oldVersion ) ) {
-                    errmsg = "this connection already had a newer version of collection '" + ns + "'";
+                if ( version < oldVersion && version.hasEqualEpoch( oldVersion ) ) {
+                    errmsg = str::stream() << "this connection already had a newer version "
+                                           << "of collection '" << ns << "'";
                     result.append( "ns" , ns );
                     version.addToBSON( result, "newVersion" );
                     globalVersion.addToBSON( result, "globalVersion" );
@@ -1074,12 +1087,13 @@ namespace mongo {
                 }
 
                 // TODO: Refactor all of this
-                if ( version < globalVersion && version.hasCompatibleEpoch( globalVersion ) ) {
+                if ( version < globalVersion && version.hasEqualEpoch( globalVersion ) ) {
                     while ( shardingState.inCriticalMigrateSection() ) {
                         log() << "waiting till out of critical section" << endl;
                         shardingState.waitTillNotInCriticalSection( 10 );
                     }
-                    errmsg = "shard global version for collection is higher than trying to set to '" + ns + "'";
+                    errmsg = str::stream() << "shard global version for collection is higher "
+                                           << "than trying to set to '" << ns << "'";
                     result.append( "ns" , ns );
                     version.addToBSON( result, "version" );
                     globalVersion.addToBSON( result, "globalVersion" );
@@ -1088,8 +1102,8 @@ namespace mongo {
                 }
 
                 if ( ! globalVersion.isSet() && ! authoritative ) {
-                    // Needed b/c when the last chunk is moved off a shard, the version gets reset to zero, which
-                    // should require a reload.
+                    // Needed b/c when the last chunk is moved off a shard,
+                    // the version gets reset to zero, which should require a reload.
                     while ( shardingState.inCriticalMigrateSection() ) {
                         log() << "waiting till out of critical section" << endl;
                         shardingState.waitTillNotInCriticalSection( 10 );
@@ -1099,20 +1113,6 @@ namespace mongo {
                     result.append( "ns" , ns );
                     result.appendBool( "need_authoritative" , true );
                     errmsg = "first time for collection '" + ns + "'";
-                    return false;
-                }
-
-                // Fall through to metadata reload below
-            }
-            else {
-
-                // Dropping
-
-                if ( ! authoritative ) {
-                    result.appendBool( "need_authoritative" , true );
-                    result.append( "ns" , ns );
-                    globalVersion.addToBSON( result, "globalVersion" );
-                    errmsg = "dropping needs to be authoritative";
                     return false;
                 }
 
@@ -1250,7 +1250,7 @@ namespace mongo {
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(dbname);
+            Client::Context ctx(txn, dbname);
 
             shardingState.appendInfo( result );
             return true;
@@ -1267,7 +1267,8 @@ namespace mongo {
         if ( ! shardingState.enabled() )
             return true;
 
-        if (!repl::isMasterNs(ns.c_str()))  {
+        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                NamespaceString(ns).db()))  {
             // right now connections to secondaries aren't versioned at all
             return true;
         }
@@ -1299,7 +1300,7 @@ namespace mongo {
 
         // Check epoch first, to send more meaningful message, since other parameters probably
         // won't match either
-        if( ! wanted.hasCompatibleEpoch( received ) ){
+        if( ! wanted.hasEqualEpoch( received ) ){
             errmsg = str::stream() << "version epoch mismatch detected for " << ns << ", "
                                    << "the collection may have been dropped and recreated";
             return false;

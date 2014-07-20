@@ -40,6 +40,9 @@
 
 namespace mongo {
 
+    // static
+    const char* CachedPlanStage::kStageType = "CACHED_PLAN";
+
     CachedPlanStage::CachedPlanStage(const Collection* collection,
                                      CanonicalQuery* cq,
                                      PlanStage* mainChild,
@@ -50,7 +53,8 @@ namespace mongo {
           _backupChildPlan(backupChild),
           _usingBackupChild(false),
           _alreadyProduced(false),
-          _updatedCache(false) { }
+          _updatedCache(false),
+          _commonStats(kStageType) {}
 
     CachedPlanStage::~CachedPlanStage() {
         // We may have produced all necessary results without hitting EOF.
@@ -65,58 +69,71 @@ namespace mongo {
     PlanStage::StageState CachedPlanStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
-	StageState childStatus = getActiveChild()->work(out);
+        StageState childStatus = getActiveChild()->work(out);
 
         if (PlanStage::ADVANCED == childStatus) {
             // we'll skip backupPlan processing now
-	    _alreadyProduced = true;
+            _alreadyProduced = true;
         }
         else if (PlanStage::IS_EOF == childStatus) {
             updateCache();
         }
-	else if (PlanStage::FAILURE == childStatus
-		 && !_alreadyProduced
-		 && !_usingBackupChild
-		 && NULL != _backupChildPlan.get()) {
-	    _usingBackupChild = true;
-	    childStatus = _backupChildPlan->work(out);
-	}
-	return childStatus;
+        else if (PlanStage::FAILURE == childStatus
+             && !_alreadyProduced
+             && !_usingBackupChild
+             && NULL != _backupChildPlan.get()) {
+            _usingBackupChild = true;
+            childStatus = _backupChildPlan->work(out);
+        }
+        return childStatus;
     }
 
     void CachedPlanStage::prepareToYield() {
-	if (! _usingBackupChild) {
+        if (! _usingBackupChild) {
             _mainChildPlan->prepareToYield();
-	}
+        }
 
-	if (NULL != _backupChildPlan.get()) {
-	  _backupChildPlan->prepareToYield();
-	}
+        if (NULL != _backupChildPlan.get()) {
+            _backupChildPlan->prepareToYield();
+        }
         ++_commonStats.yields;
     }
 
     void CachedPlanStage::recoverFromYield() {
+        if (NULL != _backupChildPlan.get()) {
+            _backupChildPlan->recoverFromYield();
+        }
 
-	if (NULL != _backupChildPlan.get()) {
-	    _backupChildPlan->recoverFromYield();
-	}
-
-	if (! _usingBackupChild) {
+        if (! _usingBackupChild) {
             _mainChildPlan->recoverFromYield();
-	}
+        }
         ++_commonStats.unyields;
     }
 
     void CachedPlanStage::invalidate(const DiskLoc& dl, InvalidationType type) {
-	if (! _usingBackupChild) {
+        if (! _usingBackupChild) {
             _mainChildPlan->invalidate(dl, type);
-	}
-	if (NULL != _backupChildPlan.get()) {
-	    _backupChildPlan->invalidate(dl, type);
-	}
+        }
+        if (NULL != _backupChildPlan.get()) {
+            _backupChildPlan->invalidate(dl, type);
+        }
         ++_commonStats.invalidates;
+    }
+
+    vector<PlanStage*> CachedPlanStage::getChildren() const {
+        vector<PlanStage*> children;
+        if (_usingBackupChild) {
+            children.push_back(_backupChildPlan.get());
+        }
+        else {
+            children.push_back(_mainChildPlan.get());
+        }
+        return children;
     }
 
     PlanStageStats* CachedPlanStage::getStats() {
@@ -125,14 +142,22 @@ namespace mongo {
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_CACHED_PLAN));
         ret->specific.reset(new CachedPlanStats(_specificStats));
 
-	if (_usingBackupChild) {
-	    ret->children.push_back(_backupChildPlan->getStats());
+        if (_usingBackupChild) {
+            ret->children.push_back(_backupChildPlan->getStats());
         }
         else {
             ret->children.push_back(_mainChildPlan->getStats());
         }
 
         return ret.release();
+    }
+
+    const CommonStats* CachedPlanStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* CachedPlanStage::getSpecificStats() {
+        return &_specificStats;
     }
 
     void CachedPlanStage::updateCache() {

@@ -26,13 +26,21 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/consensus.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/global_optime.h"
 #include "mongo/db/repl/multicmd.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/replset_commands.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     /** the first cmd called by a node seeking election and it's a basic sanity 
@@ -49,92 +57,24 @@ namespace repl {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-    private:
 
-        bool shouldVeto(const BSONObj& cmdObj, string& errmsg) {
-            // don't veto older versions
-            if (cmdObj["id"].eoo()) {
-                // they won't be looking for the veto field
-                return false;
-            }
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+            ReplicationCoordinator::ReplSetFreshArgs parsedArgs;
+            parsedArgs.id = cmdObj["id"].Int();
+            parsedArgs.setName = cmdObj["set"].checkAndGetStringData();
+            parsedArgs.who = HostAndPort(cmdObj["who"].String());
+            parsedArgs.cfgver = cmdObj["cfgver"].Int();
+            parsedArgs.opTime = OpTime(cmdObj["opTime"].Date());
 
-            unsigned id = cmdObj["id"].Int();
-            const Member* primary = theReplSet->box.getPrimary();
-            const Member* hopeful = theReplSet->findById(id);
-            const Member *highestPriority = theReplSet->getMostElectable();
-
-            if (!hopeful) {
-                errmsg = str::stream() << "replSet couldn't find member with id " << id;
-                return true;
-            }
-
-            if (theReplSet->isPrimary() &&
-                theReplSet->lastOpTimeWritten >= hopeful->hbinfo().opTime) {
-                // hbinfo is not updated, so we have to check the primary's last optime separately
-                errmsg = str::stream() << "I am already primary, " << hopeful->fullName() <<
-                    " can try again once I've stepped down";
-                return true;
-            }
-
-            if (primary &&
-                    (hopeful->hbinfo().id() != primary->hbinfo().id()) &&
-                    (primary->hbinfo().opTime >= hopeful->hbinfo().opTime)) {
-                // other members might be aware of more up-to-date nodes
-                errmsg = str::stream() << hopeful->fullName() <<
-                    " is trying to elect itself but " << primary->fullName() <<
-                    " is already primary and more up-to-date";
-                return true;
-            }
-
-            if (highestPriority &&
-                highestPriority->config().priority > hopeful->config().priority) {
-                errmsg = str::stream() << hopeful->fullName() << " has lower priority than " <<
-                    highestPriority->fullName();
-                return true;
-            }
-
-            if (!theReplSet->isElectable(id)) {
-                errmsg = str::stream() << "I don't think " << hopeful->fullName() <<
-                    " is electable";
-                return true;
-            }
-
-            return false;
-        }
-
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            if( !check(errmsg, result) )
-                return false;
-
-            if( cmdObj["set"].String() != theReplSet->name() ) {
-                errmsg = "wrong repl set name";
-                return false;
-            }
-            string who = cmdObj["who"].String();
-            int cfgver = cmdObj["cfgver"].Int();
-            OpTime opTime(cmdObj["opTime"].Date());
-
-            bool weAreFresher = false;
-            if( theReplSet->config().version > cfgver ) {
-                log() << "replSet member " << who << " is not yet aware its cfg version " << cfgver << " is stale" << rsLog;
-                result.append("info", "config version stale");
-                weAreFresher = true;
-            }
-            // check not only our own optime, but any other member we can reach
-            else if( opTime < theReplSet->lastOpTimeWritten ||
-                     opTime < theReplSet->lastOtherOpTime())  {
-                weAreFresher = true;
-            }
-            result.appendDate("opTime", theReplSet->lastOpTimeWritten.asDate());
-            result.append("fresher", weAreFresher);
-
-            bool veto = shouldVeto(cmdObj, errmsg);
-            result.append("veto", veto);
-            if (veto) {
-                result.append("errmsg", errmsg);
-            }
-
-            return true;
+            Status status = getGlobalReplicationCoordinator()->processReplSetFresh(parsedArgs,
+                                                                                   &result);
+            return appendCommandStatus(result, status);
         }
     } cmdReplSetFresh;
 
@@ -150,22 +90,34 @@ namespace repl {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
     private:
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            if( !check(errmsg, result) )
-                return false;
-            theReplSet->elect.electCmdReceived(cmdObj, &result);
-            return true;
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+            DEV log() << "replSet received elect msg " << cmdObj.toString() << rsLog;
+            else LOG(2) << "replSet received elect msg " << cmdObj.toString() << rsLog;
+
+            ReplicationCoordinator::ReplSetElectArgs parsedArgs;
+            parsedArgs.set = cmdObj["set"].checkAndGetStringData();
+            parsedArgs.whoid = cmdObj["whoid"].Int();
+            parsedArgs.cfgver = cmdObj["cfgver"].Int();
+            parsedArgs.round = cmdObj["round"].OID();
+
+            Status status = getGlobalReplicationCoordinator()->processReplSetElect(parsedArgs,
+                                                                                   &result);
+            return appendCommandStatus(result, status);
         }
     } cmdReplSetElect;
 
-    void Consensus::electCmdReceived(BSONObj cmd, BSONObjBuilder* _b) {
+    void Consensus::electCmdReceived(const StringData& set,
+                                     unsigned whoid,
+                                     int cfgver,
+                                     const OID& round,
+                                     BSONObjBuilder* _b) {
         BSONObjBuilder& b = *_b;
-        DEV log() << "replSet received elect msg " << cmd.toString() << rsLog;
-        else LOG(2) << "replSet received elect msg " << cmd.toString() << rsLog;
-        string set = cmd["set"].String();
-        unsigned whoid = cmd["whoid"].Int();
-        int cfgver = cmd["cfgver"].Int();
-        OID round = cmd["round"].OID();
         int myver = rs.config().version;
 
         const Member* primary = rs.box.getPrimary();

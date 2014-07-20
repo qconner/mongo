@@ -31,12 +31,13 @@
 #pragma once
 
 #include "mongo/db/diskloc.h"
-#include "mongo/db/storage/durable_mapped_file.h"
-#include "mongo/db/storage/record.h"
+#include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 
 namespace mongo {
 
     class NamespaceDetails;
+    class OperationContext;
+    class LockState;
 
     void mongoAbort(const char *msg);
     void abort(); // not defined -- use mongoAbort() instead
@@ -120,7 +121,7 @@ namespace mongo {
                 @return true if --dur is on.
                 @return false if --dur is off. (in which case there is action)
             */
-            virtual bool commitNow() = 0;
+            virtual bool commitNow(OperationContext* txn) = 0;
 
             /** Commit if enough bytes have been modified. Current threshold is 50MB
 
@@ -130,7 +131,7 @@ namespace mongo {
                 from growing too large.
                 @return true if commited
             */
-            virtual bool commitIfNeeded(bool force=false) = 0;
+            virtual bool commitIfNeeded(OperationContext* txn, bool force=false) = 0;
 
             /** @return true if time to commit but does NOT do a commit */
             virtual bool isCommitNeeded() const = 0;
@@ -165,23 +166,13 @@ namespace mongo {
                 call will never go through recovery and be applied to files
                 that have had changes made after this call applied.
              */
-            virtual void syncDataAndTruncateJournal() = 0;
+            virtual void syncDataAndTruncateJournal(OperationContext* txn) = 0;
 
             virtual bool isDurable() const = 0;
 
             static DurableInterface& getDur() { return *_impl; }
 
         private:
-            /** Intentionally unimplemented method.
-             It's very easy to manipulate Record::data open ended.  Thus a call to writing(Record*) is suspect.
-             This will override the templated version and yield an unresolved external.
-             */
-            Record* writing(Record* r);
-            /** Intentionally unimplemented method. BtreeBuckets are allocated in buffers larger than sizeof( BtreeBucket ). */
-//            BtreeBucket* writing( BtreeBucket* );
-            /** Intentionally unimplemented method. NamespaceDetails may be based on references to 'Extra' objects. */
-            NamespaceDetails* writing( NamespaceDetails* );
-
             static DurableInterface* _impl; // NonDurableImpl at startup()
             static void enableDurability(); // makes _impl a DurableImpl
             static void disableDurability(); // makes _impl a NonDurableImpl
@@ -198,25 +189,25 @@ namespace mongo {
             void declareWriteIntent(void *, unsigned);
             void createdFile(const std::string& filename, unsigned long long len) { }
             bool awaitCommit() { return false; }
-            bool commitNow();
-            bool commitIfNeeded(bool);
+            bool commitNow(OperationContext* txn);
+            bool commitIfNeeded(OperationContext* txn, bool force);
             bool isCommitNeeded() const { return false; }
-            void syncDataAndTruncateJournal() {}
+            void syncDataAndTruncateJournal(OperationContext* txn) {}
             bool isDurable() const { return false; }
         };
 
         class DurableImpl : public DurableInterface {
-            bool _aCommitIsNeeded();
+            bool _aCommitIsNeeded(OperationContext* txn);
             void* writingPtr(void *x, unsigned len);
             void* writingAtOffset(void *buf, unsigned ofs, unsigned len);
             void* writingRangesAtOffsets(void *buf, const std::vector< std::pair< long long, unsigned > > &ranges);
             void declareWriteIntent(void *, unsigned);
             void createdFile(const std::string& filename, unsigned long long len);
             bool awaitCommit();
-            bool commitNow();
+            bool commitNow(OperationContext* txn);
             bool isCommitNeeded() const;
-            bool commitIfNeeded(bool);
-            void syncDataAndTruncateJournal();
+            bool commitIfNeeded(OperationContext* txn, bool force);
+            void syncDataAndTruncateJournal(OperationContext* txn);
             bool isDurable() const { return true; }
         };
 

@@ -39,23 +39,14 @@
 #include "mongo/db/repl/repl_set_impl.h"
 #include "mongo/db/server_parameters.h"
 
-using namespace std;
-
 namespace mongo {
 namespace repl {
     
-    using namespace bson;
-
-    bool replSet = false;
     ReplSet *theReplSet = 0;
 
     // This is a bitmask with the first bit set. It's used to mark connections that should be kept
     // open during stepdowns
     const unsigned ScopedConn::keepOpen = 1;
-
-    bool isCurrentlyAReplSetPrimary() {
-        return theReplSet && theReplSet->isPrimary();
-    }
 
     void sethbmsg(const string& s, const int level) {
         if (theReplSet) {
@@ -66,15 +57,14 @@ namespace repl {
     ReplSet::ReplSet() {
     }
 
-    ReplSet* ReplSet::make(ReplSetCmdline& replSetCmdline) {
+    ReplSet* ReplSet::make(ReplSetSeedList& replSetSeedList) {
         auto_ptr<ReplSet> ret(new ReplSet());
-        ret->init(replSetCmdline);
+        ret->init(replSetSeedList);
         return ret.release();
     }
 
     ReplSetImpl::StartupStatus ReplSetImpl::startupStatus = PRESTART;
     DiagStr ReplSetImpl::startupStatusMsg;
-    ReplicationStartSynchronizer ReplSetImpl::rss;
 
     void ReplSet::haveNewConfig(ReplSetConfig& newConfig, bool addComment) {
         bo comment;
@@ -119,16 +109,15 @@ namespace repl {
        a separate thread takes over as ReplSetImpl::Manager, and this thread
        terminates.
     */
-    void startReplSets(ReplSetCmdline *replSetCmdline) {
+    void startReplSets(ReplSetSeedList *replSetSeedList) {
         Client::initThread("rsStart");
         try {
             verify( theReplSet == 0 );
-            if( replSetCmdline == 0 ) {
-                verify(!replSet);
+            if( replSetSeedList == 0 ) {
                 return;
             }
             replLocalAuth();
-            (theReplSet = ReplSet::make(*replSetCmdline))->go();
+            (theReplSet = ReplSet::make(*replSetSeedList))->go();
         }
         catch(std::exception& e) {
             log() << "replSet caught exception in startReplSets thread: " << e.what() << rsLog;

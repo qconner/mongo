@@ -45,13 +45,8 @@ namespace mongo {
     public:
         using BtreeBasedAccessMethod::_descriptor;
 
-        HashAccessMethod(IndexCatalogEntry* btreeState, RecordStore* rs);
+        HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
         virtual ~HashAccessMethod() { }
-
-        // This is a NO-OP.
-        virtual Status setOptions(const CursorOptions& options) {
-            return Status::OK();
-        }
 
     private:
         virtual void getKeys(const BSONObj& obj, BSONObjSet* keys);

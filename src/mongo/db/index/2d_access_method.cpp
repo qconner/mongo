@@ -31,19 +31,17 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/geo/core.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index/2d_common.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 
 namespace mongo {
 
     TwoDAccessMethod::TwoDAccessMethod(IndexCatalogEntry* btreeState,
-                                       RecordStore* rs)
-        : BtreeBasedAccessMethod(btreeState, rs) {
+                                       SortedDataInterface* btree)
+        : BtreeBasedAccessMethod(btreeState, btree) {
 
         const IndexDescriptor* descriptor = btreeState->descriptor();
 

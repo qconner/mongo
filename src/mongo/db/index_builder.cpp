@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/index_builder.h"
 
 #include "mongo/db/client.h"
@@ -35,9 +37,12 @@
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kIndexing);
 
     AtomicUInt IndexBuilder::_indexBuildCount = 0;
 
@@ -58,7 +63,7 @@ namespace mongo {
         OperationContextImpl txn;
 
         Client::initThread(name().c_str());
-        Lock::ParallelBatchWriterMode::iAmABatchParticipant();
+        Lock::ParallelBatchWriterMode::iAmABatchParticipant(txn.lockState());
 
         repl::replLocalAuth();
 
@@ -66,12 +71,13 @@ namespace mongo {
         NamespaceString ns(_index["ns"].String());
         Client::WriteContext ctx(&txn, ns.getSystemIndexesCollection());
 
-        Database* db = dbHolder().get(ns.db().toString(), storageGlobalParams.dbpath);
+        Database* db = dbHolder().get(&txn, ns.db().toString());
 
         Status status = build(&txn, db);
         if ( !status.isOK() ) {
             log() << "IndexBuilder could not build index: " << status.toString();
         }
+        ctx.commit();
 
         cc().shutdown();
     }

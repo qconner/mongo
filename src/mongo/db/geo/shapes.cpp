@@ -26,9 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/geo/core.h"
 #include "mongo/db/geo/shapes.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -125,7 +123,21 @@ namespace mongo {
         return true;
     }
 
-    double Box::intersects(const Box& other) const {
+    bool Box::intersects(const Box& other) const {
+
+        bool intersectX = between(_min.x, _max.x, other._min.x) // contain part of other range
+                          || between(_min.x, _max.x, other._max.x) // contain part of other range
+                          || between(other._min.x, other._max.x, _min.x); // other range contains us
+
+        bool intersectY = between(_min.y, _max.y, other._min.y)
+                          || between(_min.y, _max.y, other._max.y)
+                          || between(other._min.y, other._max.y, _min.y);
+
+        return intersectX && intersectY;
+    }
+
+    double Box::legacyIntersectFraction(const Box& other) const {
+
         Point boundMin(0,0);
         Point boundMax(0,0);
 
@@ -220,7 +232,7 @@ namespace mongo {
 
     bool Polygon::contains(const Point& p) const { return contains(p, 0) > 0; }
 
-    /* 
+    /*
      * Return values:
      * -1 if no intersection
      * 0 if maybe an intersection (using fudge)
@@ -384,7 +396,82 @@ namespace mongo {
         return *_bounds;
     }
 
+    R2Annulus::R2Annulus() :
+        _inner(0.0), _outer(0.0) {
+    }
+
+    R2Annulus::R2Annulus(const Point& center, double inner, double outer) :
+        _center(center), _inner(inner), _outer(outer) {
+    }
+
+    const Point& R2Annulus::center() const {
+        return _center;
+    }
+
+    double R2Annulus::getInner() const {
+        return _inner;
+    }
+
+    double R2Annulus::getOuter() const {
+        return _outer;
+    }
+
+    bool R2Annulus::contains(const Point& point) const {
+
+        // See if we're inside the inner radius
+        if (distanceCompare(point, _center, _inner) < 0) {
+            return false;
+        }
+
+        // See if we're outside the outer radius
+        if (distanceCompare(point, _center, _outer) > 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    Box R2Annulus::getR2Bounds() const {
+        return Box(_center.x - _outer, _center.y - _outer, 2 * _outer); // Box(_min.x, _min.y, edgeLength)
+    }
+
+    bool R2Annulus::fastContains(const Box& other) const {
+        return circleContainsBox(Circle(_outer, _center), other)
+            && !circleInteriorIntersectsWithBox(Circle(_inner, _center), other);
+    }
+
+    bool R2Annulus::fastDisjoint(const Box& other) const {
+        return !circleIntersectsWithBox(Circle(_outer, _center), other)
+               || circleInteriorContainsBox(Circle(_inner, _center), other);
+    }
+
+    string R2Annulus::toString() const {
+        return str::stream() << "center: " << _center.toString() << " inner: " << _inner
+                             << " outer: " << _outer;
+    }
+
     /////// Other methods
+
+    double S2Distance::distanceRad(const S2Point& pointA, const S2Point& pointB) {
+        S1Angle angle(pointA, pointB);
+        return angle.radians();
+    }
+
+    double S2Distance::minDistanceRad(const S2Point& point, const S2Polyline& line) {
+        int tmp;
+        S1Angle angle(point, line.Project(point, &tmp));
+        return angle.radians();
+    }
+
+    double S2Distance::minDistanceRad(const S2Point& point, const S2Polygon& polygon) {
+        S1Angle angle(point, polygon.Project(point));
+        return angle.radians();
+    }
+
+    double S2Distance::minDistanceRad(const S2Point& point, const S2Cap& cap) {
+        S1Angle angleToCenter(point, cap.axis());
+        return (angleToCenter - cap.angle()).radians();
+    }
 
     /**
      * Distance method that compares x or y coords when other direction is zero,
@@ -399,6 +486,16 @@ namespace mongo {
      * (radius + center.x, center.y) or vice-versa.
      */
     bool distanceWithin(const Point &p1, const Point &p2, double radius) {
+        return distanceCompare(p1, p2, radius) <= 0.0;
+    }
+
+    // Compare the distance between p1 and p2 with the radius.
+    // Float-number comparison might be inaccurate.
+    //
+    // > 0: distance is greater than radius
+    // = 0: distance equals radius
+    // < 0: distance is less than radius
+    double distanceCompare(const Point &p1, const Point &p2, double radius) {
         double a = p2.x - p1.x;
         double b = p2.y - p1.y;
 
@@ -413,35 +510,25 @@ namespace mongo {
             // for all 32-bit systems, not just affected systems.
             if (sizeof(void*) <= 4){
                 volatile double sum = p2.y > p1.y ? p1.y + radius : p2.y + radius;
-                return p2.y > p1.y ? sum >= p2.y : sum >= p1.y;
+                return p2.y > p1.y ? p2.y - sum : p1.y - sum;
             } else {
                 // Original math, correct for most systems
-                return p2.y > p1.y ? p1.y + radius >= p2.y : p2.y + radius >= p1.y;
+                return p2.y > p1.y ? p2.y - (p1.y + radius) : p1.y - (p2.y + radius);
             }
         }
 
         if (b == 0) {
             if (sizeof(void*) <= 4){
                 volatile double sum = p2.x > p1.x ? p1.x + radius : p2.x + radius;
-                return p2.x > p1.x ? sum >= p2.x : sum >= p1.x;
+                return p2.x > p1.x ? p2.x - sum : p1.x - sum;
             } else {
-                return p2.x > p1.x ? p1.x + radius >= p2.x : p2.x + radius >= p1.x;
+                return p2.x > p1.x ? p2.x - (p1.x + radius) : p1.x - (p2.x + radius);
             }
         }
 
-        return sqrt((a * a) + (b * b)) <= radius;
+        return sqrt((a * a) + (b * b)) - radius;
     }
 
-    // Technically lat/long bounds, not really tied to earth radius.
-    void checkEarthBounds(const Point &p) {
-        uassert(14808, str::stream() << "point " << p.toString()
-                                     << " must be in earth-like bounds of long "
-                                     << ": [-180, 180], lat : [-90, 90] ",
-                p.x >= -180 && p.x <= 180 && p.y >= -90 && p.y <= 90);
-    }
-
-
-    // WARNING: x and y MUST be longitude and latitude in that order
     // note: multiply by earth radius for distance
     double spheredist_rad(const Point& p1, const Point& p2) {
         // this uses the n-vector formula: http://en.wikipedia.org/wiki/N-vector
@@ -475,6 +562,14 @@ namespace mongo {
                               Point(deg2rad(p2.x), deg2rad(p2.y)));
     }
 
+    // Technically lat/long bounds, not really tied to earth radius.
+    void checkEarthBounds(const Point &p) {
+        uassert(14808, str::stream() << "point " << p.toString()
+                                     << " must be in earth-like bounds of long "
+                                     << ": [-180, 180], lat : [-90, 90] ",
+                p.x >= -180 && p.x <= 180 && p.y >= -90 && p.y <= 90);
+    }
+
     double distance(const Point& p1, const Point &p2) {
         double a = p1.x - p2.x;
         double b = p1.y - p2.y;
@@ -484,6 +579,175 @@ namespace mongo {
         if (b == 0) return abs(a);
 
         return sqrt((a * a) + (b * b));
+    }
+
+    static inline Vector2_d toVector2(const Point& p) {
+        return Vector2_d(p.x, p.y);
+    }
+
+    // Given a segment (A, B) and a segment (C, D), check whether they intersect.
+    bool linesIntersect(const Point& pA, const Point& pB, const Point& pC, const Point& pD) {
+        Vector2_d a = toVector2(pA);
+        Vector2_d b = toVector2(pB);
+        Vector2_d c = toVector2(pC);
+        Vector2_d d = toVector2(pD);
+
+        // The normal of line AB
+        Vector2_d normalAB = (b - a).Ortho();
+
+        // Dot products of AC and the normal of AB
+        // = 0 : C is on the line AB
+        // > 0 : C is on one side
+        // < 0 : C is on the other side
+        double dotProdNormalAB_AC = normalAB.DotProd(c - a);
+        double dotProdNormalAB_AD = normalAB.DotProd(d - a);
+
+        // C and D can not on the same side of line AB
+        if (dotProdNormalAB_AC * dotProdNormalAB_AD > 0) return false;
+
+        // AB and CD are on the same line
+        if (dotProdNormalAB_AC == 0 && dotProdNormalAB_AD == 0) {
+            // Test if C or D is on segment AB.
+            return (c - a).DotProd(c - b) <= 0 || (d - a).DotProd(d - b) <= 0;
+        }
+
+        // Check if A and B are on different sides of line CD.
+        Vector2_d normalCD = (d - c).Ortho();
+        double dotProdNormalCD_CA = normalCD.DotProd(a - c);
+        double dotProdNormalCD_CB = normalCD.DotProd(b - c);
+        return dotProdNormalCD_CA * dotProdNormalCD_CB <= 0; // Perhaps A or B is on line CD
+    }
+
+    static bool circleContainsBoxInternal(const Circle& circle,
+                                          const Box& box,
+                                          bool includeCircleBoundary) {
+
+        // NOTE: a circle of zero radius is a point, and there are NO points contained inside a
+        // zero-radius circle, not even the point itself.
+
+        const Point& a = box._min;
+        const Point& b = box._max;
+        double compareLL = distanceCompare( circle.center, a, circle.radius ); // Lower left
+        double compareUR = distanceCompare( circle.center, b, circle.radius ); // Upper right
+        // Upper Left
+        double compareUL = distanceCompare( circle.center, Point( a.x, b.y ), circle.radius );
+        // Lower right
+        double compareLR = distanceCompare( circle.center, Point( b.x, a.y ), circle.radius );
+        if ( includeCircleBoundary ) {
+            return compareLL <= 0 && compareUR <= 0 && compareUL <= 0 && compareLR <= 0;
+        }
+        else {
+            return compareLL < 0 && compareUR < 0 && compareUL < 0 && compareLR < 0;
+        }
+    }
+
+    bool circleContainsBox(const Circle& circle, const Box& box) {
+        return circleContainsBoxInternal(circle, box, true);
+    }
+
+    bool circleInteriorContainsBox(const Circle& circle, const Box& box) {
+        return circleContainsBoxInternal(circle, box, false);
+    }
+
+    // Check the intersection by measuring the distance between circle center and box center.
+    static bool circleIntersectsWithBoxInternal(const Circle& circle,
+                                                const Box& box,
+                                                bool includeCircleBoundary) {
+
+        // NOTE: a circle of zero radius is a point, and there are NO points to intersect inside a
+        // zero-radius circle, not even the point itself.
+        if (circle.radius == 0.0 && !includeCircleBoundary)
+            return false;
+
+        /* Collapses the four quadrants down into one.
+         *   ________
+         * r|___B___ \  <- a quarter round corner here. Let's name it "D".
+         *  |       | |
+         * h|       | |
+         *  |   A   |C|
+         *  |_______|_|
+         *      w    r
+         */
+
+        Point boxCenter = box.center();
+        double dx = abs(circle.center.x - boxCenter.x);
+        double dy = abs(circle.center.y - boxCenter.y);
+        double w = (box._max.x - box._min.x) / 2;
+        double h = (box._max.y - box._min.y) / 2;
+        const double& r = circle.radius;
+
+        // Check if circle.center is in A, B or C.
+        // The circle center could be above the box (B) or right to the box (C), but close enough.
+        if (includeCircleBoundary) {
+            if ((dx <= w + r && dy <= h) || (dx <= w && dy <= h + r)) return true;
+        } else {
+            if ((dx < w + r && dy < h) || (dx < w && dy < h + r)) return true;
+        }
+
+        // Now check if circle.center is in the round corner "D".
+        double compareResult = distanceCompare(Point(dx, dy), Point(w, h), r);
+        return compareResult < 0 || (compareResult == 0 && includeCircleBoundary);
+    }
+
+    bool circleIntersectsWithBox(const Circle& circle, const Box& box) {
+        return circleIntersectsWithBoxInternal(circle, box, true);
+    }
+
+    bool circleInteriorIntersectsWithBox(const Circle& circle, const Box& box) {
+        return circleIntersectsWithBoxInternal(circle, box, false);
+    }
+
+    bool lineIntersectsWithBox(const Point& a, const Point& b, const Box& box) {
+        Point upperLeft(box._min.x, box._max.y);
+        Point lowerRight(box._max.x, box._min.y);
+
+        return linesIntersect(a, b, upperLeft, box._min)
+                || linesIntersect(a, b, box._min, lowerRight)
+                || linesIntersect(a, b, lowerRight, box._max)
+                || linesIntersect(a, b, box._max, upperLeft);
+    }
+
+    // Doc: The last point specified is always implicitly connected to the first.
+    // [[ 0 , 0 ], [ 3 , 6 ], [ 6 , 0 ]]
+    bool edgesIntersectsWithBox(const vector<Point>& vertices, const Box& box) {
+        for (size_t i = 0; i < vertices.size() - 1; i++) {
+            if (lineIntersectsWithBox(vertices[i], vertices[i+1], box)) return true;
+        }
+        // The last point and first point.
+        return lineIntersectsWithBox(vertices[vertices.size() - 1], vertices[0], box);
+    }
+
+    bool polygonContainsBox(const Polygon& polygon, const Box& box) {
+        // All vertices of box have to be inside the polygon.
+        if (!polygon.contains(box._min)
+                || !polygon.contains(box._max)
+                || !polygon.contains(Point(box._min.x, box._max.y))
+                || !polygon.contains(Point(box._max.x, box._min.y)))
+            return false;
+
+        // No intersection between the polygon edges and the box.
+        return !edgesIntersectsWithBox(polygon.points(), box);
+    }
+
+    bool polygonIntersectsWithBox(const Polygon& polygon, const Box& box) {
+        // 1. Polygon contains the box.
+        // Check the relaxed condition that whether the polygon include any vertex of the box.
+        if (polygon.contains(box._min)
+                || polygon.contains(box._max)
+                || polygon.contains(Point(box._min.x, box._max.y))
+                || polygon.contains(Point(box._max.x, box._min.y)))
+            return true;
+
+        // 2. Box contains polygon.
+        // Check the relaxed condition that whether the box include any vertex of the polygon.
+        for (vector<Point>::const_iterator it = polygon.points().begin();
+                it != polygon.points().end(); it++) {
+            if (box.inside(*it)) return true;
+        }
+
+        // 3. Otherwise they intersect on a portion of both shapes.
+        // Edges intersects
+        return edgesIntersectsWithBox(polygon.points(), box);
     }
 
 }  // namespace mongo

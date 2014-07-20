@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/sync_tail.h"
 
@@ -42,8 +42,12 @@
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     static Counter64 opsAppliedStats;
@@ -106,12 +110,14 @@ namespace repl {
             lk.reset(new Lock::DBWrite(txn->lockState(), ns)); 
         }
 
-        Client::Context ctx(ns);
+        Client::Context ctx(txn, ns);
+        WriteUnitOfWork wunit(txn->recoveryUnit());
         ctx.getClient()->curop()->reset();
         // For non-initial-sync, we convert updates to upserts
         // to suppress errors when replaying oplog entries.
         bool ok = !applyOperation_inlock(txn, ctx.db(), op, true, convertUpdateToUpsert);
         opsAppliedStats.increment();
+        wunit.commit();
         txn->recoveryUnit()->commitIfNeeded();
 
         return ok;
@@ -128,7 +134,10 @@ namespace repl {
                 // for multiple prefetches if they are for the same database.
                 OperationContextImpl txn;
                 Client::ReadContext ctx(&txn, ns);
-                prefetchPagesForReplicatedOp(&txn, ctx.ctx().db(), op);
+                prefetchPagesForReplicatedOp(&txn,
+                                             ctx.ctx().db(),
+                                             theReplSet->getIndexPrefetchConfig(),
+                                             op);
             }
             catch (const DBException& e) {
                 LOG(2) << "ignoring exception in prefetchOp(): " << e.what() << endl;
@@ -287,8 +296,6 @@ namespace repl {
     void SyncTail::oplogApplication() {
         while( 1 ) {
             OpQueue ops;
-
-            verify( !Lock::isLocked() );
 
             Timer batchTimer;
             int lastTimeChecked = 0;
@@ -480,6 +487,7 @@ namespace repl {
         {
             OperationContextImpl txn; // XXX?
             Lock::DBWrite lk(txn.lockState(), "local");
+            WriteUnitOfWork wunit(txn.recoveryUnit());
 
             while (!ops->empty()) {
                 const BSONObj& op = ops->front();
@@ -487,6 +495,7 @@ namespace repl {
                 _logOpObjRS(op);
                 ops->pop_front();
              }
+            wunit.commit();
         }
 
         if (BackgroundSync::get()->isAssumingPrimary()) {
@@ -533,14 +542,12 @@ namespace repl {
 
     static AtomicUInt32 replWriterWorkerId;
 
-    void initializeWriterThread() {
+    static void initializeWriterThread() {
         // Only do this once per thread
         if (!ClientBasic::getCurrent()) {
             string threadName = str::stream() << "repl writer worker "
                                               << replWriterWorkerId.addAndFetch(1);
             Client::initThread( threadName.c_str() );
-            // allow us to get through the magic barrier
-            Lock::ParallelBatchWriterMode::iAmABatchParticipant();
             replLocalAuth();
         }
     }
@@ -548,6 +555,11 @@ namespace repl {
     // This free function is used by the writer threads to apply each op
     void multiSyncApply(const std::vector<BSONObj>& ops, SyncTail* st) {
         initializeWriterThread();
+
+        OperationContextImpl txn;
+
+        // allow us to get through the magic barrier
+        Lock::ParallelBatchWriterMode::iAmABatchParticipant(txn.lockState());
 
         // convert update operations only for 2.2.1 or greater, because we need guaranteed
         // idempotent operations for this to work.  See SERVER-6825
@@ -557,7 +569,6 @@ namespace repl {
              it != ops.end();
              ++it) {
             try {
-                OperationContextImpl txn;
                 if (!st->syncApply(&txn, *it, convertUpdatesToUpserts)) {
                     fassertFailedNoTrace(16359);
                 }
@@ -572,12 +583,16 @@ namespace repl {
     // This free function is used by the initial sync writer threads to apply each op
     void multiInitialSyncApply(const std::vector<BSONObj>& ops, SyncTail* st) {
         initializeWriterThread();
+
+        OperationContextImpl txn;
+
+        // allow us to get through the magic barrier
+        Lock::ParallelBatchWriterMode::iAmABatchParticipant(txn.lockState());
+
         for (std::vector<BSONObj>::const_iterator it = ops.begin();
              it != ops.end();
              ++it) {
             try {
-                OperationContextImpl txn;
-
                 if (!st->syncApply(&txn, *it)) {
                     bool status;
                     {

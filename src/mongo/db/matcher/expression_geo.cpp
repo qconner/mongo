@@ -37,9 +37,9 @@ namespace mongo {
     // Geo queries we don't need an index to answer: geoWithin and geoIntersects
     //
 
-    Status GeoMatchExpression::init( const StringData& path, const GeoQuery& query,
+    Status GeoMatchExpression::init( const StringData& path, const GeoQuery* query,
                                      const BSONObj& rawObj ) {
-        _query = query;
+        _query.reset(query);
         _rawObj = rawObj;
         return initPath( path );
     }
@@ -52,12 +52,12 @@ namespace mongo {
         if ( !geometry.parseFrom( e.Obj() ) )
                 return false;
 
-        if (GeoQuery::WITHIN == _query.getPred()) {
-            return _query.getGeometry().contains(geometry);
+        if (GeoQuery::WITHIN == _query->getPred()) {
+            return _query->getGeometry().contains(geometry);
         }
         else {
-            verify(GeoQuery::INTERSECT == _query.getPred());
-            return _query.getGeometry().intersects(geometry);
+            verify(GeoQuery::INTERSECT == _query->getPred());
+            return _query->getGeometry().intersects(geometry);
         }
     }
 
@@ -70,6 +70,10 @@ namespace mongo {
             td->debugString(&debug);
         }
         debug << "\n";
+    }
+
+    void GeoMatchExpression::toBSON(BSONObjBuilder* out) const {
+        out->appendElements(_rawObj);
     }
 
     bool GeoMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -88,7 +92,8 @@ namespace mongo {
 
     LeafMatchExpression* GeoMatchExpression::shallowClone() const {
         GeoMatchExpression* next = new GeoMatchExpression();
-        next->init( path(), _query, _rawObj);
+        next->init( path(), NULL, _rawObj);
+        next->_query = _query;
         if (getTag()) {
             next->setTag(getTag()->clone());
         }
@@ -99,9 +104,9 @@ namespace mongo {
     // Parse-only geo expressions: geoNear (formerly known as near).
     //
 
-    Status GeoNearMatchExpression::init( const StringData& path, const NearQuery& query,
+    Status GeoNearMatchExpression::init( const StringData& path, const NearQuery* query,
                                          const BSONObj& rawObj ) {
-        _query = query;
+        _query.reset(query);
         _rawObj = rawObj;
         return initPath( path );
     }
@@ -115,13 +120,17 @@ namespace mongo {
 
     void GeoNearMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << "GEONEAR " << _query.toString();
+        debug << "GEONEAR " << _query->toString();
         MatchExpression::TagData* td = getTag();
         if (NULL != td) {
             debug << " ";
             td->debugString(&debug);
         }
         debug << "\n";
+    }
+
+    void GeoNearMatchExpression::toBSON(BSONObjBuilder* out) const {
+        out->appendElements(_rawObj);
     }
 
     bool GeoNearMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -140,7 +149,8 @@ namespace mongo {
 
     LeafMatchExpression* GeoNearMatchExpression::shallowClone() const {
         GeoNearMatchExpression* next = new GeoNearMatchExpression();
-        next->init( path(), _query, _rawObj );
+        next->init( path(), NULL, _rawObj );
+        next->_query = _query;
         if (getTag()) {
             next->setTag(getTag()->clone());
         }

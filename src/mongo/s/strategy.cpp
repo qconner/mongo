@@ -28,7 +28,7 @@
 
 // strategy_sharded.cpp
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/status.h"
 #include "mongo/base/owned_pointer_vector.h"
@@ -41,7 +41,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/max_time.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/structure/catalog/index_details.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/stats/counters.h"
@@ -54,11 +53,14 @@
 #include "mongo/s/request.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/s/write_ops/batch_upconvert.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 // error codes 8010-8040
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     static bool _isSystemIndexes( const char* ns ) {
         return nsToCollectionSubstring(ns) == "system.indexes";
@@ -106,7 +108,10 @@ namespace mongo {
             if ( qr->resultFlags() & ResultFlag_ShardConfigStale ) {
                 dbcon.done();
                 // Version is zero b/c this is deprecated codepath
-                throw RecvStaleConfigException( r.getns() , "Strategy::doQuery", ChunkVersion( 0, OID() ), ChunkVersion( 0, OID() ) );
+                throw RecvStaleConfigException( r.getns(),
+                                                "Strategy::doQuery",
+                                                ChunkVersion( 0, 0, OID() ),
+                                                ChunkVersion( 0, 0, OID() ));
             }
         }
 
@@ -131,10 +136,17 @@ namespace mongo {
         audit::logQueryAuthzCheck(client, ns, q.query, status.code());
         uassertStatusOK(status);
 
-        LOG(3) << "shard query: " << q.ns << "  " << q.query << endl;
+        LOG(3) << "query: " << q.ns << " " << q.query << " ntoreturn: " << q.ntoreturn
+               << " options: " << q.queryOptions << endl;
 
         if ( q.ntoreturn == 1 && strstr(q.ns, ".$cmd") )
             throw UserException( 8010 , "something is wrong, shouldn't see a command here" );
+
+        if (q.queryOptions & QueryOption_Exhaust) {
+            uasserted(18526,
+                      string("the 'exhaust' query option is invalid for mongos queries: ") + q.ns
+                      + " " + q.query.toString());
+        }
 
         QuerySpec qSpec( (string)q.ns, q.query, q.fields, q.ntoskip, q.ntoreturn, q.queryOptions );
 
@@ -172,7 +184,14 @@ namespace mongo {
             throw;
         }
 
-        if( cursor->isSharded() ){
+        // TODO: Revisit all of this when we revisit the sharded cursor cache
+
+        if (cursor->getNumQueryShards() != 1) {
+
+            // More than one shard (or zero), manage with a ShardedClientCursor
+            // NOTE: We may also have *zero* shards here when the returnPartial flag is set.
+            // Currently the code in ShardedClientCursor handles this.
+
             ShardedClientCursorPtr cc (new ShardedClientCursor( q , cursor ));
 
             BufBuilder buffer( ShardedClientCursor::INIT_REPLY_BUFFER_SIZE );
@@ -198,14 +217,15 @@ namespace mongo {
                     startFrom, hasMore ? cc->getId() : 0 );
         }
         else{
+
+            // Only one shard is used
+
             // Remote cursors are stored remotely, we shouldn't need this around.
-            // TODO: we should probably just make cursor an auto_ptr
             scoped_ptr<ParallelSortClusteredCursor> cursorDeleter( cursor );
 
-            // TODO:  Better merge this logic.  We potentially can now use the same cursor logic for everything.
-            ShardPtr primary = cursor->getPrimary();
-            verify( primary.get() );
-            DBClientCursorPtr shardCursor = cursor->getShardCursor( *primary );
+            ShardPtr shard = cursor->getQueryShard();
+            verify( shard.get() );
+            DBClientCursorPtr shardCursor = cursor->getShardCursor(*shard);
 
             // Implicitly stores the cursor in the cache
             r.reply( *(shardCursor->getMessage()) , shardCursor->originalHost() );
@@ -218,7 +238,14 @@ namespace mongo {
     void Strategy::clientCommandOp( Request& r ) {
         QueryMessage q( r.d() );
 
-        LOG(3) << "single query: " << q.ns << "  " << q.query << "  ntoreturn: " << q.ntoreturn << " options : " << q.queryOptions << endl;
+        LOG(3) << "command: " << q.ns << " " << q.query << " ntoreturn: " << q.ntoreturn
+               << " options: " << q.queryOptions << endl;
+
+        if (q.queryOptions & QueryOption_Exhaust) {
+            uasserted(18527,
+                      string("the 'exhaust' query option is invalid for mongos commands: ") + q.ns
+                      + " " + q.query.toString());
+        }
 
         NamespaceString nss( r.getns() );
         // Regular queries are handled in strategy_shard.cpp

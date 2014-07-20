@@ -87,7 +87,15 @@ namespace mongo {
         virtual void recoverFromYield();
         virtual void invalidate(const DiskLoc& dl, InvalidationType type);
 
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_PROJECTION; }
+
         PlanStageStats* getStats();
+
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
 
         typedef unordered_set<StringData, StringData::Hasher> FieldSet;
 
@@ -109,6 +117,8 @@ namespace mongo {
                                              const FieldSet& includedFields,
                                              BSONObjBuilder& bob);
 
+        static const char* kStageType;
+
     private:
         Status transform(WorkingSetMember* member);
 
@@ -120,6 +130,7 @@ namespace mongo {
 
         // Stats
         CommonStats _commonStats;
+        ProjectionStats _specificStats;
 
         // Fast paths:
         ProjectionStageParams::ProjectionImplementation _projImpl;

@@ -127,11 +127,8 @@ namespace mongo {
          * resumed with resumeDeletes.
          */
         bool deleteRange(OperationContext* txn,
-                         const StringData& ns,
-                         const BSONObj& min,
-                         const BSONObj& max,
-                         const BSONObj& shardKeyPattern,
-                         bool secondaryThrottle,
+                         const RangeDeleteEntry& taskDetails,
+                         long long int* deletedDocs,
                          std::string* errMsg);
 
         /**

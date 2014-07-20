@@ -2,7 +2,7 @@
 //
 
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2008-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -29,25 +29,22 @@
  *    then also delete it in the license file.
  */
 
-// Where IndexDetails defined.
-#include "mongo/pch.h"
-
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/db.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/storage/extent.h"
-#include "mongo/db/storage/extent_manager.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/extent.h"
+#include "mongo/db/storage/mmap_v1/extent_manager.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
-#include "mongo/db/structure/record_store_v1_capped.h"
-#include "mongo/db/structure/record_store_v1_simple.h"
-#include "mongo/db/structure/catalog/namespace.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/structure/catalog/namespace_details_rsv1_metadata.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/storage/mmap_v1/record_store_v1_capped.h"
+#include "mongo/db/storage/mmap_v1/record_store_v1_simple.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_rsv1_metadata.h"
 #include "mongo/dbtests/dbtests.h"
 
 
@@ -363,14 +360,16 @@ namespace NamespaceTests {
 
                 DiskLoc last, first;
                 {
-                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns(),
+                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(&txn,
+                                                                            ns(),
                                                                             collection(),
                                                                             InternalPlanner::BACKWARD));
                     runner->getNext(NULL, &last);
                     ASSERT( !last.isNull() );
                 }
                 {
-                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns(),
+                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(&txn,
+                                                                            ns(),
                                                                             collection(),
                                                                             InternalPlanner::FORWARD));
                     runner->getNext(NULL, &first);
@@ -383,14 +382,16 @@ namespace NamespaceTests {
 
                 {
                     DiskLoc loc;
-                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns(),
+                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(&txn,
+                                                                            ns(),
                                                                             collection(),
                                                                             InternalPlanner::FORWARD));
                     runner->getNext(NULL, &loc);
                     ASSERT( first == loc);
                 }
                 {
-                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns(),
+                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(&txn,
+                                                                            ns(),
                                                                             collection(),
                                                                             InternalPlanner::BACKWARD));
                     DiskLoc loc;

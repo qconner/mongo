@@ -28,6 +28,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <string>
+
 namespace mongo {
     class BSONObj;
     class Database;
@@ -85,10 +88,13 @@ namespace repl {
           { msg : "text", ... }
     */
     void logOpComment(OperationContext* txn, const BSONObj& obj);
+    
+    // Same as logOpComment, except only works for replsets
+    void logOpInitiate(OperationContext* txn, const BSONObj& obj);
 
     // Flush out the cached pointers to the local database and oplog.
     // Used by the closeDatabase command to ensure we don't cache closed things.
-    void oplogCheckCloseDatabase( Database * db );
+    void oplogCheckCloseDatabase(OperationContext* txn, Database * db);
 
     /**
      * take an op and apply locally
@@ -104,10 +110,9 @@ namespace repl {
                                bool convertUpdateToUpsert = false);
 
     /**
-     * Waits until the given timeout for the OpTime from the oplog to change.
-     * Returns true if the OpTime changed occured before the timeout.
+     * Waits one second for the OpTime from the oplog to change.
      */
-    bool waitForOptimeChange(const OpTime& referenceTime, unsigned timeoutMillis);
+    void waitUpToOneSecondForOptimeChange(const OpTime& referenceTime);
 
     /**
      * Initializes the global OpTime with the value from the timestamp of the last oplog entry.

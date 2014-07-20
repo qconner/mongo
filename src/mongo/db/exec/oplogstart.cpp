@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -31,13 +31,16 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
-#include "mongo/db/storage/record.h"
 
 namespace mongo {
 
     // Does not take ownership.
-    OplogStart::OplogStart(const Collection* collection, MatchExpression* filter, WorkingSet* ws)
-        : _needInit(true),
+    OplogStart::OplogStart(OperationContext* txn,
+                           const Collection* collection,
+                           MatchExpression* filter,
+                           WorkingSet* ws)
+        : _txn(txn),
+          _needInit(true),
           _backwardsScanning(false),
           _extentHopping(false),
           _done(false),
@@ -53,7 +56,7 @@ namespace mongo {
             CollectionScanParams params;
             params.collection = _collection;
             params.direction = CollectionScanParams::BACKWARD;
-            _cs.reset(new CollectionScan(params, _workingSet, NULL));
+            _cs.reset(new CollectionScan(_txn, params, _workingSet, NULL));
             _needInit = false;
             _backwardsScanning = true;
             _timer.reset();
@@ -106,7 +109,7 @@ namespace mongo {
         _cs.reset();
 
         // Set up our extent hopping state.
-        _subIterators = _collection->getManyIterators();
+        _subIterators = _collection->getManyIterators(_txn);
     }
 
     PlanStage::StageState OplogStart::workBackwardsScan(WorkingSetID* out) {
@@ -173,6 +176,11 @@ namespace mongo {
                 i--;
             }
         }
+    }
+
+    vector<PlanStage*> OplogStart::getChildren() const {
+        vector<PlanStage*> empty;
+        return empty;
     }
 
     int OplogStart::_backwardsScanTime = 5;

@@ -45,6 +45,9 @@ namespace mongo {
 
     const size_t kMaxBytes = 32 * 1024 * 1024;
 
+    // static
+    const char* SortStage::kStageType = "SORT";
+
     SortStageKeyGenerator::SortStageKeyGenerator(const Collection* collection,
                                                  const BSONObj& sortSpec,
                                                  const BSONObj& queryObj) {
@@ -286,6 +289,7 @@ namespace mongo {
           _limit(params.limit),
           _sorted(false),
           _resultIterator(_data.end()),
+          _commonStats(kStageType),
           _memUsage(0) {
     }
 
@@ -299,6 +303,9 @@ namespace mongo {
 
     PlanStage::StageState SortStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (NULL == _sortKeyGen) {
             // This is heavy and should be done as part of work().
@@ -445,15 +452,31 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> SortStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
+    }
+
     PlanStageStats* SortStage::getStats() {
         _commonStats.isEOF = isEOF();
         _specificStats.memLimit = kMaxBytes;
         _specificStats.memUsage = _memUsage;
+        _specificStats.limit = _limit;
+        _specificStats.sortPattern = _pattern.getOwned();
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_SORT));
         ret->specific.reset(new SortStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* SortStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* SortStage::getSpecificStats() {
+        return &_specificStats;
     }
 
     /**

@@ -38,7 +38,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
@@ -60,9 +60,13 @@ namespace PlanRankingTests {
 
     class PlanRankingTestBase {
     public:
-        PlanRankingTestBase() : _internalQueryForceIntersectionPlans(internalQueryForceIntersectionPlans) {
+        PlanRankingTestBase()
+            : _internalQueryForceIntersectionPlans(internalQueryForceIntersectionPlans),
+              _client(&_txn) {
+
             Client::WriteContext ctx(&_txn, ns);
             _client.dropCollection(ns);
+            ctx.commit();
         }
 
         virtual ~PlanRankingTestBase() {
@@ -73,11 +77,13 @@ namespace PlanRankingTests {
         void insert(const BSONObj& obj) {
             Client::WriteContext ctx(&_txn, ns);
             _client.insert(ns, obj);
+            ctx.commit();
         }
 
         void addIndex(const BSONObj& obj) {
             Client::WriteContext ctx(&_txn, ns);
             _client.ensureIndex(ns, obj);
+            ctx.commit();
         }
 
         /**
@@ -108,7 +114,7 @@ namespace PlanRankingTests {
             // Put each solution from the planner into the MPR.
             for (size_t i = 0; i < solutions.size(); ++i) {
                 PlanStage* root;
-                ASSERT(StageBuilder::build(collection, *solutions[i], ws, &root));
+                ASSERT(StageBuilder::build(&_txn, collection, *solutions[i], ws, &root));
                 // Takes ownership of all arguments.
                 _mps->addPlan(solutions[i], root, ws);
             }
@@ -140,12 +146,13 @@ namespace PlanRankingTests {
         OperationContextImpl _txn;
 
     private:
-
-        DBDirectClient _client;
-        scoped_ptr<MultiPlanStage> _mps;
         // Holds the value of global "internalQueryForceIntersectionPlans" setParameter flag.
         // Restored at end of test invocation regardless of test result.
         bool _internalQueryForceIntersectionPlans;
+
+        scoped_ptr<MultiPlanStage> _mps;
+
+        DBDirectClient _client;
     };
 
     // static
@@ -716,6 +723,38 @@ namespace PlanRankingTests {
         }
     };
 
+    /**
+     * Suppose we have two plans which are roughly equivalent, other than that
+     * one uses an index which involves doing a lot more skipping of index keys.
+     * Prefer the plan which does not have to do this index key skipping.
+     */
+    class PlanRankingAccountForKeySkips : public PlanRankingTestBase {
+    public:
+        void run() {
+            for (int i = 0; i < 100; ++i) {
+                insert(BSON("a" << i << "b" << i << "c" << i));
+            }
+
+            // These indices look equivalent to the ranker for the query below unless we account
+            // for key skipping. We should pick index {a: 1} if we account for key skipping
+            // properly.
+            addIndex(BSON("b" << 1 << "c" << 1));
+            addIndex(BSON("a" << 1));
+
+            CanonicalQuery* cq;
+            ASSERT(CanonicalQuery::canonicalize(ns,
+                                                fromjson("{a: 9, b: {$ne: 10}, c: 9}"),
+                                                &cq).isOK());
+            ASSERT(NULL != cq);
+
+            // Expect to use index {a: 1, b: 1}.
+            QuerySolution* soln = pickBestPlan(cq);
+            ASSERT(QueryPlannerTestLib::solutionMatches(
+                        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}",
+                        soln->root.get()));
+        }
+    };
+
     class All : public Suite {
     public:
         All() : Suite( "query_plan_ranking" ) {}
@@ -737,6 +776,7 @@ namespace PlanRankingTests {
             // add<PlanRankingChooseBetweenIxisectPlans>();
             add<PlanRankingAvoidBlockingSort>();
             add<PlanRankingWorkPlansLongEnough>();
+            add<PlanRankingAccountForKeySkips>();
         }
     } planRankingAll;
 

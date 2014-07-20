@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -46,7 +46,7 @@ namespace QueryStageTests {
 
     class IndexScanBase {
     public:
-        IndexScanBase() {
+        IndexScanBase() : _client(&_txn) {
             Client::WriteContext ctx(&_txn, ns());
 
             for (int i = 0; i < numObj(); ++i) {
@@ -59,16 +59,19 @@ namespace QueryStageTests {
 
             addIndex(BSON("foo" << 1));
             addIndex(BSON("foo" << 1 << "baz" << 1));
+            ctx.commit();
         }
 
         virtual ~IndexScanBase() {
             Client::WriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
+            ctx.commit();
         }
 
         void addIndex(const BSONObj& obj) {
             Client::WriteContext ctx(&_txn, ns());
             _client.ensureIndex(ns(), obj);
+            ctx.commit();
         }
 
         int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
@@ -80,7 +83,7 @@ namespace QueryStageTests {
 
             WorkingSet* ws = new WorkingSet();
             PlanExecutor runner(ws, 
-                                new IndexScan(params, ws, filterExpr.get()), 
+                                new IndexScan(&_txn, params, ws, filterExpr.get()), 
                                 ctx.ctx().db()->getCollection(&_txn, ns()));
 
             int count = 0;
@@ -99,6 +102,7 @@ namespace QueryStageTests {
                 double lng = double(rand()) / RAND_MAX;
                 _client.insert(ns(), BSON("geo" << BSON_ARRAY(lng << lat)));
             }
+            ctx.commit();
         }
 
         IndexDescriptor* getIndex(const BSONObj& obj) {

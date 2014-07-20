@@ -28,7 +28,6 @@
 
 #include "mongo/db/query/explain_plan.h"
 
-#include "mongo/db/exec/2dcommon.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/db/query/type_explain.h"
 #include "mongo/util/mongoutils/str.h"
@@ -41,6 +40,10 @@ namespace mongo {
 
         bool isOrStage(StageType stageType) {
             return stageType == STAGE_OR || stageType == STAGE_SORT_MERGE;
+        }
+
+        bool isNearStage(StageType stageType) {
+            return stageType == STAGE_GEO_NEAR_2D || stageType == STAGE_GEO_NEAR_2DSPHERE;
         }
 
         bool isIntersectPlan(const PlanStageStats& stats) {
@@ -149,6 +152,9 @@ namespace mongo {
             bool sortPresent = false;
             size_t chunkSkips = 0;
 
+
+            // XXX: TEMPORARY HACK - GEONEAR explains like OR queries (both have children) until the
+            // new explain framework makes this file go away.
             const PlanStageStats* orStage = NULL;
             const PlanStageStats* root = &stats;
             const PlanStageStats* leaf = root;
@@ -156,10 +162,10 @@ namespace mongo {
             while (leaf->children.size() > 0) {
                 // We shouldn't be here if there are any ANDs
                 if (leaf->children.size() > 1) {
-                    verify(isOrStage(leaf->stageType));
+                    verify(isOrStage(leaf->stageType) || isNearStage(leaf->stageType));
                 }
 
-                if (isOrStage(leaf->stageType)) {
+                if (isOrStage(leaf->stageType) || isNearStage(leaf->stageType)) {
                     orStage = leaf;
                     break;
                 }
@@ -223,7 +229,18 @@ namespace mongo {
                     }
                 }
                 // We set the cursor name for backwards compatibility with 2.4.
-                res->setCursor("QueryOptimizerCursor");
+                if (isOrStage(leaf->stageType)) {
+                    res->setCursor("QueryOptimizerCursor");
+                }
+                else {
+                    if (leaf->stageType == STAGE_GEO_NEAR_2D)
+                        res->setCursor("GeoSearchCursor");
+                    else
+                        res->setCursor("S2NearCursor");
+
+                    res->setIndexOnly(false);
+                    res->setIsMultiKey(false);
+                }
                 res->setNScanned(nScanned);
                 res->setNScannedObjects(nScannedObjects);
             }
@@ -234,54 +251,6 @@ namespace mongo {
                 res->setNScannedObjects(csStats->docsTested);
                 res->setIndexOnly(false);
                 res->setIsMultiKey(false);
-            }
-            else if (leaf->stageType == STAGE_GEO_2D) {
-                // Cursor name depends on type of GeoBrowse.
-                // TODO: We could omit the shape from the cursor name.
-                TwoDStats* nStats = static_cast<TwoDStats*>(leaf->specific.get());
-                res->setCursor("GeoBrowse-" + nStats->type);
-                res->setNScanned(leaf->common.works);
-                res->setNScannedObjects(leaf->common.works);
-
-                // Generate index bounds from prefixes.
-                GeoHashConverter converter(nStats->converterParams);
-                BSONObjBuilder bob;
-                BSONArrayBuilder arrayBob(bob.subarrayStart(nStats->field));
-                for (size_t i = 0; i < nStats->expPrefixes.size(); ++i) {
-                    const GeoHash& prefix = nStats->expPrefixes[i];
-                    Box box = converter.unhashToBox(prefix);
-                    arrayBob.append(box.toBSON());
-                }
-                arrayBob.doneFast();
-                res->setIndexBounds(bob.obj());
-
-                // TODO: Could be multikey.
-                res->setIsMultiKey(false);
-                res->setIndexOnly(false);
-            }
-            else if (leaf->stageType == STAGE_GEO_NEAR_2DSPHERE) {
-                // TODO: This is kind of a lie for STAGE_GEO_NEAR_2DSPHERE.
-                res->setCursor("S2NearCursor");
-                // The first work() is an init.  Every subsequent work examines a document.
-                res->setNScanned(leaf->common.works);
-                res->setNScannedObjects(leaf->common.works);
-                // TODO: only adding empty index bounds for backwards compatibility.
-                res->setIndexBounds(BSONObj());
-                // TODO: Could be multikey.
-                res->setIsMultiKey(false);
-                res->setIndexOnly(false);
-            }
-            else if (leaf->stageType == STAGE_GEO_NEAR_2D) {
-                TwoDNearStats* nStats = static_cast<TwoDNearStats*>(leaf->specific.get());
-                res->setCursor("GeoSearchCursor");
-                // The first work() is an init.  Every subsequent work examines a document.
-                res->setNScanned(nStats->nscanned);
-                res->setNScannedObjects(nStats->objectsLoaded);
-                // TODO: only adding empty index bounds for backwards compatibility.
-                res->setIndexBounds(BSONObj());
-                // TODO: Could be multikey.
-                res->setIsMultiKey(false);
-                res->setIndexOnly(false);
             }
             else if (leaf->stageType == STAGE_TEXT) {
                 TextStats* tStats = static_cast<TextStats*>(leaf->specific.get());
@@ -422,8 +391,6 @@ namespace mongo {
             return "DISTINCT";
         case STAGE_FETCH:
             return "FETCH";
-        case STAGE_GEO_2D:
-            return "GEO_2D";
         case STAGE_GEO_NEAR_2D:
             return "GEO_NEAR_2D";
         case STAGE_GEO_NEAR_2DSPHERE:
@@ -455,8 +422,18 @@ namespace mongo {
         }
     }
 
-    void statsToBSON(const PlanStageStats& stats, BSONObjBuilder* bob) {
+    void statsToBSON(const PlanStageStats& stats,
+                     BSONObjBuilder* bob,
+                     BSONObjBuilder* topLevelBob) {
         invariant(bob);
+        invariant(topLevelBob);
+
+        // Stop as soon as the BSON object we're building exceeds 10 MB.
+        static const int kMaxStatsBSONSize = 10 * 1024 * 1024;
+        if (topLevelBob->len() > kMaxStatsBSONSize) {
+            bob->append("warning", "stats tree exceeded 10 MB");
+            return;
+        }
 
         // Common details.
         bob->append("type", stageTypeString(stats.stageType));
@@ -497,32 +474,16 @@ namespace mongo {
             bob->appendNumber("forcedFetches", spec->forcedFetches);
             bob->appendNumber("matchTested", spec->matchTested);
         }
-        else if (STAGE_GEO_2D == stats.stageType) {
-            TwoDStats* spec = static_cast<TwoDStats*>(stats.specific.get());
-            bob->append("geometryType", spec->type);
-            bob->append("field", spec->field);
-
-            // Generate verbose index bounds from prefixes
-            GeoHashConverter converter(spec->converterParams);
-            BSONArrayBuilder arrayBob(bob->subarrayStart("boundsVerbose"));
-            for (size_t i = 0; i < spec->expPrefixes.size(); ++i) {
-                const GeoHash& prefix = spec->expPrefixes[i];
-                Box box = converter.unhashToBox(prefix);
-                arrayBob.append(box.toString());
-            }
-        }
-        else if (STAGE_GEO_NEAR_2D == stats.stageType) {
-            TwoDNearStats* spec = static_cast<TwoDNearStats*>(stats.specific.get());
-            bob->appendNumber("objectsLoaded", spec->objectsLoaded);
-            bob->appendNumber("nscanned", spec->nscanned);
-        }
         else if (STAGE_IXSCAN == stats.stageType) {
             IndexScanStats* spec = static_cast<IndexScanStats*>(stats.specific.get());
             // TODO: how much do we really want here?  we should separate runtime stats vs. tree
             // structure (soln tostring).
             bob->append("keyPattern", spec->keyPattern.toString());
-            bob->append("boundsVerbose", spec->indexBoundsVerbose);
             bob->appendNumber("isMultiKey", spec->isMultiKey);
+
+            // The verbose bounds can get large. Truncate to 1 MB.
+            static const int kMaxVerboseBoundsSize = 1024 * 1024;
+            bob->append("boundsVerbose", spec->indexBoundsVerbose.substr(0, kMaxVerboseBoundsSize));
 
             bob->appendNumber("yieldMovedCursor", spec->yieldMovedCursor);
             bob->appendNumber("dupsTested", spec->dupsTested);
@@ -566,9 +527,13 @@ namespace mongo {
         BSONArrayBuilder childrenBob(bob->subarrayStart("children"));
         for (size_t i = 0; i < stats.children.size(); ++i) {
             BSONObjBuilder childBob(childrenBob.subobjStart());
-            statsToBSON(*stats.children[i], &childBob);
+            statsToBSON(*stats.children[i], &childBob, topLevelBob);
         }
         childrenBob.doneFast();
+    }
+
+    void statsToBSON(const PlanStageStats& stats, BSONObjBuilder* bob) {
+        statsToBSON(stats, bob, bob);
     }
 
     BSONObj statsToBSON(const PlanStageStats& stats) {
@@ -597,10 +562,6 @@ namespace mongo {
                 else if (STAGE_DISTINCT == node->getType()) {
                     const DistinctNode* dn = static_cast<const DistinctNode*>(node);
                     leafInfo << " " << dn->indexKeyPattern;
-                }
-                else if (STAGE_GEO_2D == node->getType()) {
-                    const Geo2DNode* g2d = static_cast<const Geo2DNode*>(node);
-                    leafInfo << " " << g2d->indexKeyPattern;
                 }
                 else if (STAGE_GEO_NEAR_2D == node->getType()) {
                     const GeoNear2DNode* g2dnear = static_cast<const GeoNear2DNode*>(node);

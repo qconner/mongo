@@ -44,7 +44,6 @@ namespace mongo {
         /** base declare write intent function that all the helpers call. */
         /** we batch up our write intents so that we do not have to synchronize too often */
         void DurableImpl::declareWriteIntent(void *p, unsigned len) {
-            dassert( Lock::somethingWriteLocked() );
             MemoryMappedFile::makeWritable(p, len);
             commitJob.note(p, len);
         }
@@ -63,7 +62,6 @@ namespace mongo {
         }
 
         void IntentsAndDurOps::clear() {
-            assertLockedForCommitting();
             commitJob.groupCommitMutex.dassertLocked();
             _alreadyNoted.clear();
             _intents.clear();
@@ -86,7 +84,6 @@ namespace mongo {
 
         /** note an operation other than a "basic write" */
         void CommitJob::noteOp(shared_ptr<DurOp> p) {
-            dassert( Lock::somethingWriteLocked() );
             dassert(storageGlobalParams.dur);
             // DurOp's are rare so it is ok to have the lock cost here
             SimpleMutex::scoped_lock lk(groupCommitMutex);
@@ -96,8 +93,7 @@ namespace mongo {
 
         size_t privateMapBytes = 0; // used by _REMAPPRIVATEVIEW to track how much / how fast to remap
 
-        void CommitJob::commitingBegin() { 
-            assertLockedForCommitting();
+        void CommitJob::commitingBegin() {
             _commitNumber = _notify.now();
             stats.curr->_commits++;
         }
@@ -118,7 +114,6 @@ namespace mongo {
         }
 
         void CommitJob::note(void* p, int len) {
-            dassert( Lock::somethingWriteLocked() );
             SimpleMutex::scoped_lock lk(groupCommitMutex);
             _hasWritten = true;
 

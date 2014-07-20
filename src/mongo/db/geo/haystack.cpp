@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2008-2013 10gen Inc.
+ *    Copyright (C) 2008-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -38,7 +38,6 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/commands.h"
 
@@ -111,7 +110,7 @@ namespace mongo {
             IndexDescriptor* desc = idxs[0];
             HaystackAccessMethod* ham =
                 static_cast<HaystackAccessMethod*>( collection->getIndexCatalog()->getIndex(desc) );
-            ham->searchCommand(collection, nearElt.Obj(), maxDistance.numberDouble(), search.Obj(),
+            ham->searchCommand(txn, collection, nearElt.Obj(), maxDistance.numberDouble(), search.Obj(),
                                &result, limit);
             return 1;
         }

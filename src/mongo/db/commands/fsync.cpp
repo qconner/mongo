@@ -42,6 +42,7 @@
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
@@ -95,7 +96,7 @@ namespace mongo {
         }
         virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
 
-            if (Lock::isLocked()) {
+            if (txn->lockState()->isLocked()) {
                 errmsg = "fsync: Cannot execute fsync command from contexts that hold a data lock";
                 return false;
             }
@@ -133,11 +134,10 @@ namespace mongo {
                 if (sync) {
                     // can this be GlobalRead? and if it can, it should be nongreedy.
                     Lock::GlobalWrite w(txn->lockState());
-                    getDur().commitNow();
+                    getDur().commitNow(txn);
+                    //  No WriteUnitOfWork needed, as this does no writes of its own.
                 }
-                // question : is it ok this is not in the dblock? i think so but this is a change from past behavior, 
-                // please advise.
-                result.append( "numFiles" , MemoryMappedFile::flushAll( sync ) );
+                result.append( "numFiles" , globalStorageEngine->flushAllFiles( sync ) );
             }
             return 1;
         }
@@ -149,13 +149,13 @@ namespace mongo {
         SimpleMutex::scoped_lock lkf(filesLockedFsync);
 
         OperationContextImpl txn;   // XXX?
-        Lock::GlobalWrite global(txn.lockState());
+        Lock::GlobalWrite global(txn.lockState()); // No WriteUnitOfWork needed
 
         SimpleMutex::scoped_lock lk(fsyncCmd.m);
         
         verify( ! fsyncCmd.locked ); // impossible to get here if locked is true
         try { 
-            getDur().syncDataAndTruncateJournal();
+            getDur().syncDataAndTruncateJournal(&txn);
         } 
         catch( std::exception& e ) { 
             error() << "error doing syncDataAndTruncateJournal: " << e.what() << endl;
@@ -168,7 +168,7 @@ namespace mongo {
         global.downgrade();
         
         try {
-            MemoryMappedFile::flushAll(true);
+            globalStorageEngine->flushAllFiles(true);
         }
         catch( std::exception& e ) { 
             error() << "error doing flushAll: " << e.what() << endl;
@@ -200,7 +200,6 @@ namespace mongo {
     
     // @return true if unlocked
     bool _unlockFsync() {
-        verify(!Lock::isLocked());
         SimpleMutex::scoped_lock lk( fsyncCmd.m );
         if( !fsyncCmd.locked ) { 
             return false;

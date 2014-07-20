@@ -33,8 +33,11 @@
 
 namespace mongo {
 
+    // static
+    const char* OrStage::kStageType = "OR";
+
     OrStage::OrStage(WorkingSet* ws, bool dedup, const MatchExpression* filter)
-        : _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup) { }
+        : _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup), _commonStats(kStageType) { }
 
     OrStage::~OrStage() {
         for (size_t i = 0; i < _children.size(); ++i) {
@@ -48,6 +51,9 @@ namespace mongo {
 
     PlanStage::StageState OrStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -165,8 +171,19 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> OrStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* OrStage::getStats() {
         _commonStats.isEOF = isEOF();
+
+        // Add a BSON representation of the filter to the stats tree, if there is one.
+        if (NULL != _filter) {
+            BSONObjBuilder bob;
+            _filter->toBSON(&bob);
+            _commonStats.filter = bob.obj();
+        }
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_OR));
         ret->specific.reset(new OrStats(_specificStats));
@@ -175,6 +192,14 @@ namespace mongo {
         }
 
         return ret.release();
+    }
+
+    const CommonStats* OrStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* OrStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

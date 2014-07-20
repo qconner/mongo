@@ -66,11 +66,11 @@ namespace mongo {
         return Status::OK();
     }
 
-    bool rotateLogs() {
+    bool rotateLogs(bool renameFiles) {
         using logger::RotatableFileManager;
         RotatableFileManager* manager = logger::globalRotatableFileManager();
         RotatableFileManager::FileNameStatusPairVector result(
-                manager->rotateAll("." + terseCurrentTime(false)));
+                manager->rotateAll(renameFiles, "." + terseCurrentTime(false)));
         for (RotatableFileManager::FileNameStatusPairVector::iterator it = result.begin();
                 it != result.end(); it++) {
             warning() << "Rotating log file " << it->first << " failed: " << it->second.toString()
@@ -129,9 +129,9 @@ namespace mongo {
 
     void logContext(const char *errmsg) {
         if ( errmsg ) {
-            problem() << errmsg << endl;
+            log() << errmsg << endl;
         }
-        printStackTrace(problem().stream());
+        printStackTrace(log().stream());
     }
 
     LogIndentLevel::LogIndentLevel() {

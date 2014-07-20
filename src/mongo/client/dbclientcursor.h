@@ -29,14 +29,13 @@
 
 #pragma once
 
-#include "mongo/pch.h"
-
 #include <stack>
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/export_macros.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
@@ -88,6 +87,8 @@ namespace mongo {
 
         /** throws AssertionException if get back { $err : ... } */
         BSONObj nextSafe() {
+            MONGO_LOG_DEFAULT_COMPONENT_LOCAL(::mongo::logger::LogComponent::kNetworking);
+
             BSONObj o = next();
             if( strcmp(o.firstElementFieldName(), "$err") == 0 ) {
                 std::string s = "nextSafe(): " + o.toString();

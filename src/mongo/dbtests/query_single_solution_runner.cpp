@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -45,7 +45,9 @@ namespace QuerySingleSolutionRunner {
 
     class SingleSolutionRunnerBase {
     public:
-        SingleSolutionRunnerBase() { }
+        SingleSolutionRunnerBase() : _client(&_txn) {
+        
+        }
 
         virtual ~SingleSolutionRunnerBase() {
             _client.dropCollection(ns());
@@ -89,7 +91,7 @@ namespace QuerySingleSolutionRunner {
             verify(swme.isOK());
             auto_ptr<MatchExpression> filter(swme.getValue());
             // Make the stage.
-            auto_ptr<PlanStage> root(new CollectionScan(csparams, ws.get(), filter.release()));
+            auto_ptr<PlanStage> root(new CollectionScan(&_txn, csparams, ws.get(), filter.release()));
 
             CanonicalQuery* cq;
             verify(CanonicalQuery::canonicalize(ns(), filterObj, &cq).isOK());
@@ -131,7 +133,7 @@ namespace QuerySingleSolutionRunner {
             const Collection* coll = context.db()->getCollection(&_txn, ns());
 
             auto_ptr<WorkingSet> ws(new WorkingSet());
-            IndexScan* ix = new IndexScan(ixparams, ws.get(), NULL);
+            IndexScan* ix = new IndexScan(&_txn, ixparams, ws.get(), NULL);
             auto_ptr<PlanStage> root(new FetchStage(ws.get(), ix, NULL, coll));
 
             CanonicalQuery* cq;
@@ -203,6 +205,7 @@ namespace QuerySingleSolutionRunner {
             ASSERT_EQUALS(Runner::RUNNER_DEAD, ssr->getNext(&objOut, NULL));
 
             deregisterRunner(ssr.get());
+            ctx.commit();
         }
     };
 
@@ -233,6 +236,7 @@ namespace QuerySingleSolutionRunner {
             ASSERT_EQUALS(Runner::RUNNER_DEAD, ssr->getNext(&objOut, NULL));
 
             deregisterRunner(ssr.get());
+            ctx.commit();
         }
     };
 
@@ -298,6 +302,7 @@ namespace QuerySingleSolutionRunner {
 
             int ids[] = {3, 4, 2};
             checkIds(ids, ssr.get());
+            ctx.commit();
         }
     };
 
@@ -327,6 +332,7 @@ namespace QuerySingleSolutionRunner {
             // we should not see the moved document again.
             int ids[] = {3, 4};
             checkIds(ids, ssr.get());
+            ctx.commit();
         }
     };
 
@@ -355,6 +361,7 @@ namespace QuerySingleSolutionRunner {
                 ASSERT_EQUALS(1U, numCursors());
                 ctx.ctx().db()->getCollection( &_txn, ns() )->cursorCache()->invalidateAll(false);
                 ASSERT_EQUALS(0U, numCursors());
+                ctx.commit();
             }
         };
 
@@ -392,6 +399,7 @@ namespace QuerySingleSolutionRunner {
                 // number of cursors to return to 0.
                 ccPin.deleteUnderlying();
                 ASSERT_EQUALS(0U, numCursors());
+                ctx.commit();
             }
         };
 
@@ -405,6 +413,7 @@ namespace QuerySingleSolutionRunner {
                 {
                     Client::WriteContext ctx(&_txn, ns());
                     insert(BSON("a" << 1 << "b" << 1));
+                    ctx.commit();
                 }
 
                 {

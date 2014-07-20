@@ -35,10 +35,11 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/lockstate.h"
+#include "mongo/db/concurrency/lock_mgr.h"
 
 
 namespace mongo {
-
+    class Client;
     class CurOp;
     class ProgressMeter;
 
@@ -90,13 +91,16 @@ namespace mongo {
                                           int secondsBetween = 3) = 0;
 
         /**
-         * Delegates to CurOp, but is included here to break dependencies
+         * Delegates to CurOp, but is included here to break dependencies.
+         *
+         * TODO: We return a string because of hopefully transient CurOp thread-unsafe insanity.
          */
-        virtual const char * getNS() const = 0;
+        virtual string getNS() const = 0;
 
-        //
-        // CurOp
-        //
+        /**
+         * Returns the client under which this context runs.
+         */
+        virtual Client* getClient() const = 0;
 
         /**
          * Returns CurOp. Caller does not own pointer
@@ -109,21 +113,9 @@ namespace mongo {
         virtual bool isPrimaryFor( const StringData& ns ) = 0;
 
         /**
-         * Returns a OperationContext. Caller takes ownership.
-         *
-         * This interface is used for functions that need to create transactions (aka OpCtx), but
-         * don't know which implementation they should create. It allows the calling code to make
-         * that decision for them.
-         *
-         * TODO come up with a better Factory API once we split this class up (SERVER-13931).
+         * @return Transaction* for LockManager-ment.  Caller does not own pointer
          */
-        typedef OperationContext* (*Factory)();
-
-        /**
-         * A OperationContext::Factory that always returns NULL. For things that shouldn't be
-         * touching their txns such as mongos or some unittests.
-         */
-        static OperationContext* factoryNULL() { return NULL; }
+        virtual Transaction* getTransaction() = 0;
 
     protected:
         OperationContext() { }

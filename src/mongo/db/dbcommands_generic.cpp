@@ -48,7 +48,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/repl/multicmd.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/db/server_options.h"
@@ -58,7 +57,6 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_service.h"
-#include "mongo/util/lruishmap.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
@@ -244,7 +242,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            bool didRotate = rotateLogs();
+            bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate);
             if (didRotate)
                 logProcessDetailsForLogRotate();
             return didRotate;
@@ -340,8 +338,8 @@ namespace mongo {
                                            std::vector<Privilege>* out) {} // No auth required
         CmdForceError() : Command("forceerror") {}
         bool run(OperationContext* txn, const string& dbnamne, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            uassert( 10038 , "forced error", false);
-            return true;
+            setLastError(10038, "forced error");
+            return false;
         }
     } cmdForceError;
 

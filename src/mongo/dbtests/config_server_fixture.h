@@ -36,6 +36,8 @@
 
 namespace mongo {
 
+    class OperationContext;
+
     class CustomDirectClient: public DBDirectClient {
     public:
         CustomDirectClient() {
@@ -101,7 +103,7 @@ namespace mongo {
          * Returns a connection std::string to the virtual config server.
          */
         ConnectionString configSvr() const {
-            return ConnectionString(std::string("$dummy:10000"));
+            return ConnectionString(HostAndPort("$dummy:10000"));
         }
 
         /**

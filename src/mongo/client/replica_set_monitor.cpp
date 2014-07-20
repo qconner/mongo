@@ -25,16 +25,20 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/client/replica_set_monitor.h"
 
 #include <algorithm>
 #include <boost/thread.hpp>
 #include <limits>
 
+#include "mongo/db/server_options.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/replica_set_monitor_internal.h"
 #include "mongo/util/concurrency/mutex.h" // for StaticObserver
 #include "mongo/util/background.h"
+#include "mongo/util/log.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/timer.h"
 
@@ -47,6 +51,9 @@
 #endif
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kNetworking);
+
 namespace {
     // Pull nested types to top-level scope
     typedef ReplicaSetMonitor::IsMasterReply IsMasterReply;
@@ -356,7 +363,8 @@ namespace {
         replicaSetMonitorWatcher.safeGo();
     }
 
-    ReplicaSetMonitorPtr ReplicaSetMonitor::get(const string& name, const bool createFromSeed) {
+    ReplicaSetMonitorPtr ReplicaSetMonitor::get(const std::string& name,
+                                                const bool createFromSeed) {
         LOG(3) << "ReplicaSetMonitor::get " << name;
         scoped_lock lk( setsLock );
         StringMap<ReplicaSetMonitorPtr>::const_iterator i = sets.find( name );

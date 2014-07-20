@@ -25,25 +25,34 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#pragma once
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
-
 #include "mongo/db/storage/recovery_unit_noop.h"
-#pragma once
+
 
 namespace mongo {
 
     class OperationContextNoop : public OperationContext {
     public:
+        OperationContextNoop(RecoveryUnit* ru) {
+            _recoveryUnit.reset(ru);
+        }
+
         OperationContextNoop() {
             _recoveryUnit.reset(new RecoveryUnitNoop());
         }
 
         virtual ~OperationContextNoop() { }
 
-        CurOp* getCurOp() const {
+        virtual Client* getClient() const {
+            invariant(false);
+            return NULL;
+        }
+
+        virtual CurOp* getCurOp() const {
             invariant(false);
             return NULL;
         }
@@ -76,12 +85,16 @@ namespace mongo {
             return true;
         }
 
-        virtual const char * getNS() const {
-            return NULL;
+        virtual string getNS() const {
+            return string();
         };
 
+        virtual Transaction* getTransaction() {
+            return NULL;
+        }
+
     private:
-        boost::scoped_ptr<RecoveryUnitNoop> _recoveryUnit;
+        boost::scoped_ptr<RecoveryUnit> _recoveryUnit;
     };
 
 }  // namespace mongo

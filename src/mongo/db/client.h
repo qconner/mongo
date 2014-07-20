@@ -59,6 +59,7 @@ namespace mongo {
     class AbstractMessagingPort;
     class LockCollectionForReading;
 
+
     TSP_DECLARE(Client, currentClient)
 
     typedef long long ConnectionId;
@@ -69,15 +70,13 @@ namespace mongo {
         // always be in clientsMutex when manipulating this. killop stuff uses these.
         static std::set<Client*>& clients;
         static mongo::mutex& clientsMutex;
-        static int getActiveClientCount( int& writers , int& readers );
-        class Context;
+
         ~Client();
-        static int recommendedYieldMicros( int * writers = 0 , int * readers = 0,
-                                           bool needExact = false );
+
         /** each thread which does db operations has a Client object in TLS.
          *  call this when your thread starts.
         */
-        static Client& initThread(const char *desc, AbstractMessagingPort *mp = 0);
+        static void initThread(const char *desc, AbstractMessagingPort *mp = 0);
 
         static void initThreadIfNotAlready(const char *desc) { 
             if( currentClient.get() )
@@ -92,7 +91,6 @@ namespace mongo {
 
         std::string clientAddress(bool includePort=false) const;
         CurOp* curop() const { return _curOp; }
-        Context* getContext() const { return _context; }
         const StringData desc() const { return _desc; }
         void setLastOp( OpTime op ) { _lastOp = op; }
         OpTime getLastOp() const { return _lastOp; }
@@ -102,11 +100,10 @@ namespace mongo {
 
         bool isGod() const { return _god; } /* this is for map/reduce writes */
         bool setGod(bool newVal) { const bool prev = _god; _god = newVal; return prev; }
-        std::string toString() const;
         bool gotHandshake( const BSONObj& o );
-        BSONObj getRemoteID() const { return _remoteId; }
-        BSONObj getHandshake() const { return _handshake; }
+        OID getRemoteID() const { return _remoteId; }
         ConnectionId getConnectionId() const { return _connectionId; }
+        const std::string& getThreadId() const { return _threadId; }
 
         // XXX(hk): this is per-thread mmapv1 recovery unit stuff, move into that
         // impl of recovery unit
@@ -127,19 +124,19 @@ namespace mongo {
         ConnectionId _connectionId; // > 0 for things "conn", 0 otherwise
         std::string _threadId; // "" on non support systems
         CurOp * _curOp;
-        Context * _context;
         bool _shutdown; // to track if Client::shutdown() gets called
         std::string _desc;
         bool _god;
         OpTime _lastOp;
-        BSONObj _handshake;
-        BSONObj _remoteId;
+        OID _remoteId;
 
         bool _hasWrittenSinceCheckpoint;
 
         LockState _ls;
         
     public:
+
+        class Context;
 
         /** "read lock, and set my context, all in one operation" 
          *  This handles (if not recursively locked) opening an unopened database.
@@ -158,39 +155,28 @@ namespace mongo {
         /* Set database we want to use, then, restores when we finish (are out of scope)
            Note this is also helpful if an exception happens as the state if fixed up.
         */
-        class Context : boost::noncopyable {
+        class Context {
+            MONGO_DISALLOW_COPYING(Context);
         public:
             /** this is probably what you want */
-            Context(const std::string& ns, const std::string& path=storageGlobalParams.dbpath,
-                    bool doVersion = true);
+            Context(OperationContext* txn, const std::string& ns, bool doVersion = true);
 
             /** note: this does not call finishInit -- i.e., does not call 
                       shardVersionOk() for example. 
                 see also: reset().
             */
-            Context(const std::string& ns , Database * db);
+            Context(OperationContext* txn, const std::string& ns, Database * db);
 
             // used by ReadContext
-            Context(const std::string& path, const std::string& ns, Database *db, bool doVersion = true);
+            Context(OperationContext* txn, const std::string& ns, Database *db, bool doVersion);
 
             ~Context();
             Client* getClient() const { return _client; }
             Database* db() const { return _db; }
             const char * ns() const { return _ns.c_str(); }
-            bool equals(const std::string& ns, const std::string& path=storageGlobalParams.dbpath) const {
-                return _ns == ns && _path == path;
-            }
 
             /** @return if the db was created by this Context */
             bool justCreated() const { return _justCreated; }
-
-            /** @return true iff the current Context is using db/path */
-            bool inDB(const std::string& db, const std::string& path=storageGlobalParams.dbpath) const;
-
-            void _clear() { // this is sort of an "early destruct" indication, _ns can never be uncleared
-                const_cast<std::string&>(_ns).clear();
-                _db = 0;
-            }
 
             /** call before unlocking, so clear any non-thread safe state
              *  _db gets restored on the relock
@@ -207,12 +193,11 @@ namespace mongo {
             void checkNsAccess( bool doauth );
             void checkNsAccess( bool doauth, int lockState );
             Client * const _client;
-            Context * const _oldContext;
-            const std::string _path;
             bool _justCreated;
             bool _doVersion;
             const std::string _ns;
             Database * _db;
+            OperationContext* _txn;
             
             Timer _timer;
         }; // class Client::Context
@@ -220,10 +205,15 @@ namespace mongo {
         class WriteContext : boost::noncopyable {
         public:
             WriteContext(OperationContext* opCtx, const std::string& ns, bool doVersion = true);
+
+            /** Commit any writes done so far in this context. */
+            void commit();
+
             Context& ctx() { return _c; }
 
         private:
             Lock::DBWrite _lk;
+            WriteUnitOfWork _wunit;
             Context _c;
         };
 

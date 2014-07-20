@@ -62,10 +62,6 @@ namespace mongo {
         return _threadState == 'r' || _threadState == 'R';
     }
 
-    bool LockState::hasAnyWriteLock() const { 
-        return _threadState == 'w' || _threadState == 'W';
-    }
-
     bool LockState::isLocked( const StringData& ns ) const {
         char db[MaxDatabaseNameLen];
         nsToDatabase(ns, db);
@@ -84,11 +80,19 @@ namespace mongo {
         return false;
     }
 
-    bool LockState::isWriteLocked(const StringData& ns) {
-        if (threadState() == 'W')
+    bool LockState::isLocked() const {
+        return threadState() != 0;
+    }
+
+    bool LockState::isWriteLocked() const {
+        return (threadState() == 'W' || threadState() == 'w');
+    }
+
+    bool LockState::isWriteLocked(const StringData& ns) const {
+        if (isWriteLocked()) {
             return true;
-        if (threadState() != 'w')
-            return false;
+        }
+
         return isLocked(ns);
     }
 
@@ -100,8 +104,29 @@ namespace mongo {
         return isLocked(ns);
     }
 
-    bool LockState::isNested() const {
+    bool LockState::isLockedForCommitting() const {
+        return threadState() == 'R' || threadState() == 'W';
+    }
+
+    bool LockState::isRecursive() const {
         return recursiveCount() > 1;
+    }
+
+    void LockState::assertWriteLocked(const StringData& ns) const {
+        if (!isWriteLocked(ns)) {
+            dump();
+            msgasserted(
+                16105, mongoutils::str::stream() << "expected to be write locked for " << ns);
+        }
+    }
+
+    void LockState::assertAtLeastReadLocked(const StringData& ns) const {
+        if (!isAtLeastReadLocked(ns)) {
+            log() << "error expected " << ns << " to be locked " << endl;
+            dump();
+            msgasserted(
+                16104, mongoutils::str::stream() << "expected to be read locked for " << ns);
+        }
     }
 
     void LockState::lockedStart( char newState ) {
@@ -126,7 +151,8 @@ namespace mongo {
 
     BSONObj LockState::reportState() {
         BSONObjBuilder b;
-        reportState( b );
+        reportState(&b);
+
         return b.obj();
     }
     
@@ -134,7 +160,7 @@ namespace mongo {
               thread. So be careful about thread safety here. For example reading 
               this->otherName would not be safe as-is!
     */
-    void LockState::reportState(BSONObjBuilder& res) {
+    void LockState::reportState(BSONObjBuilder* res) {
         BSONObjBuilder b;
         if( _threadState ) {
             char buf[2];
@@ -159,12 +185,13 @@ namespace mongo {
             }
         }
         BSONObj o = b.obj();
-        if( !o.isEmpty() ) 
-            res.append("locks", o);
-        res.append( "waitingForLock" , _lockPending );
+        if (!o.isEmpty()) {
+            res->append("locks", o);
+        }
+        res->append("waitingForLock", _lockPending);
     }
 
-    void LockState::dump() {
+    void LockState::dump() const {
         char s = _threadState;
         stringstream ss;
         ss << "lock status: ";

@@ -1,7 +1,7 @@
 // collection.h
 
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2012-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -35,13 +35,13 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/db/catalog/collection_cursor_cache.h"
+#include "mongo/db/catalog/collection_info_cache.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/structure/capped_callback.h"
-#include "mongo/db/structure/record_store.h"
-#include "mongo/db/catalog/collection_info_cache.h"
+#include "mongo/db/storage/capped_callback.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/platform/cstdint.h"
 
 namespace mongo {
@@ -54,8 +54,6 @@ namespace mongo {
     class OperationContext;
 
     class RecordIterator;
-    class FlatIterator;
-    class CappedIterator;
 
     class OpDebug;
 
@@ -104,16 +102,16 @@ namespace mongo {
     public:
         Collection( OperationContext* txn,
                     const StringData& fullNS,
-                    CollectionCatalogEntry* details, // takes ownership
-                    RecordStore* recordStore, // takes ownership
+                    CollectionCatalogEntry* details, // does not own
+                    RecordStore* recordStore, // does not own
                     Database* database ); // does not own
 
         ~Collection();
 
         bool ok() const { return _magic == 1357924; }
 
-        CollectionCatalogEntry* getCatalogEntry() { return _details.get(); }
-        const CollectionCatalogEntry* getCatalogEntry() const { return _details.get(); }
+        CollectionCatalogEntry* getCatalogEntry() { return _details; }
+        const CollectionCatalogEntry* getCatalogEntry() const { return _details; }
 
         CollectionInfoCache* infoCache() { return &_infoCache; }
         const CollectionInfoCache* infoCache() const { return &_infoCache; }
@@ -123,8 +121,8 @@ namespace mongo {
         const IndexCatalog* getIndexCatalog() const { return &_indexCatalog; }
         IndexCatalog* getIndexCatalog() { return &_indexCatalog; }
 
-        const RecordStore* getRecordStore() const { return _recordStore.get(); }
-        RecordStore* getRecordStore() { return _recordStore.get(); }
+        const RecordStore* getRecordStore() const { return _recordStore; }
+        RecordStore* getRecordStore() { return _recordStore; }
 
         CollectionCursorCache* cursorCache() const { return &_cursorCache; }
 
@@ -137,7 +135,8 @@ namespace mongo {
          * canonical to get all would be
          * getIterator( DiskLoc(), false, CollectionScanParams::FORWARD )
          */
-        RecordIterator* getIterator( const DiskLoc& start = DiskLoc(),
+        RecordIterator* getIterator( OperationContext* txn,
+                                     const DiskLoc& start = DiskLoc(),
                                      bool tailable = false,
                                      const CollectionScanParams::Direction& dir = CollectionScanParams::FORWARD ) const;
 
@@ -146,7 +145,7 @@ namespace mongo {
          * all returned iterators is equivalent to Iterating the full collection.
          * Caller owns all pointers in the vector.
          */
-        std::vector<RecordIterator*> getManyIterators() const;
+        std::vector<RecordIterator*> getManyIterators( OperationContext* txn ) const;
 
 
         /**
@@ -154,7 +153,7 @@ namespace mongo {
          * this should only be used at a very low level
          * does no yielding, indexes, etc...
          */
-        int64_t countTableScan( const MatchExpression* expression );
+        int64_t countTableScan( OperationContext* txn, const MatchExpression* expression );
 
         void deleteDocument( OperationContext* txn,
                              const DiskLoc& loc,
@@ -275,14 +274,13 @@ namespace mongo {
                                              const BSONObj& doc,
                                              bool enforceQuota );
 
-        // @return 0 for inf., otherwise a number of files
-        int largestFileNumberInQuota() const;
+        bool _enforceQuota( bool userEnforeQuota ) const;
 
         int _magic;
 
         NamespaceString _ns;
-        scoped_ptr<CollectionCatalogEntry> _details;
-        scoped_ptr<RecordStore> _recordStore;
+        CollectionCatalogEntry* _details;
+        RecordStore* _recordStore;
         Database* _database;
         CollectionInfoCache _infoCache;
         IndexCatalog _indexCatalog;
@@ -293,8 +291,6 @@ namespace mongo {
         mutable CollectionCursorCache _cursorCache;
 
         friend class Database;
-        friend class FlatIterator;
-        friend class CappedIterator;
         friend class IndexCatalog;
         friend class NamespaceDetails;
     };

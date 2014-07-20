@@ -32,7 +32,7 @@
 
 #include "mongo/db/db.h"
 #include "mongo/db/json.h"
-#include "mongo/db/ops/count.h"
+#include "mongo/db/commands/count.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/operation_context_impl.h"
 
@@ -42,7 +42,7 @@ namespace CountTests {
 
     class Base {
     public:
-        Base() : lk(_txn.lockState(), ns()), _context( ns() ) {
+        Base() : lk(_txn.lockState(), ns()), _wunit(_txn.recoveryUnit()), _context(&_txn, ns()) {
             _database = _context.db();
             _collection = _database->getCollection( &_txn, ns() );
             if ( _collection ) {
@@ -55,6 +55,7 @@ namespace CountTests {
         ~Base() {
             try {
                 uassertStatusOK( _database->dropCollection( &_txn, ns() ) );
+                _wunit.commit();
             }
             catch ( ... ) {
                 FAIL( "Exception while cleaning up collection" );
@@ -97,6 +98,7 @@ namespace CountTests {
 
     private:
         Lock::DBWrite lk;
+        WriteUnitOfWork _wunit;
 
         Client::Context _context;
 
@@ -190,36 +192,6 @@ namespace CountTests {
         mutable boost::condition _condition;
     };
 
-    /** A writer client will be registered for the lifetime of an object of this class. */
-    class WriterClientScope {
-    public:
-        WriterClientScope() :
-            _state( Initial ),
-            _dummyWriter( stdx::bind( &WriterClientScope::runDummyWriter, this ) ) {
-            _state.await( Ready );
-        }
-        ~WriterClientScope() {
-            // Terminate the writer thread even on exception.
-            _state.set( Finished );
-            DESTRUCTOR_GUARD( _dummyWriter.join() );
-        }
-    private:
-        enum State {
-            Initial,
-            Ready,
-            Finished
-        };
-        void runDummyWriter() {
-            Client::initThread( "dummy writer" );
-            scoped_ptr<Acquiring> a( new Acquiring( 0 , cc().lockState() ) );
-            _state.set( Ready );
-            _state.await( Finished );
-            a.reset(0);
-            cc().shutdown();
-        }
-        PendingValue _state;
-        boost::thread _dummyWriter;
-    };
     
     class All : public Suite {
     public:

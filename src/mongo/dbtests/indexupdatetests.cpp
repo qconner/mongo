@@ -30,9 +30,10 @@
 
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/global_environment_d.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/index/btree_based_bulk_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/platform/cstdint.h"
@@ -42,10 +43,6 @@
 namespace IndexUpdateTests {
 
     static const char* const _ns = "unittests.indexupdate";
-    DBDirectClient _client;
-#if 0
-    ExternalSortComparison* _aFirstSort = BtreeBasedBulkAccessMethod::getComparison(0, BSON("a" << 1));
-#endif
 
     /**
      * Test fixture for a write locked test using collection _ns.  Includes functionality to
@@ -55,12 +52,15 @@ namespace IndexUpdateTests {
     class IndexBuildBase {
     public:
         IndexBuildBase() :
-            _ctx(&_txn, _ns) {
+            _ctx(&_txn, _ns),
+            _client(&_txn) {
+
             _client.createCollection( _ns );
         }
         ~IndexBuildBase() {
             _client.dropCollection( _ns );
-            killCurrentOp.reset();
+            _ctx.commit(); // just for testing purposes
+            getGlobalEnvironment()->unsetKillAllOperations();
         }
         Collection* collection() {
             return _ctx.ctx().db()->getCollection( &_txn, _ns );
@@ -94,6 +94,7 @@ namespace IndexUpdateTests {
 
         OperationContextImpl _txn;
         Client::WriteContext _ctx;
+        DBDirectClient _client;
     };
 
     /** addKeysToPhaseOne() adds keys from a collection's documents to an external sorter. */
@@ -330,13 +331,13 @@ namespace IndexUpdateTests {
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.
-            killCurrentOp.killAll();
+            getGlobalEnvironment()->setKillAllOperations();
             BSONObj indexInfo = BSON( "key" << BSON( "a" << 1 ) << "ns" << _ns << "name" << "a_1" );
             // The call is interrupted because mayInterrupt == true.
             Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, true );
             ASSERT_NOT_OK( status.code() );
             // only want to interrupt the index build
-            killCurrentOp.reset();
+            getGlobalEnvironment()->unsetKillAllOperations();
             // The new index is not listed in the index catalog because the index build failed.
             ASSERT( !coll->getIndexCatalog()->findIndexByName( "a_1" ) );
         }
@@ -359,13 +360,13 @@ namespace IndexUpdateTests {
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.
-            killCurrentOp.killAll();
+            getGlobalEnvironment()->setKillAllOperations();
             BSONObj indexInfo = BSON( "key" << BSON( "a" << 1 ) << "ns" << _ns << "name" << "a_1" );
             // The call is not interrupted because mayInterrupt == false.
             Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, false );
             ASSERT_OK( status.code() );
             // only want to interrupt the index build
-            killCurrentOp.reset();
+            getGlobalEnvironment()->unsetKillAllOperations();
             // The new index is listed in the index catalog because the index build completed.
             ASSERT( coll->getIndexCatalog()->findIndexByName( "a_1" ) );
         }
@@ -391,7 +392,7 @@ namespace IndexUpdateTests {
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.
-            killCurrentOp.killAll();
+            getGlobalEnvironment()->setKillAllOperations();
             BSONObj indexInfo = BSON( "key" << BSON( "_id" << 1 ) <<
                                       "ns" << _ns <<
                                       "name" << "_id_" );
@@ -399,7 +400,7 @@ namespace IndexUpdateTests {
             Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, true );
             ASSERT_NOT_OK( status.code() );
             // only want to interrupt the index build
-            killCurrentOp.reset();
+            getGlobalEnvironment()->unsetKillAllOperations();
             // The new index is not listed in the index catalog because the index build failed.
             ASSERT( !coll->getIndexCatalog()->findIndexByName( "_id_" ) );
         }
@@ -425,7 +426,7 @@ namespace IndexUpdateTests {
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.
-            killCurrentOp.killAll();
+            getGlobalEnvironment()->setKillAllOperations();
             BSONObj indexInfo = BSON( "key" << BSON( "_id" << 1 ) <<
                                       "ns" << _ns <<
                                       "name" << "_id_" );
@@ -433,7 +434,7 @@ namespace IndexUpdateTests {
             Status status = coll->getIndexCatalog()->createIndex(&_txn, indexInfo, false );
             ASSERT_OK( status.code() );
             // only want to interrupt the index build
-            killCurrentOp.reset();
+            getGlobalEnvironment()->unsetKillAllOperations();
             // The new index is listed in the index catalog because the index build succeeded.
             ASSERT( coll->getIndexCatalog()->findIndexByName( "_id_" ) );
         }
@@ -452,11 +453,11 @@ namespace IndexUpdateTests {
             _txn.getCurOp()->reset();
             // Request an interrupt.  killAll() rather than kill() is required because the direct
             // client will build the index using a new opid.
-            killCurrentOp.killAll();
+            getGlobalEnvironment()->setKillAllOperations();
             // The call is not interrupted.
             _client.ensureIndex( _ns, BSON( "a" << 1 ) );
             // only want to interrupt the index build
-            killCurrentOp.reset();
+            getGlobalEnvironment()->unsetKillAllOperations();
             // The new index is listed in system.indexes because the index build completed.
             ASSERT_EQUALS( 1U,
                            _client.count( "unittests.system.indexes",
@@ -469,6 +470,7 @@ namespace IndexUpdateTests {
     public:
         void run() {
             OperationContextImpl txn;
+            WriteUnitOfWork wunit (txn.recoveryUnit());
             // Insert some documents.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
@@ -477,11 +479,12 @@ namespace IndexUpdateTests {
             // Initialize curop.
             txn.getCurOp()->reset();
             // Request an interrupt.
-            killCurrentOp.killAll();
+            getGlobalEnvironment()->setKillAllOperations();
             // The call is not interrupted.
             Helpers::ensureIndex( &txn, collection(), BSON( "a" << 1 ), false, "a_1" );
             // only want to interrupt the index build
-            killCurrentOp.reset();
+            wunit.commit();
+            getGlobalEnvironment()->unsetKillAllOperations();
             // The new index is listed in system.indexes because the index build completed.
             ASSERT_EQUALS( 1U,
                            _client.count( "unittests.system.indexes",

@@ -1,7 +1,7 @@
 // index_create.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/catalog/index_create.h"
 
 #include "mongo/base/error_codes.h"
@@ -37,17 +39,19 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile_private.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/progress_meter.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kIndexing);
 
     /**
      * Add the provided (obj, dl) pair to the provided index.
@@ -63,7 +67,7 @@ namespace mongo {
         options.dupsAllowed = true;
 
         if ( descriptor->isIdIndex() || descriptor->unique() ) {
-            if (!repl::ignoreUniqueIndex(descriptor)) {
+            if (!repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor)) {
                 options.dupsAllowed = false;
             }
         }
@@ -100,7 +104,7 @@ namespace mongo {
         unsigned long long n = 0;
         unsigned long long numDropped = 0;
 
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns,collection));
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(txn,ns,collection));
 
         std::string idxName = descriptor->indexName();
 
@@ -219,7 +223,7 @@ namespace mongo {
             backgroundOperation.reset( new BackgroundOperation(ns) );
             uassert( 13130,
                      "can't start bg index b/c in recursive lock (db.eval?)",
-                     !Lock::nested() );
+                     !txn->lockState()->isRecursive() );
             log() << "\t building index in background";
         }
 
@@ -272,7 +276,8 @@ namespace mongo {
                                             false /* cappedOk */,
                                             true /* noWarn */,
                                             &toDelete );
-                if (repl::isMasterNs(ns.c_str())) {
+                if (repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                        collection->ns().db())) {
                     repl::logOp(txn, "d", ns.c_str(), toDelete);
                 }
                 
@@ -284,7 +289,6 @@ namespace mongo {
             }
         }
 
-        verify( !btreeState->head().isNull() );
         LOG(0) << "build index done.  scanned " << n << " total records. "
                << t.millis() / 1000.0 << " secs" << endl;
 

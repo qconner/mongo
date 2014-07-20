@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/query/new_find.h"
 
 #include "mongo/client/dbclientinterface.h"
@@ -35,15 +37,16 @@
 #include "mongo/db/exec/oplogstart.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/kill_current_op.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_constants.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/single_solution_runner.h"
 #include "mongo/db/query/type_explain.h"
-#include "mongo/db/repl/repl_reads_ok.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage_options.h"
@@ -51,6 +54,8 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -108,6 +113,11 @@ namespace {
 
 namespace mongo {
 
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kQuery);
+
+    // Failpoint for checking whether we've received a getmore.
+    MONGO_FP_DECLARE(failReceivedGetmore);
+
     // TODO: Move this and the other command stuff in newRunQuery outta here and up a level.
     static bool runCommands(OperationContext* txn,
                             const char *ns,
@@ -149,6 +159,12 @@ namespace mongo {
                             int pass,
                             bool& exhaust,
                             bool* isCursorAuthorized) {
+
+        // For testing, we may want to fail if we receive a getmore.
+        if (MONGO_FAIL_POINT(failReceivedGetmore)) {
+            invariant(0);
+        }
+
         exhaust = false;
 
         // This is a read lock.
@@ -162,7 +178,10 @@ namespace mongo {
         // passing in a query object (necessary to check SlaveOK query option), the only state where
         // reads are allowed is PRIMARY (or master in master/slave).  This function uasserts if
         // reads are not okay.
-        repl::replVerifyReadsOk(ns, NULL);
+        Status status = repl::getGlobalReplicationCoordinator()->canServeReadsFor(
+                NamespaceString(ns),
+                true);
+        uassertStatusOK(status);
 
         // A pin performs a CC lookup and if there is a CC, increments the CC's pin value so it
         // doesn't time out.  Also informs ClientCursor that there is somebody actively holding the
@@ -255,6 +274,15 @@ namespace mongo {
                 return 0;
             }
 
+            // We save the client cursor when there might be more results, and hence we may receive
+            // another getmore. If we receive a EOF or an error, or the runner is dead, then we know
+            // that we will not be producing more results. We indicate that the cursor is closed by
+            // sending a cursorId of 0 back to the client.
+            //
+            // On the other hand, if we retrieve all results necessary for this batch, then
+            // 'saveClientCursor' is true and we send a valid cursorId back to the client. In
+            // this case, there may or may not actually be more results (for example, the next call
+            // to getNext(...) might just return EOF).
             bool saveClientCursor = false;
 
             if (Runner::RUNNER_DEAD == state || Runner::RUNNER_ERROR == state) {
@@ -337,7 +365,10 @@ namespace mongo {
         return qr;
     }
 
-    Status getOplogStartHack(Collection* collection, CanonicalQuery* cq, Runner** runnerOut) {
+    Status getOplogStartHack(OperationContext* txn,
+                             Collection* collection,
+                             CanonicalQuery* cq,
+                             Runner** runnerOut) {
         if ( collection == NULL )
             return Status(ErrorCodes::InternalError,
                           "getOplogStartHack called with a NULL collection" );
@@ -370,7 +401,7 @@ namespace mongo {
 
         // Make an oplog start finding stage.
         WorkingSet* oplogws = new WorkingSet();
-        OplogStart* stage = new OplogStart(collection, tsExpr, oplogws);
+        OplogStart* stage = new OplogStart(txn, collection, tsExpr, oplogws);
 
         // Takes ownership of ws and stage.
         auto_ptr<InternalRunner> runner(new InternalRunner(collection, stage, oplogws));
@@ -380,7 +411,7 @@ namespace mongo {
         Runner::RunnerState state = runner->getNext(NULL, &startLoc);
 
         // This is normal.  The start of the oplog is the beginning of the collection.
-        if (Runner::RUNNER_EOF == state) { return getRunner(collection, cq, runnerOut); }
+        if (Runner::RUNNER_EOF == state) { return getRunner(txn, collection, cq, runnerOut); }
 
         // This is not normal.  An error was encountered.
         if (Runner::RUNNER_ADVANCED != state) {
@@ -398,7 +429,7 @@ namespace mongo {
         params.tailable = cq->getParsed().hasOption(QueryOption_CursorTailable);
 
         WorkingSet* ws = new WorkingSet();
-        CollectionScan* cs = new CollectionScan(params, ws, cq->root());
+        CollectionScan* cs = new CollectionScan(txn, params, ws, cq->root());
         // Takes ownership of cq, cs, ws.
         *runnerOut = new SingleSolutionRunner(collection, cq, NULL, cs, ws);
         return Status::OK();
@@ -480,6 +511,60 @@ namespace mongo {
         // We use this a lot below.
         const LiteParsedQuery& pq = cq->getParsed();
 
+        // set this outside loop. we will need to use this both within loop and when deciding
+        // to fill in explain information
+        const bool isExplain = pq.isExplain();
+
+        // New-style explains get diverted through a separate path which calls back into the
+        // query planner and query execution mechanisms.
+        //
+        // TODO temporary until find() becomes a real command.
+        if (isExplain && enableNewExplain) {
+            size_t options = QueryPlannerParams::DEFAULT;
+            if (shardingState.needCollectionMetadata(pq.ns())) {
+                options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+            }
+
+            BufBuilder bb;
+            bb.skip(sizeof(QueryResult));
+
+            PlanExecutor* rawExec;
+            // Takes ownership of 'cq'.
+            Status execStatus = getExecutor(txn, collection, cq, &rawExec, options);
+            if (!execStatus.isOK()) {
+                uasserted(17510, "Explain error: " + execStatus.reason());
+            }
+
+            scoped_ptr<PlanExecutor> exec(rawExec);
+            BSONObjBuilder explainBob;
+            Status explainStatus = Explain::explainStages(exec.get(), Explain::EXEC_ALL_PLANS,
+                                                          &explainBob);
+            if (!explainStatus.isOK()) {
+                uasserted(18521, "Explain error: " + explainStatus.reason());
+            }
+
+            // Add the resulting object to the return buffer.
+            BSONObj explainObj = explainBob.obj();
+            bb.appendBuf((void*)explainObj.objdata(), explainObj.objsize());
+
+            curop.debug().iscommand = true;
+            // TODO: Does this get overwritten/do we really need to set this twice?
+            curop.debug().query = q.query;
+
+            // Set query result fields.
+            QueryResult* qr = reinterpret_cast<QueryResult*>(bb.buf());
+            bb.decouple();
+            qr->setResultFlagsToOk();
+            qr->len = bb.len();
+            curop.debug().responseLength = bb.len();
+            qr->setOperation(opReply);
+            qr->cursorId = 0;
+            qr->startingFrom = 0;
+            qr->nReturned = 1;
+            result.setData(qr, true);
+            return "";
+        }
+
         // We'll now try to get the query runner that will execute this query for us. There
         // are a few cases in which we know upfront which runner we should get and, therefore,
         // we shortcut the selection process here.
@@ -498,7 +583,7 @@ namespace mongo {
             rawRunner = new EOFRunner(cq, cq->ns());
         }
         else if (pq.hasOption(QueryOption_OplogReplay)) {
-            status = getOplogStartHack(collection, cq, &rawRunner);
+            status = getOplogStartHack(txn, collection, cq, &rawRunner);
         }
         else {
             // Takes ownership of cq.
@@ -506,7 +591,7 @@ namespace mongo {
             if (shardingState.needCollectionMetadata(pq.ns())) {
                 options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
             }
-            status = getRunner(collection, cq, &rawRunner, options);
+            status = getRunner(txn, collection, cq, &rawRunner, options);
         }
 
         if (!status.isOK()) {
@@ -525,7 +610,11 @@ namespace mongo {
         txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
         // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-        repl::replVerifyReadsOk(cq->ns(), &pq);
+        bool slaveOK = pq.hasOption(QueryOption_SlaveOk) || pq.hasReadPref();
+        status = repl::getGlobalReplicationCoordinator()->canServeReadsFor(
+                NamespaceString(cq->ns()),
+                slaveOK);
+        uassertStatusOK(status);
 
         // If this exists, the collection is sharded.
         // If it doesn't exist, we can assume we're not sharded.
@@ -562,10 +651,6 @@ namespace mongo {
         BSONObj obj;
         Runner::RunnerState state;
         // uint64_t numMisplacedDocs = 0;
-
-        // set this outside loop. we will need to use this both within loop and when deciding
-        // to fill in explain information
-        const bool isExplain = pq.isExplain();
 
         // Have we retrieved info about which plan the runner will
         // use to execute the query yet?

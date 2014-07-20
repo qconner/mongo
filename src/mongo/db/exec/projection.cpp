@@ -39,12 +39,18 @@ namespace mongo {
 
     static const char* kIdField = "_id";
 
+    // static
+    const char* ProjectionStage::kStageType = "PROJECTION";
+
     ProjectionStage::ProjectionStage(const ProjectionStageParams& params,
                                      WorkingSet* ws,
                                      PlanStage* child)
         : _ws(ws),
           _child(child),
+          _commonStats(kStageType),
           _projImpl(params.projImpl) {
+
+        _projObj = params.projObj;
 
         if (ProjectionStageParams::NO_FAST_PATH == _projImpl) {
             _exec.reset(new ProjectionExec(params.projObj, 
@@ -54,8 +60,6 @@ namespace mongo {
         else {
             // We shouldn't need the full expression if we're fast-pathing.
             invariant(NULL == params.fullExpression);
-
-            _projObj = params.projObj;
 
             // Sanity-check the input.
             invariant(_projObj.isOwned());
@@ -193,6 +197,9 @@ namespace mongo {
     PlanStage::StageState ProjectionStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         WorkingSetID id = WorkingSet::INVALID_ID;
         StageState status = _child->work(&id);
 
@@ -243,11 +250,30 @@ namespace mongo {
         _child->invalidate(dl, type);
     }
 
+    vector<PlanStage*> ProjectionStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
+    }
+
     PlanStageStats* ProjectionStage::getStats() {
         _commonStats.isEOF = isEOF();
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_PROJECTION));
+
+        ProjectionStats* projStats = new ProjectionStats(_specificStats);
+        projStats->projObj = _projObj;
+        ret->specific.reset(projStats);
+
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* ProjectionStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* ProjectionStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

@@ -1,7 +1,7 @@
 // fts_command_mongod.h
 
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2012-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,13 +28,14 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include <string>
 
 #include "mongo/db/client.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/fts/fts_command.h"
 #include "mongo/db/fts/fts_util.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/query/type_explain.h"
 #include "mongo/util/mongoutils/str.h"
@@ -112,7 +113,7 @@ namespace mongo {
             }
 
             Runner* rawRunner;
-            Status getRunnerStatus = getRunner(ctx.ctx().db()->getCollection(txn, ns), cq, &rawRunner);
+            Status getRunnerStatus = getRunner(txn, ctx.ctx().db()->getCollection(txn, ns), cq, &rawRunner);
             if (!getRunnerStatus.isOK()) {
                 errmsg = getRunnerStatus.reason();
                 return false;

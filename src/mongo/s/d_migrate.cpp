@@ -1,7 +1,7 @@
 // d_migrate.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -34,7 +34,7 @@
    mostly around shard management and checking
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <algorithm>
 #include <boost/thread/thread.hpp>
@@ -57,15 +57,15 @@
 #include "mongo/db/field_parser.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_config.h"
-#include "mongo/db/repl/write_concern.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/write_concern.h"
 #include "mongo/logger/ramlog.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
@@ -78,6 +78,7 @@
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/queue.h"
 #include "mongo/util/startup_test.h"
@@ -87,7 +88,34 @@
 
 using namespace std;
 
+namespace {
+    using mongo::WriteConcernOptions;
+    using mongo::repl::ReplicationCoordinator;
+
+    const int kDefaultWTimeoutMs = 60 * 1000;
+    const WriteConcernOptions DefaultWriteConcern(2, WriteConcernOptions::NONE, kDefaultWTimeoutMs);
+
+    /**
+     * Returns the default write concern for migration cleanup (at donor shard) and
+     * cloning documents (at recipient shard).
+     */
+    WriteConcernOptions getDefaultWriteConcern() {
+        ReplicationCoordinator* replCoordinator =
+                mongo::repl::getGlobalReplicationCoordinator();
+        mongo::Status status =
+                replCoordinator->checkIfWriteConcernCanBeSatisfied(DefaultWriteConcern);
+
+        if (status.isOK()) {
+            return DefaultWriteConcern;
+        }
+
+        return WriteConcernOptions(1, WriteConcernOptions::NONE, 0);
+    }
+}
+
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     MONGO_FP_DECLARE(failMigrationCommit);
     MONGO_FP_DECLARE(failMigrationConfigWritePrepare);
@@ -308,7 +336,7 @@ namespace mongo {
                 break;
 
             case 'u':
-                Client::Context ctx( _ns );
+                Client::Context ctx(txn,  _ns );
                 if ( ! Helpers::findById( txn, ctx.db(), _ns.c_str(), ide.wrap(), it ) ) {
                     warning() << "logOpForSharding couldn't find: " << ide << " even though should have" << migrateLog;
                     return;
@@ -414,7 +442,7 @@ namespace mongo {
             BSONObj min = Helpers::toKeyFormat( kp.extendRangeBound( _min, false ) );
             BSONObj max = Helpers::toKeyFormat( kp.extendRangeBound( _max, false ) );
 
-            auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, idx, min, max, false));
+            auto_ptr<Runner> runner(InternalPlanner::indexScan(txn, collection, idx, min, max, false));
 
             // use the average object size to estimate how many objects a full chunk would carry
             // do that while traversing the chunk's range using the sharding index, below
@@ -743,6 +771,24 @@ namespace mongo {
      * called to initial a move
      * usually by a mongos
      * this is called on the "from" side
+     *
+     * Format:
+     * {
+     *   moveChunk: "namespace",
+     *   from: "hostAndPort",
+     *   fromShard: "shardName",
+     *   to: "hostAndPort",
+     *   toShard: "shardName",
+     *   min: {},
+     *   max: {},
+     *   maxChunkBytes: numeric,
+     *   shardId: "_id of chunk document in config.chunks",
+     *   configdb: "hostAndPort",
+     *
+     *   // optional
+     *   secondaryThrottle: bool, //defaults to true.
+     *   writeConcern: {} // applies to individual writes.
+     * }
      */
     class MoveChunkCommand : public Command {
     public:
@@ -799,26 +845,33 @@ namespace mongo {
                 to = cmdObj["toShard"].String();
             }
 
-            // if we do a w=2 after every write
-            bool secondaryThrottle = cmdObj["secondaryThrottle"].trueValue();
-            if ( secondaryThrottle ) {
-                if (repl::theReplSet) {
-                    if (repl::theReplSet->config().getMajority() <= 1) {
-                        secondaryThrottle = false;
-                        warning() << "not enough nodes in set to use secondaryThrottle: "
-                                  << " majority: " << repl::theReplSet->config().getMajority()
-                                  << endl;
-                    }
+            // Process secondary throttle settings and assign defaults if necessary.
+            BSONObj secThrottleObj;
+            WriteConcernOptions writeConcern;
+            Status status = writeConcern.parseSecondaryThrottle(cmdObj, &secThrottleObj);
+
+            if (!status.isOK()){
+                if (status.code() != ErrorCodes::WriteConcernNotDefined) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
                 }
-                else if (!repl::anyReplEnabled() ) {
-                    secondaryThrottle = false;
-                    warning() << "secondaryThrottle selected but no replication" << endl;
+
+                writeConcern = getDefaultWriteConcern();
+            }
+            else {
+                repl::ReplicationCoordinator* replCoordinator =
+                        repl::getGlobalReplicationCoordinator();
+                Status status = replCoordinator->checkIfWriteConcernCanBeSatisfied(writeConcern);
+                if (!status.isOK()) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
                 }
-                else {
-                    // master/slave
-                    secondaryThrottle = false;
-                    warning() << "secondaryThrottle not allowed with master/slave" << endl;
-                }
+            }
+
+            if (writeConcern.shouldWaitForOtherNodes() &&
+                    writeConcern.wTimeout == WriteConcernOptions::kNoTimeout) {
+                // Don't allow no timeout.
+                writeConcern.wTimeout = kDefaultWTimeoutMs;
             }
 
             // Do inline deletion
@@ -1051,19 +1104,27 @@ namespace mongo {
                 ScopedDbConnection connTo(toShard.getConnString());
                 BSONObj res;
                 bool ok;
+
+                const bool isSecondaryThrottle(writeConcern.shouldWaitForOtherNodes());
+
+                BSONObjBuilder recvChunkStartBuilder;
+                recvChunkStartBuilder.append("_recvChunkStart", ns);
+                recvChunkStartBuilder.append("from", fromShard.getConnString());
+                recvChunkStartBuilder.append("fromShardName", fromShard.getName());
+                recvChunkStartBuilder.append("toShardName", toShard.getName());
+                recvChunkStartBuilder.append("min", min);
+                recvChunkStartBuilder.append("max", max);
+                recvChunkStartBuilder.append("shardKeyPattern", shardKeyPattern);
+                recvChunkStartBuilder.append("configServer", configServer.modelServer());
+                recvChunkStartBuilder.append("secondaryThrottle", isSecondaryThrottle);
+
+                // Follow the same convention in moveChunk.
+                if (isSecondaryThrottle && !secThrottleObj.isEmpty()) {
+                    recvChunkStartBuilder.append("writeConcern", secThrottleObj);
+                }
+
                 try{
-                    ok = connTo->runCommand( "admin" ,
-                                             BSON( "_recvChunkStart" << ns <<
-                                                   "from" << fromShard.getConnString() <<
-                                                   "fromShardName" << fromShard.getName() <<
-                                                   "toShardName" << toShard.getName() <<
-                                                   "min" << min <<
-                                                   "max" << max <<
-                                                   "shardKeyPattern" << shardKeyPattern <<
-                                                   "configServer" << configServer.modelServer() <<
-                                                   "secondaryThrottle" << secondaryThrottle
-                                             ) ,
-                                             res );
+                    ok = connTo->runCommand("admin", recvChunkStartBuilder.done(), res);
                 }
                 catch( DBException& e ){
                     errmsg = str::stream() << "moveChunk could not contact to: shard "
@@ -1092,7 +1153,8 @@ namespace mongo {
             // Track last result from TO shard for sanity check
             BSONObj res;
             for ( int i=0; i<86400; i++ ) { // don't want a single chunk move to take more than a day
-                verify(!txn->lockState()->threadState());
+                invariant(!txn->lockState()->threadState());
+
                 // Exponential sleep backoff, up to 1024ms. Don't sleep much on the first few
                 // iterations, since we want empty chunk migrations to be fast.
                 sleepmillis( 1 << std::min( i , 10 ) );
@@ -1213,7 +1275,7 @@ namespace mongo {
                     // bump the metadata's version up and "forget" about the chunk being moved
                     // this is not the commit point but in practice the state in this shard won't
                     // until the commit it done
-                    shardingState.donateChunk( ns , min , max , myVersion );
+                    shardingState.donateChunk(txn, ns, min, max, myVersion);
                 }
 
                 log() << "moveChunk setting version to: " << myVersion << migrateLog;
@@ -1249,7 +1311,7 @@ namespace mongo {
 
                         // revert the chunk manager back to the state before "forgetting" about the
                         // chunk
-                        shardingState.undoDonateChunk( ns, origCollMetadata );
+                        shardingState.undoDonateChunk(txn, ns, origCollMetadata);
                     }
                     log() << "Shard version successfully reset to clean up failed migration"
                           << endl;
@@ -1412,7 +1474,7 @@ namespace mongo {
 
                         // Revert the metadata back to the state before "forgetting"
                         // about the chunk.
-                        shardingState.undoDonateChunk( ns, origCollMetadata );
+                        shardingState.undoDonateChunk(txn, ns, origCollMetadata);
                     }
 
                     log() << "Shard version successfully reset to clean up failed migration" << endl;
@@ -1445,7 +1507,7 @@ namespace mongo {
                         ChunkVersion checkVersion =
                             ChunkVersion::fromBSON(doc[ChunkType::DEPRECATED_lastmod()]);
 
-                        if ( checkVersion.isEquivalentTo( nextVersion ) ) {
+                        if ( checkVersion.equals( nextVersion ) ) {
                             log() << "moveChunk commit confirmed" << migrateLog;
                             errmsg.clear();
 
@@ -1495,7 +1557,7 @@ namespace mongo {
                                         min.getOwned(),
                                         max.getOwned(),
                                         shardKeyPattern.getOwned(),
-                                        secondaryThrottle,
+                                        writeConcern,
                                         &errMsg)) {
                     log() << "Error occured while performing cleanup: " << errMsg << endl;
                 }
@@ -1504,12 +1566,11 @@ namespace mongo {
                 log() << "forking for cleanup of chunk data" << migrateLog;
 
                 string errMsg;
-                if (!deleter->queueDelete(OperationContextImpl::factory,
-                                          ns,
+                if (!deleter->queueDelete(ns,
                                           min.getOwned(),
                                           max.getOwned(),
                                           shardKeyPattern.getOwned(),
-                                          secondaryThrottle,
+                                          writeConcern,
                                           NULL, // Don't want to be notified.
                                           &errMsg)) {
                     log() << "could not queue migration cleanup: " << errMsg << endl;
@@ -1555,14 +1616,39 @@ namespace mongo {
 
     class MigrateStatus {
     public:
-        
-        MigrateStatus() : m_active("MigrateStatus") { active = false; }
+        enum State {
+            READY,
+            CLONE,
+            CATCHUP,
+            STEADY,
+            COMMIT_START,
+            DONE,
+            FAIL,
+            ABORT
+        };
+
+        MigrateStatus():
+            m_active("MigrateStatus"),
+            active(false),
+            stateMutex("migrateStatusStateMutex"),
+            state(READY) {
+        }
+
+        void setState(State newState) {
+            scoped_lock sl(stateMutex);
+            state = newState;
+        }
+
+        State getState() const {
+            scoped_lock sl(stateMutex);
+            return state;
+        }
 
         void prepare() {
             scoped_lock l(m_active); // reading and writing 'active'
 
             verify( ! active );
-            state = READY;
+            setState(READY);
             errmsg = "";
 
             numCloned = 0;
@@ -1578,21 +1664,21 @@ namespace mongo {
                 _go(txn);
             }
             catch ( std::exception& e ) {
-                state = FAIL;
+                setState(FAIL);
                 errmsg = e.what();
                 error() << "migrate failed: " << e.what() << migrateLog;
             }
             catch ( ... ) {
-                state = FAIL;
+                setState(FAIL);
                 errmsg = "UNKNOWN ERROR";
                 error() << "migrate failed with unknown exception" << migrateLog;
             }
 
-            if ( state != DONE ) {
+            if ( getState() != DONE ) {
                 // Unprotect the range if needed/possible on unsuccessful TO migration
                 Lock::DBWrite lk(txn->lockState(), ns);
                 string errMsg;
-                if ( !shardingState.forgetPending( ns, min, max, epoch, &errMsg ) ) {
+                if (!shardingState.forgetPending(txn, ns, min, max, epoch, &errMsg)) {
                     warning() << errMsg << endl;
                 }
             }
@@ -1602,12 +1688,16 @@ namespace mongo {
 
         void _go(OperationContext* txn) {
             verify( getActive() );
-            verify( state == READY );
+            verify( getState() == READY );
             verify( ! min.isEmpty() );
             verify( ! max.isEmpty() );
             
-            replSetMajorityCount = repl::theReplSet ?
-                                        repl::theReplSet->config().getMajority() : 0;
+            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+                    repl::ReplicationCoordinator::modeReplSet) {
+                replSetMajorityCount = repl::theReplSet->config().getMajority();
+            } else {
+                replSetMajorityCount = 0;
+            }
 
             log() << "starting receiving-end of migration of chunk " << min << " -> " << max <<
                     " for collection " << ns << " from " << from
@@ -1640,6 +1730,7 @@ namespace mongo {
                         db->createCollection( txn, ns );
                     }
                 }
+                ctx.commit();
             }
 
             {                
@@ -1662,7 +1753,7 @@ namespace mongo {
                     if ( !collection ) {
                         errmsg = str::stream() << "collection dropped during migration: " << ns;
                         warning() << errmsg;
-                        state = FAIL;
+                        setState(FAIL);
                         return;
                     }
 
@@ -1672,13 +1763,14 @@ namespace mongo {
                                                << " idx: " << idx
                                                << " error: " << status.toString();
                         warning() << errmsg;
-                        state = FAIL;
+                        setState(FAIL);
                         return;
                     }
 
                     // make sure to create index on secondaries as well
                     repl::logOp(txn, "i", db->getSystemIndexesName().c_str(), idx,
                                    NULL, NULL, true /* fromMigrate */);
+                    ctx.commit();
                 }
 
                 timing.done(1);
@@ -1692,7 +1784,7 @@ namespace mongo {
                 long long num = Helpers::removeRange( txn,
                                                       range,
                                                       false, /*maxInclusive*/
-                                                      secondaryThrottle, /* secondaryThrottle */
+                                                      writeConcern,
                                                       /*callback*/
                                                       serverGlobalParams.moveParanoia ? &rs : 0,
                                                       true ); /* flag fromMigrate in oplog */
@@ -1700,16 +1792,16 @@ namespace mongo {
                 if (num < 0) {
                     errmsg = "collection or index dropped during migrate";
                     warning() << errmsg << endl;
-                    state = FAIL;
+                    setState(FAIL);
                     return;
                 }
 
                 {
                     // Protect the range by noting that we're now starting a migration to it
                     Lock::DBWrite lk(txn->lockState(), ns);
-                    if ( !shardingState.notePending( ns, min, max, epoch, &errmsg ) ) {
+                    if (!shardingState.notePending(txn, ns, min, max, epoch, &errmsg)) {
                         warning() << errmsg << endl;
-                        state = FAIL;
+                        setState(FAIL);
                         return;
                     }
                 }
@@ -1721,10 +1813,10 @@ namespace mongo {
                 MONGO_FP_PAUSE_WHILE(migrateThreadHangAtStep2);
             }
 
-            if (state == FAIL || state == ABORT) {
+            State currentState = getState();
+            if (currentState == FAIL || currentState == ABORT) {
                 string errMsg;
-                if (!getDeleter()->queueDelete(OperationContextImpl::factory, // XXX SERVER-13931
-                                               ns, min, max, shardKeyPattern, secondaryThrottle,
+                if (!getDeleter()->queueDelete(ns, min, max, shardKeyPattern, writeConcern,
                                                NULL /* notifier */, &errMsg)) {
                     warning() << "Failed to queue delete for migrate abort: " << errMsg << endl;
                 }
@@ -1732,12 +1824,12 @@ namespace mongo {
 
             {
                 // 3. initial bulk clone
-                state = CLONE;
+                setState(CLONE);
 
                 while ( true ) {
                     BSONObj res;
                     if ( ! conn->runCommand( "admin" , BSON( "_migrateClone" << 1 ) , res ) ) {  // gets array of objects to copy, in disk order
-                        state = FAIL;
+                        setState(FAIL);
                         errmsg = "_migrateClone failed: ";
                         errmsg += res.toString();
                         error() << errmsg << migrateLog;
@@ -1750,6 +1842,15 @@ namespace mongo {
 
                     BSONObjIterator i( arr );
                     while( i.more() ) {
+                        txn->checkForInterrupt();
+
+                        if ( getState() == ABORT ) {
+                            errmsg = str::stream() << "Migration abort requested while "
+                                                   << "copying documents";
+                            error() << errmsg << migrateLog;
+                            return;
+                        }
+
                         BSONObj o = i.next().Obj();
                         {
                             Client::WriteContext cx(txn, ns );
@@ -1769,15 +1870,24 @@ namespace mongo {
                             }
 
                             Helpers::upsert( txn, ns, o, true );
+                            cx.commit();
                         }
                         thisTime++;
                         numCloned++;
                         clonedBytes += o.objsize();
 
-                        if ( secondaryThrottle && thisTime > 0 ) {
-                            if (!repl::waitForReplication(cc().getLastOp(),
-                                                             2, 60 /* seconds to wait */)) {
-                                warning() << "secondaryThrottle on, but doc insert timed out after 60 seconds, continuing" << endl;
+                        if (writeConcern.shouldWaitForOtherNodes() && thisTime > 0) {
+                            repl::ReplicationCoordinator::StatusAndDuration replStatus =
+                                    repl::getGlobalReplicationCoordinator()->awaitReplication(
+                                            txn,
+                                            cc().getLastOp(),
+                                            writeConcern);
+                            if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
+                                warning() << "secondaryThrottle on, but doc insert timed out; "
+                                             "continuing";
+                            }
+                            else {
+                                massertStatusOK(replStatus.status);
                             }
                         }
                     }
@@ -1795,11 +1905,11 @@ namespace mongo {
 
             {
                 // 4. do bulk of mods
-                state = CATCHUP;
+                setState(CATCHUP);
                 while ( true ) {
                     BSONObj res;
                     if ( ! conn->runCommand( "admin" , BSON( "_transferMods" << 1 ) , res ) ) {
-                        state = FAIL;
+                        setState(FAIL);
                         errmsg = "_transferMods failed: ";
                         errmsg += res.toString();
                         error() << "_transferMods failed: " << res << migrateLog;
@@ -1814,11 +1924,17 @@ namespace mongo {
                     const int maxIterations = 3600*50;
                     int i;
                     for ( i=0;i<maxIterations; i++) {
-                        if ( state == ABORT ) {
+                        txn->checkForInterrupt();
+
+                        if ( getState() == ABORT ) {
+                            errmsg = str::stream() << "Migration abort requested while waiting "
+                                                   << "for replication at catch up stage";
+                            error() << errmsg << migrateLog;
+
                             return;
                         }
                         
-                        if (opReplicatedEnough(lastOpApplied))
+                        if (opReplicatedEnough(txn, lastOpApplied))
                             break;
                         
                         if ( i > 100 ) {
@@ -1832,7 +1948,7 @@ namespace mongo {
                         errmsg = "secondary can't keep up with migrate";
                         error() << errmsg << migrateLog;
                         conn.done();
-                        state = FAIL;
+                        setState(FAIL);
                         return;
                     } 
                 }
@@ -1846,32 +1962,48 @@ namespace mongo {
                 // this will prevent us from going into critical section until we're ready
                 Timer t;
                 while ( t.minutes() < 600 ) {
+                    txn->checkForInterrupt();
+
+                    if (getState() == ABORT) {
+                        errmsg = "Migration abort requested while waiting for replication";
+                        error() << errmsg << migrateLog;
+                        return;
+                    }
+
                     log() << "Waiting for replication to catch up before entering critical section"
                           << endl;
                     if ( flushPendingWrites(txn, lastOpApplied ) )
                         break;
                     sleepsecs(1);
                 }
+
+                if (t.minutes() >= 600) {
+                  setState(FAIL);
+                  errmsg = "Cannot go to critical section because secondaries cannot keep up";
+                  error() << errmsg << migrateLog;
+                  return;
+                }
             }
 
             {
                 // 5. wait for commit
 
-                state = STEADY;
+                setState(STEADY);
                 bool transferAfterCommit = false;
-                while ( state == STEADY || state == COMMIT_START ) {
+                while ( getState() == STEADY || getState() == COMMIT_START ) {
+                    txn->checkForInterrupt();
 
                     // Make sure we do at least one transfer after recv'ing the commit message
                     // If we aren't sure that at least one transfer happens *after* our state
                     // changes to COMMIT_START, there could be mods still on the FROM shard that
                     // got logged *after* our _transferMods but *before* the critical section.
-                    if ( state == COMMIT_START ) transferAfterCommit = true;
+                    if ( getState() == COMMIT_START ) transferAfterCommit = true;
 
                     BSONObj res;
                     if ( ! conn->runCommand( "admin" , BSON( "_transferMods" << 1 ) , res ) ) {
                         log() << "_transferMods failed in STEADY state: " << res << migrateLog;
                         errmsg = res.toString();
-                        state = FAIL;
+                        setState(FAIL);
                         conn.done();
                         return;
                     }
@@ -1879,23 +2011,23 @@ namespace mongo {
                     if ( res["size"].number() > 0 && apply( txn, res , &lastOpApplied ) )
                         continue;
 
-                    if ( state == ABORT ) {
+                    if ( getState() == ABORT ) {
                         return;
                     }
                     
                     // We know we're finished when:
                     // 1) The from side has told us that it has locked writes (COMMIT_START)
                     // 2) We've checked at least one more time for un-transmitted mods
-                    if ( state == COMMIT_START && transferAfterCommit == true ) {
+                    if ( getState() == COMMIT_START && transferAfterCommit == true ) {
                         if ( flushPendingWrites(txn, lastOpApplied ) )
                             break;
                     }
                     
                     // Only sleep if we aren't committing
-                    if ( state == STEADY ) sleepmillis( 10 );
+                    if ( getState() == STEADY ) sleepmillis( 10 );
                 }
 
-                if ( state == FAIL ) {
+                if ( getState() == FAIL ) {
                     errmsg = "timed out waiting for commit";
                     return;
                 }
@@ -1904,7 +2036,7 @@ namespace mongo {
                 MONGO_FP_PAUSE_WHILE(migrateThreadHangAtStep5);
             }
 
-            state = DONE;
+            setState(DONE);
             conn.done();
         }
 
@@ -1918,7 +2050,7 @@ namespace mongo {
             b.append( "shardKeyPattern" , shardKeyPattern );
 
             b.append( "state" , stateString() );
-            if ( state == FAIL )
+            if ( getState() == FAIL )
                 b.append( "errmsg" , errmsg );
             {
                 BSONObjBuilder bb( b.subobjStart( "counts" ) );
@@ -1965,14 +2097,17 @@ namespace mongo {
 
                     // TODO: create a better interface to remove objects directly
                     KeyRange range( ns, id, id, idIndexPattern );
+                    const WriteConcernOptions singleNodeWrite(1, WriteConcernOptions::NONE,
+                            WriteConcernOptions::kNoTimeout);
                     Helpers::removeRange( txn,
                                           range ,
                                           true , /*maxInclusive*/
-                                          false , /* secondaryThrottle */
+                                          singleNodeWrite,
                                           serverGlobalParams.moveParanoia ? &rs : 0 , /*callback*/
                                           true ); /*fromMigrate*/
 
                     *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
+                    cx.commit();
                     didAnything = true;
                 }
             }
@@ -2002,6 +2137,7 @@ namespace mongo {
                     Helpers::upsert( txn, ns , it , true );
 
                     *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
+                    cx.commit();
                     didAnything = true;
                 }
             }
@@ -2025,15 +2161,19 @@ namespace mongo {
             return false;
         }
 
-        bool opReplicatedEnough( const ReplTime& lastOpApplied ) {
+        bool opReplicatedEnough(const OperationContext* txn, const ReplTime& lastOpApplied) {
             // if replication is on, try to force enough secondaries to catch up
             // TODO opReplicatedEnough should eventually honor priorities and geo-awareness
             //      for now, we try to replicate to a sensible number of secondaries
-            return repl::opReplicatedEnough(lastOpApplied, replSetMajorityCount);
+            WriteConcernOptions writeConcern;
+            writeConcern.wTimeout = -1;
+            writeConcern.wMode = "majority";
+            return repl::getGlobalReplicationCoordinator()->awaitReplication(txn, lastOpApplied,
+                    writeConcern).status.isOK();
         }
 
         bool flushPendingWrites(OperationContext* txn, const ReplTime& lastOpApplied ) {
-            if ( ! opReplicatedEnough( lastOpApplied ) ) {
+            if (!opReplicatedEnough(txn, lastOpApplied)) {
                 OpTime op( lastOpApplied );
                 OCCASIONALLY warning() << "migrate commit waiting for " << replSetMajorityCount 
                                        << " slaves for '" << ns << "' " << min << " -> " << max 
@@ -2048,7 +2188,7 @@ namespace mongo {
                 Lock::GlobalRead lk(txn->lockState());
 
                 // if durability is on, force a write to journal
-                if ( getDur().commitNow() ) {
+                if (getDur().commitNow(txn)) {
                     log() << "migrate commit flushed to journal for '" << ns << "' " << min << " -> " << max << migrateLog;
                 }
             }
@@ -2057,7 +2197,7 @@ namespace mongo {
         }
 
         string stateString() {
-            switch ( state ) {
+            switch ( getState() ) {
             case READY: return "ready";
             case CLONE: return "clone";
             case CATCHUP: return "catchup";
@@ -2073,9 +2213,9 @@ namespace mongo {
 
         bool startCommit() {
 
-            if ( state != STEADY )
+            if ( getState() != STEADY )
                 return false;
-            state = COMMIT_START;
+            setState(COMMIT_START);
             
             boost::xtime xt;
             boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
@@ -2085,13 +2225,13 @@ namespace mongo {
             while ( active ) {
                 if ( ! isActiveCV.timed_wait( lock.boost(), xt ) ){
                     // TIMEOUT
-                    state = FAIL;
+                    setState(FAIL);
                     log() << "startCommit never finished!" << migrateLog;
                     return false;
                 }
             }
 
-            if ( state == DONE ) {
+            if ( getState() == DONE ) {
                 return true;
             }
 
@@ -2100,7 +2240,7 @@ namespace mongo {
         }
 
         void abort() {
-            state = ABORT;
+            setState(ABORT);
             errmsg = "aborted";
         }
 
@@ -2127,11 +2267,13 @@ namespace mongo {
         long long clonedBytes;
         long long numCatchup;
         long long numSteady;
-        bool secondaryThrottle;
+        WriteConcernOptions writeConcern;
 
         int replSetMajorityCount;
 
-        enum State { READY , CLONE , CATCHUP , STEADY , COMMIT_START , DONE , FAIL , ABORT } state;
+        // protects state
+        mutable mutex stateMutex;
+        State state;
         string errmsg;
 
     } migrateStatus;
@@ -2143,10 +2285,33 @@ namespace mongo {
             ShardedConnectionInfo::addHook();
             cc().getAuthorizationSession()->grantInternalAuthorization();
         }
+
+        // Make curop active so this will show up in currOp.
+        cc().curop()->reset();
+
         migrateStatus.go(&txn);
         cc().shutdown();
     }
 
+    /**
+     * Command for initiating the recipient side of the migration to start copying data
+     * from the donor shard.
+     *
+     * {
+     *   _recvChunkStart: "namespace",
+     *   congfigServer: "hostAndPort",
+     *   from: "hostAndPort",
+     *   fromShardName: "shardName",
+     *   toShardName: "shardName",
+     *   min: {},
+     *   max: {},
+     *   shardKeyPattern: {},
+     *
+     *   // optional
+     *   secondaryThrottle: bool, // defaults to true
+     *   writeConcern: {} // applies to individual writes.
+     * }
+     */
     class RecvChunkStartCommand : public ChunkCommandHelper {
     public:
         void help(stringstream& h) const { h << "internal"; }
@@ -2172,7 +2337,7 @@ namespace mongo {
             // Pending deletes (for migrations) are serialized by the distributed collection lock,
             // we are sure we registered a delete for a range *before* we can migrate-in a
             // subrange.
-            int numDeletes = getDeleter()->getStats()->getCurrentDeletes();
+            const size_t numDeletes = getDeleter()->getTotalDeletes();
             if (numDeletes > 0) {
                 errmsg = str::stream() << "can't accept new chunks because "
                         << " there are still " << numDeletes
@@ -2213,7 +2378,37 @@ namespace mongo {
             migrateStatus.min = min;
             migrateStatus.max = max;
             migrateStatus.epoch = currentVersion.epoch();
-            migrateStatus.secondaryThrottle = cmdObj["secondaryThrottle"].trueValue();
+
+            // Process secondary throttle settings and assign defaults if necessary.
+            WriteConcernOptions writeConcern;
+            status = writeConcern.parseSecondaryThrottle(cmdObj, NULL);
+
+            if (!status.isOK()){
+                if (status.code() != ErrorCodes::WriteConcernNotDefined) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
+                }
+
+                writeConcern = getDefaultWriteConcern();
+            }
+            else {
+                repl::ReplicationCoordinator* replCoordinator =
+                        repl::getGlobalReplicationCoordinator();
+                Status status = replCoordinator->checkIfWriteConcernCanBeSatisfied(writeConcern);
+                if (!status.isOK()) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
+                }
+            }
+
+            if (writeConcern.shouldWaitForOtherNodes() &&
+                    writeConcern.wTimeout == WriteConcernOptions::kNoTimeout) {
+                // Don't allow no timeout.
+                writeConcern.wTimeout = kDefaultWTimeoutMs;
+            }
+
+            migrateStatus.writeConcern = writeConcern;
+
             if (cmdObj.hasField("shardKeyPattern")) {
                 migrateStatus.shardKeyPattern = cmdObj["shardKeyPattern"].Obj().getOwned();
             } else {
@@ -2230,11 +2425,6 @@ namespace mongo {
                     " chunk range specifiers.  Inferred shard key: " << keya << endl;
 
                 migrateStatus.shardKeyPattern = keya.getOwned();
-            }
-
-            if (migrateStatus.secondaryThrottle && ! repl::anyReplEnabled()) {
-                warning() << "secondaryThrottle asked for, but not replication" << endl;
-                migrateStatus.secondaryThrottle = false;
             }
 
             // Set the TO-side migration to active

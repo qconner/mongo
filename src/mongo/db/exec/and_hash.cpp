@@ -48,6 +48,9 @@ namespace mongo {
 
     const size_t AndHashStage::kLookAheadWorks = 10;
 
+    // static
+    const char* AndHashStage::kStageType = "AND_HASH";
+
     AndHashStage::AndHashStage(WorkingSet* ws, 
                                const MatchExpression* filter,
                                const Collection* collection)
@@ -56,6 +59,7 @@ namespace mongo {
           _filter(filter),
           _hashingChildren(true),
           _currentChild(0),
+          _commonStats(kStageType),
           _memUsage(0),
           _maxMemUsage(kDefaultMaxMemUsageBytes) {}
 
@@ -68,6 +72,7 @@ namespace mongo {
           _filter(filter),
           _hashingChildren(true),
           _currentChild(0),
+          _commonStats(kStageType),
           _memUsage(0),
           _maxMemUsage(maxMemUsage) {}
 
@@ -101,6 +106,9 @@ namespace mongo {
 
     PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -495,11 +503,22 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> AndHashStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* AndHashStage::getStats() {
         _commonStats.isEOF = isEOF();
 
         _specificStats.memLimit = _maxMemUsage;
         _specificStats.memUsage = _memUsage;
+
+        // Add a BSON representation of the filter to the stats tree, if there is one.
+        if (NULL != _filter) {
+            BSONObjBuilder bob;
+            _filter->toBSON(&bob);
+            _commonStats.filter = bob.obj();
+        }
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_AND_HASH));
         ret->specific.reset(new AndHashStats(_specificStats));
@@ -508,6 +527,14 @@ namespace mongo {
         }
 
         return ret.release();
+    }
+
+    const CommonStats* AndHashStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* AndHashStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

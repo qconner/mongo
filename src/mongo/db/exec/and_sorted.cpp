@@ -35,6 +35,9 @@
 
 namespace mongo {
 
+    // static
+    const char* AndSortedStage::kStageType = "AND_SORTED";
+
     AndSortedStage::AndSortedStage(WorkingSet* ws, 
                                    const MatchExpression* filter,
                                    const Collection* collection)
@@ -42,7 +45,8 @@ namespace mongo {
           _ws(ws),
           _filter(filter),
           _targetNode(numeric_limits<size_t>::max()),
-          _targetId(WorkingSet::INVALID_ID), _isEOF(false) { }
+          _targetId(WorkingSet::INVALID_ID), _isEOF(false),
+          _commonStats(kStageType) { }
 
     AndSortedStage::~AndSortedStage() {
         for (size_t i = 0; i < _children.size(); ++i) { delete _children[i]; }
@@ -56,6 +60,9 @@ namespace mongo {
 
     PlanStage::StageState AndSortedStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -293,8 +300,19 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> AndSortedStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* AndSortedStage::getStats() {
         _commonStats.isEOF = isEOF();
+
+        // Add a BSON representation of the filter to the stats tree, if there is one.
+        if (NULL != _filter) {
+            BSONObjBuilder bob;
+            _filter->toBSON(&bob);
+            _commonStats.filter = bob.obj();
+        }
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_AND_SORTED));
         ret->specific.reset(new AndSortedStats(_specificStats));
@@ -303,6 +321,14 @@ namespace mongo {
         }
 
         return ret.release();
+    }
+
+    const CommonStats* AndSortedStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* AndSortedStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

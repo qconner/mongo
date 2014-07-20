@@ -35,7 +35,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/structure/btree/btree_interface.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo {
 
@@ -49,8 +49,6 @@ namespace mongo {
          * Called from btree_logic.cpp when we're about to delete a Btree bucket.
          */
         static void aboutToDeleteBucket(const DiskLoc& bucket);
-
-        virtual Status setOptions(const CursorOptions& options);
 
         virtual Status seek(const BSONObj& position);
 
@@ -94,16 +92,11 @@ namespace mongo {
         friend class BtreeBasedAccessMethod;
 
         /**
-         * head is the head of the Btree.
          * interface is an abstraction to hide the fact that we have two types of Btrees.
-         *
-         * 'this' will forward by default.  Call setOptions to change this.
-         * XXX: put options in ctor(?)
          *
          * Intentionally private, we're friends with the only class allowed to call it.
          */
-        BtreeIndexCursor(const DiskLoc head,
-                         BtreeInterface* newInterface);
+        BtreeIndexCursor(SortedDataInterface::Cursor* cursor);
 
         bool isSavedPositionValid();
 
@@ -117,20 +110,7 @@ namespace mongo {
         static unordered_set<BtreeIndexCursor*> _activeCursors;
         static SimpleMutex _activeCursorsMutex;
 
-        // For saving/restoring position.
-        BtreeInterface::SavedPositionData _savedData;
-
-        int _direction;
-
-        // Not owned here.
-        BtreeInterface* _interface;
-
-        // TODO: Have some kind of BtreeInterface::BtreePosition to encapsulate this.
-        // What are we looking at RIGHT NOW?  We look at a bucket.
-        DiskLoc _bucket;
-
-        // And we look at an offset in the bucket.
-        int _keyOffset;
+        boost::scoped_ptr<SortedDataInterface::Cursor> _cursor;
     };
 
 }  // namespace mongo

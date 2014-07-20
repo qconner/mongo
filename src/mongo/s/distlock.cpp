@@ -27,19 +27,23 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/distlock.h"
 
 #include <boost/thread/thread.hpp>
 
+#include "mongo/db/server_options.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/s/type_locks.h"
 #include "mongo/s/type_lockpings.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     LabeledLevel DistributedLock::logLvl( 1 );
     DistributedLock::LastPings DistributedLock::lastPings;

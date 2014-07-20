@@ -1,0 +1,74 @@
+# -*- mode: python -*-
+
+Import("env")
+
+env.Library(
+    'network_interface_impl',
+    'network_interface_impl.cpp',
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base/base',
+        '$BUILD_DIR/mongo/clientdriver'
+        ])
+
+env.Library('replication_executor',
+            'replication_executor.cpp',
+            LIBDEPS=['$BUILD_DIR/mongo/foundation',
+                     '$BUILD_DIR/mongo/hostandport'])
+
+env.CppUnitTest('replication_executor_test',
+                'replication_executor_test.cpp',
+                LIBDEPS=['replication_executor',
+                         'replmocks'])
+
+env.Library('repl_coordinator_impl',
+            'repl_coordinator_impl.cpp',
+            LIBDEPS=['$BUILD_DIR/mongo/db/common',
+                     '$BUILD_DIR/mongo/foundation',
+                     '$BUILD_DIR/mongo/server_options_core',
+                     'repl_coordinator_interface',
+                     'replication_executor',
+                 ])
+
+env.CppUnitTest('repl_coordinator_impl_test',
+                'repl_coordinator_impl_test.cpp',
+                LIBDEPS=['repl_coordinator_impl',
+                         'replmocks'])
+
+env.Library('repl_coordinator_interface',
+            ['repl_coordinator.cpp',],
+            LIBDEPS=[
+                '$BUILD_DIR/mongo/hostandport',
+            ])
+
+env.Library('repl_coordinator_global',
+            'repl_coordinator_global.cpp',
+            LIBDEPS=['repl_coordinator_interface'])
+
+env.Library('replmocks',
+            ['repl_coordinator_mock.cpp',
+             'network_interface_mock.cpp',
+             'topology_coordinator_mock.cpp'],
+            LIBDEPS=[
+                'repl_coordinator_interface',
+                'replication_executor',
+            ])
+
+env.Library('replica_set_config',
+            [
+                'member_config.cpp',
+                'replica_set_config.cpp',
+                'replica_set_tag.cpp',
+            ],
+            LIBDEPS=[
+                '$BUILD_DIR/mongo/bson',
+                '$BUILD_DIR/mongo/hostandport',
+                '$BUILD_DIR/mongo/db/common',
+            ])
+
+env.CppUnitTest('replica_set_config_test',
+                [
+                    'member_config_test.cpp',
+                    'replica_set_config_test.cpp',
+                    'replica_set_tag_test.cpp',
+                ],
+                LIBDEPS=['replica_set_config'])

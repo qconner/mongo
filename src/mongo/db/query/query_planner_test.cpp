@@ -1612,6 +1612,28 @@ namespace {
                                 "{ixscan: {filter: null, pattern: {'a.b': 1}}}}}");
     }
 
+    // SERVER-14180
+    TEST_F(QueryPlannerTest, ElemMatchEmbeddedRegexAnd) {
+        addIndex(BSON("a.b" << 1));
+        runQuery(fromjson("{a: {$elemMatch: {b: /foo/}}, z: 1}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {a:{$elemMatch:{b:/foo/}}, z:1}, node: "
+                                "{ixscan: {filter: null, pattern: {'a.b': 1}}}}}");
+    }
+
+    // SERVER-14180
+    TEST_F(QueryPlannerTest, ElemMatchEmbeddedRegexAnd2) {
+        addIndex(BSON("a.b" << 1));
+        runQuery(fromjson("{a: {$elemMatch: {b: /foo/, b: 3}}, z: 1}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {a:{$elemMatch:{b:/foo/,b:3}}, z:1}, node: "
+                                "{ixscan: {filter: null, pattern: {'a.b': 1}}}}}");
+    }
+
     // $not can appear as a value operator inside of an elemMatch (value).  We shouldn't crash if we
     // see it.
     TEST_F(QueryPlannerTest, ElemMatchWithNotInside) {
@@ -1715,25 +1737,25 @@ namespace {
         runQuery(fromjson("{a : { $within: { $polygon : [[0,0], [2,0], [4,0]] } }}"));
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
 
         // Center
         runQuery(fromjson("{a : { $within : { $center : [[ 5, 5 ], 7 ] } }}"));
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
 
         // Centersphere
         runQuery(fromjson("{a : { $within : { $centerSphere : [[ 10, 20 ], 0.01 ] } }}"));
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
 
         // Within box.
         runQuery(fromjson("{a : {$within: {$box : [[0,0],[9,9]]}}}"));
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
 
         // TODO: test that we *don't* annotate for things we shouldn't.
     }
@@ -1747,6 +1769,20 @@ namespace {
                                " $maxDistance :100}},a: 'mouse'}"));
         assertNumSolutions(1U);
         assertSolutionExists("{fetch: {node: {geoNear2dsphere: {loc: '2dsphere'}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, Basic2DCompound) {
+        addIndex(BSON("loc" << "2d" << "a" << 1));
+
+        runQuery(fromjson("{ loc: { $geoWithin: { $box : [[0, 0],[10, 10]] } },"
+                              "a: 'mouse' }"));
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {loc : '2d', a: 1},"
+                                                      "filter: {a: 'mouse'},"
+                                                      "bounds: {loc: []," // Ignored since complex
+                                                      "         a: [['MinKey','MaxKey',true,true]]}"
+                                                      "}}}}");
     }
 
     TEST_F(QueryPlannerTest, Multikey2DSphereCompound) {
@@ -1885,7 +1921,8 @@ namespace {
 
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {node: {or: {nodes: [{geo2d: {a: '2d'}}, {geo2d: {b: '2d'}}]}}}}");
+        assertSolutionExists("{or: {nodes: [{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}},"
+                                           "{fetch: {node: {ixscan: {pattern: {b: '2d'}}}}}]}}");
     }
 
     // SERVER-3984, $or 2d index
@@ -1896,7 +1933,7 @@ namespace {
 
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {node: {or: {nodes: [{geo2d: {a: '2d'}}, {geo2d: {a: '2d'}}]}}}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
     }
 
     // SERVER-3984, $or 2dsphere index
@@ -1935,8 +1972,9 @@ namespace {
 
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {node: {andHash: {nodes: ["
-                                "{geo2d: {a: '2d'}}, {geo2d: {a: '2d'}}]}}}}");
+        // Bounds of the two 2d geo predicates are combined into
+        // a single index scan.
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
     }
 
     TEST_F(QueryPlannerTest, And2DWith2DNearSameField) {
@@ -1946,7 +1984,7 @@ namespace {
 
         // GEO_NEAR must use the index, and GEO predicate becomes a filter.
         assertNumSolutions(1U);
-        assertSolutionExists("{geoNear2d: {a: '2d'}}");
+        assertSolutionExists("{fetch: { node : { geoNear2d: {a: '2d'} } } }");
     }
 
     TEST_F(QueryPlannerTest, And2DSphereSameFieldNonNear) {
@@ -2103,7 +2141,8 @@ namespace {
         runQuery(fromjson("{a: {$near: [0, 0]}, b: {$gte: 0}}"));
 
         assertNumSolutions(1U);
-        assertSolutionExists("{geoNear2d: {a: '2d', b: 1}}");
+        assertSolutionExists("{fetch: { filter : {b:{$gte: 0}}, node: "
+                                 "{geoNear2d: {a: '2d', b: 1} } } }");
     }
 
     //
@@ -2585,6 +2624,84 @@ namespace {
         assertNumSolutions(1U);
         assertSolutionExists("{sort: {pattern: {b: 1}, limit: 0, node: "
                                 "{cscan: {filter: {a: 1}, dir: 1}}}}");
+    }
+
+    // Test $natural sort and its interaction with $natural hint.
+    TEST_F(QueryPlannerTest, NaturalSortAndHint) {
+        addIndex(BSON("x" << 1));
+
+        // Non-empty query, -1 sort, no hint.
+        runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << -1), BSONObj());
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: -1}}");
+
+        // Non-empty query, 1 sort, no hint.
+        runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << 1), BSONObj());
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+
+        // Non-empty query, -1 sort, -1 hint.
+        runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << -1),
+                                                           BSON("$natural" << -1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: -1}}");
+
+        // Non-empty query, 1 sort, -1 hint.
+        runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << 1),
+                                                           BSON("$natural" << -1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+
+        // Non-empty query, -1 sort, 1 hint.
+        runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << -1),
+                                                           BSON("$natural" << 1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: -1}}");
+
+        // Non-empty query, 1 sort, 1 hint.
+        runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << 1),
+                                                           BSON("$natural" << 1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+
+        // Empty query, -1 sort, no hint.
+        runQuerySortHint(BSONObj(), BSON("$natural" << -1), BSONObj());
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: -1}}");
+
+        // Empty query, 1 sort, no hint.
+        runQuerySortHint(BSONObj(), BSON("$natural" << 1), BSONObj());
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+
+        // Empty query, -1 sort, -1 hint.
+        runQuerySortHint(BSONObj(), BSON("$natural" << -1), BSON("$natural" << -1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: -1}}");
+
+        // Empty query, 1 sort, -1 hint.
+        runQuerySortHint(BSONObj(), BSON("$natural" << 1), BSON("$natural" << -1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+
+        // Empty query, -1 sort, 1 hint.
+        runQuerySortHint(BSONObj(), BSON("$natural" << -1), BSON("$natural" << 1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: -1}}");
+
+        // Empty query, 1 sort, 1 hint.
+        runQuerySortHint(BSONObj(), BSON("$natural" << 1), BSON("$natural" << 1));
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+    }
+
+    TEST_F(QueryPlannerTest, HintOverridesNaturalSort) {
+        addIndex(BSON("x" << 1));
+        runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << -1), BSON("x" << 1));
+
+        assertNumSolutions(1U);
+        assertSolutionExists("{fetch: {filter: {x:{$exists:true}}, node: "
+                                "{ixscan: {filter: null, pattern: {x: 1}}}}}");
     }
 
     TEST_F(QueryPlannerTest, HintValid) {
@@ -3104,7 +3221,7 @@ namespace {
         addIndex(BSON("a" << "2d"));
         runQuery(fromjson("{$and: [{a: {$near: [0, 0], $maxDistance: 0.3}}, {b: {$ne: 1}}]}"));
         assertNumSolutions(1U);
-        assertSolutionExists("{geoNear2d: {a: '2d'}}");
+        assertSolutionExists("{fetch: {node: { geoNear2d: {a: '2d'} } } }");
     }
 
     //

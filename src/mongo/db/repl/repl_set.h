@@ -36,10 +36,11 @@ namespace repl {
 
     class ReplSet : public ReplSetImpl {
     public:
-        static ReplSet* make(ReplSetCmdline& replSetCmdline);
+        static ReplSet* make(ReplSetSeedList& replSetSeedList);
         virtual ~ReplSet() {}
 
         // for the replSetStepDown command
+        // Returns false if this node isn't currently primary
         bool stepDown(int secs) { return _stepDown(secs); }
 
         // for the replSetFreeze command

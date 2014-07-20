@@ -73,14 +73,6 @@ namespace mongo {
                            DbResponse& dbresponse,
                            const HostAndPort &client );
 
-    void getDatabaseNames(std::vector<std::string> &names,
-                          const std::string& usePath = storageGlobalParams.dbpath);
-
-    /* returns true if there is no data on this server.  useful when starting replication.
-       local database does NOT count.
-    */
-    bool replHasDatabases(OperationContext* txn);
-
     /**
      * Embedded calls to the local server using the DBClientBase API without going over the network.
      *
@@ -147,11 +139,6 @@ namespace mongo {
         OperationContext* _txn; // Points either to _txnOwned or a passed-in transaction.
     };
 
-    extern int lockFile;
-#ifdef _WIN32
-    extern HANDLE lockFileHandle;
-#endif
-    void acquirePathLock(bool doingRepair=false); // if doingRepair=true don't consider unclean shutdown an error
     void maybeCreatePidFile();
 
     void exitCleanly( ExitCode code );

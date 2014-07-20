@@ -41,14 +41,11 @@
 namespace mongo {
 
     class Collection;
-    class DatabaseCatalogEntry;
     class DataFile;
+    class DatabaseCatalogEntry;
     class ExtentManager;
     class IndexCatalog;
-    class MMAP1DatabaseCatalogEntry;
-    class MmapV1ExtentManager;
     class NamespaceDetails;
-    class NamespaceIndex;
     class OperationContext;
 
     /**
@@ -60,37 +57,26 @@ namespace mongo {
     public:
         // you probably need to be in dbHolderMutex when constructing this
         Database(OperationContext* txn,
-                 const char *nm,
-                 /*out*/ bool& newDb,
-                 const std::string& path = storageGlobalParams.dbpath);
+                 const std::string& name,
+                 DatabaseCatalogEntry* dbEntry );
 
         /* you must use this to close - there is essential code in this method that is not in the ~Database destructor.
            thus the destructor is private.  this could be cleaned up one day...
         */
-        static void closeDatabase( const std::string& db, const std::string& path );
+        static void closeDatabase(OperationContext* txn,
+                                  const std::string& db);
+
+        // do not use!
+        ~Database(); // closes files and other cleanup see below.
 
         const std::string& name() const { return _name; }
-        const std::string& path() const { return _path; }
 
         void clearTmpCollections(OperationContext* txn);
-
-        bool isEmpty() const;
-
-        /**
-         * total file size of Database in bytes
-         */
-        long long fileSize() const;
-
-        int numFiles() const;
-
-        void getFileFormat( OperationContext* txn, int* major, int* minor );
 
         /**
          * @return true if success.  false if bad level or error creating profile ns
          */
         bool setProfilingLevel( OperationContext* txn, int newLevel , std::string& errmsg );
-
-        void flushFiles( bool sync );
 
         /**
          * @return true if ns is part of the database
@@ -113,10 +99,6 @@ namespace mongo {
                                              int scale = 1 );
 
         const DatabaseCatalogEntry* getDatabaseCatalogEntry() const;
-
-        // TODO: do not think this method should exist, so should try and encapsulate better
-        MmapV1ExtentManager* getExtentManager();
-        const MmapV1ExtentManager* getExtentManager() const;
 
         Status dropCollection( OperationContext* txn, const StringData& fullns );
 
@@ -149,7 +131,6 @@ namespace mongo {
          // TODO move???
          */
         static string duplicateUncasedName( const std::string &name,
-                                            const std::string &path,
                                             std::set< std::string > *duplicates = 0 );
 
         static Status validateDBName( const StringData& dbname );
@@ -161,33 +142,11 @@ namespace mongo {
 
         void _clearCollectionCache_inlock( const StringData& fullns );
 
-        ~Database(); // closes files and other cleanup see below.
-
-        void _addNamespaceToCatalog( OperationContext* txn,
-                                     const StringData& ns,
-                                     const BSONObj* options );
-
-
-        /**
-         * removes from *.system.namespaces
-         * frees extents
-         * removes from NamespaceIndex
-         * NOT RIGHT NOW, removes cache entry in Database TODO?
-         */
-        Status _dropNS( OperationContext* txn, const StringData& ns );
-
-        Status _renameSingleNamespace( OperationContext* txn,
-                                       const StringData& fromNS,
-                                       const StringData& toNS,
-                                       bool stayTemp );
-
         const std::string _name; // "alleyinsider"
-        const std::string _path; // "/data/db"
 
-        boost::scoped_ptr<MMAP1DatabaseCatalogEntry> _dbEntry;
+        boost::scoped_ptr<DatabaseCatalogEntry> _dbEntry;
 
         const std::string _profileName; // "alleyinsider.system.profile"
-        const std::string _namespacesName; // "alleyinsider.system.namespaces"
         const std::string _indexesName; // "alleyinsider.system.indexes"
 
         int _profile; // 0=off.
@@ -203,5 +162,16 @@ namespace mongo {
         friend class NamespaceDetails;
         friend class IndexCatalog;
     };
+
+    void dropDatabase(OperationContext* txn, Database* db );
+
+    void dropAllDatabasesExceptLocal(OperationContext* txn);
+
+    Status userCreateNS( OperationContext* txn,
+                         Database* db,
+                         const StringData& ns,
+                         BSONObj options,
+                         bool logForReplication,
+                         bool createDefaultIndexes = true );
 
 } // namespace mongo

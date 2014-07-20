@@ -28,7 +28,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/chunk.h"
 
@@ -49,14 +49,18 @@
 #include "mongo/s/type_collection.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/log.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/timer.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     inline bool allOfType(BSONType type, const BSONObj& o) {
         BSONObjIterator it(o);
@@ -76,7 +80,7 @@ namespace mongo {
     bool Chunk::ShouldAutoSplit = true;
 
     Chunk::Chunk(const ChunkManager * manager, BSONObj from)
-        : _manager(manager), _lastmod(0, OID()), _dataWritten(mkDataWritten())
+        : _manager(manager), _lastmod(0, 0, OID()), _dataWritten(mkDataWritten())
     {
         string ns = from.getStringField(ChunkType::ns().c_str());
         _shard.reset(from.getStringField(ChunkType::shard().c_str()));
@@ -352,37 +356,50 @@ namespace mongo {
 
     bool Chunk::moveAndCommit(const Shard& to,
                               long long chunkSize /* bytes */,
-                              bool secondaryThrottle,
+                              const WriteConcernOptions* writeConcern,
                               bool waitForDelete,
                               int maxTimeMS,
-                              BSONObj& res) const
-    {
+                              BSONObj& res) const {
         uassert( 10167 ,  "can't move shard to its current location!" , getShard() != to );
 
-        log() << "moving chunk ns: " << _manager->getns() << " moving ( " << toString() << ") " << _shard.toString() << " -> " << to.toString() << endl;
+        log() << "moving chunk ns: " << _manager->getns() << " moving ( " << toString() << ") "
+              << _shard.toString() << " -> " << to.toString() << endl;
 
         Shard from = _shard;
-
         ScopedDbConnection fromconn(from.getConnString());
 
-        bool worked = fromconn->runCommand( "admin" ,
-                                            BSON( "moveChunk" << _manager->getns() <<
-                                                  "from" << from.getAddress().toString() <<
-                                                  "to" << to.getAddress().toString() <<
-                                                  // NEEDED FOR 2.0 COMPATIBILITY
-                                                  "fromShard" << from.getName() <<
-                                                  "toShard" << to.getName() <<
-                                                  ///////////////////////////////
-                                                  "min" << _min <<
-                                                  "max" << _max <<
-                                                  "maxChunkSizeBytes" << chunkSize <<
-                                                  "shardId" << genID() <<
-                                                  "configdb" << configServer.modelServer() <<
-                                                  "secondaryThrottle" << secondaryThrottle <<
-                                                  "waitForDelete" << waitForDelete <<
-                                                  LiteParsedQuery::cmdOptionMaxTimeMS << maxTimeMS
-                                                   ) ,
-                                            res);
+        BSONObjBuilder builder;
+        builder.append("moveChunk", _manager->getns());
+        builder.append("from", from.getAddress().toString());
+        builder.append("to", to.getAddress().toString());
+        // NEEDED FOR 2.0 COMPATIBILITY
+        builder.append("fromShard", from.getName());
+        builder.append("toShard", to.getName());
+        ///////////////////////////////
+        builder.append("min", _min);
+        builder.append("max", _max);
+        builder.append("maxChunkSizeBytes", chunkSize);
+        builder.append("shardId", genID());
+        builder.append("configdb", configServer.modelServer());
+
+        // For legacy secondary throttle setting.
+        bool secondaryThrottle = true;
+        if (writeConcern &&
+                writeConcern->wNumNodes <= 1 &&
+                writeConcern->wMode.empty()) {
+            secondaryThrottle = false;
+        }
+
+        builder.append("secondaryThrottle", secondaryThrottle);
+
+        if (secondaryThrottle && writeConcern) {
+            builder.append("writeConcern", writeConcern->toBSON());
+        }
+
+        builder.append("waitForDelete", waitForDelete);
+        builder.append(LiteParsedQuery::cmdOptionMaxTimeMS, maxTimeMS);
+
+        bool worked = fromconn->runCommand("admin", builder.done(), res);
         fromconn.done();
 
         LOG( worked ? 1 : 0 ) << "moveChunk result: " << res << endl;
@@ -447,7 +464,8 @@ namespace mongo {
                 _dataWritten = 0; // we're splitting, so should wait a bit
             }
 
-            bool shouldBalance = grid.shouldBalance( _manager->getns() );
+            const bool shouldBalance = grid.getConfigShouldBalance() &&
+                    grid.getCollShouldBalance(_manager->getns());
 
             log() << "autosplitted " << _manager->getns()
                   << " shard: " << toString()
@@ -486,11 +504,13 @@ namespace mongo {
                 log().stream() << "moving chunk (auto): " << toMove << " to: " << newLocation.toString() << endl;
 
                 BSONObj res;
+
+                WriteConcernOptions noThrottle;
                 massert( 10412 ,
                          str::stream() << "moveAndCommit failed: " << res ,
                          toMove->moveAndCommit( newLocation , 
                                                 MaxChunkSize , 
-                                                false , /* secondaryThrottle - small chunk, no need */
+                                                &noThrottle, /* secondaryThrottle */
                                                 false, /* waitForDelete - small chunk, no need */
                                                 0, /* maxTimeMS - don't time out */
                                                 res ) );
@@ -806,7 +826,7 @@ namespace mongo {
     {
 
         // Reset the max version, but not the epoch, when we aren't loading from the oldManager
-        _version = ChunkVersion( 0, _version.epoch() );
+        _version = ChunkVersion( 0, 0, _version.epoch() );
         set<ChunkVersion> minorVersions;
 
         // If we have a previous version of the ChunkManager to work from, use that info to reduce
@@ -872,7 +892,7 @@ namespace mongo {
             // Set all our data to empty
             chunkMap.clear();
             shardVersions.clear();
-            _version = ChunkVersion( 0, OID() );
+            _version = ChunkVersion( 0, 0, OID() );
 
             return true;
         }
@@ -896,7 +916,7 @@ namespace mongo {
             // Set all our data to empty to be extra safe
             chunkMap.clear();
             shardVersions.clear();
-            _version = ChunkVersion( 0, OID() );
+            _version = ChunkVersion( 0, 0, OID() );
 
             return allInconsistent;
         }
@@ -994,8 +1014,12 @@ namespace mongo {
         }
     }
 
-    bool ChunkManager::hasShardKey( const BSONObj& obj ) const {
-        return _key.hasShardKey( obj );
+    bool ChunkManager::hasShardKey(const BSONObj& doc) const {
+        return _key.hasShardKey(doc);
+    }
+
+    bool ChunkManager::hasTargetableShardKey(const BSONObj& doc) const {
+        return _key.hasTargetableShardKey(doc);
     }
 
     void ChunkManager::calcInitSplitsAndShards( const Shard& primary,
@@ -1106,7 +1130,7 @@ namespace mongo {
             }
         }
 
-        _version = ChunkVersion( 0, version.epoch() );
+        _version = ChunkVersion( 0, 0, version.epoch() );
     }
 
     ChunkPtr ChunkManager::findIntersectingChunk( const BSONObj& point ) const {
@@ -1332,7 +1356,7 @@ namespace mongo {
     bool ChunkManager::compatibleWith( const ChunkManager& other, const Shard& shard ) const {
         // Return true if the shard version is the same in the two chunk managers
         // TODO: This doesn't need to be so strong, just major vs
-        return other.getVersion( shard ).isEquivalentTo( getVersion( shard ) );
+        return other.getVersion( shard ).equals( getVersion( shard ) );
 
     }
 
@@ -1433,7 +1457,7 @@ namespace mongo {
 
             if ( ! setShardVersion( conn.conn(),
                                     _ns,
-                                    ChunkVersion( 0, OID() ),
+                                    ChunkVersion( 0, 0, OID() ),
                                     ChunkManagerPtr(),
                                     true, res ) )
             {

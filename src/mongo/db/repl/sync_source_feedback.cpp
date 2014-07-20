@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/sync_source_feedback.h"
 
 #include "mongo/client/constants.h"
@@ -38,16 +40,20 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/rs.h"  // theReplSet
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     // used in replAuthenticate
     static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
-    void SyncSourceFeedback::associateMember(const BSONObj& id, Member* member) {
+    void SyncSourceFeedback::associateMember(const OID& rid, Member* member) {
         invariant(member);
-        const OID rid = id["_id"].OID();
+        LOG(2) << "Associating RID " << rid << " with member: " << member->fullName();
         boost::unique_lock<boost::mutex> lock(_mtx);
         _handshakeNeeded = true;
         _members[rid] = member;
@@ -84,6 +90,7 @@ namespace repl {
                 _me = b.obj();
                 Helpers::putSingleton(&txn, "local.me", _me);
             }
+            ctx.commit();
             // _me is used outside of a read lock, so we must copy it out of the mmap
             _me = _me.getOwned();
         }
@@ -126,6 +133,8 @@ namespace repl {
                 ++it) {
             BSONObj res;
             try {
+                LOG(2) << "Sending to " << _connection.get()->toString() << " the replication "
+                        "handshake: " << *it;
                 if (!_connection->runCommand("admin", *it, res)) {
                     massert(17447, "upstream updater is not supported by the member from which we"
                             " are syncing, please update all nodes to 2.6 or later.",
@@ -176,7 +185,8 @@ namespace repl {
         if (ot > _slaveMap[rid]) {
             _slaveMap[rid] = ot;
             _positionChanged = true;
-            LOG(2) << "now last is " << _slaveMap[rid].toString() << endl;
+            LOG(2) << "Updating our knowledge of the replication progress for node with RID " <<
+                    rid << " to be at optime " << ot;
             _cond.notify_all();
         }
     }
@@ -193,6 +203,10 @@ namespace repl {
         OID myID = _me["_id"].OID();
         {
             boost::unique_lock<boost::mutex> lock(_mtx);
+            if (_handshakeNeeded) {
+                // Don't send updates if there are nodes that haven't yet been handshaked
+                return false;
+            }
             for (map<mongo::OID, OpTime>::const_iterator itr = _slaveMap.begin();
                     itr != _slaveMap.end(); ++itr) {
                 BSONObjBuilder entry(array.subobjStart());
@@ -210,6 +224,7 @@ namespace repl {
         array.done();
         BSONObj res;
 
+        LOG(2) << "Sending slave oplog progress to upstream updater: " << cmd.done();
         bool ok;
         try {
             ok = _connection->runCommand("admin", cmd.obj(), res);

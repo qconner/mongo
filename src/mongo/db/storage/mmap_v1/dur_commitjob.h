@@ -35,12 +35,9 @@
 #include "mongo/db/storage/mmap_v1/durop.h"
 #include "mongo/util/alignedbuilder.h"
 #include "mongo/util/concurrency/synchronization.h"
-#include "mongo/util/mongoutils/hash.h"
 
 namespace mongo {
     namespace dur {
-
-        void assertLockedForCommitting();
 
         /** Declaration of an intent to write to a region of a memory mapped view
          *  We store the end rather than the start pointer to make operator< faster
@@ -78,7 +75,7 @@ namespace mongo {
                @return true if already indicated.
             */
             bool checkAndSet(void* p, int len) {
-                unsigned x = mongoutils::hashPointer(p);
+                unsigned x = hashPointer(p);
                 std::pair<void*, int>& nd = nodes[x % N];
                 if( nd.first == p ) {
                     if( nd.second < len ) {
@@ -93,6 +90,15 @@ namespace mongo {
             }
         private:
             enum { N = Prime }; // this should be small the idea is that it fits in the cpu cache easily
+            static unsigned hashPointer(void *v) {
+                unsigned x = 0;
+                unsigned char *p = (unsigned char *) &v;
+                for( unsigned i = 0; i < sizeof(void*); i++ ) {
+                    x = x * 131 + p[i];
+                }
+                return x;
+            }
+
             std::pair<void*,int> nodes[N];
         };
 
@@ -136,7 +142,6 @@ namespace mongo {
             void note(void* p, int len);
 
             std::vector< shared_ptr<DurOp> >& ops() {
-                dassert( Lock::isLocked() );          // a rather weak check, we require more than that
                 groupCommitMutex.dassertLocked(); // this is what really makes the below safe
                 return _intentsAndDurOps._durOps;                
             }

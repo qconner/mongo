@@ -37,8 +37,6 @@
 
 namespace mongo {
 
-    const size_t QueryPlannerAnalysis::kMaxScansToExplode = 50;
-
     //
     // Helpers for bounds explosion AKA quick-and-dirty SERVER-1205.
     //
@@ -339,7 +337,7 @@ namespace mongo {
         }
 
         // Too many ixscans spoil the performance.
-        if (totalNumScans > QueryPlannerAnalysis::kMaxScansToExplode) {
+        if (totalNumScans > (size_t)internalQueryMaxScansToExplode) {
             QLOG() << "Could expand ixscans to pull out sort order but resulting scan count"
                    << "(" << totalNumScans << ") is too high.";
             return false;
@@ -548,8 +546,7 @@ namespace mongo {
 
         // Only these stages can produce flagged results.  A stage has to hold state past one call
         // to work(...) in order to possibly flag a result.
-        bool couldProduceFlagged = hasNode(solnRoot, STAGE_GEO_2D)
-                                || hasAndHashStage
+        bool couldProduceFlagged = hasAndHashStage
                                 || hasNode(solnRoot, STAGE_AND_SORTED)
                                 || hasNode(solnRoot, STAGE_FETCH);
 

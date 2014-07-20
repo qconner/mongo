@@ -85,8 +85,6 @@ namespace mongo {
 
         virtual bool hasOutOfMemoryException() = 0;
 
-        virtual void installBenchRun();
-
         virtual bool isKillPending() const = 0;
 
         virtual void gc() = 0;
@@ -258,5 +256,4 @@ namespace mongo {
     const char* jsSkipWhiteSpace(const char* raw);
 
     extern ScriptEngine* globalScriptEngine;
-    extern DBClientBase* directDBClient;
 }

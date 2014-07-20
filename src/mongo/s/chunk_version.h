@@ -68,10 +68,6 @@ namespace mongo {
             : _minor(minor),_major(major), _epoch(epoch) {
         }
 
-        ChunkVersion( unsigned long long ll, const OID& epoch )
-            : _combined( ll ), _epoch(epoch) {
-        }
-
         static ChunkVersion DROPPED() {
             return ChunkVersion( 0, 0, OID() ); // dropped OID is zero time, zero machineId/inc
         }
@@ -84,6 +80,12 @@ namespace mongo {
         static ChunkVersion IGNORED() {
             ChunkVersion version = ChunkVersion();
             version._epoch.init( 0, true ); // ignored OID is zero time, max machineId/inc
+            return version;
+        }
+
+        static ChunkVersion fromDeprecatedLong(unsigned long long num, const OID& epoch) {
+            ChunkVersion version(0, 0, epoch);
+            version._combined = num;
             return version;
         }
 
@@ -178,13 +180,13 @@ namespace mongo {
 
         // Can we write to this data and not have a problem?
         bool isWriteCompatibleWith( const ChunkVersion& otherVersion ) const {
-            if( ! hasCompatibleEpoch( otherVersion ) ) return false;
+            if( ! hasEqualEpoch( otherVersion ) ) return false;
             return otherVersion._major == _major;
         }
 
         // Is this the same version?
-        bool isEquivalentTo( const ChunkVersion& otherVersion ) const {
-            if( ! hasCompatibleEpoch( otherVersion ) ) return false;
+        bool equals( const ChunkVersion& otherVersion ) const {
+            if( ! hasEqualEpoch( otherVersion ) ) return false;
             return otherVersion._combined == _combined;
         }
 
@@ -214,14 +216,12 @@ namespace mongo {
         }
 
         // Is this in the same epoch?
-        bool hasCompatibleEpoch( const ChunkVersion& otherVersion ) const {
-            return hasCompatibleEpoch( otherVersion._epoch );
+        bool hasEqualEpoch( const ChunkVersion& otherVersion ) const {
+            return hasEqualEpoch( otherVersion._epoch );
         }
 
-        bool hasCompatibleEpoch( const OID& otherEpoch ) const {
-            // TODO : Change logic from eras are not-unequal to eras are equal
-            if( otherEpoch.isSet() && _epoch.isSet() && otherEpoch != _epoch ) return false;
-            return true;
+        bool hasEqualEpoch( const OID& otherEpoch ) const {
+            return _epoch == otherEpoch;
         }
 
         //
@@ -264,17 +264,13 @@ namespace mongo {
                 return ChunkVersion( 0, 0, el.OID() );
             }
 
-            if( el.isNumber() ){
-                return ChunkVersion( static_cast<unsigned long long>(el.numberLong()), OID() );
-            }
-
             if( type == Timestamp || type == Date ){
-                return ChunkVersion( el._numberLong(), OID() );
+                return fromDeprecatedLong( el._numberLong(), OID() );
             }
 
             *canParse = false;
 
-            return ChunkVersion( 0, OID() );
+            return ChunkVersion( 0, 0, OID() );
         }
 
         //

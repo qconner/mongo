@@ -29,7 +29,7 @@
  *    then also delete it in the license file.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/db/commands.h"
 
@@ -271,7 +271,7 @@ namespace mongo {
     void Command::logIfSlow( const Timer& timer, const string& msg ) {
         int ms = timer.millis();
         if (ms > serverGlobalParams.slowMS) {
-            out() << msg << " took " << ms << " ms." << endl;
+            log() << msg << " took " << ms << " ms." << endl;
         }
     }
 

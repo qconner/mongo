@@ -46,6 +46,7 @@ namespace mongo {
     class ChunkRange;
     class ChunkManager;
     class ChunkObjUnitTest;
+    struct WriteConcernOptions;
 
     typedef shared_ptr<const Chunk> ChunkPtr;
 
@@ -75,7 +76,7 @@ namespace mongo {
         // serialization support
         //
 
-        void serialize(BSONObjBuilder& to, ChunkVersion myLastMod=ChunkVersion(0,OID()));
+        void serialize(BSONObjBuilder& to, ChunkVersion myLastMod = ChunkVersion(0, 0, OID()));
 
         //
         // chunk boundary support
@@ -172,7 +173,7 @@ namespace mongo {
          *
          * @param to shard to move this chunk to
          * @param chunSize maximum number of bytes beyond which the migrate should no go trhough
-         * @param secondaryThrottle whether during migrate all writes should block for repl
+         * @param writeConcern detailed write concern. NULL means the default write concern.
          * @param waitForDelete whether chunk move should wait for cleanup or return immediately
          * @param maxTimeMS max time for the migrate request
          * @param res the object containing details about the migrate execution
@@ -180,7 +181,7 @@ namespace mongo {
          */
         bool moveAndCommit(const Shard& to,
                            long long chunkSize,
-                           bool secondaryThrottle,
+                           const WriteConcernOptions* writeConcern,
                            bool waitForDelete,
                            int maxTimeMS,
                            BSONObj& res) const;
@@ -376,7 +377,9 @@ namespace mongo {
 
         const ShardKeyPattern& getShardKey() const {  return _key; }
 
-        bool hasShardKey( const BSONObj& obj ) const;
+        bool hasShardKey(const BSONObj& doc) const;
+
+        bool hasTargetableShardKey(const BSONObj& doc) const;
 
         bool isUnique() const { return _unique; }
 

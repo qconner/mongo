@@ -57,7 +57,9 @@ namespace QueryMultiPlanRunner {
 
     class MultiPlanRunnerBase {
     public:
-        MultiPlanRunnerBase() { }
+        MultiPlanRunnerBase() : _client(&_txn) {
+
+        }
 
         virtual ~MultiPlanRunnerBase() {
             _client.dropCollection(ns());
@@ -82,19 +84,18 @@ namespace QueryMultiPlanRunner {
 
         static const char* ns() { return "unittests.QueryStageMultiPlanRunner"; }
 
-    private:
-        static DBDirectClient _client;
+    protected:
+        OperationContextImpl _txn;
+        DBDirectClient _client;
     };
 
-    DBDirectClient MultiPlanRunnerBase::_client;
 
     // Basic ranking test: collection scan vs. highly selective index scan.  Make sure we also get
     // all expected results out as well.
     class MPRCollectionScanVsHighlySelectiveIXScan : public MultiPlanRunnerBase {
     public:
         void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
+            Client::WriteContext ctx(&_txn, ns());
 
             const int N = 5000;
             for (int i = 0; i < N; ++i) {
@@ -107,22 +108,22 @@ namespace QueryMultiPlanRunner {
             // Every call to work() returns something so this should clearly win (by current scoring
             // at least).
             IndexScanParams ixparams;
-            ixparams.descriptor = getIndex(&txn, ctx.ctx().db(), BSON("foo" << 1));
+            ixparams.descriptor = getIndex(&_txn, ctx.ctx().db(), BSON("foo" << 1));
             ixparams.bounds.isSimpleRange = true;
             ixparams.bounds.startKey = BSON("" << 7);
             ixparams.bounds.endKey = BSON("" << 7);
             ixparams.bounds.endKeyInclusive = true;
             ixparams.direction = 1;
 
-            const Collection* coll = ctx.ctx().db()->getCollection(&txn, ns());
+            const Collection* coll = ctx.ctx().db()->getCollection(&_txn, ns());
 
             auto_ptr<WorkingSet> sharedWs(new WorkingSet());
-            IndexScan* ix = new IndexScan(ixparams, sharedWs.get(), NULL);
+            IndexScan* ix = new IndexScan(&_txn, ixparams, sharedWs.get(), NULL);
             auto_ptr<PlanStage> firstRoot(new FetchStage(sharedWs.get(), ix, NULL, coll));
 
             // Plan 1: CollScan with matcher.
             CollectionScanParams csparams;
-            csparams.collection = ctx.ctx().db()->getCollection( &txn, ns() );
+            csparams.collection = ctx.ctx().db()->getCollection( &_txn, ns() );
             csparams.direction = CollectionScanParams::FORWARD;
 
             // Make the filter.
@@ -131,7 +132,7 @@ namespace QueryMultiPlanRunner {
             verify(swme.isOK());
             auto_ptr<MatchExpression> filter(swme.getValue());
             // Make the stage.
-            auto_ptr<PlanStage> secondRoot(new CollectionScan(csparams, sharedWs.get(),
+            auto_ptr<PlanStage> secondRoot(new CollectionScan(&_txn, csparams, sharedWs.get(),
                                                               filter.get()));
 
             // Hand the plans off to the runner.
@@ -139,7 +140,7 @@ namespace QueryMultiPlanRunner {
             verify(CanonicalQuery::canonicalize(ns(), BSON("foo" << 7), &cq).isOK());
             verify(NULL != cq);
 
-            MultiPlanStage* mps = new MultiPlanStage(ctx.ctx().db()->getCollection(&txn, ns()),cq);
+            MultiPlanStage* mps = new MultiPlanStage(ctx.ctx().db()->getCollection(&_txn, ns()),cq);
             mps->addPlan(createQuerySolution(), firstRoot.release(), sharedWs.get());
             mps->addPlan(createQuerySolution(), secondRoot.release(), sharedWs.get());
 
@@ -149,7 +150,7 @@ namespace QueryMultiPlanRunner {
             ASSERT_EQUALS(0, mps->bestPlanIdx());
 
             SingleSolutionRunner sr(
-                ctx.ctx().db()->getCollection(&txn, ns()),
+                ctx.ctx().db()->getCollection(&_txn, ns()),
                 cq,
                 mps->bestSolution(),
                 mps,
@@ -163,6 +164,7 @@ namespace QueryMultiPlanRunner {
                 ASSERT_EQUALS(obj["foo"].numberInt(), 7);
                 ++results;
             }
+            ctx.commit();
 
             ASSERT_EQUALS(results, N / 10);
         }

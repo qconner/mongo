@@ -29,14 +29,16 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <boost/thread.hpp>
 
 #include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/d_concurrency.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/bits.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/mvar.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -45,6 +47,7 @@
 #include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/concurrency/qlock.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/log.h"
 #include "mongo/server.h"
 
 namespace mongo { 
@@ -52,6 +55,8 @@ namespace mongo {
 }
 
 namespace ThreadedTests {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     template <int nthreads_param=10>
     class ThreadedTest {
@@ -81,8 +86,13 @@ namespace ThreadedTests {
         }
     };
 
+
+#ifdef MONGO_PLATFORM_32
+    // Avoid OOM on Linux-32 by using fewer threads
+    const int nthr=45;
+#else
     const int nthr=135;
-    //const int nthr=7;
+#endif
     class MongoMutexTest : public ThreadedTest<nthr> {
 #if defined(_DEBUG)
         enum { N = 2000 };
@@ -103,7 +113,9 @@ namespace ThreadedTests {
                 // in _DEBUG builds on linux we mprotect each time a writelock
                 // is taken. That can greatly slow down this test if there are
                 // many open files
-                DBDirectClient db;
+                OperationContextImpl txn;
+                DBDirectClient db(&txn);
+
                 db.simpleCommand("admin", NULL, "closeAllDatabases");
             }
 
@@ -189,9 +201,9 @@ namespace ThreadedTests {
                             char what = 'r';
                             Lock::DBRead r(&lockState, "foo");
                             ASSERT(lockState.threadState() == what && lockState.isAtLeastReadLocked("foo"));
-                            ASSERT( !lockState.isNested() );
+                            ASSERT(!lockState.isRecursive());
                             Lock::DBRead r2(&lockState, "foo");
-                            ASSERT(lockState.isNested());
+                            ASSERT(lockState.isRecursive());
                             ASSERT(lockState.threadState() == what && lockState.isAtLeastReadLocked("foo"));
                             Lock::DBRead r3(&lockState, "local");
                             if( sometimes ) {
@@ -201,7 +213,7 @@ namespace ThreadedTests {
                             ASSERT(lockState.threadState() == what && lockState.isAtLeastReadLocked("local"));
                         }
                         else if( q == 1 ) {
-                            // test locking local only -- with no preceeding lock
+                            // test locking local only -- with no preceding lock
                             { 
                                 Lock::DBRead x(&lockState, "local");
                                 //Lock::DBRead y("q");
@@ -211,6 +223,7 @@ namespace ThreadedTests {
                             }
                             {
                                 Lock::DBWrite x(&lockState, "local");
+                                //  No actual writing here, so no WriteUnitOfWork
                                 if( sometimes ) {
                                     Lock::TempRelease t(&lockState);
                                 }

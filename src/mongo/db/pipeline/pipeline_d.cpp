@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2012 10gen Inc.
+ * Copyright (c) 2012-2014 MongoDB Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -34,7 +34,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_runner.h"
@@ -76,12 +75,13 @@ namespace {
 }
 
     boost::shared_ptr<Runner> PipelineD::prepareCursorSource(
+            OperationContext* txn,
             Collection* collection,
             const intrusive_ptr<Pipeline>& pPipeline,
             const intrusive_ptr<ExpressionContext>& pExpCtx) {
         // get the full "namespace" name
         const string& fullName = pExpCtx->ns.ns();
-        Lock::assertAtLeastReadLocked(fullName);
+        pExpCtx->opCtx->lockState()->assertAtLeastReadLocked(fullName);
 
         // We will be modifying the source vector as we go
         Pipeline::SourceContainer& sources = pPipeline->sources;
@@ -179,7 +179,7 @@ namespace {
                                              &cq,
                                              whereCallback);
             Runner* rawRunner;
-            if (status.isOK() && getRunner(collection, cq, &rawRunner, runnerOptions).isOK()) {
+            if (status.isOK() && getRunner(txn, collection, cq, &rawRunner, runnerOptions).isOK()) {
                 // success: The Runner will handle sorting for us using an index.
                 runner.reset(rawRunner);
                 sortInRunner = true;
@@ -204,7 +204,7 @@ namespace {
                                              whereCallback));
 
             Runner* rawRunner;
-            uassertStatusOK(getRunner(collection, cq, &rawRunner, runnerOptions));
+            uassertStatusOK(getRunner(txn, collection, cq, &rawRunner, runnerOptions));
             runner.reset(rawRunner);
         }
 

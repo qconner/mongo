@@ -1,7 +1,7 @@
 // documentsourcetests.cpp : Unit tests for DocumentSource classes.
 
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2012-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -178,7 +178,7 @@ namespace DocumentSourceTests {
                 CanonicalQuery* cq;
                 uassertStatusOK(CanonicalQuery::canonicalize(ns, /*query=*/BSONObj(), &cq));
                 Runner* runnerBare;
-                uassertStatusOK(getRunner(ctx.ctx().db()->getCollection(&_opCtx, ns), cq, &runnerBare));
+                uassertStatusOK(getRunner(&_opCtx, ctx.ctx().db()->getCollection(&_opCtx, ns), cq, &runnerBare));
 
                 _runner.reset(runnerBare);
                 _runner->saveState();
@@ -295,36 +295,6 @@ namespace DocumentSourceTests {
             mutable boost::condition _condition;
         };
 
-        /** A writer client will be registered for the lifetime of an object of this class. */
-        class WriterClientScope {
-        public:
-            WriterClientScope() :
-            _state( Initial ),
-            _dummyWriter( stdx::bind( &WriterClientScope::runDummyWriter, this ) ) {
-                _state.await( Ready );
-            }
-            ~WriterClientScope() {
-                // Terminate the writer thread even on exception.
-                _state.set( Finished );
-                DESTRUCTOR_GUARD( _dummyWriter.join() );
-            }
-        private:
-            enum State {
-                Initial,
-                Ready,
-                Finished
-            };
-            void runDummyWriter() {
-                Client::initThread( "dummy writer" );
-                scoped_ptr<Acquiring> a( new Acquiring( 0 , cc().lockState() ) );
-                _state.set( Ready );
-                _state.await( Finished );
-                a.reset(0);
-                cc().shutdown();
-            }
-            PendingValue _state;
-            boost::thread _dummyWriter;
-        };
 
         /** Test coalescing a limit into a cursor */
         class LimitCoalesce : public Base {

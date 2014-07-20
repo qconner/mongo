@@ -53,6 +53,16 @@ namespace mongo {
     */
     class OID {
     public:
+
+        /**
+         * Functor compatible with std::hash for std::unordered_{map,set}
+         * Warning: The hash function is subject to change. Do not use in cases where hashes need
+         *          to be consistent across versions.
+         */
+        struct Hasher {
+            size_t operator() (const OID& oid) const;
+        };
+
         OID() : a(0), b(0) { }
 
         enum {
@@ -170,7 +180,5 @@ namespace mongo {
         /** Javascript JSON compatible */
         JS
     };
-
-     std::ostream& operator<<( std::ostream &s, const OID &o );
 
 }

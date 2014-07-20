@@ -56,7 +56,6 @@
 
 using namespace std;
 using namespace mongo;
-using namespace bson;
 
 int dummy;
 unsigned recSizeKB;
@@ -121,7 +120,7 @@ void workerThread() {
             }
             if( w ) {
                 for( unsigned p = P; p <= recSizeKB; p += P ) {
-                    if( rofs < len ) 
+                    if( wofs < len )
                         mmf[wofs] = 3;
                     wofs += PG;
                 }
@@ -200,7 +199,7 @@ void go() {
 
     cout << "testing..."<< endl;
 
-    cout << "optoins:" << o.toString() << endl;
+    cout << "options:" << o.toString() << endl;
     unsigned wthr = 1;
     if( !o["nThreads"].eoo() ) {
         wthr = (unsigned) o["nThreads"].Int();

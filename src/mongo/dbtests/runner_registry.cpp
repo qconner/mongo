@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -40,7 +40,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/single_solution_runner.h"
 #include "mongo/dbtests/dbtests.h"
@@ -50,12 +49,20 @@ namespace RunnerRegistry {
 
     class RunnerRegistryBase {
     public:
-        RunnerRegistryBase() {
+        RunnerRegistryBase()
+            : _client(&_opCtx)
+        {
             _ctx.reset(new Client::WriteContext(&_opCtx, ns()));
             _client.dropCollection(ns());
 
             for (int i = 0; i < N(); ++i) {
                 _client.insert(ns(), BSON("foo" << i));
+            }
+        }
+
+        ~RunnerRegistryBase() {
+            if (_ctx.get()) {
+                _ctx->commit();
             }
         }
 
@@ -68,7 +75,7 @@ namespace RunnerRegistry {
             params.collection = collection();
             params.direction = CollectionScanParams::FORWARD;
             params.tailable = false;
-            auto_ptr<CollectionScan> scan(new CollectionScan(params, ws.get(), NULL));
+            auto_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, ws.get(), NULL));
 
             // Create a runner to hold it
             CanonicalQuery* cq;
@@ -95,12 +102,13 @@ namespace RunnerRegistry {
         }
 
         static const char* ns() { return "unittests.RunnerRegistryDiskLocInvalidation"; }
-        static DBDirectClient _client;
-        auto_ptr<Client::WriteContext> _ctx;
+
+        // Order of these is important for initialization
         OperationContextImpl _opCtx;
+        auto_ptr<Client::WriteContext> _ctx;
+        DBDirectClient _client;
     };
 
-    DBDirectClient RunnerRegistryBase::_client;
 
     // Test that a registered runner receives invalidation notifications.
     class RunnerRegistryDiskLocInvalid : public RunnerRegistryBase {
@@ -268,6 +276,7 @@ namespace RunnerRegistry {
 
             // Drop a DB that's not ours.  We can't have a lock at all to do this as dropping a DB
             // requires a "global write lock."
+            _ctx->commit();
             _ctx.reset();
             _client.dropDatabase("somesillydb");
             _ctx.reset(new Client::WriteContext(&_opCtx, ns()));
@@ -284,6 +293,7 @@ namespace RunnerRegistry {
             registerRunner(run.get());
 
             // Drop our DB.  Once again, must give up the lock.
+            _ctx->commit();
             _ctx.reset();
             _client.dropDatabase("unittests");
             _ctx.reset(new Client::WriteContext(&_opCtx, ns()));
@@ -291,6 +301,8 @@ namespace RunnerRegistry {
             // Unregister and restore state.
             deregisterRunner(run.get());
             run->restoreState(&_opCtx);
+            _ctx->commit();
+            _ctx.reset();
 
             // Runner was killed.
             ASSERT_EQUALS(Runner::RUNNER_DEAD, run->getNext(&obj, NULL));

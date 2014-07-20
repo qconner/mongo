@@ -1,7 +1,7 @@
 // find_and_modify.cpp
 
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2012-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/commands/find_and_modify.h"
 
@@ -42,8 +42,11 @@
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     /* Find and Modify an object returning either the old (default) or new value*/
     class CmdFindAndModify : public Command {
@@ -94,7 +97,7 @@ namespace mongo {
             }
 
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(ns);
+            Client::Context ctx(txn, ns);
             
             return runNoDirectClient( txn, ns , 
                                       query , fields , update , 
@@ -134,7 +137,9 @@ namespace mongo {
                                       string& errmsg) {
 
             Lock::DBWrite lk(txn->lockState(), ns);
-            Client::Context cx( ns );
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            Client::Context cx(txn, ns);
+            
             Collection* collection = cx.db()->getCollection( txn, ns );
 
             const WhereCallbackReal whereCallback = WhereCallbackReal(StringData(ns));
@@ -148,7 +153,7 @@ namespace mongo {
 
                 Runner* rawRunner;
                 massert(17384, "Could not get runner for query " + queryOriginal.toString(),
-                        getRunner(collection, cq, &rawRunner, QueryPlannerParams::DEFAULT).isOK());
+                        getRunner(txn, collection, cq, &rawRunner, QueryPlannerParams::DEFAULT).isOK());
 
                 auto_ptr<Runner> runner(rawRunner);
 
@@ -297,7 +302,7 @@ namespace mongo {
                     
                 }
             }
-            
+            wunit.commit();
             return true;
         }
         
@@ -330,7 +335,8 @@ namespace mongo {
             }
 
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(ns);
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            Client::Context ctx(txn, ns);
 
             BSONObj out = db.findOne(ns, q, fields);
             if (out.isEmpty()) {
@@ -423,9 +429,9 @@ namespace mongo {
 
             result.append("value", out);
 
+            wunit.commit();
             return true;
         }
     } cmdFindAndModify;
-
 
 }

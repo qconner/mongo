@@ -36,12 +36,43 @@
 namespace mongo {
 
     PlanExecutor::PlanExecutor(WorkingSet* ws, PlanStage* rt, const Collection* collection)
-        : _collection(collection), _workingSet(ws), _root(rt), _killed(false) {}
+        : _collection(collection),
+          _cq(NULL),
+          _workingSet(ws),
+          _qs(NULL),
+          _root(rt),
+          _killed(false) { }
+
+    PlanExecutor::PlanExecutor(WorkingSet* ws, PlanStage* rt, CanonicalQuery* cq,
+                               const Collection* collection)
+        : _collection(collection),
+          _cq(cq),
+          _workingSet(ws),
+          _qs(NULL),
+          _root(rt),
+          _killed(false) { }
+
+    PlanExecutor::PlanExecutor(WorkingSet* ws, PlanStage* rt, QuerySolution* qs,
+                               CanonicalQuery* cq, const Collection* collection)
+        : _collection(collection),
+          _cq(cq),
+          _workingSet(ws),
+          _qs(qs),
+          _root(rt),
+          _killed(false) { }
 
     PlanExecutor::~PlanExecutor() { }
 
-    WorkingSet* PlanExecutor::getWorkingSet() {
+    WorkingSet* PlanExecutor::getWorkingSet() const {
         return _workingSet.get();
+    }
+
+    PlanStage* PlanExecutor::getStages() const {
+        return _root.get();
+    }
+
+    CanonicalQuery* PlanExecutor::getCanonicalQuery() const {
+        return _cq.get();
     }
 
     PlanStageStats* PlanExecutor::getStats() const {
@@ -141,6 +172,23 @@ namespace mongo {
 
     void PlanExecutor::kill() {
         _killed = true;
+    }
+
+    Status PlanExecutor::executePlan() {
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        PlanStage::StageState code = PlanStage::NEED_TIME;
+        while (PlanStage::NEED_TIME == code || PlanStage::ADVANCED == code) {
+            code = _root->work(&id);
+        }
+
+        if (PlanStage::FAILURE == code) {
+            BSONObj obj;
+            WorkingSetCommon::getStatusMemberObject(*_workingSet, id, &obj);
+            return Status(ErrorCodes::BadValue,
+                          "Exec error: " + WorkingSetCommon::toStatusString(obj));
+        }
+
+        return Status::OK();
     }
 
 } // namespace mongo

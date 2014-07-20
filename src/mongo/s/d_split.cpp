@@ -1,7 +1,7 @@
 // @file  d_split.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +28,7 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <map>
 #include <string>
@@ -54,10 +54,12 @@
 #include "mongo/s/d_logic.h"
 #include "mongo/s/distlock.h"
 #include "mongo/s/type_chunk.h"
+#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     class CmdMedianKey : public Command {
     public:
@@ -144,7 +146,7 @@ namespace mongo {
                 max = Helpers::toKeyFormat( kp.extendRangeBound( max, false ) );
             }
 
-            auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, idx, min, max,
+            auto_ptr<Runner> runner(InternalPlanner::indexScan(txn, collection, idx, min, max,
                                                                false, InternalPlanner::FORWARD));
 
             // Find the 'missingField' value used to represent a missing document field in a key of
@@ -375,7 +377,7 @@ namespace mongo {
                 long long currCount = 0;
                 long long numChunks = 0;
                 
-                auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, idx, min, max,
+                auto_ptr<Runner> runner(InternalPlanner::indexScan(txn, collection, idx, min, max,
                     false, InternalPlanner::FORWARD));
 
                 BSONObj currKey;
@@ -433,7 +435,7 @@ namespace mongo {
                     currCount = 0;
                     log() << "splitVector doing another cycle because of force, keyCount now: " << keyCount << endl;
 
-                    runner.reset(InternalPlanner::indexScan(collection, idx, min, max,
+                    runner.reset(InternalPlanner::indexScan(txn, collection, idx, min, max,
                                                             false, InternalPlanner::FORWARD));
 
                     state = runner->getNext(&currKey, NULL);
@@ -825,7 +827,7 @@ namespace mongo {
             
             {
                 Lock::DBWrite writeLk(txn->lockState(), ns);
-                shardingState.splitChunk( ns , min , max , splitKeys , maxVersion );
+                shardingState.splitChunk(txn, ns, min, max, splitKeys, maxVersion);
             }
 
             //
@@ -877,7 +879,7 @@ namespace mongo {
                     BSONObj newmin = Helpers::toKeyFormat( kp.extendRangeBound( chunk.min, false) );
                     BSONObj newmax = Helpers::toKeyFormat( kp.extendRangeBound( chunk.max, false) );
 
-                    auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, idx,
+                    auto_ptr<Runner> runner(InternalPlanner::indexScan(txn, collection, idx,
                                                                        newmin, newmax, false));
 
                     // check if exactly one document found

@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,7 +36,7 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/structure/btree/btree_interface.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo {
 
@@ -48,7 +48,7 @@ namespace mongo {
          */
         BtreeBasedBulkAccessMethod(OperationContext* txn,
                                    BtreeBasedAccessMethod* real,
-                                   BtreeInterface* interface,
+                                   SortedDataInterface* interface,
                                    const IndexDescriptor* descriptor);
 
         ~BtreeBasedBulkAccessMethod() {}
@@ -75,7 +75,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        virtual Status touch(const BSONObj& obj) {
+        virtual Status touch(OperationContext* txn, const BSONObj& obj) {
             return _notAllowed();
         }
 
@@ -83,7 +83,7 @@ namespace mongo {
             return _notAllowed();
         }
 
-        virtual Status validate(int64_t* numKeys) {
+        virtual Status validate(OperationContext* txn, int64_t* numKeys) {
             return _notAllowed();
         }
 
@@ -95,7 +95,8 @@ namespace mongo {
             return _notAllowed();
         }
 
-        virtual Status validateUpdate(const BSONObj& from,
+        virtual Status validateUpdate(OperationContext* txn,
+                                      const BSONObj& from,
                                       const BSONObj& to,
                                       const DiskLoc& loc,
                                       const InsertDeleteOptions& options,
@@ -109,7 +110,9 @@ namespace mongo {
             return _notAllowed();
         }
 
-        virtual Status newCursor(IndexCursor **out) const {
+        virtual Status newCursor(OperationContext*txn,
+                                 const CursorOptions& opts,
+                                 IndexCursor** out) const {
             return _notAllowed();
         }
 
@@ -132,7 +135,7 @@ namespace mongo {
         BtreeBasedAccessMethod* _real;
 
         // Not owned here.
-        BtreeInterface* _interface;
+        SortedDataInterface* _interface;
 
         // The external sorter.
         boost::scoped_ptr<BSONObjExternalSorter> _sorter;

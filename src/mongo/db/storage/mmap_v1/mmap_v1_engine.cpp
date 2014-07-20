@@ -30,310 +30,360 @@
 
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
 
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/index/2d_access_method.h"
-#include "mongo/db/index/btree_access_method.h"
-#include "mongo/db/index/btree_based_access_method.h"
-#include "mongo/db/index/fts_access_method.h"
-#include "mongo/db/index/hash_access_method.h"
-#include "mongo/db/index/haystack_access_method.h"
-#include "mongo/db/index/s2_access_method.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/structure/catalog/namespace_details_collection_entry.h"
-#include "mongo/db/structure/catalog/namespace_details_rsv1_metadata.h"
-#include "mongo/db/structure/record_store_v1_capped.h"
-#include "mongo/db/structure/record_store_v1_simple.h"
+#include <boost/filesystem/path.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <fstream>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <sys/file.h>
+#endif
+
+#include "mongo/db/mongod_options.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/storage/mmap_v1/dur_commitjob.h"
+#include "mongo/db/storage/mmap_v1/dur_journal.h"
+#include "mongo/db/storage/mmap_v1/dur_recover.h"
+#include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/platform/process_id.h"
+#include "mongo/util/file_allocator.h"
+#include "mongo/util/mmap.h"
 
 namespace mongo {
 
-    MONGO_EXPORT_SERVER_PARAMETER(newCollectionsUsePowerOf2Sizes, bool, true);
+namespace {
+#ifdef _WIN32
+    HANDLE lockFileHandle;
+#endif
 
-    MMAP1DatabaseCatalogEntry::MMAP1DatabaseCatalogEntry( OperationContext* txn,
-                                                          const StringData& name,
-                                                          const StringData& path,
-                                                          bool directoryPerDB )
-        : DatabaseCatalogEntry( name ),
-          _path( path.toString() ),
-          _extentManager( name, path, directoryPerDB ),
-          _namespaceIndex( _path, name.toString() ) {
+    // This is used by everyone, including windows.
+    int lockFile = 0;
 
-        try {
-            _checkDuplicateUncasedNames();
+#if !defined(__sunos__)
+    void writePid(int fd) {
+        stringstream ss;
+        ss << ProcessId::getCurrent() << endl;
+        string s = ss.str();
+        const char * data = s.c_str();
+#ifdef _WIN32
+        verify( _write( fd, data, strlen( data ) ) );
+#else
+        verify( write( fd, data, strlen( data ) ) );
+#endif
+    }
 
-            Status s = _extentManager.init(txn);
-            if ( !s.isOK() ) {
-                msgasserted( 16966, str::stream() << "_extentManager.init failed: " << s.toString() );
+    // if doingRepair is true don't consider unclean shutdown an error
+    void acquirePathLock(MMAPV1Engine* storageEngine, bool doingRepair) {
+        string name = (boost::filesystem::path(storageGlobalParams.dbpath) / "mongod.lock").string();
+
+        bool oldFile = false;
+
+        if ( boost::filesystem::exists( name ) && boost::filesystem::file_size( name ) > 0 ) {
+            oldFile = true;
+        }
+
+#ifdef _WIN32
+        lockFileHandle = CreateFileA( name.c_str(), GENERIC_READ | GENERIC_WRITE,
+            0 /* do not allow anyone else access */, NULL, 
+            OPEN_ALWAYS /* success if fh can open */, 0, NULL );
+
+        if (lockFileHandle == INVALID_HANDLE_VALUE) {
+            DWORD code = GetLastError();
+            char *msg;
+            FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
+                NULL, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                (LPSTR)&msg, 0, NULL);
+            string m = msg;
+            str::stripTrailing(m, "\r\n");
+            uasserted(ErrorCodes::DBPathInUse,
+                      str::stream() << "Unable to create/open lock file: "
+                                    << name << ' ' << m
+                                    << ". Is a mongod instance already running?");
+        }
+        lockFile = _open_osfhandle((intptr_t)lockFileHandle, 0);
+#else
+        lockFile = open( name.c_str(), O_RDWR | O_CREAT , S_IRWXU | S_IRWXG | S_IRWXO );
+        if( lockFile <= 0 ) {
+            uasserted( ErrorCodes::DBPathInUse,
+                       str::stream() << "Unable to create/open lock file: "
+                                     << name << ' ' << errnoWithDescription()
+                                     << " Is a mongod instance already running?" );
+        }
+        if (flock( lockFile, LOCK_EX | LOCK_NB ) != 0) {
+            close ( lockFile );
+            lockFile = 0;
+            uasserted(ErrorCodes::DBPathInUse,
+                      "Unable to lock file: " + name + ". Is a mongod instance already running?");
+        }
+#endif
+
+        if ( oldFile ) {
+            // we check this here because we want to see if we can get the lock
+            // if we can't, then its probably just another mongod running
+            
+            string errmsg;
+            if (doingRepair && dur::haveJournalFiles()) {
+                errmsg = "************** \n"
+                         "You specified --repair but there are dirty journal files. Please\n"
+                         "restart without --repair to allow the journal files to be replayed.\n"
+                         "If you wish to repair all databases, please shutdown cleanly and\n"
+                         "run with --repair again.\n"
+                         "**************";
             }
+            else if (storageGlobalParams.dur) {
+                if (!dur::haveJournalFiles(/*anyFiles=*/true)) {
+                    // Passing anyFiles=true as we are trying to protect against starting in an
+                    // unclean state with the journal directory unmounted. If there are any files,
+                    // even prealloc files, then it means that it is mounted so we can continue.
+                    // Previously there was an issue (SERVER-5056) where we would fail to start up
+                    // if killed during prealloc.
 
-            // If already exists, open.  Otherwise behave as if empty until
-            // there's a write, then open.
+                    vector<string> dbnames;
+                    storageEngine->listDatabases( &dbnames );
 
-            if ( _namespaceIndex.pathExists() ) {
-                _namespaceIndex.init( txn );
-
-                // upgrade freelist
-                NamespaceString oldFreeList( name, "$freelist" );
-                NamespaceDetails* details = _namespaceIndex.details( oldFreeList.ns() );
-                if ( details ) {
-                    if ( !details->firstExtent.isNull() ) {
-                        _extentManager.freeExtents(txn,
-                                                   details->firstExtent,
-                                                   details->lastExtent);
+                    if ( dbnames.size() == 0 ) {
+                        // this means that mongod crashed
+                        // between initial startup and when journaling was initialized
+                        // it is safe to continue
                     }
-                    _namespaceIndex.kill_ns( txn, oldFreeList.ns() );
+                    else {
+                        errmsg = str::stream()
+                            << "************** \n"
+                            << "old lock file: " << name << ".  probably means unclean shutdown,\n"
+                            << "but there are no journal files to recover.\n"
+                            << "this is likely human error or filesystem corruption.\n"
+                            << "please make sure that your journal directory is mounted.\n"
+                            << "found " << dbnames.size() << " dbs.\n"
+                            << "see: http://dochub.mongodb.org/core/repair for more information\n"
+                            << "*************";
+                    }
+
                 }
-            }
-        }
-        catch(std::exception& e) {
-            log() << "warning database " << path << " " << name << " could not be opened";
-            DBException* dbe = dynamic_cast<DBException*>(&e);
-            if ( dbe != 0 ) {
-                log() << "DBException " << dbe->getCode() << ": " << e.what() << endl;
             }
             else {
-                log() << e.what() << endl;
-            }
-            _extentManager.reset();
-            throw;
-        }
-
-
-    }
-
-    MMAP1DatabaseCatalogEntry::~MMAP1DatabaseCatalogEntry() {
-    }
-
-    void MMAP1DatabaseCatalogEntry::getCollectionNamespaces( std::list<std::string>* tofill ) const {
-        _namespaceIndex.getCollectionNamespaces( tofill );
-    }
-
-    void MMAP1DatabaseCatalogEntry::_checkDuplicateUncasedNames() const {
-        string duplicate = Database::duplicateUncasedName(name(), _path);
-        if ( !duplicate.empty() ) {
-            stringstream ss;
-            ss << "db already exists with different case already have: [" << duplicate
-               << "] trying to create [" << name() << "]";
-            uasserted( DatabaseDifferCaseCode , ss.str() );
-        }
-    }
-
-    namespace {
-        int _massageExtentSize( const ExtentManager* em, long long size ) {
-            if ( size < em->minSize() )
-                return em->minSize();
-            if ( size > em->maxSize() )
-                return em->maxSize();
-            return static_cast<int>( size );
-        }
-    }
-
-    Status MMAP1DatabaseCatalogEntry::createCollection( OperationContext* txn,
-                                                        const StringData& ns,
-                                                        const CollectionOptions& options,
-                                                        bool allocateDefaultSpace ) {
-        _namespaceIndex.init( txn );
-
-        if ( _namespaceIndex.details( ns ) ) {
-            return Status( ErrorCodes::NamespaceExists,
-                           str::stream() << "namespace already exists: " << ns );
-        }
-
-        BSONObj optionsAsBSON = options.toBSON();
-        _addNamespaceToNamespaceCollection( txn, ns, &optionsAsBSON );
-
-        _namespaceIndex.add_ns( txn, ns, DiskLoc(), options.capped );
-
-        // allocation strategy set explicitly in flags or by server-wide default
-        if ( !options.capped ) {
-            NamespaceDetailsRSV1MetaData md( ns,
-                                             _namespaceIndex.details( ns ),
-                                             _getNamespaceRecordStore( txn, ns ) );
-
-            if ( options.flagsSet ) {
-                md.setUserFlag( txn, options.flags );
-            }
-            else if ( newCollectionsUsePowerOf2Sizes ) {
-                md.setUserFlag( txn, NamespaceDetails::Flag_UsePowerOf2Sizes );
-            }
-        }
-        else if ( options.cappedMaxDocs > 0 ) {
-            txn->recoveryUnit()->writingInt( _namespaceIndex.details( ns )->maxDocsInCapped ) =
-                options.cappedMaxDocs;
-        }
-
-        if ( allocateDefaultSpace ) {
-            scoped_ptr<RecordStoreV1Base> rs( _getRecordStore( txn, ns ) );
-            if ( options.initialNumExtents > 0 ) {
-                int size = _massageExtentSize( &_extentManager, options.cappedSize );
-                for ( int i = 0; i < options.initialNumExtents; i++ ) {
-                    rs->increaseStorageSize( txn, size, -1 );
+                if (!dur::haveJournalFiles() && !doingRepair) {
+                    errmsg = str::stream()
+                             << "************** \n"
+                             << "Unclean shutdown detected.\n"
+                             << "Please visit http://dochub.mongodb.org/core/repair for recovery instructions.\n"
+                             << "*************";
                 }
             }
-            else if ( !options.initialExtentSizes.empty() ) {
-                for ( size_t i = 0; i < options.initialExtentSizes.size(); i++ ) {
-                    int size = options.initialExtentSizes[i];
-                    size = _massageExtentSize( &_extentManager, size );
-                    rs->increaseStorageSize( txn, size, -1 );
+
+            if (!errmsg.empty()) {
+                log() << errmsg << endl;
+#ifdef _WIN32
+                CloseHandle( lockFileHandle );
+#else
+                close ( lockFile );
+#endif
+                lockFile = 0;
+                uassert( 12596 , "old lock file" , 0 );
+            }
+        }
+
+        // Not related to lock file, but this is where we handle unclean shutdown
+        if (!storageGlobalParams.dur && dur::haveJournalFiles()) {
+            log() << "**************" << endl;
+            log() << "Error: journal files are present in journal directory, yet starting without journaling enabled." << endl;
+            log() << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
+            log() << "**************" << endl;
+            uasserted(13597, "can't start without --journal enabled when journal/ files are present");
+        }
+
+#ifdef _WIN32
+        uassert( 13625, "Unable to truncate lock file", _chsize(lockFile, 0) == 0);
+        writePid( lockFile );
+        _commit( lockFile );
+#else
+        uassert( 13342, "Unable to truncate lock file", ftruncate(lockFile, 0) == 0);
+        writePid( lockFile );
+        fsync( lockFile );
+        flushMyDirectory(name);
+#endif
+    }
+#else
+    void acquirePathLock(MMAPV1Engine* storageEngine, bool) {
+        // TODO - this is very bad that the code above not running here.
+
+        // Not related to lock file, but this is where we handle unclean shutdown
+        if (!storageGlobalParams.dur && dur::haveJournalFiles()) {
+            log() << "**************" << endl;
+            log() << "Error: journal files are present in journal directory, yet starting without --journal enabled." << endl;
+            log() << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
+            log() << "Alternatively (not recommended), you can backup everything, then delete the journal files, and run --repair" << endl;
+            log() << "**************" << endl;
+            uasserted(13618, "can't start without --journal enabled when journal/ files are present");
+        }
+    }
+#endif
+
+
+    /// warn if readahead > 256KB (gridfs chunk size)
+    void checkReadAhead(const string& dir) {
+#ifdef __linux__
+        try {
+            const dev_t dev = getPartition(dir);
+
+            // This path handles the case where the filesystem uses the whole device (including LVM)
+            string path = str::stream() <<
+                "/sys/dev/block/" << major(dev) << ':' << minor(dev) << "/queue/read_ahead_kb";
+
+            if (!boost::filesystem::exists(path)){
+                // This path handles the case where the filesystem is on a partition.
+                path = str::stream()
+                    << "/sys/dev/block/" << major(dev) << ':' << minor(dev) // this is a symlink
+                    << "/.." // parent directory of a partition is for the whole device
+                    << "/queue/read_ahead_kb";
+            }
+
+            if (boost::filesystem::exists(path)) {
+                ifstream file (path.c_str());
+                if (file.is_open()) {
+                    int kb;
+                    file >> kb;
+                    if (kb > 256) {
+                        log() << startupWarningsLog;
+
+                        log() << "** WARNING: Readahead for " << dir << " is set to " << kb << "KB"
+                                << startupWarningsLog;
+
+                        log() << "**          We suggest setting it to 256KB (512 sectors) or less"
+                                << startupWarningsLog;
+
+                        log() << "**          http://dochub.mongodb.org/core/readahead"
+                                << startupWarningsLog;
+                    }
                 }
             }
-            else if ( options.capped ) {
-                // normal
-                do {
-                    // Must do this at least once, otherwise we leave the collection with no
-                    // extents, which is invalid.
-                    int sz = _massageExtentSize( &_extentManager,
-                                                 options.cappedSize - rs->storageSize() );
-                    sz &= 0xffffff00;
-                    rs->increaseStorageSize( txn, sz, -1 );
-                } while( rs->storageSize() < options.cappedSize );
+        }
+        catch (const std::exception& e) {
+            log() << "unable to validate readahead settings due to error: " << e.what()
+                  << startupWarningsLog;
+            log() << "for more information, see http://dochub.mongodb.org/core/readahead"
+                  << startupWarningsLog;
+        }
+#endif // __linux__
+    }
+
+    // This is unrelated to the _tmp directory in dbpath.
+    void clearTmpFiles() {
+        boost::filesystem::path path(storageGlobalParams.dbpath);
+        for ( boost::filesystem::directory_iterator i( path );
+                i != boost::filesystem::directory_iterator(); ++i ) {
+            string fileName = boost::filesystem::path(*i).leaf().string();
+            if ( boost::filesystem::is_directory( *i ) &&
+                    fileName.length() && fileName[ 0 ] == '$' )
+                boost::filesystem::remove_all( *i );
+        }
+    }
+} // namespace
+
+    MMAPV1Engine::MMAPV1Engine() {
+        // TODO check non-journal subdirs if using directory-per-db
+        checkReadAhead(storageGlobalParams.dbpath);
+
+        acquirePathLock(this, storageGlobalParams.repair);
+
+        FileAllocator::get()->start();
+
+        MONGO_ASSERT_ON_EXCEPTION_WITH_MSG( clearTmpFiles(), "clear tmp files" );
+
+        // dur::startup() depends on globalStorageEngine being set before calling.
+        // TODO clean up dur::startup() so this isn't needed.
+        invariant(!globalStorageEngine);
+        globalStorageEngine = this;
+
+        dur::startup();
+    }
+
+    MMAPV1Engine::~MMAPV1Engine() {
+    }
+
+    RecoveryUnit* MMAPV1Engine::newRecoveryUnit( OperationContext* opCtx ) {
+        return new DurRecoveryUnit( opCtx );
+    }
+
+    void MMAPV1Engine::listDatabases( std::vector<std::string>* out ) const {
+        _listDatabases( storageGlobalParams.dbpath, out );
+    }
+
+    DatabaseCatalogEntry* MMAPV1Engine::getDatabaseCatalogEntry( OperationContext* opCtx,
+                                                                 const StringData& db ) {
+        return new MMAPV1DatabaseCatalogEntry( opCtx,
+                                               db,
+                                               storageGlobalParams.dbpath,
+                                               storageGlobalParams.directoryperdb,
+                                               false );
+    }
+
+    void MMAPV1Engine::_listDatabases( const std::string& directory,
+                                       std::vector<std::string>* out ) {
+        boost::filesystem::path path( directory );
+        for ( boost::filesystem::directory_iterator i( path );
+              i != boost::filesystem::directory_iterator();
+              ++i ) {
+            if (storageGlobalParams.directoryperdb) {
+                boost::filesystem::path p = *i;
+                string dbName = p.leaf().string();
+                p /= ( dbName + ".ns" );
+                if ( exists( p ) )
+                    out->push_back( dbName );
             }
             else {
-                rs->increaseStorageSize( txn, _extentManager.initialSize( 128 ), -1 );
+                string fileName = boost::filesystem::path(*i).leaf().string();
+                if ( fileName.length() > 3 && fileName.substr( fileName.length() - 3, 3 ) == ".ns" )
+                    out->push_back( fileName.substr( 0, fileName.length() - 3 ) );
             }
         }
-
-        return Status::OK();
     }
 
-    CollectionCatalogEntry* MMAP1DatabaseCatalogEntry::getCollectionCatalogEntry( OperationContext* txn,
-                                                                                  const StringData& ns ) {
-        NamespaceDetails* details = _namespaceIndex.details( ns );
-        if ( !details ) {
-            return NULL;
+    int MMAPV1Engine::flushAllFiles( bool sync ) {
+        return MongoFile::flushAll( sync );
+    }
+
+    void MMAPV1Engine::cleanShutdown(OperationContext* txn) {
+        // wait until file preallocation finishes
+        // we would only hang here if the file_allocator code generates a
+        // synchronous signal, which we don't expect
+        log() << "shutdown: waiting for fs preallocator..." << endl;
+        FileAllocator::get()->waitUntilFinished();
+
+        if (storageGlobalParams.dur) {
+            log() << "shutdown: final commit..." << endl;
+            getDur().commitNow(txn);
+
+            flushAllFiles(true);
         }
 
-        return new NamespaceDetailsCollectionCatalogEntry( ns,
-                                                           details,
-                                                           _getIndexRecordStore( txn ),
-                                                           this );
-    }
+        log() << "shutdown: closing all files..." << endl;
+        stringstream ss3;
+        MemoryMappedFile::closeAllFiles( ss3 );
+        log() << ss3.str() << endl;
 
-    RecordStore* MMAP1DatabaseCatalogEntry::getRecordStore( OperationContext* txn,
-                                                            const StringData& ns ) {
-        return _getRecordStore( txn, ns );
-    }
-
-    RecordStoreV1Base* MMAP1DatabaseCatalogEntry::_getRecordStore( OperationContext* txn,
-                                                                   const StringData& ns ) {
-
-        // XXX TODO - CACHE
-
-        NamespaceString nss( ns );
-        NamespaceDetails* details = _namespaceIndex.details( ns );
-        if ( !details ) {
-            return NULL;
+        if (storageGlobalParams.dur) {
+            dur::journalCleanup(true);
         }
 
-        auto_ptr<NamespaceDetailsRSV1MetaData> md( new NamespaceDetailsRSV1MetaData( ns,
-                                                                                     details,
-                                                                                     _getNamespaceRecordStore( txn, ns ) ) );
-
-        if ( details->isCapped ) {
-            return new CappedRecordStoreV1( txn,
-                                            NULL, //TOD(ERH) this will blow up :)
-                                            ns,
-                                            md.release(),
-                                            &_extentManager,
-                                            nss.coll() == "system.indexes" );
+#if !defined(__sunos__)
+        if ( lockFile ) {
+            log() << "shutdown: removing fs lock..." << endl;
+            /* This ought to be an unlink(), but Eliot says the last
+               time that was attempted, there was a race condition
+               with acquirePathLock().  */
+#ifdef _WIN32
+            if( _chsize( lockFile , 0 ) )
+                log() << "couldn't remove fs lock " << errnoWithDescription(_doserrno) << endl;
+            CloseHandle(lockFileHandle);
+#else
+            if( ftruncate( lockFile , 0 ) )
+                log() << "couldn't remove fs lock " << errnoWithDescription() << endl;
+            flock( lockFile, LOCK_UN );
+#endif
         }
-
-        return new SimpleRecordStoreV1( txn,
-                                        ns,
-                                        md.release(),
-                                        &_extentManager,
-                                        nss.coll() == "system.indexes" );
+#endif
     }
-
-    IndexAccessMethod* MMAP1DatabaseCatalogEntry::getIndex( OperationContext* txn,
-                                                            const CollectionCatalogEntry* collection,
-                                                            IndexCatalogEntry* entry ) {
-        const string& type = entry->descriptor()->getAccessMethodName();
-
-        string ns = collection->ns().ns();
-
-        if ( IndexNames::TEXT == type ||
-             entry->descriptor()->getInfoElement("expireAfterSeconds").isNumber() ) {
-            NamespaceDetailsRSV1MetaData md( ns,
-                                             _namespaceIndex.details( ns ),
-                                             _getNamespaceRecordStore( txn, ns ) );
-            md.setUserFlag( txn, NamespaceDetails::Flag_UsePowerOf2Sizes );
-        }
-
-        RecordStore* rs = _getRecordStore( txn, entry->descriptor()->indexNamespace() );
-        invariant( rs );
-
-        if (IndexNames::HASHED == type)
-            return new HashAccessMethod( entry, rs );
-
-        if (IndexNames::GEO_2DSPHERE == type)
-            return new S2AccessMethod( entry, rs );
-
-        if (IndexNames::TEXT == type)
-            return new FTSAccessMethod( entry, rs );
-
-        if (IndexNames::GEO_HAYSTACK == type)
-            return new HaystackAccessMethod( entry, rs );
-
-        if ("" == type)
-            return new BtreeAccessMethod( entry, rs );
-
-        if (IndexNames::GEO_2D == type)
-            return new TwoDAccessMethod( entry, rs );
-
-        log() << "Can't find index for keyPattern " << entry->descriptor()->keyPattern();
-        fassertFailed(17489);
-    }
-
-    RecordStoreV1Base* MMAP1DatabaseCatalogEntry::_getIndexRecordStore( OperationContext* txn ) {
-        NamespaceString nss( name(), "system.indexes" );
-        RecordStoreV1Base* rs = _getRecordStore( txn, nss.ns() );
-        if ( rs != NULL )
-            return rs;
-        CollectionOptions options;
-        Status status = createCollection( txn, nss.ns(), options, true );
-        massertStatusOK( status );
-        rs = _getRecordStore( txn, nss.ns() );
-        invariant( rs );
-        return rs;
-    }
-
-    RecordStoreV1Base* MMAP1DatabaseCatalogEntry::_getNamespaceRecordStore( OperationContext* txn,
-                                                                            const StringData& whosAsking) {
-        NamespaceString nss( name(), "system.namespaces" );
-        if ( nss == whosAsking )
-            return NULL;
-        RecordStoreV1Base* rs = _getRecordStore( txn, nss.ns() );
-        if ( rs != NULL )
-            return rs;
-        CollectionOptions options;
-        Status status = createCollection( txn, nss.ns(), options, true );
-        massertStatusOK( status );
-        rs = _getRecordStore( txn, nss.ns() );
-        invariant( rs );
-        return rs;
-
-    }
-
-    void MMAP1DatabaseCatalogEntry::_addNamespaceToNamespaceCollection( OperationContext* txn,
-                                                                        const StringData& ns,
-                                                                        const BSONObj* options ) {
-        if ( nsToCollectionSubstring( ns ) == "system.namespaces" ) {
-            // system.namespaces holds all the others, so it is not explicitly listed in the catalog.
-            return;
-        }
-
-        BSONObjBuilder b;
-        b.append("name", ns);
-        if ( options && !options->isEmpty() )
-            b.append("options", *options);
-        BSONObj obj = b.done();
-
-        RecordStoreV1Base* rs = _getNamespaceRecordStore( txn, ns );
-        invariant( rs );
-        StatusWith<DiskLoc> loc = rs->insertRecord( txn, obj.objdata(), obj.objsize(), -1 );
-        massertStatusOK( loc.getStatus() );
-    }
-
 }

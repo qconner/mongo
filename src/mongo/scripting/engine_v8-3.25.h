@@ -41,6 +41,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/scripting/v8_deadline_monitor.h"
 #include "mongo/scripting/v8-3.25_profiler.h"
+#include "mongo/util/log.h"
 
 /**
  * V8_SIMPLE_HEADER must be placed in any function called from a public API
@@ -92,6 +93,8 @@ namespace mongo {
          * V8Scope is destructed.
          */
         ~ObjTracker() {
+            MONGO_LOG_DEFAULT_COMPONENT_LOCAL(::mongo::logger::LogComponent::kQuery);
+
             if (!_container.empty()) {
                 LOG(1) << "freeing " << _container.size() << " uncollected "
                        << typeid(_ObjType).name() << " objects" << endl;
@@ -593,7 +596,7 @@ namespace mongo {
     /**
      * Check for an error condition (e.g. empty handle, JS exception, OOM) after executing
      * a v8 operation.
-     * @resultHandle         handle storing the result of the preceeding v8 operation
+     * @resultHandle         handle storing the result of the preceding v8 operation
      * @try_catch            the active v8::TryCatch exception handler
      * @param reportError    if true, log an error message
      * @param assertOnError  if true, throw an exception if an error is detected

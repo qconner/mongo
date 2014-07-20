@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -40,7 +40,6 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
@@ -49,15 +48,17 @@ namespace QueryStageFetch {
 
     class QueryStageFetchBase {
     public:
-        QueryStageFetchBase() { }
+        QueryStageFetchBase() : _client(&_txn) {
+        
+        }
 
         virtual ~QueryStageFetchBase() {
             _client.dropCollection(ns());
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(DiskLoc(), false,
-                                                       CollectionScanParams::FORWARD);
+            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(), false,
+                                                   CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
                 out->insert(nextLoc);
@@ -76,10 +77,10 @@ namespace QueryStageFetch {
         static const char* ns() { return "unittests.QueryStageFetch"; }
 
     private:
-        static DBDirectClient _client;
+        OperationContextImpl _txn;
+        DBDirectClient _client;
     };
 
-    DBDirectClient QueryStageFetchBase::_client;
 
     //
     // Test that a WSM with an obj is passed through verbatim.
@@ -102,6 +103,7 @@ namespace QueryStageFetch {
             set<DiskLoc> locs;
             getLocs(&locs, coll);
             ASSERT_EQUALS(size_t(1), locs.size());
+            ctx.commit();
 
             // Create a mock stage that returns the WSM.
             auto_ptr<MockStage> mockStage(new MockStage(&ws));
@@ -198,6 +200,7 @@ namespace QueryStageFetch {
             // No more data to fetch, so, EOF.
             state = fetchStage->work(&id);
             ASSERT_EQUALS(PlanStage::IS_EOF, state);
+            ctx.commit();
         }
     };
 

@@ -27,7 +27,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/scripting/engine.h"
 
@@ -37,14 +37,12 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/platform/unordered_set.h"
-#include "mongo/scripting/bench.h"
 #include "mongo/util/file.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
     long long Scope::_lastVersion = 1;
     static const unsigned kMaxJsFileLength = std::numeric_limits<unsigned>::max() - 1;
-    DBClientBase* directDBClient;
 
     ScriptEngine::ScriptEngine() : _scopeInitCallback() {
     }
@@ -192,6 +190,7 @@ namespace mongo {
         _loadedVersion = _lastVersion;
         string coll = _localDBName + ".system.js";
 
+        DBClientBase* directDBClient = createDirectClient();
         auto_ptr<DBClientCursor> c = directDBClient->query(coll, Query(), 0, 0, NULL,
             QueryOption_SlaveOk, 0);
         massert(16669, "unable to get db client cursor from query", c.get());
@@ -277,14 +276,6 @@ namespace mongo {
         execSetup(JSFiles::bulk_api);
         execSetup(JSFiles::collection);
         execSetup(JSFiles::upgrade_check);
-    }
-
-    /** install BenchRunner suite */
-    void Scope::installBenchRun() {
-        injectNative("benchRun", BenchRunner::benchRunSync);
-        injectNative("benchRunSync", BenchRunner::benchRunSync);
-        injectNative("benchStart", BenchRunner::benchStart);
-        injectNative("benchFinish", BenchRunner::benchFinish);
     }
 
 namespace {

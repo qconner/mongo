@@ -28,18 +28,19 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
 #include "mongo/db/storage/mmap_v1/dur_recover.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
+#include "mongo/util/log.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
-#ifdef _WIN32
-    extern SimpleMutex globalFlushMutex; // defined in mongo/util/mmap_win.cpp
-#endif
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kStorage);
+
     namespace dur {
 
         void debugValidateAllMapsMatch();
@@ -99,9 +100,6 @@ namespace mongo {
         */
 
         void WRITETODATAFILES(const JSectHeader& h, AlignedBuilder& uncompressed) {
-#ifdef _WIN32
-            SimpleMutex::scoped_lock _globalFlushMutex(globalFlushMutex);
-#endif
             Timer t;
             WRITETODATAFILES_Impl1(h, uncompressed);
             long long m = t.micros();

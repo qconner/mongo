@@ -1,7 +1,7 @@
 // rename_collection.cpp
 
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -94,10 +94,15 @@ namespace mongo {
 
         virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             Lock::GlobalWrite globalWriteLock(txn->lockState());
-            bool ok = wrappedRun(txn, dbname, cmdObj, errmsg, result, fromRepl);
-            if (ok && !fromRepl)
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            if (!wrappedRun(txn, dbname, cmdObj, errmsg, result, fromRepl)) {
+                return false;
+            }
+            if (!fromRepl) {
                 repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
-            return ok;
+            }
+            wunit.commit();
+            return true;
         }
         virtual bool wrappedRun(OperationContext* txn,
                                 const string& dbname,
@@ -139,7 +144,7 @@ namespace mongo {
             std::vector<BSONObj> indexesInProg;
 
             {
-                Client::Context srcCtx( source );
+                Client::Context srcCtx(txn, source);
                 Collection* sourceColl = srcCtx.db()->getCollection( txn, source );
 
                 if ( !sourceColl ) {
@@ -160,8 +165,8 @@ namespace mongo {
                 }
 
                 unsigned int longestAllowed =
-                    min(int(Namespace::MaxNsColletionLen),
-                        int(Namespace::MaxNsLen) - 2/*strlen(".$")*/ - longestIndexNameLength);
+                    min(int(NamespaceString::MaxNsCollectionLen),
+                        int(NamespaceString::MaxNsLen) - 2/*strlen(".$")*/ - longestIndexNameLength);
                 if (target.size() > longestAllowed) {
                     StringBuilder sb;
                     sb << "collection name length of " << target.size()
@@ -176,13 +181,13 @@ namespace mongo {
                     indexesInProg = stopIndexBuilds( txn, srcCtx.db(), cmdObj );
                     capped = sourceColl->isCapped();
                     if ( capped ) {
-                        size = sourceColl->getRecordStore()->storageSize();
+                        size = sourceColl->getRecordStore()->storageSize( txn );
                     }
                 }
             }
 
             {
-                Client::Context ctx( target );
+                Client::Context ctx(txn,  target );
 
                 // Check if the target namespace exists and if dropTarget is true.
                 // If target exists and dropTarget is not true, return false.
@@ -245,21 +250,21 @@ namespace mongo {
             Collection* sourceColl = NULL;
 
             {
-                Client::Context srcCtx( source );
+                Client::Context srcCtx(txn, source);
                 sourceColl = srcCtx.db()->getCollection( txn, source );
-                sourceIt.reset( sourceColl->getIterator( DiskLoc(), false, CollectionScanParams::FORWARD ) );
+                sourceIt.reset( sourceColl->getIterator( txn, DiskLoc(), false, CollectionScanParams::FORWARD ) );
             }
 
             Collection* targetColl = NULL;
             while ( !sourceIt->isEOF() ) {
                 BSONObj o;
                 {
-                    Client::Context srcCtx( source );
+                    Client::Context srcCtx(txn, source);
                     o = sourceColl->docFor(sourceIt->getNext());
                 }
                 // Insert and check return status of insert.
                 {
-                    Client::Context ctx( target );
+                    Client::Context ctx(txn,  target );
                     if ( !targetColl )
                         targetColl = ctx.db()->getCollection( txn, target );
                     // No logOp necessary because the entire renameCollection command is one logOp.
@@ -275,7 +280,7 @@ namespace mongo {
 
             // If inserts were unsuccessful, drop the target collection and return false.
             if ( !insertSuccessful ) {
-                Client::Context ctx( target );
+                Client::Context ctx(txn,  target );
                 Status s = ctx.db()->dropCollection( txn, target );
                 if ( !s.isOK() )
                     errmsg = s.toString();
@@ -287,7 +292,7 @@ namespace mongo {
             vector<BSONObj> copiedIndexes;
             bool indexSuccessful = true;
             {
-                Client::Context srcCtx( source );
+                Client::Context srcCtx(txn, source);
                 IndexCatalog::IndexIterator sourceIndIt =
                     sourceColl->getIndexCatalog()->getIndexIterator( true );
 
@@ -313,7 +318,7 @@ namespace mongo {
             }
 
             {
-                Client::Context ctx( target );
+                Client::Context ctx(txn,  target );
                 if ( !targetColl )
                     targetColl = ctx.db()->getCollection( txn, target );
 
@@ -339,7 +344,7 @@ namespace mongo {
 
             // Drop the source collection.
             {
-                Client::Context srcCtx( source );
+                Client::Context srcCtx(txn, source);
                 Status s = srcCtx.db()->dropCollection( txn, source );
                 if ( !s.isOK() ) {
                     errmsg = s.toString();

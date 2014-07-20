@@ -562,34 +562,9 @@ namespace mongo {
         int skip;
     };
 
-    //
-    // Geo nodes.  A thin wrapper above an IXSCAN until we can yank functionality out of
-    // the IXSCAN layer into the stage layer.
-    //
-
-    // TODO: This is probably an expression index.
-    struct Geo2DNode : public QuerySolutionNode {
-        Geo2DNode() { }
-        virtual ~Geo2DNode() { }
-
-        virtual StageType getType() const { return STAGE_GEO_2D; }
-        virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
-
-        bool fetched() const { return false; }
-        bool hasField(const std::string& field) const;
-        bool sortedByDiskLoc() const { return false; }
-        const BSONObjSet& getSort() const { return _sorts; }
-        BSONObjSet _sorts;
-
-        QuerySolutionNode* clone() const;
-
-        BSONObj indexKeyPattern;
-        GeoQuery gq;
-    };
-
     // This is a standalone stage.
     struct GeoNear2DNode : public QuerySolutionNode {
-        GeoNear2DNode() : numWanted(100), addPointMeta(false), addDistMeta(false) { }
+        GeoNear2DNode() : numToReturn(0), addPointMeta(false), addDistMeta(false) { }
         virtual ~GeoNear2DNode() { }
 
         virtual StageType getType() const { return STAGE_GEO_NEAR_2D; }
@@ -605,7 +580,15 @@ namespace mongo {
         BSONObjSet _sorts;
 
         NearQuery nq;
-        int numWanted;
+        IndexBounds baseBounds;
+
+        // TODO: Remove both of these
+        int numToReturn;
+        // A full match expression for the query with geoNear removed is currently needed -
+        // since 2D geoNear has a default limit not set in the query, we must limit ourselves and
+        // so generate only valid results.
+        scoped_ptr<MatchExpression> fullFilterExcludingNear;
+
         BSONObj indexKeyPattern;
         bool addPointMeta;
         bool addDistMeta;

@@ -52,8 +52,7 @@ namespace repl {
     ScopedConn::M& ScopedConn::_map = *(new ScopedConn::M());
     mutex ScopedConn::mapMutex("ScopedConn::mapMutex");
 
-    using namespace mongoutils::html;
-    using namespace bson;
+    using namespace html;
 
     static RamLog * _rsLog = RamLog::get("rs");
     Tee* rsLog = _rsLog;

@@ -29,11 +29,15 @@
 #include "mongo/base/counter.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/is_master.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/write_concern.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/stats/timer_stats.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/util/mmap.h"
 
 namespace mongo {
 
@@ -53,10 +57,10 @@ namespace mongo {
         }
 
         const bool isConfigServer = serverGlobalParams.configsvr;
-        const bool isMasterSlaveNode = repl::anyReplEnabled() && !repl::theReplSet;
-        const bool isReplSetNode = repl::anyReplEnabled() && repl::theReplSet;
+        const repl::ReplicationCoordinator::Mode replMode =
+                repl::getGlobalReplicationCoordinator()->getReplicationMode();
 
-        if ( isConfigServer || ( !isMasterSlaveNode && !isReplSetNode ) ) {
+        if ( isConfigServer || replMode == repl::ReplicationCoordinator::modeNone ) {
 
             // Note that config servers can be replicated (have an oplog), but we still don't allow
             // w > 1
@@ -69,7 +73,9 @@ namespace mongo {
             }
         }
 
-        if ( !isReplSetNode && !writeConcern.wMode.empty() && writeConcern.wMode != "majority" ) {
+        if ( replMode != repl::ReplicationCoordinator::modeReplSet &&
+                !writeConcern.wMode.empty() &&
+                writeConcern.wMode != "majority" ) {
             return Status( ErrorCodes::BadValue,
                            string( "cannot use non-majority 'w' mode " ) + writeConcern.wMode
                            + " when a host is not a member of a replica set" );
@@ -141,7 +147,7 @@ namespace mongo {
             break;
         case WriteConcernOptions::FSYNC:
             if ( !getDur().isDurable() ) {
-                result->fsyncFiles = MemoryMappedFile::flushAll( true );
+                result->fsyncFiles = globalStorageEngine->flushAllFiles( true );
             }
             else {
                 // We only need to commit the journal if we're durable
@@ -157,70 +163,36 @@ namespace mongo {
 
         // Now wait for replication
 
-        if ( replOpTime.isNull() ) {
+        if (replOpTime.isNull()) {
             // no write happened for this client yet
             return Status::OK();
         }
 
-        if ( writeConcern.wNumNodes <= 1 && writeConcern.wMode.empty() ) {
+        // needed to avoid incrementing gleWtimeStats SERVER-9005
+        if (writeConcern.wNumNodes <= 1 && writeConcern.wMode.empty()) {
             // no desired replication check
             return Status::OK();
         }
 
-        if (!repl::anyReplEnabled() || serverGlobalParams.configsvr) {
-            // no replication check needed (validated above)
-            return Status::OK();
-        }
-
-        const bool isMasterSlaveNode = repl::anyReplEnabled() && !repl::theReplSet;
-        if ( writeConcern.wMode == "majority" && isMasterSlaveNode ) {
-            // with master/slave, majority is equivalent to w=1
-            return Status::OK();
-        }
-
-        // We're sure that replication is enabled and that we have more than one node or a wMode
-        TimerHolder gleTimerHolder( &gleWtimeStats );
-
         // Now we wait for replication
         // Note that replica set stepdowns and gle mode changes are thrown as errors
-        // TODO: Make this cleaner
-        Status replStatus = Status::OK();
-        try {
-            while ( 1 ) {
-
-                if ( writeConcern.wNumNodes > 0 ) {
-                    if (repl::opReplicatedEnough(replOpTime, writeConcern.wNumNodes)) {
-                        break;
-                    }
-                }
-                else if (repl::opReplicatedEnough(replOpTime, writeConcern.wMode)) {
-                    break;
-                }
-
-                if ( writeConcern.wTimeout > 0 &&
-                     gleTimerHolder.millis() >= writeConcern.wTimeout ) {
-                    gleWtimeouts.increment();
-                    result->err = "timeout";
-                    result->wTimedOut = true;
-                    replStatus = Status( ErrorCodes::WriteConcernFailed,
-                                         "waiting for replication timed out" );
-                    break;
-                }
-
-                sleepmillis(1);
-                txn->checkForInterrupt();
-            }
+        repl::ReplicationCoordinator::StatusAndDuration replStatus =
+                repl::getGlobalReplicationCoordinator()->awaitReplication(txn,
+                                                                          replOpTime,
+                                                                          writeConcern);
+        if (replStatus.status == ErrorCodes::ExceededTimeLimit) {
+            gleWtimeouts.increment();
+            replStatus.status = Status(ErrorCodes::WriteConcernFailed,
+                                       "waiting for replication timed out");
+            result->err = "timeout";
+            result->wTimedOut = true;
         }
-        catch( const AssertionException& ex ) {
-            // Our replication state changed while enforcing write concern
-            replStatus = ex.toStatus();
-        }
-
         // Add stats
-        result->writtenTo = repl::getHostsWrittenTo(replOpTime);
-        result->wTime = gleTimerHolder.recordMillis();
+        result->writtenTo = repl::getGlobalReplicationCoordinator()->getHostsWrittenTo(replOpTime);
+        gleWtimeStats.recordMillis(replStatus.duration.total_milliseconds());
+        result->wTime = replStatus.duration.total_milliseconds();
 
-        return replStatus;
+        return replStatus.status;
     }
 
 } // namespace mongo

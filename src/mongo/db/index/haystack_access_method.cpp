@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/index/haystack_access_method.h"
 
 #include "mongo/base/status.h"
@@ -34,13 +36,15 @@
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index/haystack_access_method_internal.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
-    HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState, RecordStore* rs)
-        : BtreeBasedAccessMethod(btreeState, rs) {
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kQuery);
+
+    HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
+        : BtreeBasedAccessMethod(btreeState, btree) {
 
         const IndexDescriptor* descriptor = btreeState->descriptor();
 
@@ -57,7 +61,7 @@ namespace mongo {
         ExpressionKeysPrivate::getHaystackKeys(obj, _geoField, _otherFields, _bucketSize, keys);
     }
 
-    void HaystackAccessMethod::searchCommand(Collection* collection,
+    void HaystackAccessMethod::searchCommand(OperationContext* txn, Collection* collection,
                                              const BSONObj& nearObj, double maxDistance,
                                              const BSONObj& search, BSONObjBuilder* result,
                                              unsigned limit) {
@@ -96,7 +100,7 @@ namespace mongo {
                 unordered_set<DiskLoc, DiskLoc::Hasher> thisPass;
 
 
-                scoped_ptr<Runner> runner(InternalPlanner::indexScan(collection,
+                scoped_ptr<Runner> runner(InternalPlanner::indexScan(txn,  collection,
                                                                      _descriptor, key, key, true));
                 Runner::RunnerState state;
                 DiskLoc loc;

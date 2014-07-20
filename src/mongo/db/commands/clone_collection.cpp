@@ -45,11 +45,10 @@
 #include "mongo/db/index_builder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
@@ -110,7 +109,7 @@ namespace mongo {
 
             {
                 HostAndPort h(fromhost);
-                if( h.isSelf() ) {
+                if (repl::isSelf(h)) {
                     errmsg = "can't cloneCollection from self";
                     return false;
                 }
@@ -134,7 +133,7 @@ namespace mongo {
             Cloner cloner;
             auto_ptr<DBClientConnection> myconn;
             myconn.reset( new DBClientConnection() );
-            if ( ! myconn->connect( fromhost , errmsg ) )
+            if ( ! myconn->connect( HostAndPort(fromhost) , errmsg ) )
                 return false;
 
             cloner.setConnection( myconn.release() );

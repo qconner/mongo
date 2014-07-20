@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -38,17 +38,23 @@
 
 namespace mongo {
 
-    TextStage::TextStage(const TextStageParams& params,
+    // static
+    const char* TextStage::kStageType = "TEXT";
+
+    TextStage::TextStage(OperationContext* txn,
+                         const TextStageParams& params,
                          WorkingSet* ws,
                          const MatchExpression* filter)
-        : _params(params),
+        : _txn(txn),
+          _params(params),
           _ftsMatcher(params.query, params.spec),
           _ws(ws),
           _filter(filter),
+          _commonStats(kStageType),
           _internalState(INIT_SCANS),
           _currentIndexScanner(0) {
-
         _scoreIterator = _scores.end();
+        _specificStats.indexPrefix = _params.indexPrefix;
     }
 
     TextStage::~TextStage() { }
@@ -59,6 +65,9 @@ namespace mongo {
 
     PlanStage::StageState TextStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
         invariant(_internalState != DONE);
@@ -131,11 +140,32 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> TextStage::getChildren() const {
+        vector<PlanStage*> empty;
+        return empty;
+    }
+
     PlanStageStats* TextStage::getStats() {
         _commonStats.isEOF = isEOF();
+
+        // Add a BSON representation of the filter to the stats tree, if there is one.
+        if (NULL != _filter) {
+            BSONObjBuilder bob;
+            _filter->toBSON(&bob);
+            _commonStats.filter = bob.obj();
+        }
+
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_TEXT));
         ret->specific.reset(new TextStats(_specificStats));
         return ret.release();
+    }
+
+    const CommonStats* TextStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* TextStage::getSpecificStats() {
+        return &_specificStats;
     }
 
     PlanStage::StageState TextStage::initScans(WorkingSetID* out) {
@@ -159,7 +189,7 @@ namespace mongo {
             params.bounds.isSimpleRange = true;
             params.descriptor = _params.index;
             params.direction = -1;
-            _scanners.mutableVector().push_back(new IndexScan(params, _ws, NULL));
+            _scanners.mutableVector().push_back(new IndexScan(_txn, params, _ws, NULL));
         }
 
         // If we have no terms we go right to EOF.

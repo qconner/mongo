@@ -36,13 +36,20 @@
 
 namespace mongo {
 
-    DistinctScan::DistinctScan(const DistinctParams& params, WorkingSet* workingSet)
-        : _workingSet(workingSet),
+    // static
+    const char* DistinctScan::kStageType = "DISTINCT";
+
+    DistinctScan::DistinctScan(OperationContext* txn, const DistinctParams& params, WorkingSet* workingSet)
+        : _txn(txn),
+          _workingSet(workingSet),
           _descriptor(params.descriptor),
           _iam(params.descriptor->getIndexCatalog()->getIndex(params.descriptor)),
           _btreeCursor(NULL),
           _hitEnd(false),
-          _params(params) { }
+          _params(params),
+          _commonStats(kStageType) {
+        _specificStats.keyPattern = _params.descriptor->keyPattern();
+    }
 
     void DistinctScan::initIndexCursor() {
         // Create an IndexCursor over the btree we're distinct-ing over.
@@ -56,12 +63,11 @@ namespace mongo {
         }
 
         IndexCursor *cursor;
-        Status s = _iam->newCursor(&cursor);
+        Status s = _iam->newCursor(_txn, cursorOptions, &cursor);
         verify(s.isOK());
         verify(cursor);
         // Is this assumption always valid?  See SERVER-12397
         _btreeCursor.reset(static_cast<BtreeIndexCursor*>(cursor));
-        _btreeCursor->setOptions(cursorOptions);
 
         // Create a new bounds checker.  The bounds checker gets our start key and assists in
         // executing the scan and staying within the required bounds.
@@ -87,6 +93,9 @@ namespace mongo {
 
     PlanStage::StageState DistinctScan::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (NULL == _btreeCursor.get()) {
             // First call to work().  Perform cursor init.
@@ -139,18 +148,20 @@ namespace mongo {
     void DistinctScan::prepareToYield() {
         ++_commonStats.yields;
 
-        if (isEOF() || (NULL == _btreeCursor.get())) { return; }
+        if (_hitEnd || (NULL == _btreeCursor.get())) { return; }
         // We save these so that we know if the cursor moves during the yield.  If it moves, we have
         // to make sure its ending position is valid w.r.t. our bounds.
-        _savedKey = _btreeCursor->getKey().getOwned();
-        _savedLoc = _btreeCursor->getValue();
+        if (!_btreeCursor->isEOF()) {
+            _savedKey = _btreeCursor->getKey().getOwned();
+            _savedLoc = _btreeCursor->getValue();
+        }
         _btreeCursor->savePosition();
     }
 
     void DistinctScan::recoverFromYield() {
         ++_commonStats.unyields;
 
-        if (isEOF() || (NULL == _btreeCursor.get())) { return; }
+        if (_hitEnd || (NULL == _btreeCursor.get())) { return; }
 
         // We can have a valid position before we check isEOF(), restore the position, and then be
         // EOF upon restore.
@@ -208,11 +219,24 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> DistinctScan::getChildren() const {
+        vector<PlanStage*> empty;
+        return empty;
+    }
+
     PlanStageStats* DistinctScan::getStats() {
         _commonStats.isEOF = isEOF();
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_DISTINCT));
         ret->specific.reset(new DistinctScanStats(_specificStats));
         return ret.release();
+    }
+
+    const CommonStats* DistinctScan::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* DistinctScan::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

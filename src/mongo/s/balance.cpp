@@ -26,13 +26,14 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/balance.h"
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
@@ -46,9 +47,12 @@
 #include "mongo/s/type_mongos.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/s/type_tags.h"
+#include "mongo/util/log.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     Balancer balancer;
 
@@ -58,7 +62,7 @@ namespace mongo {
     }
 
     int Balancer::_moveChunks(const vector<CandidateChunkPtr>* candidateChunks,
-                              bool secondaryThrottle,
+                              const WriteConcernOptions* writeConcern,
                               bool waitForDelete)
     {
         int movedCount = 0;
@@ -95,7 +99,7 @@ namespace mongo {
                 BSONObj res;
                 if (c->moveAndCommit(Shard::make(chunkInfo.to),
                                      Chunk::MaxChunkSize,
-                                     secondaryThrottle,
+                                     writeConcern,
                                      waitForDelete,
                                      0, /* maxTimeMS */
                                      res)) {
@@ -431,7 +435,7 @@ namespace mongo {
             break;
         }
 
-        int sleepTime = 30;
+        int sleepTime = 10;
 
         // getConnectioString and dist lock constructor does not throw, which is what we expect on while
         // on the balancer thread
@@ -453,9 +457,18 @@ namespace mongo {
                 // refresh chunk size (even though another balancer might be active)
                 Chunk::refreshChunkSize();
 
-                BSONObj balancerConfig;
+                SettingsType balancerConfig;
+                string errMsg;
+
+                if (!grid.getBalancerSettings(&balancerConfig, &errMsg)) {
+                    warning() << errMsg;
+                    return ;
+                }
+
                 // now make sure we should even be running
-                if ( ! grid.shouldBalance( "", &balancerConfig ) ) {
+                if (balancerConfig.isKeySet() && // balancer config doc exists
+                        !grid.shouldBalance(balancerConfig)) {
+
                     LOG(1) << "skipping balancing round because balancing is disabled" << endl;
 
                     // Ping again so scripts can determine if we're active without waiting
@@ -467,9 +480,6 @@ namespace mongo {
                     continue;
                 }
 
-                sleepTime = balancerConfig[SettingsType::shortBalancerSleep()].trueValue() ? 30 :
-                                                                                             6;
-                
                 uassert( 13258 , "oids broken after resetting!" , _checkOIDs() );
 
                 {
@@ -494,20 +504,26 @@ namespace mongo {
                         continue;
                     }
 
-                    LOG(1) << "*** start balancing round" << endl;
+                    const bool waitForDelete = (balancerConfig.isWaitForDeleteSet() ?
+                            balancerConfig.getWaitForDelete() : false);
 
-                    bool waitForDelete = false;
-                    if (balancerConfig["_waitForDelete"].trueValue()) {
-                        waitForDelete = balancerConfig["_waitForDelete"].trueValue();
+                    scoped_ptr<WriteConcernOptions> writeConcern;
+                    if (balancerConfig.isKeySet()) { // if balancer doc exists.
+                        StatusWith<WriteConcernOptions*> extractStatus =
+                                balancerConfig.extractWriteConcern();
+                        if (extractStatus.isOK()) {
+                            writeConcern.reset(extractStatus.getValue());
+                        }
+                        else {
+                            warning() << extractStatus.toString();
+                        }
                     }
 
-                    bool secondaryThrottle = true; // default to on
-                    if ( balancerConfig[SettingsType::secondaryThrottle()].type() ) {
-                        secondaryThrottle = balancerConfig[SettingsType::secondaryThrottle()].trueValue();
-                    }
-
-                    LOG(1) << "waitForDelete: " << waitForDelete << endl;
-                    LOG(1) << "secondaryThrottle: " << secondaryThrottle << endl;
+                    LOG(1) << "*** start balancing round. "
+                           << "waitForDelete: " << waitForDelete
+                           << ", secondaryThrottle: "
+                           << (writeConcern.get() ? writeConcern->toBSON().toString() : "default")
+                           << endl;
 
                     vector<CandidateChunkPtr> candidateChunks;
                     _doBalanceRound( conn.conn() , &candidateChunks );
@@ -517,7 +533,7 @@ namespace mongo {
                     }
                     else {
                         _balancedLastTime = _moveChunks(&candidateChunks,
-                                                        secondaryThrottle,
+                                                        writeConcern.get(),
                                                         waitForDelete );
                     }
 
@@ -529,7 +545,7 @@ namespace mongo {
                 
                 conn.done();
 
-                sleepsecs( _balancedLastTime ? sleepTime / 6 : sleepTime );
+                sleepsecs( _balancedLastTime ? sleepTime / 10 : sleepTime );
             }
             catch ( std::exception& e ) {
                 log() << "caught exception while doing balance: " << e.what() << endl;

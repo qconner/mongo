@@ -35,11 +35,13 @@
 #include "mongo/pch.h"
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
 #include "mongo/client/export_macros.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_port.h"
 
@@ -320,7 +322,7 @@ namespace mongo {
         static ConnectionString mock( const HostAndPort& server ) {
             ConnectionString connStr;
             connStr._servers.push_back( server );
-            connStr._string = server.toString( true );
+            connStr._string = server.toString();
             return connStr;
         }
 
@@ -876,7 +878,7 @@ namespace mongo {
            jscode    source code for a javascript function.
            info      the command object which contains any information on the invocation result including
                       the return value and other information.  If an error occurs running the jscode, error
-                     information will be in info.  (try "out() << info.toString()")
+                     information will be in info.  (try "log() << info.toString()")
            retValue  return value from the jscode function.
            args      args to pass to the jscode function.  when invoked, the 'args' variable will be defined
                      for use by the jscode.
@@ -1188,6 +1190,8 @@ namespace mongo {
         virtual uint64_t getSockCreationMicroSec() const {
             return INVALID_SOCK_CREATION_TIME;
         }
+
+        virtual void reset() {}
 
     }; // DBClientBase
 

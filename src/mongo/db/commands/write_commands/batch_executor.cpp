@@ -26,25 +26,28 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/commands/write_commands/batch_executor.h"
 
 #include <memory>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/delete_executor.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/update_executor.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
-#include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/server_parameters.h"
@@ -57,9 +60,12 @@
 #include "mongo/s/write_ops/batched_upsert_detail.h"
 #include "mongo/s/write_ops/write_error_detail.h"
 #include "mongo/util/elapsed_tracker.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     namespace {
 
@@ -353,10 +359,12 @@ namespace mongo {
                 response->setWriteConcernError( wcError.release() );
             }
 
-            if (repl::anyReplEnabled()) {
+            repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+            const repl::ReplicationCoordinator::Mode replMode = replCoord->getReplicationMode();
+            if (replMode != repl::ReplicationCoordinator::modeNone) {
                 response->setLastOp( _client->getLastOp() );
-                if (repl::theReplSet) {
-                    response->setElectionId(repl::theReplSet->getElectionId());
+                if (replMode == repl::ReplicationCoordinator::modeReplSet) {
+                    response->setElectionId(replCoord->getElectionId());
                 }
             }
 
@@ -402,12 +410,13 @@ namespace mongo {
         error->setErrMessage( errMsg );
     }
 
-    static bool checkShardVersion(ShardingState* shardingState,
+    static bool checkShardVersion(OperationContext* txn,
+                                  ShardingState* shardingState,
                                   const BatchedCommandRequest& request,
                                   WriteOpResult* result) {
 
         const NamespaceString nss( request.getTargetingNS() );
-        Lock::assertWriteLocked( nss.ns() );
+        txn->lockState()->assertWriteLocked( nss.ns() );
 
         ChunkVersion requestShardVersion =
             request.isMetadataSet() && request.getMetadata()->isShardVersionSet() ?
@@ -433,8 +442,9 @@ namespace mongo {
         return true;
     }
 
-    static bool checkIsMasterForCollection(const std::string& ns, WriteOpResult* result) {
-        if (!repl::isMasterNs(ns.c_str())) {
+    static bool checkIsMasterForDatabase(const std::string& ns, WriteOpResult* result) {
+        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                NamespaceString(ns).db())) {
             WriteErrorDetail* errorDetail = new WriteErrorDetail;
             result->setError(errorDetail);
             errorDetail->setErrCode(ErrorCodes::NotMaster);
@@ -453,12 +463,13 @@ namespace mongo {
         error->setErrMessage( errMsg );
     }
 
-    static bool checkIndexConstraints(ShardingState* shardingState,
+    static bool checkIndexConstraints(OperationContext* txn,
+                                      ShardingState* shardingState,
                                       const BatchedCommandRequest& request,
                                       WriteOpResult* result) {
 
         const NamespaceString nss( request.getTargetingNS() );
-        Lock::assertWriteLocked( nss.ns() );
+        txn->lockState()->assertWriteLocked( nss.ns() );
 
         if ( !request.isUniqueIndexRequest() )
             return true;
@@ -502,7 +513,7 @@ namespace mongo {
         currentOp->ensureStarted();
         currentOp->setNS( currWrite.getRequest()->getNS() );
 
-        currentOp->debug().ns = currentOp->getNS();
+        currentOp->debug().ns = currentOp->getNS().c_str();
         currentOp->debug().op = currentOp->getOp();
 
         if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert ) {
@@ -844,12 +855,14 @@ namespace mongo {
         incOpStats( updateItem );
 
         WriteOpResult result;
+
+        WriteUnitOfWork wunit(_txn->recoveryUnit());
         multiUpdate( _txn, updateItem, &result );
+        wunit.commit();
 
         if ( !result.getStats().upsertedID.isEmpty() ) {
             *upsertedId = result.getStats().upsertedID;
         }
-
         // END CURRENT OP
         incWriteStats( updateItem, result.getStats(), result.getError(), currentOp.get() );
         finishCurrentOp( _txn, _client, currentOp.get(), result.getError() );
@@ -903,22 +916,23 @@ namespace mongo {
 
         invariant(!_context.get());
         _writeLock.reset(new Lock::DBWrite(txn->lockState(), request->getNS()));
-        if (!checkIsMasterForCollection(request->getNS(), result)) {
+        if (!checkIsMasterForDatabase(request->getNS(), result)) {
             return false;
         }
-        if (!checkShardVersion(&shardingState, *request, result)) {
+        if (!checkShardVersion(txn, &shardingState, *request, result)) {
             return false;
         }
-        if (!checkIndexConstraints(&shardingState, *request, result)) {
+        if (!checkIndexConstraints(txn, &shardingState, *request, result)) {
             return false;
         }
-        _context.reset(new Client::Context(request->getNS(),
-                                           storageGlobalParams.dbpath,
-                                           false /* don't check version */));
+
+        _context.reset(new Client::Context(txn, request->getNS(), false));
+
         Database* database = _context->db();
         dassert(database);
         _collection = database->getCollection(txn, request->getTargetingNS());
         if (!_collection) {
+            WriteUnitOfWork wunit (txn->recoveryUnit());
             // Implicitly create if it doesn't exist
             _collection = database->createCollection(txn, request->getTargetingNS());
             if (!_collection) {
@@ -928,6 +942,7 @@ namespace mongo {
                                             request->getTargetingNS())));
                 return false;
             }
+            wunit.commit();
         }
         return true;
     }
@@ -960,12 +975,14 @@ namespace mongo {
 
         try {
             if (state->lockAndCheck(result)) {
+                WriteUnitOfWork wunit (state->txn->recoveryUnit());
                 if (!state->request->isInsertIndexRequest()) {
                     singleInsert(state->txn, insertDoc, state->getCollection(), result);
                 }
                 else {
                     singleCreateIndex(state->txn, insertDoc, state->getCollection(), result);
                 }
+                wunit.commit();
             }
         }
         catch (const DBException& ex) {
@@ -1022,7 +1039,7 @@ namespace mongo {
 
         const string& insertNS = collection->ns().ns();
 
-        Lock::assertWriteLocked( insertNS );
+        txn->lockState()->assertWriteLocked( insertNS );
 
         StatusWith<DiskLoc> status = collection->insertDocument( txn, docToInsert, true );
 
@@ -1049,7 +1066,7 @@ namespace mongo {
 
         const string indexNS = collection->ns().getSystemIndexesCollection();
 
-        Lock::assertWriteLocked( indexNS );
+        txn->lockState()->assertWriteLocked( indexNS );
 
         Status status = collection->getIndexCatalog()->createIndex(txn, indexDesc, true);
 
@@ -1087,15 +1104,14 @@ namespace mongo {
         }
 
         ///////////////////////////////////////////
-        Lock::DBWrite writeLock(txn->lockState(), nsString.ns());
+        Lock::DBWrite writeLock(txn->lockState(), nsString.ns(), useExperimentalDocLocking);
         ///////////////////////////////////////////
 
-        if ( !checkShardVersion( &shardingState, *updateItem.getRequest(), result ) )
+        WriteUnitOfWork wunit(txn->recoveryUnit());
+        if (!checkShardVersion(txn, &shardingState, *updateItem.getRequest(), result))
             return;
 
-        Client::Context ctx( nsString.ns(),
-                             storageGlobalParams.dbpath,
-                             false /* don't check version */ );
+        Client::Context ctx(txn, nsString.ns(), false /* don't check version */);
 
         try {
             UpdateResult res = executor.execute(txn, ctx.db());
@@ -1118,6 +1134,7 @@ namespace mongo {
             }
             result->setError(toWriteError(status));
         }
+        wunit.commit();
     }
 
     /**
@@ -1146,19 +1163,18 @@ namespace mongo {
         ///////////////////////////////////////////
         Lock::DBWrite writeLock(txn->lockState(), nss.ns());
         ///////////////////////////////////////////
+        WriteUnitOfWork wunit(txn->recoveryUnit());
 
         // Check version once we're locked
 
-        if ( !checkShardVersion( &shardingState, *removeItem.getRequest(), result ) ) {
+        if (!checkShardVersion(txn, &shardingState, *removeItem.getRequest(), result)) {
             // Version error
             return;
         }
 
         // Context once we're locked, to set more details in currentOp()
         // TODO: better constructor?
-        Client::Context writeContext( nss.ns(),
-                                      storageGlobalParams.dbpath,
-                                      false /* don't check version */);
+        Client::Context writeContext(txn, nss.ns(), false /* don't check version */);
 
         try {
             result->getStats().n = executor.execute(txn, writeContext.db());
@@ -1170,6 +1186,7 @@ namespace mongo {
             }
             result->setError(toWriteError(status));
         }
+        wunit.commit();
     }
 
 } // namespace mongo

@@ -11,6 +11,11 @@ b = DBRef(a.getRef(), a.getId());
 printjson(a);
 assert.eq(tojson(a), tojson(b), "dbref");
 
+a = new DBRef("test", "theid", "testdb");
+b = DBRef(a.getRef(), a.getId(), a.getDb());
+printjson(a);
+assert.eq(tojson(a), tojson(b), "dbref");
+
 a = new DBPointer("test", new ObjectId());
 b = DBPointer(a.getCollection(), a.getId());
 printjson(a);
@@ -50,6 +55,29 @@ a = new NumberInt(100);
 b = NumberInt(a.toNumber());
 printjson(a);
 assert.eq(tojson(a), tojson(b), "int");
+
+// ObjectId.fromDate
+
+a = new ObjectId();
+var timestampA = a.getTimestamp();
+var dateA = new Date(timestampA.getTime());
+
+// ObjectId.fromDate - invalid input types
+assert.throws(function() { ObjectId.fromDate(undefined); }, null,
+              "ObjectId.fromDate should error on undefined date" );
+
+assert.throws(function() { ObjectId.fromDate(12345); }, null,
+              "ObjectId.fromDate should error on numerical value" );
+
+assert.throws(function() { ObjectId.fromDate(dateA.toISOString()); }, null,
+              "ObjectId.fromDate should error on string value" );
+
+// ObjectId.fromDate - Date
+b = ObjectId.fromDate(dateA);
+printjson(a);
+assert.eq(tojson(a.getTimestamp()), tojson(b.getTimestamp()), "ObjectId.fromDate - Date");
+
+
 
 // tojsonObject
 

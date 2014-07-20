@@ -61,7 +61,20 @@ namespace mongo {
         virtual void prepareToYield() { }
         virtual void recoverFromYield() { }
         virtual void invalidate(const DiskLoc& dl, InvalidationType type) { }
+
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_MOCK; }
+
+        //
+        // Exec stats -- do not call for the mock stage.
+        //
+
         virtual PlanStageStats* getStats() { return NULL; }
+
+        virtual const CommonStats* getCommonStats() { return NULL; }
+
+        virtual const SpecificStats* getSpecificStats() { return NULL; }
 
         /**
          * Add a result to the back of the queue.  work() goes through the queue.

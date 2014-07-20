@@ -38,6 +38,7 @@
 #include "mongo/db/geo/hash.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/platform/cstdint.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -55,13 +56,18 @@ namespace mongo {
 
     // Every stage has CommonStats.
     struct CommonStats {
-        CommonStats() : works(0),
+        CommonStats(const char* type)
+                      : stageTypeStr(type),
+                        works(0),
                         yields(0),
                         unyields(0),
                         invalidates(0),
                         advanced(0),
                         needTime(0),
+                        executionTimeMillis(0),
                         isEOF(false) { }
+        // String giving the type of the stage. Not owned.
+        const char* stageTypeStr;
 
         // Count calls into the stage.
         size_t works;
@@ -73,6 +79,13 @@ namespace mongo {
         size_t advanced;
         size_t needTime;
 
+        // BSON representation of a MatchExpression affixed to this node. If there
+        // is no filter affixed, then 'filter' should be an empty BSONObj.
+        BSONObj filter;
+
+        // Time elapsed while working inside this stage.
+        long long executionTimeMillis;
+
         // TODO: have some way of tracking WSM sizes (or really any series of #s).  We can measure
         // the size of our inputs and the size of our outputs.  We can do a lot with the WS here.
 
@@ -80,6 +93,37 @@ namespace mongo {
         // the user, eg. time_t totalTimeSpent;
 
         bool isEOF;
+    private:
+        // Default constructor is illegal.
+        CommonStats();
+    };
+
+    /**
+     * This class increments a counter by the time elapsed since its construction when
+     * it goes out of scope.
+     */
+    class ScopedTimer {
+    public:
+        ScopedTimer(long long* counter) : _counter(counter) {
+            _start = curTimeMillis64();
+        }
+
+        ~ScopedTimer() {
+            long long elapsed = curTimeMillis64() - _start;
+            *_counter += elapsed;
+        }
+
+    private:
+        // Default constructor disallowed.
+        ScopedTimer();
+
+        MONGO_DISALLOW_COPYING(ScopedTimer);
+
+        // Reference to the counter that we are incrementing with the elapsed time.
+        long long* _counter;
+
+        // Time at which the timer was constructed.
+        long long _start;
     };
 
     // The universal container for a stage's stats.
@@ -199,21 +243,47 @@ namespace mongo {
         size_t docsTested;
     };
 
+    struct CountStats : public SpecificStats {
+        CountStats() : isMultiKey(false),
+                       keysExamined(0) { }
+
+        virtual ~CountStats() { }
+
+        virtual SpecificStats* clone() const {
+            CountStats* specific = new CountStats(*this);
+            // BSON objects have to be explicitly copied.
+            specific->keyPattern = keyPattern.getOwned();
+            return specific;
+        }
+
+        BSONObj keyPattern;
+
+        bool isMultiKey;
+
+        size_t keysExamined;
+
+    };
+
     struct DistinctScanStats : public SpecificStats {
         DistinctScanStats() : keysExamined(0) { }
 
         virtual SpecificStats* clone() const {
-            return new DistinctScanStats(*this);
+            DistinctScanStats* specific = new DistinctScanStats(*this);
+            specific->keyPattern = keyPattern.getOwned();
+            return specific;
         }
 
         // How many keys did we look at while distinct-ing?
         size_t keysExamined;
+
+        BSONObj keyPattern;
     };
 
     struct FetchStats : public SpecificStats {
         FetchStats() : alreadyHasObj(0),
                        forcedFetches(0),
-                       matchTested(0) { }
+                       matchTested(0),
+                       docsExamined(0) { }
 
         virtual ~FetchStats() { }
 
@@ -234,6 +304,28 @@ namespace mongo {
 
         // We know how many passed (it's the # of advanced) and therefore how many failed.
         size_t matchTested;
+
+        // The total number of full documents touched by the fetch stage.
+        size_t docsExamined;
+    };
+
+    struct IDHackStats : public SpecificStats {
+        IDHackStats() : keysExamined(0),
+                        docsExamined(0) { }
+
+        virtual ~IDHackStats() { }
+
+        virtual SpecificStats* clone() const {
+            IDHackStats* specific = new IDHackStats(*this);
+            return specific;
+        }
+
+        // Number of entries retrieved from the index while executing the idhack.
+        size_t keysExamined;
+
+        // Number of documents retrieved from the collection while executing the idhack.
+        size_t docsExamined;
+
     };
 
     struct IndexScanStats : public SpecificStats {
@@ -292,6 +384,17 @@ namespace mongo {
 
     };
 
+    struct LimitStats : public SpecificStats {
+        LimitStats() : limit(0) { }
+
+        virtual SpecificStats* clone() const {
+            LimitStats* specific = new LimitStats(*this);
+            return specific;
+        }
+
+        size_t limit;
+    };
+
     struct MultiPlanStats : public SpecificStats {
         MultiPlanStats() { }
 
@@ -322,6 +425,18 @@ namespace mongo {
         std::vector<size_t> matchTested;
     };
 
+    struct ProjectionStats : public SpecificStats {
+        ProjectionStats() { }
+
+        virtual SpecificStats* clone() const {
+            ProjectionStats* specific = new ProjectionStats(*this);
+            return specific;
+        }
+
+        // Object specifying the projection transformation to apply.
+        BSONObj projObj;
+    };
+
     struct SortStats : public SpecificStats {
         SortStats() : forcedFetches(0), memUsage(0), memLimit(0) { }
 
@@ -340,6 +455,12 @@ namespace mongo {
 
         // What's our memory limit?
         size_t memLimit;
+
+        // The number of results to return from the sort.
+        size_t limit;
+
+        // The pattern according to which we are sorting.
+        BSONObj sortPattern;
     };
 
     struct MergeSortStats : public SpecificStats {
@@ -359,6 +480,9 @@ namespace mongo {
 
         // How many records were we forced to fetch as the result of an invalidation?
         size_t forcedFetches;
+
+        // The pattern according to which we are sorting.
+        BSONObj sortPattern;
     };
 
     struct ShardingFilterStats : public SpecificStats {
@@ -372,43 +496,57 @@ namespace mongo {
         size_t chunkSkips;
     };
 
-    struct TwoDStats : public SpecificStats {
-        TwoDStats() { }
+    struct SkipStats : public SpecificStats {
+        SkipStats() : skip(0) { }
 
         virtual SpecificStats* clone() const {
-            TwoDStats* specific = new TwoDStats(*this);
+            SkipStats* specific = new SkipStats(*this);
             return specific;
         }
 
-        // Type of GeoBrowse (box, circle, ...)
-        std::string type;
-
-        // Field name in 2d index.
-        std::string field;
-
-        // Geo hash converter parameters.
-        // Used to construct a geo hash converter to generate
-        // explain-style index bounds from geo hashes.
-        GeoHashConverter::Parameters converterParams;
-
-        // Geo hashes generated by GeoBrowse::fillStack.
-        // Raw data for explain index bounds.
-        std::vector<GeoHash> expPrefixes;
+        size_t skip;
     };
 
-    struct TwoDNearStats : public SpecificStats {
-        TwoDNearStats() : objectsLoaded(0), nscanned(0) { }
+    struct IntervalStats {
 
-        virtual SpecificStats* clone() const {
-            TwoDNearStats* specific = new TwoDNearStats(*this);
-            return specific;
+        IntervalStats() :
+            numResultsFound(0),
+            numResultsBuffered(0),
+            minDistanceFound(-1),
+            maxDistanceFound(-1),
+            minDistanceBuffered(-1),
+            maxDistanceBuffered(-1) {
         }
 
-        size_t objectsLoaded;
+        long long numResultsFound;
+        long long numResultsBuffered;
 
-        // Since 2d's near does all its work in one go we can't divine the real nscanned from
-        // anything else.
-        size_t nscanned;
+        double minDistanceFound;
+        double maxDistanceFound;
+        double minDistanceBuffered;
+        double maxDistanceBuffered;
+    };
+
+    class NearStats : public SpecificStats {
+    public:
+
+        NearStats() {}
+
+        virtual SpecificStats* clone() const {
+            return new NearStats(*this);
+        }
+
+        long long totalResultsFound() {
+            long long totalResultsFound = 0;
+            for (vector<IntervalStats>::iterator it = intervalStats.begin();
+                it != intervalStats.end(); ++it) {
+                totalResultsFound += it->numResultsFound;
+            }
+            return totalResultsFound;
+        }
+
+        vector<IntervalStats> intervalStats;
+        BSONObj keyPattern;
     };
 
     struct TextStats : public SpecificStats {
@@ -425,6 +563,9 @@ namespace mongo {
 
         // Human-readable form of the FTSQuery associated with the text stage.
         BSONObj parsedTextQuery;
+
+        // Index keys that precede the "text" index key.
+        BSONObj indexPrefix;
     };
 
 }  // namespace mongo

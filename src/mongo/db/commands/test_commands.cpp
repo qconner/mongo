@@ -1,7 +1,7 @@
 // test_commands.cpp
 
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,12 +28,13 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/base/init.h"
 #include "mongo/base/initializer_context.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/repl/oplog.h"
@@ -63,7 +64,8 @@ namespace mongo {
             BSONObj obj = cmdObj[ "obj" ].embeddedObjectUserCheck();
 
             Lock::DBWrite lk(txn->lockState(), ns);
-            Client::Context ctx( ns );
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            Client::Context ctx(txn,  ns );
             Database* db = ctx.db();
             Collection* collection = db->getCollection( txn, ns );
             if ( !collection ) {
@@ -74,6 +76,10 @@ namespace mongo {
                 }
             }
             StatusWith<DiskLoc> res = collection->insertDocument( txn, obj, false );
+            Status status = res.getStatus();
+            if (status.isOK()) {
+                wunit.commit();
+            }
             return appendCommandStatus( result, res.getStatus() );
         }
     };
@@ -144,7 +150,8 @@ namespace mongo {
             Collection* collection = ctx.ctx().db()->getCollection( txn, nss.ns() );
             massert( 13417, "captrunc collection not found or empty", collection);
 
-            boost::scoped_ptr<Runner> runner(InternalPlanner::collectionScan(nss.ns(),
+            boost::scoped_ptr<Runner> runner(InternalPlanner::collectionScan(txn,
+                                                                             nss.ns(),
                                                                              collection,
                                                                              InternalPlanner::BACKWARD));
             DiskLoc end;
@@ -154,6 +161,7 @@ namespace mongo {
                 massert( 13418, "captrunc invalid n", Runner::RUNNER_ADVANCED == state);
             }
             collection->temp_cappedTruncateAfter( txn, end, inc );
+            ctx.commit();
             return true;
         }
     };
@@ -201,6 +209,7 @@ namespace mongo {
 
             if (!fromRepl)
                 repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
+            ctx.commit();
             return true;
         }
     };

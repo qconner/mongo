@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,6 +36,8 @@
    local.pair.sync       - [deprecated] { initialsynccomplete: 1 }
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/master_slave.h"
 
 #include <pcrecpp.h>
@@ -43,6 +45,7 @@
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
@@ -50,14 +53,18 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h" // replLocalAuth()
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     void pretouchOperation(OperationContext* txn, const BSONObj& op);
@@ -179,6 +186,7 @@ namespace repl {
                 _me = b.obj();
                 Helpers::putSingleton(&txn, "local.me", _me);
             }
+            ctx.commit();
         }
     }
 
@@ -195,9 +203,10 @@ namespace repl {
         LOG( 1 ) << "Saving repl source: " << o << endl;
 
         {
-            OpDebug debug;
-            Client::Context ctx("local.sources");
             OperationContextImpl txn;
+            OpDebug debug;
+
+            Client::Context ctx(&txn, "local.sources");
 
             const NamespaceString requestNs("local.sources");
             UpdateRequest request(requestNs);
@@ -233,17 +242,19 @@ namespace repl {
     */
     void ReplSource::loadAll(OperationContext* txn, SourceVector &v) {
         const char* localSources = "local.sources";
-        Client::Context ctx(localSources);
+        Client::Context ctx(txn, localSources);
         SourceVector old = v;
         v.clear();
 
+        const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if (!replSettings.source.empty()) {
             // --source <host> specified.
             // check that no items are in sources other than that
             // add if missing
             int n = 0;
             auto_ptr<Runner> runner(
-                InternalPlanner::collectionScan(localSources,
+                InternalPlanner::collectionScan(txn,
+                                                localSources,
                                                 ctx.db()->getCollection(txn, localSources)));
             BSONObj obj;
             Runner::RunnerState state;
@@ -287,14 +298,15 @@ namespace repl {
         }
 
         auto_ptr<Runner> runner(
-            InternalPlanner::collectionScan(localSources,
+            InternalPlanner::collectionScan(txn,
+                                            localSources,
                                             ctx.db()->getCollection(txn, localSources)));
         BSONObj obj;
         Runner::RunnerState state;
         while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
             ReplSource tmp(obj);
             if ( tmp.syncedTo.isNull() ) {
-                DBDirectClient c;
+                DBDirectClient c(txn);
                 if ( c.exists( "local.oplog.$main" ) ) {
                     BSONObj op = c.findOne( "local.oplog.$main", QUERY( "op" << NE << "n" ).sort( BSON( "$natural" << -1 ) ) );
                     if ( !op.isEmpty() ) {
@@ -331,7 +343,10 @@ namespace repl {
     void ReplSource::forceResync( OperationContext* txn, const char *requester ) {
         BSONObj info;
         {
-            dbtemprelease t(txn->lockState());
+            // This is always a GlobalWrite lock (so no ns/db used from the context)
+            invariant(txn->lockState()->isW());
+            Lock::TempRelease tempRelease(txn->lockState());
+
             if (!oplogReader.connect(hostName, _me)) {
                 msgassertedNoTrace( 14051 , "unable to connect to resync");
             }
@@ -360,38 +375,15 @@ namespace repl {
 
     void ReplSource::resyncDrop( OperationContext* txn, const string& db ) {
         log() << "resync: dropping database " << db;
-        Client::Context ctx(db);
+        Client::Context ctx(txn, db);
         dropDatabase(txn, ctx.db());
-    }
-
-    /**
-     * @param errmsg out  - Error message (if encountered).
-     * @param errCode out - If provided, this will be set on error to the server's error code.
-     *                      Currently this will only be set if there is an error in the initial
-     *                      system.namespaces query.
-     */
-    bool cloneFrom(OperationContext* txn,
-                           Client::Context& context,
-                           const string& masterHost,
-                           const CloneOptions& options,
-                           string& errmsg,
-                           int* errCode) {
-
-        Cloner cloner;
-        return cloner.go(txn,
-                         context,
-                         masterHost.c_str(),
-                         options,
-                         NULL,
-                         errmsg,
-                         errCode);
     }
 
     /* grab initial copy of a database from the master */
     void ReplSource::resync(OperationContext* txn, const std::string& dbName) {
         const std::string db(dbName);   // need local copy of the name, we're dropping the original
         resyncDrop( txn, db );
-        Client::Context ctx( db );
+
         {
             log() << "resync: cloning database " << db << " to get an initial copy" << endl;
             ReplInfo r("resync: cloning a database");
@@ -405,7 +397,15 @@ namespace repl {
             cloneOptions.snapshot = true;
             cloneOptions.mayYield = true;
             cloneOptions.mayBeInterrupted = false;
-            bool ok = cloneFrom(txn, ctx,hostName, cloneOptions, errmsg, &errCode);
+
+            Cloner cloner;
+            bool ok = cloner.go(txn,
+                                db,
+                                hostName.c_str(),
+                                cloneOptions,
+                                NULL,
+                                errmsg,
+                                &errCode);
 
             if ( !ok ) {
                 if ( errCode == DatabaseDifferCaseCode ) {
@@ -414,7 +414,7 @@ namespace repl {
                     return;
                 }
                 else {
-                    problem() << "resync of " << db << " from " << hostName << " failed " << errmsg << endl;
+                    log() << "resync of " << db << " from " << hostName << " failed " << errmsg << endl;
                     throw SyncException();
                 }
             }
@@ -451,7 +451,7 @@ namespace repl {
                                             const char* ns,
                                             const char* db ) {
         // We are already locked at this point
-        if (dbHolder()._isLoaded(ns, storageGlobalParams.dbpath)) {
+        if (dbHolder().get(txn, ns) != NULL) {
             // Database is already present.
             return true;   
         }
@@ -461,7 +461,7 @@ namespace repl {
             // missing from master after optime "ts".
             return false;   
         }
-        if (Database::duplicateUncasedName(db, storageGlobalParams.dbpath).empty()) {
+        if (Database::duplicateUncasedName(db).empty()) {
             // No duplicate database names are present.
             return true;
         }
@@ -469,7 +469,9 @@ namespace repl {
         OpTime lastTime;
         bool dbOk = false;
         {
-            dbtemprelease release(txn->lockState());
+            // This is always a GlobalWrite lock (so no ns/db used from the context)
+            invariant(txn->lockState()->isW());
+            Lock::TempRelease(txn->lockState());
 
             // We always log an operation after executing it (never before), so
             // a database list will always be valid as of an oplog entry generated
@@ -514,7 +516,7 @@ namespace repl {
         
         // Check for duplicates again, since we released the lock above.
         set< string > duplicates;
-        Database::duplicateUncasedName(db, storageGlobalParams.dbpath, &duplicates);
+        Database::duplicateUncasedName(db, &duplicates);
         
         // The database is present on the master and no conflicting databases
         // are present on the master.  Drop any local conflicts.
@@ -522,12 +524,13 @@ namespace repl {
             ___databaseIgnorer.doIgnoreUntilAfter( *i, lastTime );
             incompleteCloneDbs.erase(*i);
             addDbNextPass.erase(*i);
-            Client::Context ctx(*i);
+
+            Client::Context ctx(txn, *i);
             dropDatabase(txn, ctx.db());
         }
         
         massert(14034, "Duplicate database names present after attempting to delete duplicates",
-                Database::duplicateUncasedName(db, storageGlobalParams.dbpath).empty());
+                Database::duplicateUncasedName(db).empty());
         return true;
     }
 
@@ -570,12 +573,12 @@ namespace repl {
         nsToDatabase(ns, clientName);
 
         if ( *ns == '.' ) {
-            problem() << "skipping bad op in oplog: " << op.toString() << endl;
+            log() << "skipping bad op in oplog: " << op.toString() << endl;
             return;
         }
         else if ( *ns == 0 ) {
             /*if( op.getStringField("op")[0] != 'n' )*/ {
-                problem() << "halting replication, bad op in oplog:\n  " << op.toString() << endl;
+                log() << "halting replication, bad op in oplog:\n  " << op.toString() << endl;
                 replAllDead = "bad object in oplog";
                 throw SyncException();
             }
@@ -586,6 +589,7 @@ namespace repl {
         if ( !only.empty() && only != clientName )
             return;
 
+        const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if (replSettings.pretouch &&
             !alreadyLocked/*doesn't make sense if in write lock already*/) {
             if (replSettings.pretouch > 1) {
@@ -635,11 +639,14 @@ namespace repl {
         if (!handleDuplicateDbName(txn, op, ns, clientName)) {
             return;   
         }
-                
-        Client::Context ctx( ns );
+
+        // This code executes on the slaves only, so it doesn't need to be sharding-aware since
+        // mongos will not send requests there. That's why the last argument is false (do not do
+        // version checking).
+        Client::Context ctx(txn, ns, false);
         ctx.getClient()->curop()->reset();
 
-        bool empty = ctx.db()->isEmpty();
+        bool empty = ctx.db()->getDatabaseCatalogEntry()->isEmpty();
         bool incompleteClone = incompleteCloneDbs.count( clientName ) != 0;
 
         LOG(6) << "ns: " << ns << ", justCreated: " << ctx.justCreated() << ", empty: " << empty << ", incompleteClone: " << incompleteClone << endl;
@@ -667,7 +674,7 @@ namespace repl {
                     log() << "An earlier initial clone of '" << clientName << "' did not complete, now resyncing." << endl;
                 }
                 save();
-                Client::Context ctx(ns);
+                Client::Context ctx(txn, ns);
                 nClonedThisPass++;
                 resync(txn, ctx.db()->name());
                 addDbNextPass.erase(clientName);
@@ -718,6 +725,7 @@ namespace repl {
                                "replApplyBatchSize has to be >= 1 and < 1024" );
             }
 
+            const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
             if ( replSettings.slavedelay != 0 && b > 1 ) {
                 return Status( ErrorCodes::BadValue,
                                "can't use a batch size > 1 with slavedelay" );
@@ -803,7 +811,7 @@ namespace repl {
         }
 
         if( !oplogReader.haveCursor() ) {
-            problem() << "repl: dbclient::query returns null (conn closed?)" << endl;
+            log() << "repl: dbclient::query returns null (conn closed?)" << endl;
             oplogReader.resetConnection();
             return -1;
         }
@@ -846,16 +854,16 @@ namespace repl {
                 if ( !err.empty() ) {
                     // 13051 is "tailable cursor requested on non capped collection"
                     if (op.getIntField("code") == 13051) {
-                        problem() << "trying to slave off of a non-master" << '\n';
+                        log() << "trying to slave off of a non-master" << '\n';
                         massert( 13344 ,  "trying to slave off of a non-master", false );
                     }
                     else {
-                        problem() << "repl: $err reading remote oplog: " + err << '\n';
+                        log() << "repl: $err reading remote oplog: " + err << '\n';
                         massert( 10390 ,  "got $err reading remote oplog", false );
                     }
                 }
                 else {
-                    problem() << "repl: bad object read from remote oplog: " << op.toString() << '\n';
+                    log() << "repl: bad object read from remote oplog: " << op.toString() << '\n';
                     massert( 10391 , "repl: bad object read from remote oplog", false);
                 }
             }
@@ -898,31 +906,23 @@ namespace repl {
             int n = 0;
             time_t saveLast = time(0);
             while ( 1 ) {
-
-                bool moreInitialSyncsPending = !addDbNextPass.empty() && n; // we need "&& n" to assure we actually process at least one op to get a sync point recorded in the first place.
+                // we need "&& n" to assure we actually process at least one op to get a sync
+                // point recorded in the first place.
+                const bool moreInitialSyncsPending = !addDbNextPass.empty() && n;
 
                 if ( moreInitialSyncsPending || !oplogReader.more() ) {
                     Lock::GlobalWrite lk(txn->lockState());
-
-                    // NOTE aaron 2011-03-29 This block may be unnecessary, but I'm leaving it in place to avoid changing timing behavior.
-                    {
-                        dbtemprelease t(txn->lockState());
-                        if ( !moreInitialSyncsPending && oplogReader.more() ) {
-                            continue;
-                        }
-                        // otherwise, break out of loop so we can set to completed or clone more dbs
-                    }
                     
-                    if( oplogReader.awaitCapable() && tailing )
+                    if (oplogReader.awaitCapable() && tailing) {
                         okResultCode = 0; // don't sleep
+                    }
+
                     syncedTo = nextOpTime;
                     save(); // note how far we are synced up to now
                     log() << "repl:   applied " << n << " operations" << endl;
                     nApplied = n;
                     log() << "repl:  end sync_pullOpLog syncedTo: " << syncedTo.toStringLong() << endl;
                     break;
-                }
-                else {
                 }
 
                 OCCASIONALLY if( n > 0 && ( n > 100000 || time(0) - saveLast > 60 ) ) {
@@ -962,6 +962,8 @@ namespace repl {
                         replInfo = replAllDead = "sync error last >= nextOpTime";
                         uassert( 10123 , "replication error last applied optime at slave >= nextOpTime from master", false);
                     }
+                    const ReplSettings& replSettings =
+                            getGlobalReplicationCoordinator()->getSettings();
                     if ( replSettings.slavedelay && ( unsigned( time( 0 ) ) < nextOpTime.getSecs() + replSettings.slavedelay ) ) {
                         verify( justOne );
                         oplogReader.putBack( op );
@@ -989,7 +991,7 @@ namespace repl {
                     }
                     op = oplogReader.next();
 
-                    getDur().commitIfNeeded();
+                    getDur().commitIfNeeded(txn);
                 }
             }
         }
@@ -1051,7 +1053,8 @@ namespace repl {
             Lock::GlobalWrite lk(txn.lockState());
             ReplSource::loadAll(&txn, sources);
 
-            replSettings.fastsync = false; // only need this param for initial reset
+            // only need this param for initial reset
+            getGlobalReplicationCoordinator()->getSettings().fastsync = false;
         }
 
         if ( sources.empty() ) {
@@ -1122,7 +1125,8 @@ namespace repl {
                 Lock::GlobalWrite lk(txn.lockState());
                 if ( replAllDead ) {
                     // throttledForceResyncDead can throw
-                    if ( !replSettings.autoresync || !ReplSource::throttledForceResyncDead( &txn, "auto" ) ) {
+                    if ( !getGlobalReplicationCoordinator()->getSettings().autoresync ||
+                            !ReplSource::throttledForceResyncDead( &txn, "auto" ) ) {
                         log() << "all sources dead: " << replAllDead << ", sleeping for 5 seconds" << endl;
                         break;
                     }
@@ -1144,7 +1148,7 @@ namespace repl {
                 }
             }
             catch (...) {
-                out() << "caught exception in _replMain" << endl;
+                log() << "caught exception in _replMain" << endl;
                 s = 4;
             }
 
@@ -1223,16 +1227,16 @@ namespace repl {
             }
             catch ( AssertionException& ) {
                 ReplInfo r("Assertion in replSlaveThread(): sleeping 5 minutes before retry");
-                problem() << "Assertion in replSlaveThread(): sleeping 5 minutes before retry" << endl;
+                log() << "Assertion in replSlaveThread(): sleeping 5 minutes before retry" << endl;
                 sleepsecs(300);
             }
             catch ( DBException& e ) {
-                problem() << "exception in replSlaveThread(): " << e.what()
-                          << ", sleeping 5 minutes before retry" << endl;
+                log() << "exception in replSlaveThread(): " << e.what()
+                      << ", sleeping 5 minutes before retry" << endl;
                 sleepsecs(300);
             }
             catch ( ... ) {
-                problem() << "error in replSlaveThread(): sleeping 5 minutes before retry" << endl;
+                log() << "error in replSlaveThread(): sleeping 5 minutes before retry" << endl;
                 sleepsecs(300);
             }
         }
@@ -1242,6 +1246,7 @@ namespace repl {
 
         oldRepl();
 
+        ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if( !replSettings.slave && !replSettings.master )
             return;
 
@@ -1270,8 +1275,6 @@ namespace repl {
     int _dummy_z;
 
     void pretouchN(vector<BSONObj>& v, unsigned a, unsigned b) {
-        DEV verify( ! Lock::isW() );
-
         Client *c = currentClient.get();
         if( c == 0 ) {
             Client::initThread("pretouchN");
@@ -1301,7 +1304,7 @@ namespace repl {
                     BSONObjBuilder b;
                     b.append(_id);
                     BSONObj result;
-                    Client::Context ctx( ns );
+                    Client::Context ctx(&txn, ns);
                     if( Helpers::findById(&txn, ctx.db(), ns, b.done(), result) )
                         _dummy_z += result.objsize(); // touch
                 }
@@ -1314,8 +1317,9 @@ namespace repl {
 
     void pretouchOperation(OperationContext* txn, const BSONObj& op) {
 
-        if( Lock::somethingWriteLocked() )
+        if (txn->lockState()->isWriteLocked()) {
             return; // no point pretouching if write locked. not sure if this will ever fire, but just in case.
+        }
 
         const char *which = "o";
         const char *opType = op.getStringField("op");

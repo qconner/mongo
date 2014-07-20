@@ -379,18 +379,14 @@ namespace BasicTests {
             OperationContextImpl txn;
             Lock::GlobalWrite lk(txn.lockState());
 
-            bool isNew = false;
-            // this leaks as ~Database is private
-            // if that changes, should put this on the stack
-            {
-                Database * db = new Database( &txn, "dbtests_basictests_ownsns" , isNew );
-                verify( isNew );
+            WriteUnitOfWork wunit(txn.recoveryUnit());
+            Database db( &txn, "dbtests_basictests_ownsns", NULL );
+            wunit.commit();
 
-                ASSERT( db->ownsNS( "dbtests_basictests_ownsns.x" ) );
-                ASSERT( db->ownsNS( "dbtests_basictests_ownsns.x.y" ) );
-                ASSERT( ! db->ownsNS( "dbtests_basictests_ownsn.x.y" ) );
-                ASSERT( ! db->ownsNS( "dbtests_basictests_ownsnsa.x.y" ) );
-            }
+            ASSERT( db.ownsNS( "dbtests_basictests_ownsns.x" ) );
+            ASSERT( db.ownsNS( "dbtests_basictests_ownsns.x.y" ) );
+            ASSERT( !db.ownsNS( "dbtests_basictests_ownsn.x.y" ) );
+            ASSERT( !db.ownsNS( "dbtests_basictests_ownsnsa.x.y" ) );
         }
     };
 

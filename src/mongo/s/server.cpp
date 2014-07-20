@@ -28,7 +28,7 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/server.h"
 
@@ -46,6 +46,8 @@
 #include "mongo/db/auth/user_cache_invalidator_job.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/dbwebserver.h"
+#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/global_environment_noop.h"
 #include "mongo/db/initialize_server_global_state.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
@@ -86,6 +88,8 @@
 #include "mongo/util/version.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
 #if defined(_WIN32)
     ntservice::NtServiceDefaultStrings defaultServiceStrings = {
@@ -221,6 +225,14 @@ static bool runMongosServer( bool doUpgrade ) {
     ReplicaSetMonitor::setConfigChangeHook(
         stdx::bind(&ConfigServer::replicaSetChange, &configServer, stdx::placeholders::_1 , stdx::placeholders::_2));
 
+    // Mongos connection pools already takes care of authenticating new connections so the
+    // replica set connection shouldn't need to.
+    DBClientReplicaSet::setAuthPooledSecondaryConn(false);
+
+    if (getHostName().empty()) {
+        dbexit(EXIT_BADOPTIONS);
+    }
+
     if (!configServer.init(mongosGlobalParams.configdbs)) {
         log() << "couldn't resolve config db address" << endl;
         return false;
@@ -269,8 +281,7 @@ static bool runMongosServer( bool doUpgrade ) {
 
     if (serverGlobalParams.isHttpInterfaceEnabled)
         boost::thread web( stdx::bind(&webServerThread,
-                                       new NoAdminAccess(), // takes ownership
-                                       OperationContext::factoryNULL) ); // XXX SERVER-13931
+                                       new NoAdminAccess())); // takes ownership
 
     Status status = getGlobalAuthorizationManager()->initialize();
     if (!status.isOK()) {
@@ -330,13 +341,13 @@ static int _main() {
             }
 
             if ( configAddr.isLocalHost() != grid.allowLocalHost() ) {
-                out() << "cannot mix localhost and ip addresses in configdbs" << endl;
+                log() << "cannot mix localhost and ip addresses in configdbs" << endl;
                 return 10;
             }
 
         }
         catch ( DBException& e) {
-            out() << "configdb: " << e.what() << endl;
+            log() << "configdb: " << e.what() << endl;
             return 9;
         }
     }
@@ -372,6 +383,11 @@ MONGO_INITIALIZER_GENERAL(CreateAuthorizationManager,
     return Status::OK();
 }
 
+MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
+    setGlobalEnvironment(new GlobalEnvironmentNoop());
+    return Status::OK();
+}
+
 #ifdef MONGO_SSL
 MONGO_INITIALIZER_GENERAL(setSSLManagerType, 
                           MONGO_NO_PREREQUISITES, 
@@ -386,7 +402,7 @@ int mongoSMain(int argc, char* argv[], char** envp) {
     if (argc < 1)
         return EXIT_FAILURE;
 
-    setupSignalHandlers();
+    setupSignalHandlers(false);
 
     mongosCommand = argv[0];
 

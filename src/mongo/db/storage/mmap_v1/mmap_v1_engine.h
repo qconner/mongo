@@ -30,86 +30,31 @@
 
 #pragma once
 
-#include "mongo/base/status.h"
-#include "mongo/base/string_data.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
-#include "mongo/db/structure/catalog/namespace_index.h"
+#include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
-    class CollectionCatalogEntry;
-    struct CollectionOptions;
-    class IndexAccessMethod;
-    class IndexCatalogEntry;
-    class IndexDescriptor;
-    class RecordStore;
-    class RecordStoreV1Base;
-    class OperationContext;
-
-    class MMAP1DatabaseCatalogEntry : public DatabaseCatalogEntry {
+    class MMAPV1Engine : public StorageEngine {
     public:
-        MMAP1DatabaseCatalogEntry( OperationContext* txn,
-                                   const StringData& name,
-                                   const StringData& path,
-                                   bool directoryperdb );
+        MMAPV1Engine();
+        virtual ~MMAPV1Engine();
 
-        virtual ~MMAP1DatabaseCatalogEntry();
+        RecoveryUnit* newRecoveryUnit( OperationContext* opCtx );
+        void listDatabases( std::vector<std::string>* out ) const;
+        int flushAllFiles( bool sync );
 
-        bool exists() const { return _namespaceIndex.pathExists(); }
+        Status repairDatabase( OperationContext* tnx,
+                               const std::string& dbName,
+                               bool preserveClonedFilesOnFailure,
+                               bool backupOriginalFiles );
 
-        Status createCollection( OperationContext* txn,
-                                 const StringData& ns,
-                                 const CollectionOptions& options,
-                                 bool allocateDefaultSpace );
+        DatabaseCatalogEntry* getDatabaseCatalogEntry( OperationContext* opCtx,
+                                                       const StringData& db );
 
-        void getCollectionNamespaces( std::list<std::string>* tofill ) const;
-
-        /*
-         * ownership passes to caller
-         * will return NULL if ns does not exist
-         */
-        CollectionCatalogEntry* getCollectionCatalogEntry( OperationContext* txn,
-                                                           const StringData& ns );
-
-        // ownership passes to caller
-        RecordStore* getRecordStore( OperationContext* txn,
-                                     const StringData& ns );
-
-        // ownership passes to caller
-        IndexAccessMethod* getIndex( OperationContext* txn,
-                                     const CollectionCatalogEntry* collection,
-                                     IndexCatalogEntry* index );
-
-        const MmapV1ExtentManager* getExtentManager() const { return &_extentManager; } // TODO(ERH): remove
-        MmapV1ExtentManager* getExtentManager() { return &_extentManager; } // TODO(ERH): remove
-
-        const NamespaceIndex& namespaceIndex() const { return _namespaceIndex; } // TODO(ERH): remove
-        NamespaceIndex& namespaceIndex() { return _namespaceIndex; } // TODO(ERH): remove
+        void cleanShutdown(OperationContext* txn);
 
     private:
-
-        RecordStoreV1Base* _getIndexRecordStore( OperationContext* txn );
-        RecordStoreV1Base* _getNamespaceRecordStore( OperationContext* txn,
-                                                     const StringData& whosAsking );
-
-        RecordStoreV1Base* _getRecordStore( OperationContext* txn,
-                                            const StringData& ns );
-
-        void _addNamespaceToNamespaceCollection( OperationContext* txn,
-                                                 const StringData& ns,
-                                                 const BSONObj* options );
-        /**
-         * @throws DatabaseDifferCaseCode if the name is a duplicate based on
-         * case insensitive matching.
-         */
-        void _checkDuplicateUncasedNames() const;
-
-        std::string _path;
-
-        MmapV1ExtentManager _extentManager;
-        NamespaceIndex _namespaceIndex;
-
-        friend class NamespaceDetailsCollectionCatalogEntry;
+        static void _listDatabases( const std::string& directory,
+                                    std::vector<std::string>* out );
     };
 }

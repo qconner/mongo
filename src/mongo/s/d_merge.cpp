@@ -124,7 +124,7 @@ namespace mongo {
             return false;
         }
 
-        dassert( metadata->getShardVersion().isEquivalentTo( shardVersion ) );
+        dassert( metadata->getShardVersion().equals( shardVersion ) );
 
         if ( !metadata->isValidKey( minKey ) || !metadata->isValidKey( maxKey ) ) {
 
@@ -293,7 +293,7 @@ namespace mongo {
         {
             OperationContextImpl txn; // XXX?
             Lock::DBWrite writeLk(txn.lockState(), nss.ns());
-            shardingState.mergeChunks( nss.ns(), minKey, maxKey, mergeVersion );
+            shardingState.mergeChunks(&txn, nss.ns(), minKey, maxKey, mergeVersion);
         }
 
         //

@@ -84,6 +84,9 @@ namespace mongo {
             // SERVER-4328 todo : is global ok or does this take a long time? i believe multiple 
             // ns used so locking individually requires more analysis
             Lock::GlobalWrite globalWriteLock(txn->lockState());
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+
+            DBDirectClient db(txn);
 
             // Preconditions check reads the database state, so needs to be done locked
             if ( cmdObj["preCondition"].type() == Array ) {
@@ -91,6 +94,7 @@ namespace mongo {
                 while ( i.more() ) {
                     BSONObj f = i.next().Obj();
 
+                    DBDirectClient db( txn );
                     BSONObj realres = db.findOne( f["ns"].String() , f["q"].Obj() );
 
                     // Apply-ops would never have a $where matcher, so use the default callback,
@@ -128,9 +132,9 @@ namespace mongo {
                 // a DBWrite on the namespace creates a nested lock, and yields are disallowed for
                 // operations that hold a nested lock.
                 Lock::DBWrite lk(txn->lockState(), ns);
-                invariant(Lock::nested());
+                invariant(txn->lockState()->isRecursive());
 
-                Client::Context ctx(ns);
+                Client::Context ctx(txn, ns);
                 bool failed = repl::applyOperation_inlock(txn,
                                                              ctx.db(),
                                                              temp,
@@ -169,11 +173,13 @@ namespace mongo {
                 repl::logOp(txn, "c", tempNS.c_str(), cmdBuilder.done());
             }
 
-            return errors == 0;
+            if (errors != 0) {
+                return false;
+            }
+
+            wunit.commit();
+            return true;
         }
-
-        DBDirectClient db;
-
     } applyOpsCmd;
 
 }

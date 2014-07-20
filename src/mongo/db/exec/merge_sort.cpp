@@ -34,6 +34,9 @@
 
 namespace mongo {
 
+    // static
+    const char* MergeSortStage::kStageType = "SORT_MERGE";
+
     MergeSortStage::MergeSortStage(const MergeSortStageParams& params,
                                    WorkingSet* ws,
                                    const Collection* collection)
@@ -41,7 +44,8 @@ namespace mongo {
           _ws(ws),
           _pattern(params.pattern),
           _dedup(params.dedup),
-          _merging(StageWithValueComparison(ws, params.pattern)) { }
+          _merging(StageWithValueComparison(ws, params.pattern)),
+          _commonStats(kStageType) { }
 
     MergeSortStage::~MergeSortStage() {
         for (size_t i = 0; i < _children.size(); ++i) { delete _children[i]; }
@@ -62,6 +66,9 @@ namespace mongo {
 
     PlanStage::StageState MergeSortStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -242,8 +249,14 @@ namespace mongo {
         return false;
     }
 
+    vector<PlanStage*> MergeSortStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* MergeSortStage::getStats() {
         _commonStats.isEOF = isEOF();
+
+        _specificStats.sortPattern = _pattern;
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_SORT_MERGE));
         ret->specific.reset(new MergeSortStats(_specificStats));
@@ -251,6 +264,14 @@ namespace mongo {
             ret->children.push_back(_children[i]->getStats());
         }
         return ret.release();
+    }
+
+    const CommonStats* MergeSortStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* MergeSortStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

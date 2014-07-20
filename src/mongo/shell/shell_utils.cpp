@@ -27,7 +27,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/shell/shell_utils.h"
 
@@ -35,6 +35,7 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/index/external_key_generator.h"
+#include "mongo/shell/bench.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils_extended.h"
@@ -47,6 +48,7 @@ namespace mongo {
 
     namespace JSFiles {
         extern const JSFile servers;
+        extern const JSFile mongodtest;
         extern const JSFile shardingtest;
         extern const JSFile servers_misc;
         extern const JSFile replsettest;
@@ -143,6 +145,23 @@ namespace mongo {
 #endif
         }
 
+        BSONObj isAddressSanitizerActive(const BSONObj& a, void* data) {
+            bool isSanitized = false;
+            // See the following for information on how we detect address sanitizer in clang and gcc.
+            //
+            // - http://clang.llvm.org/docs/AddressSanitizer.html#has-feature-address-sanitizer
+            // - https://gcc.gnu.org/ml/gcc-patches/2012-11/msg01827.html
+            //
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+            isSanitized = true;
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+            isSanitized = true;
+#endif
+            return BSON( "" << isSanitized );
+        }
+
         BSONObj getBuildInfo(const BSONObj& a, void* data) {
             uassert( 16822, "getBuildInfo accepts no arguments", a.nFields() == 0 );
             BSONObjBuilder b;
@@ -202,6 +221,7 @@ namespace mongo {
             scope.injectNative( "_srand" , JSSrand );
             scope.injectNative( "_rand" , JSRand );
             scope.injectNative( "_isWindows" , isWindows );
+            scope.injectNative( "_isAddressSanitizerActive", isAddressSanitizerActive );
             scope.injectNative( "interpreterVersion", interpreterVersion );
             scope.injectNative( "getBuildInfo", getBuildInfo );
             scope.injectNative( "isKeyTooLarge", isKeyTooLarge );
@@ -221,11 +241,16 @@ namespace mongo {
             scope.externalSetup();
             mongo::shell_utils::installShellUtils( scope );
             scope.execSetup(JSFiles::servers);
+            scope.execSetup(JSFiles::mongodtest);
             scope.execSetup(JSFiles::shardingtest);
             scope.execSetup(JSFiles::servers_misc);
             scope.execSetup(JSFiles::replsettest);
             scope.execSetup(JSFiles::replsetbridge);
-            scope.installBenchRun();
+
+            scope.injectNative("benchRun", BenchRunner::benchRunSync);
+            scope.injectNative("benchRunSync", BenchRunner::benchRunSync);
+            scope.injectNative("benchStart", BenchRunner::benchStart);
+            scope.injectNative("benchFinish", BenchRunner::benchFinish);
 
             if ( !_dbConnect.empty() ) {
                 uassert( 12513, "connect failed", scope.exec( _dbConnect , "(connect)" , false , true , false ) );

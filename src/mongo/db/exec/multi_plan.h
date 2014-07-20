@@ -53,6 +53,11 @@ namespace mongo {
 
         virtual ~MultiPlanStage();
 
+        /**
+         * Helper used by the destructor to delete losing candidate plans.
+         */
+        void clearCandidates();
+
         virtual bool isEOF();
 
         virtual StageState work(WorkingSetID* out);
@@ -63,13 +68,21 @@ namespace mongo {
 
         virtual void invalidate(const DiskLoc& dl, InvalidationType type);
 
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_MULTI_PLAN; }
+
         virtual PlanStageStats* getStats();
+
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
 
         /** Takes ownership of QuerySolution and PlanStage. not of WorkingSet */
         void addPlan(QuerySolution* solution, PlanStage* root, WorkingSet* sharedWs);
 
         /**
-         * Runs all plans added by addPlan, ranks them, and picks a best.  Deletes all loser plans.
+         * Runs all plans added by addPlan, ranks them, and picks a best.
          * All further calls to getNext(...) will return results from the best plan.
          */
         void pickBestPlan();
@@ -90,14 +103,43 @@ namespace mongo {
          */
         bool hasBackupPlan() const;
 
-    private:
+        //
+        // Used by explain.
+        //
+
         /**
-         * Have all our candidate plans do something.
-         * If all our candidate plans fail, *objOut will contain
-         * information on the failure.
+         * Gathers execution stats for all losing plans.
          */
-        bool workAllPlans();
+        vector<PlanStageStats*> generateCandidateStats();
+
+        /**
+         * Runs the candidate plans until each has either hit EOF or returned DEAD. Results
+         * from the plans are thrown out, but execution stats are gathered.
+         *
+         * You should call this after calling pickBestPlan(...). It expects that a winning plan
+         * has already been selected.
+         */
+        Status executeAllPlans();
+
+        static const char* kStageType;
+
+    private:
+        //
+        // Have all our candidate plans do something.
+        // If all our candidate plans fail, *objOut will contain
+        // information on the failure.
+        //
+
+        /**
+         * Calls work on each child plan in a round-robin fashion. We stop when any plan hits EOF
+         * or returns 'numResults' results.
+         *
+         * Returns true if we need to keep working the plans and false otherwise.
+         */
+        bool workAllPlans(size_t numResults);
+
         void allPlansSaveState();
+
         void allPlansRestoreState();
 
         static const int kNoSuchPlan = -1;

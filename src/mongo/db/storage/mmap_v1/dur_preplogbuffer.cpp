@@ -45,7 +45,6 @@
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/server.h"
 #include "mongo/util/alignedbuilder.h"
-#include "mongo/util/mongoutils/hash.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/timer.h"
@@ -176,7 +175,6 @@ namespace mongo {
         */
         static void _PREPLOGBUFFER(JSectHeader& h, AlignedBuilder& bb) {
             verify(storageGlobalParams.dur);
-            assertLockedForCommitting();
 
             resetLogBuffer(h, bb); // adds JSectHeader
 
@@ -192,7 +190,6 @@ namespace mongo {
             return;
         }
         void PREPLOGBUFFER(/*out*/ JSectHeader& h, AlignedBuilder& ab) {
-            assertLockedForCommitting();
             Timer t;
             j.assureLogFileOpen(); // so fileId is set
             _PREPLOGBUFFER(h, ab);

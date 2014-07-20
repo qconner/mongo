@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/auth/authz_manager_external_state_d.h"
 
 #include <boost/thread/mutex.hpp>
@@ -40,10 +42,14 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kAccessControl);
 
     AuthzManagerExternalStateMongod::AuthzManagerExternalStateMongod() {}
     AuthzManagerExternalStateMongod::~AuthzManagerExternalStateMongod() {}
@@ -99,8 +105,7 @@ namespace mongo {
 
     Status AuthzManagerExternalStateMongod::getAllDatabaseNames(
                 OperationContext* txn, std::vector<std::string>* dbnames) {
-        Lock::GlobalRead lk(txn->lockState());
-        getDatabaseNames(*dbnames);
+        globalStorageEngine->listDatabases( dbnames );
         return Status::OK();
     }
 

@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/query/query_planner.h"
 
 #include <vector>
@@ -42,8 +44,11 @@
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kQuery);
 
     // Copied verbatim from db/index.h
     static bool isIdIndex( const BSONObj &pattern ) {
@@ -167,6 +172,9 @@ namespace mongo {
         // every elt in sort matched kp
         return !sortIt.more();
     }
+
+    // static
+    const int QueryPlanner::kPlannerVersion = 1;
 
     Status QueryPlanner::cacheDataFromTaggedTree(const MatchExpression* const taggedTree,
                                                  const vector<IndexEntry>& relevantIndices,
@@ -415,10 +423,18 @@ namespace mongo {
             return Status::OK();
         }
 
-        // The hint can be $natural: 1.  If this happens, output a collscan.
-        if (!query.getParsed().getHint().isEmpty()) {
-            BSONElement natural = query.getParsed().getHint().getFieldDotted("$natural");
-            if (!natural.eoo()) {
+        // The hint or sort can be $natural: 1.  If this happens, output a collscan. If both
+        // a $natural hint and a $natural sort are specified, then the direction of the collscan
+        // is determined by the sign of the sort (not the sign of the hint).
+        if (!query.getParsed().getHint().isEmpty() || !query.getParsed().getSort().isEmpty()) {
+            BSONObj hintObj = query.getParsed().getHint();
+            BSONObj sortObj = query.getParsed().getSort();
+            BSONElement naturalHint = hintObj.getFieldDotted("$natural");
+            BSONElement naturalSort = sortObj.getFieldDotted("$natural");
+
+            // A hint overrides a $natural sort. This means that we don't force a table
+            // scan if there is a $natural sort with a non-$natural hint.
+            if (!naturalHint.eoo() || (!naturalSort.eoo() && hintObj.isEmpty())) {
                 QLOG() << "Forcing a table scan due to hinted $natural\n";
                 // min/max are incompatible with $natural.
                 if (canTableScan && query.getParsed().getMin().isEmpty()
@@ -606,76 +622,6 @@ namespace mongo {
                 // Don't leave tags on query tree.
                 query.root()->resetTag();
                 return Status(ErrorCodes::BadValue, "unable to find index for $geoNear query");
-            }
-
-            GeoNearMatchExpression* gnme = static_cast<GeoNearMatchExpression*>(gnNode);
-
-            vector<size_t> newFirst;
-
-            // 2d + GEO_NEAR is annoying.  Because 2d's GEO_NEAR isn't streaming we have to embed
-            // the full query tree inside it as a matcher.
-            for (size_t i = 0; i < tag->first.size(); ++i) {
-                // GEO_NEAR has a non-2d index it can use.  We can deal w/that in normal planning.
-                if (!is2DIndex(relevantIndices[tag->first[i]].keyPattern)) {
-                    newFirst.push_back(tag->first[i]);
-                    continue;
-                }
-
-                // If we're here, GEO_NEAR has a 2d index.  We create a 2dgeonear plan with the
-                // entire tree as a filter, if possible.
-
-                GeoNear2DNode* solnRoot = new GeoNear2DNode();
-                solnRoot->nq = gnme->getData();
-                if (NULL != query.getProj()) {
-                    solnRoot->addPointMeta = query.getProj()->wantGeoNearPoint();
-                    solnRoot->addDistMeta = query.getProj()->wantGeoNearDistance();
-                }
-
-                if (MatchExpression::GEO_NEAR != query.root()->matchType()) {
-                    // root is an AND, clone and delete the GEO_NEAR child.
-                    MatchExpression* filterTree = query.root()->shallowClone();
-                    verify(MatchExpression::AND == filterTree->matchType());
-
-                    bool foundChild = false;
-                    for (size_t i = 0; i < filterTree->numChildren(); ++i) {
-                        if (MatchExpression::GEO_NEAR == filterTree->getChild(i)->matchType()) {
-                            foundChild = true;
-                            scoped_ptr<MatchExpression> holder(filterTree->getChild(i));
-                            filterTree->getChildVector()->erase(filterTree->getChildVector()->begin() + i);
-                            break;
-                        }
-                    }
-                    verify(foundChild);
-                    solnRoot->filter.reset(filterTree);
-                }
-
-                solnRoot->numWanted = query.getParsed().getNumToReturn();
-                if (0 == solnRoot->numWanted) {
-                    solnRoot->numWanted = 100;
-                }
-                solnRoot->indexKeyPattern = relevantIndices[tag->first[i]].keyPattern;
-
-                // Remove the 2d index.  2d can only be the first field, and we know there is
-                // only one GEO_NEAR, so we don't care if anyone else was assigned it; it'll
-                // only be first for gnNode.
-                tag->first.erase(tag->first.begin() + i);
-
-                QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query,
-                                                                              params,
-                                                                              solnRoot);
-
-                if (NULL != soln) {
-                    out->push_back(soln);
-                }
-            }
-
-            // Continue planning w/non-2d indices tagged for this pred.
-            tag->first.swap(newFirst);
-
-            if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
-                // Don't leave tags on query tree.
-                query.root()->resetTag();
-                return Status::OK();
             }
 
             QLOG() << "Rated tree after geonear processing:" << query.root()->toString();

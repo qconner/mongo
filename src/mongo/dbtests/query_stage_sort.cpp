@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -47,7 +47,9 @@ namespace QueryStageSortTests {
 
     class QueryStageSortTestBase {
     public:
-        QueryStageSortTestBase() { }
+        QueryStageSortTestBase() : _client(&_txn) {
+        
+        }
 
         void fillData() {
             for (int i = 0; i < numObj(); ++i) {
@@ -64,8 +66,8 @@ namespace QueryStageSortTests {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(DiskLoc(), false,
-                                                       CollectionScanParams::FORWARD);
+            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(), false,
+                                                   CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
                 out->insert(nextLoc);
@@ -168,7 +170,9 @@ namespace QueryStageSortTests {
 
 
         static const char* ns() { return "unittests.QueryStageSort"; }
-    private:
+
+    protected:
+        OperationContextImpl _txn;
         DBDirectClient _client;
     };
 
@@ -179,17 +183,17 @@ namespace QueryStageSortTests {
         virtual int numObj() { return 100; }
 
         void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
+            Client::WriteContext ctx(&_txn, ns());
 
             Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&txn, ns());
+            Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                coll = db->createCollection(&_txn, ns());
             }
 
             fillData();
             sortAndCheck(1, coll);
+            ctx.commit();
         }
     };
 
@@ -199,17 +203,17 @@ namespace QueryStageSortTests {
         virtual int numObj() { return 100; }
 
         void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
+            Client::WriteContext ctx(&_txn, ns());
 
             Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&txn, ns());
+            Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                coll = db->createCollection(&_txn, ns());
             }
 
             fillData();
             sortAndCheck(-1, coll);
+            ctx.commit();
         }
     };
 
@@ -228,17 +232,17 @@ namespace QueryStageSortTests {
         virtual int numObj() { return 10000; }
 
         void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
+            Client::WriteContext ctx(&_txn, ns());
 
             Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&txn, ns());
+            Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                coll = db->createCollection(&_txn, ns());
             }
 
             fillData();
             sortAndCheck(-1, coll);
+            ctx.commit();
         }
     };
 
@@ -248,13 +252,12 @@ namespace QueryStageSortTests {
         virtual int numObj() { return 2000; }
 
         void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
+            Client::WriteContext ctx(&_txn, ns());
             
             Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&txn, ns());
+            Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                coll = db->createCollection(&_txn, ns());
             }
             fillData();
 
@@ -315,6 +318,7 @@ namespace QueryStageSortTests {
                 ASSERT(!member->hasLoc());
                 ++count;
             }
+            ctx.commit();
 
             // Returns all docs.
             ASSERT_EQUALS(limit() ? limit() : numObj(), count);
@@ -339,13 +343,12 @@ namespace QueryStageSortTests {
         virtual int numObj() { return 100; }
 
         void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
+            Client::WriteContext ctx(&_txn, ns());
             
             Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&txn, ns());
+            Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                coll = db->createCollection(&_txn, ns());
             }
 
             WorkingSet* ws = new WorkingSet();
@@ -372,6 +375,7 @@ namespace QueryStageSortTests {
                     ws, new FetchStage(ws, new SortStage(params, ws, ms), NULL, coll), coll);
             Runner::RunnerState runnerState = runner.getNext(NULL, NULL);
             ASSERT_EQUALS(Runner::RUNNER_ERROR, runnerState);
+            ctx.commit();
         }
     };
 

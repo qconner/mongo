@@ -28,7 +28,7 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "pcrecpp.h"
 
@@ -36,7 +36,6 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/client.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
@@ -53,10 +52,13 @@
 #include "mongo/s/type_settings.h"
 #include "mongo/s/type_shard.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     int ConfigServer::VERSION = 3;
     Shard Shard::EMPTY;
@@ -390,7 +392,7 @@ namespace mongo {
             
             if ( ! newest.isEmpty() ) {
                 ChunkVersion v = ChunkVersion::fromBSON(newest, ChunkType::DEPRECATED_lastmod());
-                if ( v.isEquivalentTo( oldVersion ) ) {
+                if ( v.equals( oldVersion ) ) {
                     scoped_lock lk( _lock );
                     CollectionInfo& ci = _collections[ns];
                     uassert( 15885 , str::stream() << "not sharded after reloading from chunks : " << ns , ci.isSharded() );
@@ -425,7 +427,7 @@ namespace mongo {
                     // Only reload if the version we found is newer than our own in the same
                     // epoch
                     if( currentVersion <= ci.getCM()->getVersion() &&
-                        ci.getCM()->getVersion().hasCompatibleEpoch( currentVersion ) )
+                        ci.getCM()->getVersion().hasEqualEpoch( currentVersion ) )
                     {
                         return ci.getCM();
                     }
@@ -449,7 +451,7 @@ namespace mongo {
         uassert( 14822 ,  (string)"state changed in the middle: " + ns , ci.isSharded() );
 
         // Reset if our versions aren't the same
-        bool shouldReset = ! temp->getVersion().isEquivalentTo( ci.getCM()->getVersion() );
+        bool shouldReset = ! temp->getVersion().equals( ci.getCM()->getVersion() );
         
         // Also reset if we're forced to do so
         if( ! shouldReset && forceReload ){
@@ -782,14 +784,7 @@ namespace mongo {
     }
 
     bool ConfigServer::init( vector<string> configHosts ) {
-
         uassert( 10187 ,  "need configdbs" , configHosts.size() );
-
-        string hn = getHostName();
-        if ( hn.empty() ) {
-            sleepsecs(5);
-            dbexit( EXIT_BADOPTIONS );
-        }
 
         set<string> hosts;
         for ( size_t i=0; i<configHosts.size(); i++ ) {

@@ -42,9 +42,8 @@
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 
 namespace mongo {
 
@@ -89,7 +88,10 @@ namespace mongo {
                 return false;
             }
 
-            if (repl::isCurrentlyAReplSetPrimary() && !cmdObj["force"].trueValue()) {
+            repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+            if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet
+                    && replCoord->getCurrentMemberState().primary()
+                    && !cmdObj["force"].trueValue()) {
                 errmsg = "will not run compact on an active replica set primary as this is a slow blocking operation. use force:true to force";
                 return false;
             }
@@ -142,8 +144,10 @@ namespace mongo {
 
 
             Lock::DBWrite lk(txn->lockState(), ns.ns());
+            //  SERVER-14085: The following will have to go as we push down WOUW
+            WriteUnitOfWork wunit(txn->recoveryUnit());
             BackgroundOperation::assertNoBgOpInProgForNs(ns.ns());
-            Client::Context ctx(ns);
+            Client::Context ctx(txn, ns);
 
             Collection* collection = ctx.db()->getCollection(txn, ns.ns());
             if( ! collection ) {
@@ -170,6 +174,7 @@ namespace mongo {
             log() << "compact " << ns << " end";
 
             IndexBuilder::restoreIndexes(indexesInProg);
+            wunit.commit();
 
             return true;
         }

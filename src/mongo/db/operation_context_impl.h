@@ -25,13 +25,13 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#pragma once
 
 #include <boost/scoped_ptr.hpp>
 #include <string>
 
 #include "mongo/db/operation_context.h"
 
-#pragma once
 
 namespace mongo {
 
@@ -39,7 +39,7 @@ namespace mongo {
     public:
         OperationContextImpl();
 
-        virtual ~OperationContextImpl() { }
+        virtual ~OperationContextImpl();
 
         virtual RecoveryUnit* recoveryUnit() const;
 
@@ -50,7 +50,9 @@ namespace mongo {
                                           unsigned long long progressMeterTotal,
                                           int secondsBetween);
 
-        virtual const char * getNS() const;
+        virtual string getNS() const;
+
+        virtual Client* getClient() const;
 
         virtual CurOp* getCurOp() const;
 
@@ -60,13 +62,11 @@ namespace mongo {
 
         virtual bool isPrimaryFor( const StringData& ns );
 
-        /**
-         * Returns an OperationContext. Caller takes ownership.
-         */
-        static OperationContext* factory();
+        virtual Transaction* getTransaction();
 
     private:
         boost::scoped_ptr<RecoveryUnit> _recovery;
+        Transaction _tx;
     };
 
 }  // namespace mongo

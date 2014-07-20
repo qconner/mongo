@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/rs.h"
 
@@ -38,22 +38,23 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/initial_sync.h"
 #include "mongo/db/repl/initial_sync.h"
 #include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/repl/repl_settings.h"  // replSettings
-#include "mongo/db/structure/catalog/namespace_details.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     using namespace mongoutils;
-    using namespace bson;
 
     // add try/catch with sleep
 
@@ -86,11 +87,14 @@ namespace repl {
         fassert( 16233, failedAttempts < maxFailedAttempts);
     }
 
-    bool ReplSetImpl::_syncDoInitialSync_clone(Cloner& cloner, const char *master,
-                                               const list<string>& dbs, bool dataPass) {
+    bool ReplSetImpl::_syncDoInitialSync_clone(OperationContext* txn,
+                                               Cloner& cloner,
+                                               const char *master,
+                                               const list<string>& dbs,
+                                               bool dataPass) {
 
         for( list<string>::const_iterator i = dbs.begin(); i != dbs.end(); i++ ) {
-            string db = *i;
+            const string db = *i;
             if( db == "local" ) 
                 continue;
             
@@ -98,9 +102,6 @@ namespace repl {
                 sethbmsg( str::stream() << "initial sync cloning db: " << db , 0);
             else
                 sethbmsg( str::stream() << "initial sync cloning indexes for : " << db , 0);
-
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, db);
 
             string err;
             int errCode;
@@ -115,13 +116,18 @@ namespace repl {
             options.syncData = dataPass;
             options.syncIndexes = ! dataPass;
 
-            if (!cloner.go(&txn, ctx.ctx(), master, options, NULL, err, &errCode)) {
+            // Make database stable
+            Lock::DBWrite dbWrite(txn->lockState(), db);
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+
+            if (!cloner.go(txn, db, master, options, NULL, err, &errCode)) {
                 sethbmsg(str::stream() << "initial sync: error while "
                                        << (dataPass ? "cloning " : "indexing ") << db
                                        << ".  " << (err.empty() ? "" : err + ".  ")
                                        << "sleeping 5 minutes" ,0);
                 return false;
             }
+            wunit.commit();
         }
 
         return true;
@@ -141,6 +147,7 @@ namespace repl {
 
         LOG(1) << "replSet empty oplog" << rsLog;
         uassertStatusOK( collection->truncate(&txn) );
+        ctx.commit();
     }
 
     const Member* ReplSetImpl::getMemberToSyncTo() {
@@ -321,12 +328,6 @@ namespace repl {
                 lastH = 0;
 
                 log() << "replSet cleaning up [1]" << rsLog;
-                {
-                    OperationContextImpl txn; // XXX?
-                    Client::WriteContext cx(&txn, "local.");
-                    cx.ctx().db()->flushFiles(true);
-                }
-                log() << "replSet cleaning up [2]" << rsLog;
 
                 log() << "replSet initial sync failed will try again" << endl;
 
@@ -398,7 +399,7 @@ namespace repl {
         // written by applyToHead calls
         BSONObj minValid;
 
-        if (replSettings.fastsync) {
+        if (getGlobalReplicationCoordinator()->getSettings().fastsync) {
             log() << "fastsync: skipping database clone" << rsLog;
 
             // prime oplog
@@ -417,7 +418,7 @@ namespace repl {
             list<string> dbs = r.conn()->getDatabaseNames();
 
             Cloner cloner;
-            if (!_syncDoInitialSync_clone(cloner, sourceHostname.c_str(), dbs, true)) {
+            if (!_syncDoInitialSync_clone(&txn, cloner, sourceHostname.c_str(), dbs, true)) {
                 veto(source->fullName(), 600);
                 sleepsecs(300);
                 return;
@@ -444,7 +445,7 @@ namespace repl {
             lastOp = minValid;
 
             sethbmsg("initial sync building indexes",0);
-            if (!_syncDoInitialSync_clone(cloner, sourceHostname.c_str(), dbs, false)) {
+            if (!_syncDoInitialSync_clone(&txn, cloner, sourceHostname.c_str(), dbs, false)) {
                 veto(source->fullName(), 600);
                 sleepsecs(300);
                 return;
@@ -471,7 +472,6 @@ namespace repl {
         {
             Client::WriteContext cx(&txn, "local.");
 
-            cx.ctx().db()->flushFiles(true);
             try {
                 log() << "replSet set minValid=" << minValid["ts"]._opTime().toString() << rsLog;
             }
@@ -483,8 +483,7 @@ namespace repl {
 
             // Clear the initial sync flag.
             theReplSet->clearInitialSyncFlag();
-
-            cx.ctx().db()->flushFiles(true);
+            cx.commit();
         }
         {
             boost::unique_lock<boost::mutex> lock(theReplSet->initialSyncMutex);

@@ -36,7 +36,8 @@
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/repl/is_master.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/background.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -51,8 +52,6 @@ namespace repl {
     class SlaveTracking : public BackgroundJob { // SERVER-4328 todo review
     public:
         string name() const { return "SlaveTracking"; }
-
-        static const char * NS;
 
         struct Ident {
 
@@ -80,7 +79,6 @@ namespace repl {
         void run() {
             Client::initThread( "slaveTracking" );
             cc().getAuthorizationSession()->grantInternalAuthorization();
-            DBDirectClient db;
             while ( ! inShutdown() ) {
                 sleepsecs( 1 );
 
@@ -90,6 +88,8 @@ namespace repl {
                 if ( inShutdown() )
                     return;
                 
+                OperationContextImpl txn;
+
                 if ( lockedForWriting() ) {
                     // note: there is still a race here
                     // since we could call fsyncLock between this and the last lock
@@ -113,7 +113,7 @@ namespace repl {
                 
                 _currentlyUpdatingCache = true;
                 for ( list< pair<BSONObj,BSONObj> >::iterator i=todo.begin(); i!=todo.end(); i++ ) {
-                    db.update( NS , i->first , i->second , true );
+                    DBDirectClient(&txn).update("local.slaves", i->first, i->second, true);
                 }
                 _currentlyUpdatingCache = false;
 
@@ -194,8 +194,11 @@ namespace repl {
         }
 
         bool replicatedToNum(OpTime& op, int w) {
-            massert( ErrorCodes::NotMaster,
-                     "replicatedToNum called but not master anymore", _isMaster() );
+            massert(ErrorCodes::NotMaster,
+                    "replicatedToNum called but not master anymore",
+                    getGlobalReplicationCoordinator()->getReplicationMode() !=
+                            ReplicationCoordinator::modeReplSet ||
+                            getGlobalReplicationCoordinator()->getCurrentMemberState().primary());
 
             if ( w <= 1 )
                 return true;
@@ -208,7 +211,10 @@ namespace repl {
         bool waitForReplication(OpTime& op, int w, int maxSecondsToWait) {
             static const int noLongerMasterAssertCode = ErrorCodes::NotMaster;
             massert(noLongerMasterAssertCode, 
-                    "waitForReplication called but not master anymore", _isMaster() );
+                    "waitForReplication called but not master anymore",
+                    getGlobalReplicationCoordinator()->getReplicationMode() != 
+                            ReplicationCoordinator::modeReplSet ||
+                            getGlobalReplicationCoordinator()->getCurrentMemberState().primary());
 
             if ( w <= 1 )
                 return true;
@@ -219,15 +225,20 @@ namespace repl {
             boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
             xt.sec += maxSecondsToWait;
             
+            ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
             scoped_lock mylk(_mutex);
             while ( ! _replicatedToNum_slaves_locked( op, w ) ) {
                 if ( ! _threadsWaitingForReplication.timed_wait( mylk.boost() , xt ) ) {
                     massert(noLongerMasterAssertCode,
-                            "waitForReplication called but not master anymore", _isMaster());
+                            "waitForReplication called but not master anymore",
+                            replCoord->getReplicationMode() != ReplicationCoordinator::modeReplSet
+                                    || replCoord->getCurrentMemberState().primary());
                     return false;
                 }
                 massert(noLongerMasterAssertCode, 
-                        "waitForReplication called but not master anymore", _isMaster());
+                        "waitForReplication called but not master anymore",
+                        replCoord->getReplicationMode() != ReplicationCoordinator::modeReplSet
+                                || replCoord->getCurrentMemberState().primary());
             }
             return true;
         }
@@ -278,64 +289,11 @@ namespace repl {
 
     } slaveTracking;
 
-    const char * SlaveTracking::NS = "local.slaves";
-
-    // parse optimes from replUpdatePositionCommand and pass them to SyncSourceFeedback
-    bool updateSlaveLocations(BSONArray optimes) {
-        BSONForEach(elem, optimes) {
-            BSONObj entry = elem.Obj();
-            BSONObj id = BSON("_id" << entry["_id"].OID());
-            OpTime ot = entry["optime"]._opTime();
-            BSONObj config = entry["config"].Obj();
-
-            // update locally
-            // This updates the slave tracking map, as well as updates
-            // the GhostSlave cache, and updates the tag groups
-            if (!slaveTracking.update(id, config, "local.oplog.rs", ot)) {
-                return false;
-            }
-
-            if (theReplSet && !theReplSet->isPrimary()) {
-                // pass along if we are not primary
-                LOG(2) << "received notification that " << entry << " has reached optime: "
-                       << ot.toStringPretty();
-                theReplSet->syncSourceFeedback.updateMap(entry["_id"].OID(), ot);
-            }
-        }
-        return true;
-    }
-
-    void updateSlaveLocation( CurOp& curop, const char * ns , OpTime lastOp ) {
-        if ( lastOp.isNull() )
-            return;
-
-        verify( str::startsWith(ns, "local.oplog.") );
-
-        Client * c = curop.getClient();
-        verify(c);
-        BSONObj rid = c->getRemoteID();
-        if ( rid.isEmpty() )
-            return;
-
-        BSONObj handshake = c->getHandshake();
-        if (handshake.hasField("config")) {
-            slaveTracking.update(rid, handshake["config"].Obj(), ns, lastOp);
-        }
-        else {
-            BSONObjBuilder bob;
-            bob.append("host", curop.getRemoteString());
-            bob.append("upgradeNeeded", true);
-            slaveTracking.update(rid, bob.done(), ns, lastOp);
-        }
-
-        if (theReplSet && !theReplSet->isPrimary()) {
-            // we don't know the slave's port, so we make the replica set keep
-            // a map of rids to slaves
-            // pass along if we are not primary
-            LOG(2) << "received notification via getmore that " << rid << " has reached optime: "
-                   << lastOp.toStringPretty();
-            theReplSet->syncSourceFeedback.updateMap(rid["_id"].OID(), lastOp);
-        }
+    bool updateSlaveTracking(const BSONObj& rid,
+                             const BSONObj config,
+                             const string& ns,
+                             OpTime last) {
+        return slaveTracking.update(rid, config, ns, last);
     }
 
     bool opReplicatedEnough( OpTime op , BSONElement w ) {

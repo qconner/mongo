@@ -184,7 +184,7 @@ namespace mongo {
         return ss;
     }
 
-    BSONObj IndexBounds::toBSON() const {
+    BSONObj IndexBounds::toLegacyBSON() const {
         BSONObjBuilder builder;
         if (isSimpleRange) {
             // TODO
@@ -222,10 +222,39 @@ namespace mongo {
 
                     fieldBuilder.append(
                         static_cast<BSONArray>(intervalBuilder.arr().clientReadable()));
+
+                    // If the bounds object gets too large, truncate it.
+                    static const int kMaxBoundsSize = 1024 * 1024;
+                    if (builder.len() > kMaxBoundsSize) {
+                        intervalBuilder.doneFast();
+                        fieldBuilder.append(BSON("warning" << "bounds obj exceeds 1 MB"));
+                        fieldBuilder.doneFast();
+                        return builder.obj();
+                    }
                 }
             }
         }
+
         return builder.obj();
+    }
+
+    BSONObj IndexBounds::toBSON() const {
+        BSONObjBuilder bob;
+        vector<OrderedIntervalList>::const_iterator itField;
+        for (itField = fields.begin(); itField != fields.end(); ++itField) {
+            BSONArrayBuilder fieldBuilder(bob.subarrayStart(itField->name));
+
+            vector<Interval>::const_iterator itInterval;
+            for (itInterval = itField->intervals.begin()
+                    ; itInterval != itField->intervals.end()
+                    ; ++itInterval) {
+                fieldBuilder.append(itInterval->toString());
+            }
+
+            fieldBuilder.doneFast();
+        }
+
+        return bob.obj();
     }
 
     //

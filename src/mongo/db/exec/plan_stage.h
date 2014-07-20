@@ -41,11 +41,11 @@ namespace mongo {
      * A PlanStage ("stage") is the basic building block of a "Query Execution Plan."  A stage is
      * the smallest piece of machinery used in executing a compiled query.  Stages either access
      * data (from a collection or an index) to create a stream of results, or transform a stream of
-     * results (e.g. AND, OR, SORT) to create a stream of results.  
+     * results (e.g. AND, OR, SORT) to create a stream of results.
      *
      * Stages have zero or more input streams but only one output stream.  Data-accessing stages are
      * leaves and data-transforming stages have children.  Stages can be connected together to form
-     * a tree which is then executed (see plan_runner.h) to solve a query.  
+     * a tree which is then executed (see plan_runner.h) to solve a query.
      *
      * A stage's input and output are each typed.  Only stages with compatible types can be
      * connected.
@@ -197,12 +197,49 @@ namespace mongo {
         virtual void invalidate(const DiskLoc& dl, InvalidationType type) = 0;
 
         /**
+         * Retrieve a list of this stage's children. This stage keeps ownership of
+         * its children.
+         */
+        virtual std::vector<PlanStage*> getChildren() const = 0;
+
+        /**
+         * What type of stage is this?
+         */
+        virtual StageType stageType() const = 0;
+
+        //
+        // Execution stats.
+        //
+
+        /**
          * Returns a tree of stats.  See plan_stats.h for the details of this structure.  If the
          * stage has any children it must propagate the request for stats to them.
+         *
+         * Creates plan stats tree which has the same topology as the original execution tree,
+         * but has a separate lifetime.
          *
          * Caller owns returned pointer.
          */
         virtual PlanStageStats* getStats() = 0;
+
+        /**
+         * Get the CommonStats for this stage. The pointer is *not* owned by the caller.
+         *
+         * The returned pointer is only valid when the corresponding stage is also valid.
+         * It must not exist past the stage. If you need the stats to outlive the stage,
+         * use the getStats(...) method above.
+         */
+        virtual const CommonStats* getCommonStats() = 0;
+
+        /**
+         * Get stats specific to this stage. Some stages may not have specific stats, in which
+         * case they return NULL. The pointer is *not* owned by the caller.
+         *
+         * The returned pointer is only valid when the corresponding stage is also valid.
+         * It must not exist past the stage. If you need the stats to outlive the stage,
+         * use the getStats(...) method above.
+         */
+        virtual const SpecificStats* getSpecificStats() = 0;
 
     };
 

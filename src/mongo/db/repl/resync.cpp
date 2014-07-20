@@ -28,7 +28,7 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/master_slave.h"  // replSettings
-#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h" // replLocalAuth()
 #include "mongo/db/operation_context_impl.h"
 
@@ -68,8 +68,9 @@ namespace repl {
 
             const std::string ns = parseNs(dbname, cmdObj);
             Lock::GlobalWrite globalWriteLock(txn->lockState());
-            Client::Context ctx(ns);
-            if (replSettings.usingReplSets()) {
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            Client::Context ctx(txn, ns);
+            if (getGlobalReplicationCoordinator()->getSettings().usingReplSets()) {
                 if (!theReplSet) {
                     errmsg = "no replication yet active";
                     return false;
@@ -96,6 +97,7 @@ namespace repl {
 
             ReplSource::forceResyncDead( txn, "client" );
             result.append( "info", "triggered resync for all sources" );
+            wunit.commit();
             return true;
         }
 

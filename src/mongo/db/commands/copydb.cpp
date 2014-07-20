@@ -46,11 +46,9 @@
 #include "mongo/db/index_builder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
@@ -153,11 +151,6 @@ namespace mongo {
                 return false;
             }
 
-            // SERVER-4328 todo lock just the two db's not everything for the fromself case
-            scoped_ptr<Lock::ScopedLock> lk( fromSelf ?
-                                             static_cast<Lock::ScopedLock*>(new Lock::GlobalWrite(txn->lockState())) :
-                                             static_cast<Lock::ScopedLock*>(new Lock::DBWrite(txn->lockState(), todb)));
-
             Cloner cloner;
             string username = cmdObj.getStringField( "username" );
             string nonce = cmdObj.getStringField( "nonce" );
@@ -166,7 +159,6 @@ namespace mongo {
                 uassert( 13008, "must call copydbgetnonce first", authConn_.get() );
                 BSONObj ret;
                 {
-                    dbtemprelease t(txn->lockState());
                     if ( !authConn_->runCommand( cloneOptions.fromDB,
                                                  BSON( "authenticate" << 1 << "user" << username
                                                        << "nonce" << nonce << "key" << key ), ret ) ) {
@@ -183,14 +175,25 @@ namespace mongo {
                 if (!cs.isValid()) {
                     return false;
                 }
+
                 DBClientBase* conn = cs.connect(errmsg);
                 if (!conn) {
                     return false;
                 }
                 cloner.setConnection(conn);
             }
-            Client::Context ctx(todb);
-            return cloner.go(txn, ctx, fromhost, cloneOptions, NULL, errmsg );
+
+
+            // SERVER-4328 todo lock just the two db's not everything for the fromself case
+            scoped_ptr<Lock::ScopedLock> lk( fromSelf ?
+                                             static_cast<Lock::ScopedLock*>(new Lock::GlobalWrite(txn->lockState())) :
+                                             static_cast<Lock::ScopedLock*>(new Lock::DBWrite(txn->lockState(), todb)));
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            if (!cloner.go(txn, todb, fromhost, cloneOptions, NULL, errmsg )) {
+                return false;
+            }
+            wunit.commit();
+            return true;
         }
 
     } cmdCopyDB;

@@ -26,9 +26,14 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/mongoutils/str.h"
+
+#include <algorithm>
+#include <math.h>
 
 // for updateCache
 #include "mongo/db/catalog/collection.h"
@@ -38,8 +43,15 @@
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kQuery);
+
+    // static
+    const char* MultiPlanStage::kStageType = "MULTI_PLAN";
+
     MultiPlanStage::MultiPlanStage(const Collection* collection, CanonicalQuery* cq)
         : _collection(collection),
           _query(cq),
@@ -47,7 +59,8 @@ namespace mongo {
           _backupPlanIdx(kNoSuchPlan),
           _failure(false),
           _failureCount(0),
-          _statusMemberId(WorkingSet::INVALID_ID) { }
+          _statusMemberId(WorkingSet::INVALID_ID),
+          _commonStats(kStageType) { }
 
     MultiPlanStage::~MultiPlanStage() {
         if (bestPlanChosen()) {
@@ -63,6 +76,9 @@ namespace mongo {
                 delete _candidates[_backupPlanIdx].solution;
                 delete _candidates[_backupPlanIdx].root;
             }
+
+            // Clean up the losing candidates.
+            clearCandidates();
         }
         else {
             for (size_t ix = 0; ix < _candidates.size(); ++ix) {
@@ -96,6 +112,9 @@ namespace mongo {
     }
 
     PlanStage::StageState MultiPlanStage::work(WorkingSetID* out) {
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (_failure) {
             *out = _statusMemberId;
             return PlanStage::FAILURE;
@@ -155,10 +174,23 @@ namespace mongo {
                                 size_t(fraction * _collection->numRecords()));
         }
 
+        // We treat ntoreturn as though it is a limit during plan ranking.
+        // This means that ranking might not be great for sort + batchSize.
+        // But it also means that we don't buffer too much data for sort + limit.
+        // See SERVER-14174 for details.
+        size_t numToReturn = _query->getParsed().getNumToReturn();
+
+        // Determine the number of results which we will produce during the plan
+        // ranking phase before stopping.
+        size_t numResults = (size_t)internalQueryPlanEvaluationMaxResults;
+        if (numToReturn > 0) {
+            numResults = std::min(numToReturn, numResults);
+        }
+
         // Work the plans, stopping when a plan hits EOF or returns some
         // fixed number of results.
         for (size_t ix = 0; ix < numWorks; ++ix) {
-            bool moreToDo = workAllPlans();
+            bool moreToDo = workAllPlans(numResults);
             if (!moreToDo) { break; }
         }
 
@@ -190,6 +222,43 @@ namespace mongo {
                     _backupPlanIdx = ix;
                     break;
                 }
+            }
+        }
+
+        // Logging for tied plans.
+        if (ranking->tieForBest && NULL != _collection) {
+            // These arrays having two or more entries is implied by 'tieForBest'.
+            invariant(ranking->scores.size() > 1);
+            invariant(ranking->candidateOrder.size() > 1);
+
+            size_t winnerIdx = ranking->candidateOrder[0];
+            size_t runnerUpIdx = ranking->candidateOrder[1];
+
+            LOG(1) << "Winning plan tied with runner-up."
+                   << " ns: " << _collection->ns()
+                   << " " << _query->toStringShort()
+                   << " winner score: " << ranking->scores[0]
+                   << " winner summary: "
+                   << getPlanSummary(*_candidates[winnerIdx].solution)
+                   << " runner-up score: " << ranking->scores[1]
+                   << " runner-up summary: "
+                   << getPlanSummary(*_candidates[runnerUpIdx].solution);
+
+            // There could be more than a 2-way tie, so log the stats for the remaining plans
+            // involved in the tie.
+            static const double epsilon = 1e-10;
+            for (size_t i = 2; i < ranking->scores.size(); i++) {
+                if (fabs(ranking->scores[i] - ranking->scores[0]) >= epsilon) {
+                    break;
+                }
+
+                size_t planIdx = ranking->candidateOrder[i];
+
+                LOG(1) << "Plan " << i << " involved in multi-way tie."
+                       << " ns: " << _collection->ns()
+                       << " " << _query->toStringShort()
+                       << " score: " << ranking->scores[i]
+                       << " summary: " << getPlanSummary(*_candidates[planIdx].solution);
             }
         }
 
@@ -228,18 +297,12 @@ namespace mongo {
                 _collection->infoCache()->getPlanCache()->add(*_query, solutions, ranking.release());
             }
         }
+    }
 
-        // Clear out the candidate plans, leaving only stats as we're all done w/them.
-        // Traverse candidate plans in order or score
-        for (size_t orderingIndex = 0;
-             orderingIndex < candidateOrder.size(); ++orderingIndex) {
-            // index into candidates/ranking
-            int ix = candidateOrder[orderingIndex];
-
-            if (ix == _bestPlanIdx) { continue; }
-            if (ix == _backupPlanIdx) { continue; }
-
-            delete _candidates[ix].solution;
+    vector<PlanStageStats*> MultiPlanStage::generateCandidateStats() {
+        for (size_t ix = 0; ix < _candidates.size(); ix++) {
+            if (ix == (size_t)_bestPlanIdx) { continue; }
+            if (ix == (size_t)_backupPlanIdx) { continue; }
 
             // Remember the stats for the candidate plan because we always show it on an
             // explain. (The {verbose:false} in explain() is client-side trick; we always
@@ -248,11 +311,24 @@ namespace mongo {
             if (stats) {
                 _candidateStats.push_back(stats);
             }
+        }
+
+        return _candidateStats;
+    }
+
+    void MultiPlanStage::clearCandidates() {
+        // Clear out the candidate plans, leaving only stats as we're all done w/them.
+        // Traverse candidate plans in order or score
+        for (size_t ix = 0; ix < _candidates.size(); ix++) {
+            if (ix == (size_t)_bestPlanIdx) { continue; }
+            if (ix == (size_t)_backupPlanIdx) { continue; }
+
             delete _candidates[ix].root;
+            delete _candidates[ix].solution;
         }
     }
 
-    bool MultiPlanStage::workAllPlans() {
+    bool MultiPlanStage::workAllPlans(size_t numResults) {
         bool doneWorking = false;
 
         for (size_t ix = 0; ix < _candidates.size(); ++ix) {
@@ -267,8 +343,7 @@ namespace mongo {
                 candidate.results.push_back(id);
 
                 // Once a plan returns enough results, stop working.
-                if (candidate.results.size()
-                    >= size_t(internalQueryPlanEvaluationMaxResults)) {
+                if (candidate.results.size() >= numResults) {
                     doneWorking = true;
                 }
             }
@@ -299,6 +374,38 @@ namespace mongo {
         }
 
         return !doneWorking;
+    }
+
+    Status MultiPlanStage::executeAllPlans() {
+        // Boolean vector keeping track of which plans are done.
+        vector<bool> planDone(_candidates.size(), false);
+
+        // Number of plans that are done.
+        size_t doneCount = 0;
+
+        while (doneCount < _candidates.size()) {
+            for (size_t i = 0; i < _candidates.size(); i++) {
+                if (planDone[i]) {
+                    continue;
+                }
+
+                WorkingSetID id = WorkingSet::INVALID_ID;
+                PlanStage::StageState state = _candidates[i].root->work(&id);
+
+                if (PlanStage::IS_EOF == state || PlanStage::DEAD == state) {
+                    doneCount++;
+                    planDone[i] = true;
+                }
+                else if (PlanStage::FAILURE == state) {
+                    // Propogate error.
+                    BSONObj errObj;
+                    WorkingSetCommon::getStatusMemberObject(*_candidates[i].ws, id, &errObj);
+                    return Status(ErrorCodes::BadValue, WorkingSetCommon::toStatusString(errObj));
+                }
+            }
+        }
+
+        return Status::OK();
     }
 
     void MultiPlanStage::prepareToYield() {
@@ -413,6 +520,21 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> MultiPlanStage::getChildren() const {
+        vector<PlanStage*> children;
+
+        if (bestPlanChosen()) {
+            children.push_back(_candidates[_bestPlanIdx].root);
+        }
+        else {
+            for (size_t i = 0; i < _candidates.size(); i++) {
+                children.push_back(_candidates[i].root);
+            }
+        }
+
+        return children;
+    }
+
     PlanStageStats* MultiPlanStage::getStats() {
         if (bestPlanChosen()) {
             return _candidates[_bestPlanIdx].root->getStats();
@@ -425,6 +547,14 @@ namespace mongo {
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_MULTI_PLAN));
 
         return ret.release();
+    }
+
+    const CommonStats* MultiPlanStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* MultiPlanStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

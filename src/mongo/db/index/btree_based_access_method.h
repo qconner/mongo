@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,12 +36,12 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/structure/btree/btree_interface.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/mmap_v1/btree/bucket_deletion_notification.h"  // XXX HK this can go away
 
 namespace mongo {
 
     class ExternalSortComparison;
-    class RecordStore;
 
     /**
      * Any access method that is Btree based subclasses from this.
@@ -58,7 +58,7 @@ namespace mongo {
         MONGO_DISALLOW_COPYING( BtreeBasedAccessMethod );
     public:
         BtreeBasedAccessMethod( IndexCatalogEntry* btreeState,
-                                RecordStore* recordStore );
+                                SortedDataInterface* btree );
 
         virtual ~BtreeBasedAccessMethod() { }
 
@@ -74,7 +74,8 @@ namespace mongo {
                               const InsertDeleteOptions& options,
                               int64_t* numDeleted);
 
-        virtual Status validateUpdate(const BSONObj& from,
+        virtual Status validateUpdate(OperationContext* txn,
+                                      const BSONObj& from,
                                       const BSONObj& to,
                                       const DiskLoc& loc,
                                       const InsertDeleteOptions& options,
@@ -84,7 +85,9 @@ namespace mongo {
                               const UpdateTicket& ticket,
                               int64_t* numUpdated);
 
-        virtual Status newCursor(IndexCursor **out) const;
+        virtual Status newCursor(OperationContext* txn,
+                                 const CursorOptions& opts,
+                                 IndexCursor** out) const;
 
         virtual Status initializeAsEmpty(OperationContext* txn);
 
@@ -94,14 +97,24 @@ namespace mongo {
                                    bool mayInterrupt,
                                    std::set<DiskLoc>* dups );
 
-        virtual Status touch(const BSONObj& obj);
+        virtual Status touch(OperationContext* txn, const BSONObj& obj);
 
         virtual Status touch(OperationContext* txn) const;
 
-        virtual Status validate(int64_t* numKeys);
+        virtual Status validate(OperationContext* txn, int64_t* numKeys);
 
         // XXX: consider migrating callers to use IndexCursor instead
-        virtual DiskLoc findSingle( const BSONObj& key ) const;
+        virtual DiskLoc findSingle( OperationContext* txn, const BSONObj& key ) const;
+
+        /**
+         * Invalidates all active cursors, which point at the bucket being deleted.
+         * TODO see if there is a better place to put this.
+         */
+        class InvalidateCursorsNotification : public BucketDeletionNotification {
+        public:
+            virtual void aboutToDeleteBucket(const DiskLoc& bucket);
+        };
+        static InvalidateCursorsNotification invalidateCursors;
 
     protected:
         // Friends who need getKeys.
@@ -113,7 +126,6 @@ namespace mongo {
         virtual void getKeys(const BSONObj &obj, BSONObjSet *keys) = 0;
 
         IndexCatalogEntry* _btreeState; // owned by IndexCatalogEntry
-        scoped_ptr<RecordStore> _recordStore; // owned by us
         const IndexDescriptor* _descriptor;
 
     private:
@@ -121,7 +133,7 @@ namespace mongo {
                           const BSONObj& key,
                           const DiskLoc& loc);
 
-        scoped_ptr<BtreeInterface> _newInterface;
+        scoped_ptr<SortedDataInterface> _newInterface;
     };
 
     /**

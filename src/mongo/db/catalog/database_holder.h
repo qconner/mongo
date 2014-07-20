@@ -34,83 +34,40 @@
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 
-namespace mongo { 
+namespace mongo {
 
     /**
-     * path + dbname -> Database
+     * dbname -> Database
      */
     class DatabaseHolder {
         typedef std::map<std::string,Database*> DBs;
-        typedef std::map<std::string,DBs> Paths;
         // todo: we want something faster than this if called a lot:
         mutable SimpleMutex _m;
-        Paths _paths;
-        int _size;
+        DBs _dbs;
     public:
-        DatabaseHolder() : _m("dbholder"),_size(0) { }
+        DatabaseHolder() : _m("dbholder"){ }
 
-        bool __isLoaded( const std::string& ns , const std::string& path ) const {
-            SimpleMutex::scoped_lock lk(_m);
-            Paths::const_iterator x = _paths.find( path );
-            if ( x == _paths.end() )
-                return false;
-            const DBs& m = x->second;
-
-            std::string db = _todb( ns );
-
-            DBs::const_iterator it = m.find(db);
-            return it != m.end();
-        }
-        // must be write locked as otherwise isLoaded could go false->true on you 
-        // in the background and you might not expect that.
-        bool _isLoaded( const std::string& ns , const std::string& path ) const {
-            Lock::assertWriteLocked(ns);
-            return __isLoaded(ns,path);
-        }
-
-        Database * get( const std::string& ns , const std::string& path ) const {
-            SimpleMutex::scoped_lock lk(_m);
-            Lock::assertAtLeastReadLocked(ns);
-            Paths::const_iterator x = _paths.find( path );
-            if ( x == _paths.end() )
-                return 0;
-            const DBs& m = x->second;
-            std::string db = _todb( ns );
-            DBs::const_iterator it = m.find(db);
-            if ( it != m.end() )
-                return it->second;
-            return 0;
-        }
+        Database* get(OperationContext* txn,
+                      const std::string& ns) const;
 
         Database* getOrCreate(OperationContext* txn,
                               const std::string& ns,
-                              const std::string& path,
                               bool& justCreated);
 
-        void erase( const std::string& ns , const std::string& path ) {
-            SimpleMutex::scoped_lock lk(_m);
-            verify( Lock::isW() );
-            DBs& m = _paths[path];
-            _size -= (int)m.erase( _todb( ns ) );
-        }
+        void erase(OperationContext* txn, const std::string& ns);
 
         /** @param force - force close even if something underway - use at shutdown */
-        bool closeAll( const std::string& path , BSONObjBuilder& result, bool force );
-
-        // "info" as this is informational only could change on you if you are not write locked
-        int sizeInfo() const { return _size; }
+        bool closeAll(OperationContext* txn,
+                      BSONObjBuilder& result,
+                      bool force);
 
         /**
-         * gets all unique db names, ignoring paths
          * need some lock
          */
         void getAllShortNames( std::set<std::string>& all ) const {
             SimpleMutex::scoped_lock lk(_m);
-            for ( Paths::const_iterator i=_paths.begin(); i!=_paths.end(); i++ ) {
-                DBs m = i->second;
-                for( DBs::const_iterator j=m.begin(); j!=m.end(); j++ ) {
-                    all.insert( j->first );
-                }
+            for( DBs::const_iterator j=_dbs.begin(); j!=_dbs.end(); j++ ) {
+                all.insert( j->first );
             }
         }
 

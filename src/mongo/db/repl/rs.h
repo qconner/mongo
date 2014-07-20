@@ -65,50 +65,18 @@
 namespace mongo {
 namespace repl {
 
-    extern bool replSet; // true if using repl sets
     extern class ReplSet *theReplSet; // null until initialized
 
-    class ReplSetCmdline;
+    class ReplSetSeedList;
 
     // Main entry point for replica sets
-    void startReplSets(ReplSetCmdline *replSetCmdline);
-
-    bool isCurrentlyAReplSetPrimary();
+    void startReplSets(ReplSetSeedList *replSetSeedList);
 
     /**
      * does local authentication
      * directly authorizes against AuthenticationInfo
      */
     void replLocalAuth();
-
-    /** inlines ----------------- */
-
-    inline bool ignoreUniqueIndex(const IndexDescriptor* idx) {
-        if (!idx->unique()) {
-            return false;
-        }
-        if (!theReplSet) {
-            return false;
-        }
-        // see SERVER-6671
-        MemberState ms = theReplSet->state();
-        if (! ((ms == MemberState::RS_STARTUP2) ||
-               (ms == MemberState::RS_RECOVERING) ||
-               (ms == MemberState::RS_ROLLBACK))) {
-            return false;
-        }
-        // 2 is the oldest oplog version where operations
-        // are fully idempotent.
-        if (theReplSet->oplogVersion < 2) {
-            return false;
-        }
-        // Never ignore _id index
-        if (idx->isIdIndex()) {
-            return false;
-        }
-
-        return true;
-    }
 
 } // namespace repl
 } // namespace mongo

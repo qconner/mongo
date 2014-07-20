@@ -26,9 +26,14 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/geo/r2_region_coverer.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kQuery);
 
     // Definition
     int const R2RegionCoverer::kDefaultMaxCells = 8;
@@ -175,7 +180,7 @@ namespace mongo {
             // at the same level, we prefer the cells with the smallest number of
             // intersecting children.  Finally, we prefer cells that have the smallest
             // number of children that cannot be refined any further.
-            int priority = -((((candidate->cell.getBits() << 4)
+            int priority = -(((((int)candidate->cell.getBits() << 4)
                               + candidate->numChildren) << 4)
                               + numTerminals);
             _candidateQueue->push(make_pair(priority, candidate)); // queue owns candidate

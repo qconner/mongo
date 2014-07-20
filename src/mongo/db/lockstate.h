@@ -42,10 +42,10 @@ namespace mongo {
     public:
         LockState();
 
-        void dump();
+        void dump() const;
 
         BSONObj reportState();
-        void reportState(BSONObjBuilder& b);
+        void reportState(BSONObjBuilder* b);
         
         unsigned recursiveCount() const { return _recursive; }
 
@@ -57,12 +57,17 @@ namespace mongo {
         bool isRW() const; // RW
         bool isW() const; // W
         bool hasAnyReadLock() const; // explicitly rR
-        bool hasAnyWriteLock() const; // wW
         
         bool isLocked(const StringData& ns) const; // rwRW
-        bool isWriteLocked(const StringData& ns);
+        bool isLocked() const;
+        bool isWriteLocked() const;
+        bool isWriteLocked(const StringData& ns) const;
         bool isAtLeastReadLocked(const StringData& ns) const;
-        bool isNested() const;
+        bool isLockedForCommitting() const;
+        bool isRecursive() const;
+
+        void assertWriteLocked(const StringData& ns) const;
+        void assertAtLeastReadLocked(const StringData& ns) const;
 
         /** pending means we are currently trying to get a lock */
         bool hasLockPending() const { return _lockPending || _lockPendingParallelWriter; }

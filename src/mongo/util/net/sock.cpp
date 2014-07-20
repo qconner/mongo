@@ -27,7 +27,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/sock.h"
 
@@ -45,15 +45,20 @@
 # endif
 #endif
 
+#include "mongo/db/server_options.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/value.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/socket_poll.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kNetworking);
+
     MONGO_FP_DECLARE(throwSockExcep);
 
     static bool ipv6 = false;
@@ -939,8 +944,7 @@ namespace mongo {
         WinsockInit() {
             WSADATA d;
             if ( WSAStartup(MAKEWORD(2,2), &d) != 0 ) {
-                out() << "ERROR: wsastartup failed " << errnoWithDescription() << endl;
-                problem() << "ERROR: wsastartup failed " << errnoWithDescription() << endl;
+                log() << "ERROR: wsastartup failed " << errnoWithDescription() << endl;
                 _exit(EXIT_NTSERVICE_ERROR);
             }
         }
