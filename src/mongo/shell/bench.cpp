@@ -802,10 +802,10 @@ namespace mongo {
                                << " could not authenticate to admin db; admin db access is "
                                "still required to use benchRun with auth enabled");
                  }
-                 // Get final stats
-                 conn->simpleCommand( "admin" , &after , "serverStatus" );
-                 after = after.getOwned();
              }
+             // Get final stats
+             conn->simpleCommand( "admin" , &after , "serverStatus" );
+             after = after.getOwned();
          }
 
          {
