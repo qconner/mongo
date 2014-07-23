@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright 2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,60 +28,36 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <string>
-
-#include "mongo/base/status.h"
-#include "mongo/db/query/runner.h"
+#include "mongo/base/status_with.h"
 
 namespace mongo {
+namespace repl {
 
-    class BSONObj;
-    class CanonicalQuery;
-    class DiskLoc;
-    class TypeExplain;
-    struct PlanInfo;
+    class ReplicationCoordinatorExternalState;
+    class ReplicaSetConfig;
 
     /**
-     * EOFRunner is EOF immediately and doesn't do anything except return EOF and possibly die
-     * during a yield.
+     * Validates that "newConfig" is a legal initial configuration that can be
+     * initiated by the current node (identified via "externalState").
+     *
+     * Returns the index of the current node's member configuration in "newConfig",
+     * on success, and an indicative error on failure.
      */
-    class EOFRunner : public Runner {
-    public:
+    StatusWith<int> validateConfigForInitiate(
+            ReplicationCoordinatorExternalState* externalState,
+            const ReplicaSetConfig& newConfig);
 
-        /* Takes ownership */
-        EOFRunner(CanonicalQuery* cq, const std::string& ns);
+    /**
+     * Validates that "newConfig" is a legal successor configuration to "oldConfig" that can be
+     * initiated by the current node (identified via "externalState").
+     *
+     * Returns the index of the current node's member configuration in "newConfig",
+     * on success, and an indicative error on failure.
+     */
+    StatusWith<int> validateConfigForReconfig(
+            ReplicationCoordinatorExternalState* externalState,
+            const ReplicaSetConfig& oldConfig,
+            const ReplicaSetConfig& newConfig);
 
-        virtual ~EOFRunner();
-
-        virtual Runner::RunnerState getNext(BSONObj* objOut, DiskLoc* dlOut);
-
-        virtual bool isEOF();
-
-        virtual void saveState();
-
-        virtual bool restoreState(OperationContext* opCtx);
-
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
-
-        virtual const std::string& ns();
-
-        virtual void kill();
-
-        // this can return NULL since we never yield or anything over it
-        virtual const Collection* collection() { return NULL; }
-
-        /**
-         * Always returns OK, allocating and filling in '*explain' with a fake ("zeroed")
-         * collection scan plan. Fills in '*planInfo' with information indicating an
-         * EOF runner. Caller owns '*explain', though.
-         */
-        virtual Status getInfo(TypeExplain** explain,
-                               PlanInfo** planInfo) const;
-
-    private:
-        boost::scoped_ptr<CanonicalQuery> _cq;
-        std::string _ns;
-    };
-
+}  // namespace repl
 }  // namespace mongo

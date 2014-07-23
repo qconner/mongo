@@ -253,13 +253,13 @@ namespace repl {
             // check that no items are in sources other than that
             // add if missing
             int n = 0;
-            auto_ptr<Runner> runner(
+            auto_ptr<PlanExecutor> exec(
                 InternalPlanner::collectionScan(txn,
                                                 localSources,
                                                 ctx.db()->getCollection(txn, localSources)));
             BSONObj obj;
-            Runner::RunnerState state;
-            while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
+            PlanExecutor::ExecState state;
+            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
                 n++;
                 ReplSource tmp(txn, obj);
                 if (tmp.hostName != replSettings.source) {
@@ -279,7 +279,7 @@ namespace repl {
                     dbexit( EXIT_REPLICATION_ERROR );
                 }
             }
-            uassert(17065, "Internal error reading from local.sources", Runner::RUNNER_EOF == state);
+            uassert(17065, "Internal error reading from local.sources", PlanExecutor::IS_EOF == state);
             uassert( 10002 ,  "local.sources collection corrupt?", n<2 );
             if ( n == 0 ) {
                 // source missing.  add.
@@ -298,13 +298,13 @@ namespace repl {
             }
         }
 
-        auto_ptr<Runner> runner(
+        auto_ptr<PlanExecutor> exec(
             InternalPlanner::collectionScan(txn,
                                             localSources,
                                             ctx.db()->getCollection(txn, localSources)));
         BSONObj obj;
-        Runner::RunnerState state;
-        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
+        PlanExecutor::ExecState state;
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
             ReplSource tmp(txn, obj);
             if ( tmp.syncedTo.isNull() ) {
                 DBDirectClient c(txn);
@@ -317,7 +317,7 @@ namespace repl {
             }
             addSourceToList(txn, v, tmp, old);
         }
-        uassert(17066, "Internal error reading from local.sources", Runner::RUNNER_EOF == state);
+        uassert(17066, "Internal error reading from local.sources", PlanExecutor::IS_EOF == state);
     }
 
     bool ReplSource::throttledForceResyncDead( OperationContext* txn, const char *requester ) {
@@ -348,7 +348,7 @@ namespace repl {
             invariant(txn->lockState()->isW());
             Lock::TempRelease tempRelease(txn->lockState());
 
-            if (!oplogReader.connect(hostName, _me)) {
+            if (!oplogReader.connect(hostName, getGlobalReplicationCoordinator()->getMyRID())) {
                 msgassertedNoTrace( 14051 , "unable to connect to resync");
             }
             /* todo use getDatabaseNames() method here */
@@ -1026,7 +1026,7 @@ namespace repl {
             return -1;
         }
 
-        if ( !oplogReader.connect(hostName, _me) ) {
+        if ( !oplogReader.connect(hostName, getGlobalReplicationCoordinator()->getMyRID()) ) {
             LOG(4) << "repl:  can't connect to sync source" << endl;
             return -1;
         }

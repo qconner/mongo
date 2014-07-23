@@ -365,10 +365,11 @@ namespace mongo {
 
                 const string systemIndexes = ctx.db()->name() + ".system.indexes";
                 Collection* coll = ctx.db()->getCollection( &txn, systemIndexes );
-                auto_ptr<Runner> runner(InternalPlanner::collectionScan(&txn, systemIndexes,coll));
+                auto_ptr<PlanExecutor> exec(
+                    InternalPlanner::collectionScan(&txn, systemIndexes,coll));
                 BSONObj index;
-                Runner::RunnerState state;
-                while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&index, NULL))) {
+                PlanExecutor::ExecState state;
+                while (PlanExecutor::ADVANCED == (state = exec->getNext(&index, NULL))) {
                     const BSONObj key = index.getObjectField("key");
                     const string plugin = IndexNames::findPluginName(key);
 
@@ -393,7 +394,7 @@ namespace mongo {
                     }
                 }
 
-                if (Runner::RUNNER_EOF != state) {
+                if (PlanExecutor::IS_EOF != state) {
                     warning() << "Internal error while reading collection " << systemIndexes;
                 }
 
@@ -624,7 +625,11 @@ namespace mongo {
             exitCleanly(EXIT_CLEAN);
         }
 
-        uassertStatusOK(getGlobalAuthorizationManager()->initialize());
+        {
+            OperationContextImpl txn;
+
+            uassertStatusOK(getGlobalAuthorizationManager()->initialize(&txn));
+        }
 
         /* this is for security on certain platforms (nonce generation) */
         srand((unsigned) (curTimeMicros() ^ startupSrandTimer.micros()));

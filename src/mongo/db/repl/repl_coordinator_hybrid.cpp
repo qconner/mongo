@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/repl_coordinator_hybrid.h"
+#include "mongo/db/repl/repl_coordinator_external_state_impl.h"
 
 namespace mongo {
 
@@ -37,7 +38,7 @@ namespace mongo {
 namespace repl {
 
     HybridReplicationCoordinator::HybridReplicationCoordinator(const ReplSettings& settings) :
-            _legacy(settings), _impl(settings) {}
+            _legacy(settings), _impl(settings, new ReplicationCoordinatorExternalStateImpl()) {}
     HybridReplicationCoordinator::~HybridReplicationCoordinator() {}
 
     void HybridReplicationCoordinator::startReplication(
@@ -88,22 +89,26 @@ namespace repl {
         return legacyStatus;
     }
 
-    Status HybridReplicationCoordinator::stepDown(bool force,
+    Status HybridReplicationCoordinator::stepDown(OperationContext* txn,
+                                                  bool force,
                                                   const Milliseconds& waitTime,
                                                   const Milliseconds& stepdownTime) {
-        Status legacyStatus = _legacy.stepDown(force, waitTime, stepdownTime);
-        Status implStatus = _impl.stepDown(force, waitTime, stepdownTime);
+        Status legacyStatus = _legacy.stepDown(txn, force, waitTime, stepdownTime);
+        Status implStatus = _impl.stepDown(txn, force, waitTime, stepdownTime);
         return legacyStatus;
     }
 
     Status HybridReplicationCoordinator::stepDownAndWaitForSecondary(
+            OperationContext* txn,
             const Milliseconds& initialWaitTime,
             const Milliseconds& stepdownTime,
             const Milliseconds& postStepdownWaitTime) {
-        Status legacyStatus = _legacy.stepDownAndWaitForSecondary(initialWaitTime,
+        Status legacyStatus = _legacy.stepDownAndWaitForSecondary(txn,
+                                                                  initialWaitTime,
                                                                   stepdownTime,
                                                                   postStepdownWaitTime);
-        Status implStatus = _impl.stepDownAndWaitForSecondary(initialWaitTime,
+        Status implStatus = _impl.stepDownAndWaitForSecondary(txn,
+                                                              initialWaitTime,
                                                               stepdownTime,
                                                               postStepdownWaitTime);
         return legacyStatus;
@@ -164,9 +169,9 @@ namespace repl {
         _impl.processReplSetGetStatus(&implResult);
     }
 
-    bool HybridReplicationCoordinator::setMaintenanceMode(bool activate) {
-        bool legacyResponse = _legacy.setMaintenanceMode(activate);
-        _impl.setMaintenanceMode(activate);
+    bool HybridReplicationCoordinator::setMaintenanceMode(OperationContext* txn, bool activate) {
+        bool legacyResponse = _legacy.setMaintenanceMode(txn, activate);
+        _impl.setMaintenanceMode(txn, activate);
         return legacyResponse;
     }
 
@@ -230,11 +235,12 @@ namespace repl {
         return legacyStatus;
     }
 
-    Status HybridReplicationCoordinator::processReplSetMaintenance(bool activate,
+    Status HybridReplicationCoordinator::processReplSetMaintenance(OperationContext* txn,
+                                                                   bool activate,
                                                                    BSONObjBuilder* resultObj) {
-        Status legacyStatus = _legacy.processReplSetMaintenance(activate, resultObj);
+        Status legacyStatus = _legacy.processReplSetMaintenance(txn, activate, resultObj);
         BSONObjBuilder implResult;
-        Status implStatus = _impl.processReplSetMaintenance(activate, &implResult);
+        Status implStatus = _impl.processReplSetMaintenance(txn, activate, &implResult);
         return legacyStatus;
     }
 
