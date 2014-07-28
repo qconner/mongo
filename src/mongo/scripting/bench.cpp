@@ -42,7 +42,6 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/md5.h"
 #include "mongo/util/timer.h"
-#include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
 
 
@@ -70,22 +69,6 @@ namespace {
 
 namespace mongo {
 
-    BenchRunEventCounter::BenchRunEventCounter() {
-        reset();
-    }
-
-    BenchRunEventCounter::~BenchRunEventCounter() {}
-
-    void BenchRunEventCounter::reset() {
-        _numEvents = 0;
-        _totalTimeMicros = 0;
-    }
-
-    void BenchRunEventCounter::updateFrom(const BenchRunEventCounter &other) {
-        _numEvents += other._numEvents;
-        _totalTimeMicros += other._totalTimeMicros;
-    }
-
     BenchRunStats::BenchRunStats() {
         reset();
     }
@@ -96,11 +79,14 @@ namespace mongo {
         error = false;
         errCount = 0;
 
-        findOneCounter.reset();
-        updateCounter.reset();
-        insertCounter.reset();
-        deleteCounter.reset();
-        queryCounter.reset();
+        findOneCounter = 0;
+        updateCounter = 0;
+        insertCounter = 0;
+        deleteCounter = 0;
+        queryCounter = 0;
+        commandCounter = 0;
+        gleCounter = 0;
+        threadTimeMicros = 0;
 
         trappedErrors.clear();
     }
@@ -110,11 +96,14 @@ namespace mongo {
             error = true;
         errCount += other.errCount;
 
-        findOneCounter.updateFrom(other.findOneCounter);
-        updateCounter.updateFrom(other.updateCounter);
-        insertCounter.updateFrom(other.insertCounter);
-        deleteCounter.updateFrom(other.deleteCounter);
-        queryCounter.updateFrom(other.queryCounter);
+        findOneCounter   += other.findOneCounter;
+        updateCounter    += other.updateCounter;
+        insertCounter    += other.insertCounter;
+        deleteCounter    += other.deleteCounter;
+        queryCounter     += other.queryCounter;
+        commandCounter   += other.commandCounter;
+        gleCounter       += other.gleCounter;
+        threadTimeMicros += other.threadTimeMicros;
 
         for (size_t i = 0; i < other.trappedErrors.size(); ++i)
             trappedErrors.push_back(other.trappedErrors[i]);
@@ -328,11 +317,11 @@ namespace mongo {
     void BenchRunWorker::generateLoadOnConnection( DBClientBase* conn ) {
         verify( conn );
         long long count = 0;
-        mongo::Timer timer;
 
         BsonTemplateEvaluator bsonTemplateEvaluator;
         invariant(bsonTemplateEvaluator.setId(_id) == BsonTemplateEvaluator::StatusSuccess);
 
+        mongo::Timer timer;
         while ( !shouldStop() ) {
             BSONObjIterator i( _config->ops );
             while ( i.more() ) {
@@ -401,7 +390,7 @@ namespace mongo {
 
                         BSONObj result;
                         {
-                            BenchRunEventTrace _bret(&_stats.findOneCounter);
+                            ++_stats.findOneCounter;
                             result = conn->findOne( ns , fixQuery( e["query"].Obj(),
                                                                    bsonTemplateEvaluator ) );
                         }
@@ -423,6 +412,7 @@ namespace mongo {
                     else if ( op == "command" ) {
 
                         BSONObj result;
+                        ++_stats.commandCounter;
                         conn->runCommand( ns, fixQuery( e["command"].Obj(), bsonTemplateEvaluator ),
                                           result, e["options"].numberInt() );
 
@@ -456,12 +446,12 @@ namespace mongo {
 
                         // use special query function for exhaust query option
                         if (options & QueryOption_Exhaust) {
-                            BenchRunEventTrace _bret(&_stats.queryCounter);
+                            ++_stats.queryCounter;
                             stdx::function<void (const BSONObj&)> castedDoNothing(doNothing);
                             count =  conn->query(castedDoNothing, ns, fixedQuery, &filter, options);
                         }
                         else {
-                            BenchRunEventTrace _bret(&_stats.queryCounter);
+                            ++_stats.queryCounter;
                             cursor = conn->query(ns, fixedQuery, limit, skip, &filter, options,
                                                  batchSize);
                             count = cursor->itcount();
@@ -496,7 +486,7 @@ namespace mongo {
                         BSONObj result;
 
                         {
-                            BenchRunEventTrace _bret(&_stats.updateCounter);
+                            ++_stats.updateCounter;
 
                             if (useWriteCmd) {
                                 // TODO: Replace after SERVER-11774.
@@ -518,8 +508,10 @@ namespace mongo {
                                 conn->update(ns, fixQuery(query,
                                             bsonTemplateEvaluator), update,
                                             upsert , multi);
-                                if (safe)
+                                if (safe) {
                                     result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
+                                    ++_stats.gleCounter;
+                                }
                             }
                         }
 
@@ -546,8 +538,7 @@ namespace mongo {
                         BSONObj result;
 
                         {
-                            BenchRunEventTrace _bret(&_stats.insertCounter);
-
+                            ++_stats.insertCounter;
                             BSONObjBuilder builder;
                             BSONObj insertDoc = fixQuery(e["doc"].Obj(), bsonTemplateEvaluator);
                             builder.append("insert",
@@ -565,8 +556,10 @@ namespace mongo {
                             }
                             else {
                                 conn->insert(ns, insertDoc);
-                                if (safe)
+                                if (safe) {
                                     result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
+                                    ++_stats.gleCounter;
+                                }
                             }
                         }
 
@@ -596,7 +589,7 @@ namespace mongo {
                         BSONObj result;
 
                         {
-                            BenchRunEventTrace _bret(&_stats.deleteCounter);
+                            ++_stats.deleteCounter;
 
                             if (useWriteCmd) {
                                 // TODO: Replace after SERVER-11774.
@@ -617,8 +610,10 @@ namespace mongo {
                             else {
                                 conn->remove(ns, fixQuery(query,
                                     bsonTemplateEvaluator), !multi);
-                                if (safe)
+                                if (safe) {
                                     result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
+                                    ++_stats.gleCounter;
+								}
                             }
                         }
 
@@ -689,6 +684,7 @@ namespace mongo {
 
                 if (++count % 100 == 0 && !useWriteCmd) {
                     conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
+                    ++_stats.gleCounter;
                 }
 
                 if (delay > 0)
@@ -697,6 +693,8 @@ namespace mongo {
         }
 
         conn->getLastError();
+        ++_stats.gleCounter;
+        _stats.threadTimeMicros = timer.micros();
     }
 
     namespace {
@@ -768,6 +766,9 @@ namespace mongo {
                                "required to use benchRun with auth enabled");
                  }
              }
+             // Get initial stats
+             conn->simpleCommand( "admin" , &before , "serverStatus" );
+             before = before.getOwned();
          }
 
          // Start threads
@@ -778,18 +779,11 @@ namespace mongo {
          }
 
          _brState.waitForState(BenchRunState::BRS_RUNNING);
-
-         // initial stats
-         conn->simpleCommand( "admin" , &before , "serverStatus" );
-         before = before.getOwned();
-         _brTimer = new mongo::Timer();
      }
 
      void BenchRunner::stop() {
          _brState.tellWorkersToFinish();
          _brState.waitForState(BenchRunState::BRS_FINISHED);
-         _microsElapsed = _brTimer->micros();
-         delete _brTimer;
 
          {
              boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
@@ -829,26 +823,20 @@ namespace mongo {
         stats->reset();
         for ( size_t i = 0; i < _workers.size(); ++i )
             stats->updateFrom( _workers[i]->stats() );
+
+        stats->opcounters["insert"] = stats->insertCounter;
+        stats->opcounters["query"] = stats->queryCounter + stats->findOneCounter;
+        stats->opcounters["update"] = stats->updateCounter;
+        stats->opcounters["delete"] = stats->deleteCounter;
+        stats->opcounters["command"] = stats->commandCounter;
+        stats->opcounters["gle"] = stats->gleCounter;
+
+        // calculate getmore from the ServerStatus command
         BSONObj before = this->before["opcounters"].Obj();
         BSONObj after = this->after["opcounters"].Obj();
-        {
-             BSONObjIterator i( after );
-             while ( i.more() ) {
-                 BSONElement e = i.next();
-                 long long delta = e.numberLong();
-                 delta -= before[e.fieldName()].numberLong();
-                 stats->opcounters[e.fieldName()] = delta;
-             }
-        }
+        stats->opcounters["getmore"] = after["getmore"].numberLong() -
+                                       before["getmore"].numberLong();
     }
-
-     static void appendAverageMicrosIfAvailable(
-             BSONObjBuilder &buf, const std::string &name, const BenchRunEventCounter &counter) {
-
-         if (counter.getNumEvents() > 0)
-             buf.append(name,
-                        static_cast<double>(counter.getTotalTimeMicros()) / counter.getNumEvents());
-     }
 
      BSONObj BenchRunner::finish( BenchRunner* runner ) {
 
@@ -867,25 +855,39 @@ namespace mongo {
          BSONObj before = runner->before["opcounters"].Obj();
          BSONObj after = runner->after["opcounters"].Obj();
 
+         // NB: per-thread timers reduce accuracy of latency calculations
          BSONObjBuilder buf;
          buf.append( "note" , "values per second" );
          buf.append( "errCount", (long long) stats.errCount );
          buf.append( "trapped", "error: not implemented" );
-         appendAverageMicrosIfAvailable(buf, "findOneLatencyAverageMicros", stats.findOneCounter);
-         appendAverageMicrosIfAvailable(buf, "insertLatencyAverageMicros", stats.insertCounter);
-         appendAverageMicrosIfAvailable(buf, "deleteLatencyAverageMicros", stats.deleteCounter);
-         appendAverageMicrosIfAvailable(buf, "updateLatencyAverageMicros", stats.updateCounter);
-         appendAverageMicrosIfAvailable(buf, "queryLatencyAverageMicros", stats.queryCounter);
+         if (stats.findOneCounter)
+             buf.append("findOneLatencyAverageMicros",
+                        static_cast<double>(stats.threadTimeMicros) / stats.findOneCounter);
+         if (stats.insertCounter)
+             buf.append("insertLatencyAverageMicros",
+                        static_cast<double>(stats.threadTimeMicros) / stats.insertCounter );
+         if (stats.deleteCounter)
+             buf.append("deleteLatencyAverageMicros",
+                        static_cast<double>(stats.threadTimeMicros) / stats.deleteCounter );
+         if (stats.updateCounter)
+             buf.append("updateLatencyAverageMicros",
+                        static_cast<double>(stats.threadTimeMicros) / stats.updateCounter );
+         if (stats.queryCounter)
+             buf.append("queryLatencyAverageMicros",
+                        static_cast<double>(stats.threadTimeMicros) / stats.queryCounter );
+         if (stats.commandCounter)
+             buf.append("commandLatencyAverageMicros",
+                        static_cast<double>(stats.threadTimeMicros) / stats.commandCounter );
 
-         {
-             BSONObjIterator i( after );
-             while ( i.more() ) {
-                 BSONElement e = i.next();
-                 double x = e.number();
-                 x -= before[e.fieldName()].number();
-                 std::string s = e.fieldName();
-                 buf.append( s, x / (runner->_microsElapsed / 1000000.0) );
-             }
+         const uint32_t nThreads = runner->_config->parallel;
+         const double cumSeconds = static_cast<double>(stats.threadTimeMicros) / 1000000;
+
+         // calculate ops/s based on per-thread timers and counters
+         for (std::map<std::string, long long>::const_iterator it = stats.opcounters.begin();
+              it != stats.opcounters.end();
+              ++it) {
+
+            buf.append(it->first, (static_cast<double>(it->second) / cumSeconds) * nThreads);
          }
 
          BSONObj zoo = buf.obj();
@@ -906,14 +908,7 @@ namespace mongo {
 
          OID oid = OID( start.firstElement().String() );
          BenchRunner* runner = BenchRunner::get( oid );
-
-         Timer assertTimer;
          sleepmillis( (int)(1000.0 * runner->config().seconds) );
-         unsigned long long e = assertTimer.micros();
-
-         int elapsed = (int)round(e / 1000.0);
-         int desired = (int)(1000.0 * runner->config().seconds);
-         verify(elapsed >= desired);  // identify any short/interrupted sleep()
 
          return benchFinish( start, data );
      }

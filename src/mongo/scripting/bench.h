@@ -128,97 +128,6 @@ namespace mongo {
     };
 
     /**
-     * An event counter for events that have an associated duration.
-     *
-     * Not thread safe.  Expected use is one instance per thread during parallel execution.
-     */
-    class BenchRunEventCounter : private boost::noncopyable {
-    public:
-        /// Constructs a zeroed out counter.
-        BenchRunEventCounter();
-        ~BenchRunEventCounter();
-
-        /**
-         * Zero out the counter.
-         */
-        void reset();
-
-        /**
-         * Conceptually the equivalent of "+=".  Adds "other" into this.
-         */
-        void updateFrom( const BenchRunEventCounter &other );
-
-        /**
-         * Count one instance of the event, which took "timeMicros" microseconds.
-         */
-        void countOne(long long timeMicros) {
-            ++_numEvents;
-            _totalTimeMicros += timeMicros;
-        }
-
-        /**
-         * Get the total number of microseconds ellapsed during all observed events.
-         */
-        unsigned long long getTotalTimeMicros() const { return _totalTimeMicros; }
-
-        /**
-         * Get the number of observed events.
-         */
-        unsigned long long getNumEvents() const { return _numEvents; }
-
-    private:
-        unsigned long long _numEvents;
-        long long _totalTimeMicros;
-    };
-
-    /**
-     * RAII object for tracing an event.
-     *
-     * Construct an instance of this at the beginning of an event, and have it go out of scope at
-     * the end, to facilitate tracking events.
-     *
-     * This type can be used to separately count failures and successes by passing two event
-     * counters to the BenchRunEventCounter constructor, and calling "succeed()" on the object at
-     * the end of a successful event.  If an exception is thrown, the fail counter will receive the
-     * event, and otherwise, the succes counter will.
-     *
-     * In all cases, the counter objects must outlive the trace object.
-     */
-    class BenchRunEventTrace : private boost::noncopyable {
-    public:
-        explicit BenchRunEventTrace(BenchRunEventCounter *eventCounter) {
-            initialize(eventCounter, eventCounter, false);
-        }
-
-        BenchRunEventTrace(BenchRunEventCounter *successCounter,
-                           BenchRunEventCounter *failCounter,
-                           bool defaultToFailure=true) {
-            initialize(successCounter, failCounter, defaultToFailure);
-        }
-
-        ~BenchRunEventTrace() {
-            (_succeeded ? _successCounter : _failCounter)->countOne(_timer.micros());
-        }
-
-        void succeed() { _succeeded = true; }
-        void fail() { _succeeded = false; }
-
-    private:
-        void initialize(BenchRunEventCounter *successCounter,
-                        BenchRunEventCounter *failCounter,
-                        bool defaultToFailure) {
-            _successCounter = successCounter;
-            _failCounter = failCounter;
-            _succeeded = !defaultToFailure;
-        }
-
-        Timer _timer;
-        BenchRunEventCounter *_successCounter;
-        BenchRunEventCounter *_failCounter;
-        bool _succeeded;
-    };
-
-    /**
      * Statistics object representing the result of a bench run activity.
      */
     class BenchRunStats : private boost::noncopyable {
@@ -233,14 +142,17 @@ namespace mongo {
         bool error;
         unsigned long long errCount;
 
-        BenchRunEventCounter findOneCounter;
-        BenchRunEventCounter updateCounter;
-        BenchRunEventCounter insertCounter;
-        BenchRunEventCounter deleteCounter;
-        BenchRunEventCounter queryCounter;
+        uint64_t findOneCounter;
+        uint64_t updateCounter;
+        uint64_t insertCounter;
+        uint64_t deleteCounter;
+        uint64_t queryCounter;
+        uint64_t commandCounter;
+        uint64_t gleCounter;
 
         std::map<std::string, long long> opcounters;
         std::vector<BSONObj> trappedErrors;
+        int64_t threadTimeMicros;
     };
 
     /**
@@ -422,8 +334,6 @@ namespace mongo {
 
         OID _oid;
         BenchRunState _brState;
-        Timer *_brTimer;
-        unsigned long long _microsElapsed;
         boost::scoped_ptr<BenchRunConfig> _config;
         std::vector<BenchRunWorker *> _workers;
 
