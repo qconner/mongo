@@ -948,4 +948,9 @@ namespace mongo {
         return BSON( "" << finalObj );
     }
 
+	double BenchRunner::round(double d)
+    {
+        return (d < 0.0 ? ceil(d - 0.5) : floor(d + 0.5) );
+    }
+
 } // namespace mongo
