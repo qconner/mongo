@@ -181,6 +181,7 @@ namespace {
             << ActionType::listDatabases
             << ActionType::listShards // clusterManager gets this also
             << ActionType::netstat
+            << ActionType::replSetGetConfig // clusterManager gets this also
             << ActionType::replSetGetStatus // clusterManager gets this also
             << ActionType::serverStatus
             << ActionType::top
@@ -223,6 +224,7 @@ namespace {
             << ActionType::appendOplogNote // backup gets this also
             << ActionType::applicationMessage // hostManager gets this also
             << ActionType::replSetConfigure
+            << ActionType::replSetGetConfig // clusterMonitor gets this also
             << ActionType::replSetGetStatus // clusterMonitor gets this also
             << ActionType::replSetStateChange
             << ActionType::resync // hostManager gets this also
@@ -353,6 +355,12 @@ namespace {
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
                 Privilege(ResourcePattern::forClusterResource(), ActionType::invalidateUserCache));
+
+
+        ActionSet readRoleAndIndexActions;
+        readRoleAndIndexActions += readRoleActions;
+        readRoleAndIndexActions << ActionType::createIndex << ActionType::dropIndex;
+
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
                 Privilege(ResourcePattern::forCollectionName("system.users"),
@@ -361,12 +369,12 @@ namespace {
                 privileges,
                 Privilege(ResourcePattern::forExactNamespace(
                                   AuthorizationManager::usersCollectionNamespace),
-                          readRoleActions));
+                          readRoleAndIndexActions));
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
                 Privilege(ResourcePattern::forExactNamespace(
                                   AuthorizationManager::rolesCollectionNamespace),
-                          readRoleActions));
+                          readRoleAndIndexActions));
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
                 Privilege(ResourcePattern::forExactNamespace(
@@ -471,12 +479,12 @@ namespace {
     }
 
     void addBackupPrivileges(PrivilegeVector* privileges) {
-        ActionSet normalResourceActions;
-        normalResourceActions << ActionType::find
-                              << ActionType::collStats;
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
-                Privilege(ResourcePattern::forAnyNormalResource(), normalResourceActions));
+                Privilege(ResourcePattern::forAnyResource(), ActionType::collStats));
+        Privilege::addPrivilegeToPrivilegeVector(
+                privileges,
+                Privilege(ResourcePattern::forAnyNormalResource(), ActionType::find));
 
         ActionSet clusterActions;
         clusterActions << ActionType::getParameter // To check authSchemaVersion

@@ -8,7 +8,6 @@ Import("env")
 
 env.Library('base', ['mongo_version_range.cpp',
                      'range_arithmetic.cpp',
-                     'shard_key_pattern.cpp',
                      'type_changelog.cpp',
                      'type_chunk.cpp',
                      'type_collection.cpp',
@@ -316,6 +315,7 @@ env.CppUnitTest(
         'cluster_write_op_conversion',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/server_options', # DbMessage needs server options
+        "$BUILD_DIR/mongo/clientdriver",
     ]
 )
 
@@ -329,6 +329,7 @@ env.CppUnitTest(
         'cluster_write_op_conversion',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/server_options', # DbMessage needs server options
+        "$BUILD_DIR/mongo/clientdriver",
     ]
 )
 

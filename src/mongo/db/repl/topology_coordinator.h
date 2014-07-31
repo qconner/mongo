@@ -31,6 +31,7 @@
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/repl/repl_coordinator.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
@@ -46,6 +47,7 @@ namespace repl {
     class MemberHeartbeatData;
     struct MemberState;
     class ReplicaSetConfig;
+    class ReplSetHeartbeatResponse;
     class TagSubgroup;
 
     /**
@@ -114,8 +116,9 @@ namespace repl {
         // produce a reply to a heartbeat
         virtual void prepareHeartbeatResponse(const ReplicationExecutor::CallbackData& data,
                                               Date_t now,
-                                              const BSONObj& cmdObj, 
-                                              BSONObjBuilder* resultObj,
+                                              const ReplSetHeartbeatArgs& args,
+                                              const std::string& ourSetName,
+                                              ReplSetHeartbeatResponse* response,
                                               Status* result) = 0;
 
         // update internal state with heartbeat response corresponding to 'id'
@@ -124,15 +127,18 @@ namespace repl {
                                                           int id) = 0;
 
         // produce a reply to a status request
-        virtual void prepareStatusResponse(Date_t now,
-                                           const BSONObj& cmdObj,
-                                           BSONObjBuilder& result,
-                                           unsigned uptime) = 0;
+        virtual void prepareStatusResponse(const ReplicationExecutor::CallbackData& data,
+                                           Date_t now,
+                                           unsigned uptime,
+                                           BSONObjBuilder* response,
+                                           Status* result) = 0;
 
         // produce a reply to a freeze request
-        virtual void prepareFreezeResponse(Date_t now,
-                                           const BSONObj& cmdObj,
-                                           BSONObjBuilder& result) = 0;
+        virtual void prepareFreezeResponse(const ReplicationExecutor::CallbackData& data,
+                                           Date_t now,
+                                           int secs,
+                                           BSONObjBuilder* response,
+                                           Status* result) = 0;
 
         // transition PRIMARY to SECONDARY; caller must already be holding an appropriate dblock
         virtual void relinquishPrimary(OperationContext* txn) = 0;

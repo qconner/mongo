@@ -29,6 +29,7 @@
 #pragma once
 
 #include <boost/date_time/posix_time/posix_time_types.hpp>
+#include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
@@ -50,8 +51,20 @@ namespace mongo {
 
 namespace repl {
 
+    class ReplSetHeartbeatArgs;
+    class ReplSetHeartbeatResponse;
     class TopologyCoordinator;
 
+    /**
+     * Global variable that contains a std::string telling why master/slave halted
+     *
+     * "dead" means something really bad happened like replication falling completely out of sync.
+     * when non-null, we are dead and the string is informational
+     *
+     * TODO(dannenberg) remove when master slave goes
+     */
+    extern const char *replAllDead;
+    
     /**
      * The ReplicationCoordinator is responsible for coordinating the interaction of replication
      * with the rest of the system.  The public methods on ReplicationCoordinator are the public
@@ -92,13 +105,6 @@ namespace repl {
         virtual void shutdown() = 0;
 
         /**
-         * Returns true if it is safe to shut down the server now.  Currently the only time this
-         * can be false is if this node is primary and there are no secondaries within 10 seconds
-         * of our optime.
-         */
-        virtual bool isShutdownOkay() const = 0;
-
-        /**
          * Returns a reference to the parsed command line arguments that are related to replication.
          * TODO(spencer): Change this to a const ref once we are no longer using it for mutable
          * global state.
@@ -122,7 +128,7 @@ namespace repl {
          * Returns true if this node is configured to be a member of a replica set or master/slave
          * setup.
          */
-        virtual bool isReplEnabled() const { return getReplicationMode() != modeNone; }
+        virtual bool isReplEnabled() const = 0;
 
         /**
          * Returns the current replica set state of this node (PRIMARY, SECONDARY, STARTUP, etc).
@@ -217,7 +223,9 @@ namespace repl {
          * Returns Status::OK() if it is valid for this node to serve reads on the given collection
          * and an errorcode indicating why the node cannot if it cannot.
          */
-        virtual Status canServeReadsFor(const NamespaceString& ns, bool slaveOk) = 0;
+        virtual Status canServeReadsFor(OperationContext* txn,
+                                        const NamespaceString& ns,
+                                        bool slaveOk) = 0;
 
         /**
          * Returns true if this node should ignore unique index constraints on new documents.
@@ -237,7 +245,7 @@ namespace repl {
          * @returns ErrorCodes::NodeNotFound if the member cannot be found in sync progress tracking
          * @returns Status::OK() otherwise
          */
-        virtual Status setLastOptime(const OID& rid, const OpTime& ts) = 0;
+        virtual Status setLastOptime(OperationContext* txn, const OID& rid, const OpTime& ts) = 0;
 
         /**
          * Retrieves and returns the current election id, which is a unique id which changes after
@@ -248,19 +256,37 @@ namespace repl {
         /**
          * Returns the RID for this node.  The RID is used to identify this node to our sync source
          * when sending updates about our replication progress.
+         *
+         * TODO(spencer): Remove txn argument once Legacy is gone
          */
-        virtual OID getMyRID() = 0;
+        virtual OID getMyRID(OperationContext* txn) = 0;
 
         /**
          * Prepares a BSONObj describing an invocation of the replSetUpdatePosition command that can
          * be sent to this node's sync source to update it about our progress in replication.
          */
-        virtual void prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) = 0;
+        virtual void prepareReplSetUpdatePositionCommand(OperationContext* txn,
+                                                         BSONObjBuilder* cmdBuilder) = 0;
+
+        /**
+         * For ourself and each secondary chaining off of us, adds a BSONObj to "handshakes"
+         * describing an invocation of the replSetUpdateCommand that can be sent to this node's
+         * sync source to handshake us and our chained secondaries, informing the sync source that
+         * we are replicating off of it.
+         */
+        virtual void prepareReplSetUpdatePositionCommandHandshakes(
+                OperationContext* txn,
+                std::vector<BSONObj>* handshakes) = 0;
 
         /**
          * Handles an incoming replSetGetStatus command. Adds BSON to 'result'.
          */
-        virtual void processReplSetGetStatus(BSONObjBuilder* result) = 0;
+        virtual Status processReplSetGetStatus(BSONObjBuilder* result) = 0;
+
+        /**
+         * Handles an incoming replSetGetConfig command. Adds BSON to 'result'.
+         */
+        virtual void processReplSetGetConfig(BSONObjBuilder* result) = 0;
 
         /**
          * Toggles maintenanceMode to the value expressed by 'activate'
@@ -294,10 +320,11 @@ namespace repl {
         virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj) = 0;
 
         /**
-         * Handles an incoming heartbeat command. Adds BSON to 'resultObj'; 
+         * Handles an incoming heartbeat command with arguments 'args'. Populates 'response'; 
          * returns a Status with either OK or an error message.
          */
-        virtual Status processHeartbeat(const BSONObj& cmdObj, BSONObjBuilder* resultObj) = 0;
+        virtual Status processHeartbeat(const ReplSetHeartbeatArgs& args,
+                                        ReplSetHeartbeatResponse* response) = 0;
 
         /**
          * Arguments for the replSetReconfig command.
@@ -375,29 +402,38 @@ namespace repl {
          * returns Status::OK() if the all updates are processed correctly, ErrorCodes::NodeNotFound
          * if any updating node cannot be found in the config, or any of the normal replset
          * command ErrorCodes.
+         *
+         * TODO(spencer): Remove this method in favor of parsing BSON in the command body and
+         * calling setLastOptime directly.
          */
-        virtual Status processReplSetUpdatePosition(const BSONArray& updates,
+        virtual Status processReplSetUpdatePosition(OperationContext* txn,
+                                                    const BSONArray& updates,
                                                     BSONObjBuilder* resultObj) = 0;
 
         /**
          * Handles an incoming replSetUpdatePosition command that contains a handshake.
-         * returns Status::OK() if the handshake processes properly, ErrorCodes::NodeNotFound
-         * if the handshaking node cannot be found in the config, or any of the normal replset
+         * returns the same codes as processHandshake below, as well as any of the normal replset
          * command ErrorCodes.
+         * TODO(spencer): Remove this method in favor of just using processHandshake
          */
-        virtual Status processReplSetUpdatePositionHandshake(const BSONObj& handshake,
+        virtual Status processReplSetUpdatePositionHandshake(const OperationContext* txn,
+                                                             const BSONObj& handshake,
                                                              BSONObjBuilder* resultObj) = 0;
 
         /**
          * Handles an incoming Handshake command (or a handshake from replSetUpdatePosition).
          * Associates the node's 'remoteID' with its 'handshake' object. This association is used
          * to update local.slaves and to forward the node's replication progress upstream when this
-         * node is being chainged through.
+         * node is being chained through.
          *
-         * Returns true if it was able to associate the 'remoteID' and 'handshake' and false
-         * otherwise.
+         * Returns ErrorCodes::ProtocolError if the handshake is missing required fields and
+         * ErrorCodes::NodeNotFound if no replica set member is found with the given member ID.
+         *
+         * TODO(spencer): Remove remoteID arg and get it from the handshake instead.
          */
-        virtual bool processHandshake(const OID& remoteID, const BSONObj& handshake) = 0;
+        virtual Status processHandshake(const OperationContext* txn,
+                                        const OID& remoteID,
+                                        const BSONObj& handshake) = 0;
 
         /**
          * Returns once the oplog's most recent entry changes or after one second, whichever
@@ -415,6 +451,21 @@ namespace repl {
          * at OpTime 'op'.
          */
         virtual std::vector<BSONObj> getHostsWrittenTo(const OpTime& op) = 0;
+
+        /**
+         * Returns a BSONObj containing a representation of the current default write concern.
+         */
+        virtual BSONObj getGetLastErrorDefault() = 0;
+
+        /**
+         * Checks that the --replSet flag was passed when starting up the node and that the node
+         * has a valid replica set config.
+         *
+         * Returns a Status indicating whether those conditions are met with errorcode 
+         * NoReplicationEnabled if --replSet was not present during start up or with errorcode
+         * NotYetInitialized in the absence of a valid config. Also adds error info to "result".
+         */
+        virtual Status checkReplEnabledForCommand(BSONObjBuilder* result) = 0;
 
     protected:
 

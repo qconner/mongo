@@ -68,10 +68,9 @@ namespace {
         int comparison(const IndexEntry& lhs, const IndexEntry& rhs) const {
             BSONObjIterator lhsIt(lhs.key);
             BSONObjIterator rhsIt(rhs.key);
-            
-            for (unsigned mask = 1; lhsIt.more(); mask <<= 1) {
-                invariant(rhsIt.more());
 
+            // Iterate through both BSONObjects, comparing individual elements one by one
+            for (unsigned mask = 1; lhsIt.more(); mask <<= 1) {
                 const BSONElement l = lhsIt.next();
                 const BSONElement r = rhsIt.next();
 
@@ -98,9 +97,12 @@ namespace {
                     invariant(lEqBehavior == normal);
                     return lEqBehavior == less ? 1 : -1;
                 }
-                
+
             }
-            invariant(!rhsIt.more());
+
+            // There's no more data in lhs, but there's data in rhs. So, rhs is greater than lhs.
+            if (rhsIt.more())
+                return 1;
 
             // This means just look at the key, not the loc.
             if (lhs.loc.isNull() || rhs.loc.isNull())
@@ -108,7 +110,7 @@ namespace {
 
             return lhs.loc.compare(rhs.loc); // is supposed to ignore ordering
         }
-        
+
         /**
          * Preps a query for compare(). Strips fieldNames if there are any.
          */
@@ -119,10 +121,14 @@ namespace {
                                        const vector<bool>& suffixInclusive,
                                        const int cursorDirection) {
 
-            // See comment above for why this is done.
+            // Due to the limitations in the std::set API we need to use the same type (IndexEntry)
+            // for both the stored data and the "query". We cheat and encode extra information in
+            // the first byte of the field names in the query. This works because all stored objects
+            // should have all field names empty, so their first bytes are '\0'.
             const char exclusiveByte = (cursorDirection == 1
                                             ? IndexEntryComparison::greater
                                             : IndexEntryComparison::less);
+
             const StringData exclusiveFieldName(&exclusiveByte, 1);
 
             BSONObjBuilder bb;
@@ -143,11 +149,23 @@ namespace {
                 }
             }
 
+            // have we seen a field in the query object that represents an exclusve bound (i.e., we
+            // inserted an 'l' or a 'g' into a field name already
+            bool seenExclusive = prefixExclusive;
+
             // Handle the suffix. Note that the useful parts of the suffix start at index prefixLen
             // rather than at 0.
             invariant(keySuffix.size() == suffixInclusive.size());
             for (size_t i = prefixLen; i < keySuffix.size(); i++) {
-                if (suffixInclusive[i]) {
+                // if an exclusive field has already been encountered, then nothing after it matters
+                // and the rest of the elements in the vector can be NULL. We want the query object
+                // to have as many elements as the vector, so we append empty elements to the BSON.
+                if (!keySuffix[i]) {
+                    invariant(seenExclusive);
+                    bb.append(StringData(), false);
+                }
+                else if (suffixInclusive[i]) {
+                    seenExclusive = true;
                     bb.appendAs(*keySuffix[i], StringData());
                 }
                 else {
@@ -243,10 +261,11 @@ namespace {
 
     class Heap1BtreeImpl : public SortedDataInterface {
     public:
-        Heap1BtreeImpl(const IndexCatalogEntry& info, IndexSet* data) 
+        Heap1BtreeImpl(const IndexCatalogEntry& info, IndexSet* data)
             : _info(info),
-              _data(data)
-        {}
+              _data(data) {
+            _currentKeySize = 0;
+        }
 
         virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* txn, bool dupsAllowed) {
             return new Heap1BtreeBuilderImpl(_data, dupsAllowed);
@@ -256,6 +275,7 @@ namespace {
                               const BSONObj& key,
                               const DiskLoc& loc,
                               bool dupsAllowed) {
+
             invariant(!loc.isNull());
             invariant(loc.isValid());
             invariant(!hasFieldNames(key));
@@ -265,6 +285,7 @@ namespace {
                 return dupKeyError(key);
 
             _data->insert(IndexEntry(key.getOwned(), loc));
+            _currentKeySize += key.objsize();
             return Status::OK();
         }
 
@@ -275,13 +296,20 @@ namespace {
 
             const size_t numDeleted = _data->erase(IndexEntry(key, loc));
             invariant(numDeleted <= 1);
+            if ( numDeleted == 1 )
+                _currentKeySize -= key.objsize();
+
             return numDeleted == 1;
-            
         }
 
         virtual void fullValidate(OperationContext* txn, long long *numKeysOut) {
             // TODO check invariants?
             *numKeysOut = _data->size();
+        }
+
+        virtual long long getSpaceUsedBytes( OperationContext* txn ) const {
+            // 24 is a guess for DiskLoc + std::set overhead
+            return _currentKeySize + ( sizeof(IndexEntry) * _data->size() );
         }
 
         virtual Status dupKeyCheck(OperationContext* txn, const BSONObj& key, const DiskLoc& loc) {
@@ -374,7 +402,8 @@ namespace {
                     return;
                 }
 
-                _savedKey = _it->key;
+                _savedAtEnd = false;
+                _savedKey = _it->key.getOwned();
                 _savedLoc = _it->loc;
             }
 
@@ -396,6 +425,7 @@ namespace {
             bool _savedAtEnd;
             BSONObj _savedKey;
             DiskLoc _savedLoc;
+
         };
 
         // TODO see if this can share any code with ForwardIterator
@@ -473,7 +503,8 @@ namespace {
                     return;
                 }
 
-                _savedKey = _it->key;
+                _savedAtEnd = false;
+                _savedKey = _it->key.getOwned();
                 _savedLoc = _it->loc;
             }
 
@@ -528,6 +559,7 @@ namespace {
     private:
         const IndexCatalogEntry& _info;
         IndexSet* _data;
+        long long _currentKeySize;
     };
 } // namespace
 

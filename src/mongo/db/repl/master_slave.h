@@ -56,9 +56,6 @@ namespace repl {
     extern volatile int relinquishSyncingSome;
     extern volatile int syncing;
 
-    // Global variable that contains a std::string telling why master/slave halted
-    extern const char *replAllDead;
-
     extern const char *replInfo;
 
     /* A replication exception */
@@ -153,7 +150,7 @@ namespace repl {
         ReplSource(OperationContext* txn);
 
         /* -1 = error */
-        int sync(int& nApplied);
+        int sync(OperationContext* txn, int& nApplied);
 
         void save(OperationContext* txn); // write ourself to local.sources
 

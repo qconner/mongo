@@ -171,10 +171,11 @@ namespace mongo {
                     return false;
                 }
 
-                // Can't index negations of MOD, REGEX, or ELEM_MATCH_VALUE.
+                // Can't index negations of MOD, REGEX, TYPE_OPERATOR, or ELEM_MATCH_VALUE.
                 MatchExpression::MatchType childtype = node->getChild(0)->matchType();
                 if (MatchExpression::REGEX == childtype ||
                     MatchExpression::MOD == childtype ||
+                    MatchExpression::TYPE_OPERATOR == childtype ||
                     MatchExpression::ELEM_MATCH_VALUE == childtype) {
                     return false;
                 }
@@ -244,16 +245,15 @@ namespace mongo {
             else if (exprtype == MatchExpression::GEO_NEAR) {
                 GeoNearMatchExpression* gnme = static_cast<GeoNearMatchExpression*>(node);
                 // Make sure the near query is compatible with 2dsphere.
-                if (gnme->getData().centroid.crs == SPHERE || gnme->getData().isNearSphere) {
-                    return true;
-                }
+                return gnme->getData().centroid.crs == SPHERE;
             }
             return false;
         }
         else if (IndexNames::GEO_2D == indexedFieldType) {
             if (exprtype == MatchExpression::GEO_NEAR) {
                 GeoNearMatchExpression* gnme = static_cast<GeoNearMatchExpression*>(node);
-                return gnme->getData().centroid.crs == FLAT;
+                // Make sure the near query is compatible with 2d index
+                return gnme->getData().centroid.crs == FLAT || !gnme->getData().isWrappingQuery;
             }
             else if (exprtype == MatchExpression::GEO) {
                 // 2d only supports within.

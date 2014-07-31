@@ -113,6 +113,12 @@ namespace repl {
         const MemberConfig& getMemberAt(size_t i) const;
 
         /**
+         * Returns a pointer to the MemberConfig corresponding to the member with the given _id in
+         * the config, or NULL if there is no member with that ID.
+         */
+        const MemberConfig* findMemberByID(int id) const;
+
+        /**
          * Gets the default write concern for the replica set described by this configuration.
          */
         const WriteConcernOptions& getDefaultWriteConcern() const { return _defaultWriteConcern; }
@@ -128,6 +134,11 @@ namespace repl {
          * for purposes of replicating data.
          */
         int getMajorityNumber() const { return _majorityNumber; }
+
+        /**
+         * Gets the number of votes required to win an election.
+         */
+        int getMajorityVoteCount() const { return _majorityVoteCount; }
 
         /**
          * Returns true if automatic (not explicitly set) chaining is allowed.
@@ -172,10 +183,10 @@ namespace repl {
         Status _parseSettingsSubdocument(const BSONObj& settings);
 
         /**
-         * Calculates majority number based on current config and stores in _majorityNumber.
-         * Called during initialize().
+         * Calculates and stores the majorities for replicating data (_majorityNumber) and for
+         * electing a primary (_majorityVoteCount).
          */
-        void _calculateMajorityNumber();
+        void _calculateMajorities();
 
         bool _isInitialized;
         long long _version;
@@ -185,6 +196,7 @@ namespace repl {
         Seconds _heartbeatTimeoutPeriod;
         bool _chainingAllowed;
         int _majorityNumber;
+        int _majorityVoteCount;
         ReplicaSetTagConfig _tagConfig;
         StringMap<ReplicaSetTagPattern> _customWriteConcernModes;
     };

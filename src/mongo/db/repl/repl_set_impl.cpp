@@ -32,7 +32,6 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/commands/get_last_error.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/index_rebuilder.h"
@@ -41,6 +40,7 @@
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/repl_set_seed_list.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -518,9 +518,8 @@ namespace {
         //       we cannot error out at this point, except fatally.  Check errors earlier.
         lock lk(this);
 
-        if (getLastErrorDefault || !c.getLastErrorDefaults.isEmpty()) {
-            // see comment in dbcommands.cpp for getlasterrordefault
-            getLastErrorDefault = new BSONObj(c.getLastErrorDefaults);
+        if (!getLastErrorDefault.isEmpty() || !c.getLastErrorDefaults.isEmpty()) {
+            getLastErrorDefault = c.getLastErrorDefaults;
         }
 
         list<ReplSetConfig::MemberCfg*> newOnes;
@@ -914,22 +913,6 @@ namespace {
             return mv["ts"]._opTime();
         }
         return OpTime();
-    }
-
-    bool ReplSetImpl::registerSlave(const OID& rid, const int memberId) {
-        Member* member = NULL;
-        {
-            lock lk(this);
-            member = getMutableMember(memberId);
-        }
-
-        // it is possible that a node that was removed in a reconfig tried to handshake this node
-        // in that case, the Member will no longer be in the _members List and member will be NULL
-        if (!member) {
-            return false;
-        }
-        syncSourceFeedback.associateMember(rid, member);
-        return true;
     }
 
 } // namespace repl

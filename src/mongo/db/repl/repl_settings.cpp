@@ -26,10 +26,22 @@
  *    it in the license file.
  */
 
-#pragma once
+#include "mongo/db/repl/repl_settings.h"
+
+#include "mongo/base/init.h"
+#include "mongo/base/status.h"
+#include "mongo/db/server_parameters.h"
 
 namespace mongo {
-    class BSONObj;
+namespace repl {
 
-    extern BSONObj *getLastErrorDefault;
-} // namespace mongo
+    MONGO_EXPORT_STARTUP_SERVER_PARAMETER(maxSyncSourceLagSecs, int, 30);
+    MONGO_INITIALIZER(maxSyncSourceLagSecsCheck) (InitializerContext*) {
+        if (maxSyncSourceLagSecs < 1) {
+            return Status(ErrorCodes::BadValue, "maxSyncSourceLagSecs must be > 0");
+        }
+        return Status::OK();
+    }
+
+}
+}

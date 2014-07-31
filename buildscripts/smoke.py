@@ -206,6 +206,8 @@ class mongod(NullMongod):
         argv += ['--setParameter', 'enableTestCommands=1', '--httpinterface']
         if self.kwargs.get('small_oplog'):
             argv += ["--master", "--oplogSize", "511"]
+        if self.kwargs.get('storage_engine'):
+            argv += ["--storageEngine", self.kwargs.get('storage_engine')]
         params = self.kwargs.get('set_parameters', None)
         if params:
             for p in params.split(','): argv += ['--setParameter', p]
@@ -539,6 +541,8 @@ def runTest(test, result):
         # this updates the default data directory for mongod processes started through shell (src/mongo/shell/servers.js)
         evalString += 'MongoRunner.dataDir = "' + os.path.abspath(smoke_db_prefix + '/data/db') + '";'
         evalString += 'MongoRunner.dataPath = MongoRunner.dataDir + "/";'
+        if temp_path:
+            evalString += 'TestData.tmpPath = "' + temp_path + '";'
         if os.sys.platform == "win32":
             # double quotes in the evalString on windows; this
             # prevents the backslashes from being removed when
@@ -549,6 +553,7 @@ def runTest(test, result):
             evalString += 'jsTest.authenticate(db.getMongo());'
 
         argv = argv + [ '--eval', evalString]
+
 
     if argv[0].endswith( 'dbtest' ) or argv[0].endswith( 'dbtest.exe' ):
         if no_preallocj :
@@ -635,6 +640,7 @@ def run_tests(tests):
             master = mongod(small_oplog_rs=small_oplog_rs,
                             small_oplog=small_oplog,
                             no_journal=no_journal,
+                            storage_engine=storage_engine,
                             set_parameters=set_parameters,
                             no_preallocj=no_preallocj,
                             auth=auth,
@@ -652,6 +658,7 @@ def run_tests(tests):
                            small_oplog_rs=small_oplog_rs,
                            small_oplog=small_oplog,
                            no_journal=no_journal,
+                           storage_engine=storage_engine,
                            set_parameters=set_parameters,
                            no_preallocj=no_preallocj,
                            auth=auth,
@@ -718,6 +725,7 @@ def run_tests(tests):
                         master = mongod(small_oplog_rs=small_oplog_rs,
                                         small_oplog=small_oplog,
                                         no_journal=no_journal,
+                                        storage_engine=storage_engine,
                                         set_parameters=set_parameters,
                                         no_preallocj=no_preallocj,
                                         auth=auth,
@@ -984,7 +992,7 @@ def add_exe(e):
 def set_globals(options, tests):
     global mongod_executable, mongod_port, shell_executable, continue_on_failure
     global small_oplog, small_oplog_rs
-    global no_journal, set_parameters, set_parameters_mongos, no_preallocj
+    global no_journal, set_parameters, set_parameters_mongos, no_preallocj, storage_engine
     global auth, authMechanism, keyFile, keyFileData, smoke_db_prefix, test_path, start_mongod
     global use_ssl, use_x509
     global file_of_commands_mode
@@ -1018,6 +1026,7 @@ def set_globals(options, tests):
     if hasattr(options, "small_oplog_rs"):
         small_oplog_rs = options.small_oplog_rs
     no_journal = options.no_journal
+    storage_engine = options.storage_engine
     set_parameters = options.set_parameters
     set_parameters_mongos = options.set_parameters_mongos
     no_preallocj = options.no_preallocj
@@ -1132,7 +1141,7 @@ def add_to_failfile(tests, options):
 
 def main():
     global mongod_executable, mongod_port, shell_executable, continue_on_failure, small_oplog
-    global no_journal, set_parameters, set_parameters_mongos, no_preallocj, auth
+    global no_journal, set_parameters, set_parameters_mongos, no_preallocj, auth, storage_engine
     global keyFile, smoke_db_prefix, test_path, use_write_commands
 
     parser = OptionParser(usage="usage: smoke.py [OPTIONS] ARGS*")
@@ -1163,6 +1172,8 @@ def main():
     parser.add_option('--small-oplog-rs', dest='small_oplog_rs', default=False,
                       action="store_true",
                       help='Run tests with replica set replication & use a small oplog')
+    parser.add_option('--storageEngine', dest='storage_engine', default=None,
+                      help='What storage engine to start mongod with')
     parser.add_option('--nojournal', dest='no_journal', default=False,
                       action="store_true",
                       help='Do not turn on journaling in tests')
@@ -1204,7 +1215,7 @@ def main():
     parser.add_option('--set-parameters-mongos', dest='set_parameters_mongos', default="",
                       help='Adds --setParameter to mongos for each passed in item in the csv list - ex. "param1=1,param2=foo" ')
     parser.add_option('--temp-path', dest='temp_path', default=None,
-                      help='If present, passed as --tempPath to unittests and dbtests')
+                      help='If present, passed as --tempPath to unittests and dbtests or TestData.tmpPath to mongo')
     # Buildlogger invocation from command line
     parser.add_option('--buildlogger-builder', dest='buildlogger_builder', default=None,
                       action="store", help='Set the "builder name" for buildlogger')

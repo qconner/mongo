@@ -48,6 +48,7 @@ namespace mongo {
 namespace repl {
 
     struct FixUpInfo;
+    class OplogReader;
     class ReplSetSeedList;
     class ReplSetHealthPollTask;
 
@@ -256,8 +257,6 @@ namespace repl {
          */
         bool setMaintenanceMode(OperationContext* txn, const bool inc);
 
-        // Records a new slave's id in the GhostSlave map, at handshake time.
-        bool registerSlave(const OID& rid, const int memberId);
     private:
         Member* head() const { return _members.head(); }
     public:
@@ -318,7 +317,7 @@ namespace repl {
 
         const ReplSetConfig::MemberCfg& myConfig() const { return _config; }
         bool tryToGoLiveAsASecondary(OperationContext* txn, OpTime&); // readlocks
-        void syncRollback(OplogReader& r);
+        void syncRollback(OperationContext* txn, OplogReader& r);
         void syncThread();
         const OpTime lastOtherOpTime() const;
         /**
@@ -346,6 +345,8 @@ namespace repl {
         // bool for indicating resync need on this node and the mutex that protects it
         bool initialSyncRequested;
         boost::mutex initialSyncMutex;
+
+        BSONObj getLastErrorDefault;
     private:
         IndexPrefetchConfig _indexPrefetchConfig;
 

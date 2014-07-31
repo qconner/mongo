@@ -295,11 +295,11 @@ namespace mongo {
         return Status::OK();
 
     }
-    
+
     void HeapRecordStore::appendCustomStats( OperationContext* txn,
                                              BSONObjBuilder* result,
                                              double scale ) const {
-        result->append( "note", "HeapRecordStore has no cusom stats yet" );
+        result->appendBool( "capped", _isCapped );
     }
 
     Status HeapRecordStore::touch(OperationContext* txn, BSONObjBuilder* output) const {
@@ -309,7 +309,7 @@ namespace mongo {
         }
         return Status::OK();
     }
-    
+
     Status HeapRecordStore::setCustomOption(
                 OperationContext* txn, const BSONElement& option, BSONObjBuilder* info) {
         invariant(!"setCustomOption not yet implemented");
@@ -415,10 +415,10 @@ namespace mongo {
             ++_it;
     }
 
-    void HeapRecordIterator::prepareToYield() {
+    void HeapRecordIterator::saveState() {
     }
 
-    bool HeapRecordIterator::recoverFromYield() {
+    bool HeapRecordIterator::restoreState() {
         return !_killedByInvalidate;
     }
 
@@ -480,10 +480,10 @@ namespace mongo {
         }
     }
 
-    void HeapRecordReverseIterator::prepareToYield() {
+    void HeapRecordReverseIterator::saveState() {
     }
 
-    bool HeapRecordReverseIterator::recoverFromYield() {
+    bool HeapRecordReverseIterator::restoreState() {
         return !_killedByInvalidate;
     }
 
