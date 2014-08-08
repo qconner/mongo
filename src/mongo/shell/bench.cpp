@@ -909,13 +909,7 @@ namespace mongo {
          OID oid = OID( start.firstElement().String() );
          BenchRunner* runner = BenchRunner::get( oid );
 
-         Timer assertTimer;
          sleepmillis( (int)(1000.0 * runner->config().seconds) );
-         unsigned long long e = assertTimer.micros();
-
-         int elapsed = (int)round(e / 1000.0);
-         int desired = (int)(1000.0 * runner->config().seconds);
-         verify(elapsed >= desired);  // identify any short/interrupted sleep()
 
          return benchFinish( start, data );
      }
