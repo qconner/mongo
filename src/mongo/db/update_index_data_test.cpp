@@ -1,4 +1,4 @@
-// index_set_tests.cpp
+// update_index_data_tests.cpp
 
 /*    Copyright 2012 10gen Inc.
  *
@@ -29,12 +29,12 @@
 
 #include "mongo/unittest/unittest.h"
 
-#include "mongo/db/index_set.h"
+#include "mongo/db/update_index_data.h"
 
 namespace mongo {
 
-    TEST( IndexPathSetTest, Simple1 ) {
-        IndexPathSet a;
+    TEST( UpdateIndexDataTest, Simple1 ) {
+        UpdateIndexData a;
         a.addPath( "a.b" );
         ASSERT_TRUE( a.mightBeIndexed( "a.b" ) );
         ASSERT_TRUE( a.mightBeIndexed( "a" ) );
@@ -43,16 +43,54 @@ namespace mongo {
 
         ASSERT_FALSE( a.mightBeIndexed( "b" ) );
         ASSERT_FALSE( a.mightBeIndexed( "a.c" ) );
+
+        a.clear();
+        ASSERT_FALSE( a.mightBeIndexed( "a.b" ) );
     }
 
-    TEST( IndexPathSetTest, Simple2 ) {
-        IndexPathSet a;
+    TEST( UpdateIndexDataTest, Simple2 ) {
+        UpdateIndexData a;
         a.addPath( "ab" );
+        ASSERT_FALSE( a.mightBeIndexed( "a" ) );
+        a.clear();
+        ASSERT_FALSE( a.mightBeIndexed( "ab" ) );
+    }
+
+    TEST( UpdateIndexDataTest, Component1 ) {
+        UpdateIndexData a;
+        a.addPathComponent( "a" );
+        ASSERT_FALSE( a.mightBeIndexed( "" ) );
+        ASSERT_TRUE( a.mightBeIndexed( "a" ) );
+        ASSERT_TRUE( a.mightBeIndexed( "b.a" ) );
+        ASSERT_TRUE( a.mightBeIndexed( "a.b" ) );
+        ASSERT_TRUE( a.mightBeIndexed( "b.a.c" ) );
+        ASSERT_FALSE( a.mightBeIndexed( "b.c" ) );
+        ASSERT_FALSE( a.mightBeIndexed( "ab" ) );
+        a.clear();
         ASSERT_FALSE( a.mightBeIndexed( "a" ) );
     }
 
+    TEST( UpdateIndexDataTest, AllPathsIndexed1 ) {
+        UpdateIndexData a;
+        a.allPathsIndexed();
+        ASSERT_TRUE( a.mightBeIndexed( "a" ) );
+        a.clear();
+        ASSERT_FALSE( a.mightBeIndexed( "a" ) );
+    }
 
-    TEST( IndexPathSetTest, getCanonicalIndexField1 ) {
+    TEST( UpdateIndexDataTest, AllPathsIndexed2 ) {
+        UpdateIndexData a;
+        a.allPathsIndexed();
+        ASSERT_TRUE( a.mightBeIndexed( "a" ) );
+        ASSERT_TRUE( a.mightBeIndexed( "" ) );
+        a.addPathComponent( "a" );
+        ASSERT_TRUE( a.mightBeIndexed( "a" ) );
+        ASSERT_TRUE( a.mightBeIndexed( "b" ) );
+        a.clear();
+        ASSERT_FALSE( a.mightBeIndexed( "a" ) );
+    }
+
+    TEST( UpdateIndexDataTest, getCanonicalIndexField1 ) {
         string x;
 
         ASSERT_FALSE( getCanonicalIndexField( "a", &x ) );

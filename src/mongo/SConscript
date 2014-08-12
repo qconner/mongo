@@ -149,8 +149,8 @@ env.CppUnitTest('bsonobjbuilder_test', ['bson/bsonobjbuilder_test.cpp'],
 env.CppUnitTest('namespacestring_test', ['db/namespace_string_test.cpp'],
                 LIBDEPS=['bson'])
 
-env.CppUnitTest('index_set_test', ['db/index_set_test.cpp'],
-                LIBDEPS=['bson','index_set'])
+env.CppUnitTest('update_index_data_test', ['db/update_index_data_test.cpp'],
+                LIBDEPS=['bson','update_index_data','db/common'])
 
 env.Library('path',
             ['db/matcher/path.cpp',
@@ -444,6 +444,7 @@ coredbEnv.Library("coredb", [
         "db/commands/find_and_modify_common.cpp",
         "db/commands/hashcmd.cpp",
         "db/commands/isself.cpp",
+        "db/repl/isself.cpp",
         "db/commands/mr_common.cpp",
         "db/commands/rename_collection_common.cpp",
         "db/commands/server_status.cpp",
@@ -547,7 +548,7 @@ if has_option( "mm" ):
 else:
     mmapFiles += [ "util/mmap_${OS_FAMILY}.cpp" ]
 
-env.Library('index_set', [ 'db/index_set.cpp' ] )
+env.Library('update_index_data', [ 'db/update_index_data.cpp' ], LIPDEPS=[ 'db/common' ])
 
 # Global Configuration.  Used by both mongos and mongod.
 env.Library('global_environment_experiment',
@@ -579,7 +580,6 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/repl/repl_coordinator_external_state_impl.cpp",
                     "db/repl/repl_coordinator_hybrid.cpp",
                     "db/repl/repl_coordinator_legacy.cpp",
-                    "db/repl/repl_set_seed_list.cpp",
                     "db/repl/repl_set_health_poll_task.cpp",
                     "db/repl/repl_set_impl.cpp",
                     "db/repl/replset_commands.cpp",
@@ -725,7 +725,9 @@ serverOnlyFiles += mmapFiles
 
 serverOnlyFiles += [ "db/stats/snapshots.cpp", "db/stats/range_deleter_server_status.cpp" ]
 
-env.Library('coreshard', ['s/distlock.cpp',
+env.Library('coreshard', [# This is only here temporarily for auto-split logic in chunk.cpp.
+                          's/balancer_policy.cpp',
+                          's/distlock.cpp',
                           's/config.cpp',
                           's/grid.cpp',
                           's/chunk.cpp',
@@ -751,8 +753,6 @@ mongosLibraryFiles = [
     "s/cursors.cpp",
     "s/s_only.cpp",
     "s/balance.cpp",
-    "s/balancer_policy.cpp",
-    "s/writeback_listener.cpp",
     "s/version_manager.cpp",
     "s/version_mongos.cpp",
     "s/mongos_persistence_stubs.cpp",
@@ -907,8 +907,8 @@ serveronlyLibdeps = ["coreshard",
                      "defaultversion",
                      "global_optime",
                      "index_key_validate",
-                     "index_set",
                      'range_deleter',
+                     "update_index_data",
                      's/metadata',
                      's/batch_write_types',
                      "db/catalog/collection_options",
@@ -934,8 +934,14 @@ serveronlyEnv.Library("serveronly", serverOnlyFiles,
 
 env.Library("message_server_port", "util/net/message_server_port.cpp")
 
-env.Library("signal_handlers", "util/signal_handlers.cpp",
+env.Library("signal_handlers_synchronous",
+            ['util/signal_handlers_synchronous.cpp',],
             LIBDEPS=["stacktrace", "foundation"]
+            )
+
+env.Library("signal_handlers",
+            ["util/signal_handlers.cpp",],
+            LIBDEPS=["foundation", "signal_handlers_synchronous"]
             )
 
 # These files go into mongos and mongod only, not into the shell or any tools.

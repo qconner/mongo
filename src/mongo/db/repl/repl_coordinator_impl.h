@@ -40,7 +40,6 @@
 #include "mongo/db/repl/repl_coordinator_external_state.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_executor.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/platform/unordered_map.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -48,21 +47,23 @@ namespace mongo {
 namespace repl {
 
     class SyncSourceFeedback;
+    class TopologyCoordinator;
 
     class ReplicationCoordinatorImpl : public ReplicationCoordinator {
         MONGO_DISALLOW_COPYING(ReplicationCoordinatorImpl);
 
     public:
 
-        // Takes ownership of the passed in ReplicationCoordinatorExternalState.
+        // Takes ownership of the "externalState", "topCoord" and "network" objects.
         ReplicationCoordinatorImpl(const ReplSettings& settings,
-                                   ReplicationCoordinatorExternalState* externalState);
+                                   ReplicationCoordinatorExternalState* externalState,
+                                   ReplicationExecutor::NetworkInterface* network,
+                                   TopologyCoordinator* topoCoord);
         virtual ~ReplicationCoordinatorImpl();
 
         // ================== Members of public ReplicationCoordinator API ===================
 
-        virtual void startReplication(TopologyCoordinator* topCoord,
-                                      ReplicationExecutor::NetworkInterface* network);
+        virtual void startReplication(OperationContext* txn);
 
         virtual void shutdown();
 
@@ -154,16 +155,10 @@ namespace repl {
                                            BSONObjBuilder* resultObj);
 
         virtual Status processReplSetUpdatePosition(OperationContext* txn,
-                                                    const BSONArray& updates,
-                                                    BSONObjBuilder* resultObj);
-
-        virtual Status processReplSetUpdatePositionHandshake(const OperationContext* txn,
-                                                             const BSONObj& handshake,
-                                                             BSONObjBuilder* resultObj);
+                                                    const UpdatePositionArgs& updates);
 
         virtual Status processHandshake(const OperationContext* txn,
-                                        const OID& remoteID,
-                                        const BSONObj& handshake);
+                                        const HandshakeArgs& handshake);
 
         virtual void waitUpToOneSecondForOptimeChange(const OpTime& ot);
 
@@ -178,12 +173,6 @@ namespace repl {
         virtual bool isReplEnabled() const;
 
         // ================== Members of replication code internal API ===================
-
-        // Called by the TopologyCoordinator whenever this node's replica set state transitions.
-        void setCurrentMemberState(const MemberState& newState);
-
-        // Called by the TopologyCoordinator whenever the replica set configuration is updated
-        void setCurrentReplicaSetConfig(const ReplicaSetConfig& newConfig, int myIndex);
 
         /**
          * Does a heartbeat for a member of the replica set.
@@ -201,10 +190,41 @@ namespace repl {
          */
         void cancelHeartbeats();
 
+        // ================== Test support API ===================
+
+        /**
+         * If called after startReplication(), blocks until all asynchronous
+         * activities associated with replication start-up complete.
+         */
+        void waitForStartUp();
+
     private:
 
         // Struct that holds information about clients waiting for replication.
         struct WaiterInfo;
+
+        // Struct that holds information about nodes in this replication group, mainly used for
+        // tracking replication progress for write concern satisfaction.
+        struct SlaveInfo {
+            OpTime opTime; // Our last known OpTime that this slave has replicated to.
+            HostAndPort hostAndPort; // Client address of the slave.
+            int memberID; // ID of the node in the replica set config, or -1 if we're not a replSet.
+            SlaveInfo() : memberID(-1) {}
+        };
+
+        // Map of node RIDs to their SlaveInfo.
+        typedef unordered_map<OID, SlaveInfo, OID::Hasher> SlaveInfoMap;
+
+        typedef std::vector<ReplicationExecutor::CallbackHandle> HeartbeatHandles;
+
+        // Called by the TopologyCoordinator whenever this node's replica set state transitions.
+        void _onSelfStateChange(const MemberState& newState);
+
+        /*
+         * Returns the OpTime of the last applied operation on this node.
+         */
+        OpTime _getLastOpApplied();
+        OpTime _getLastOpApplied_inlock();
 
         /*
          * Returns true if the given writeConcern is satisfied up to "optime".
@@ -227,7 +247,7 @@ namespace repl {
         void _untrackHeartbeatHandle(const ReplicationExecutor::CallbackHandle& handle);
 
         /**
-         * Start a heartbeat for each member in the current config
+         * Starts a heartbeat for each member in the current config
          */
         void _startHeartbeats();
 
@@ -239,32 +259,46 @@ namespace repl {
          */
         Mode _getReplicationMode_inlock() const;
 
-        // Handles to actively queued heartbeats
-        typedef std::vector<ReplicationExecutor::CallbackHandle> HeartbeatHandles;
+        /**
+         * Starts loading the replication configuration from local storage, and if it is valid,
+         * schedules a callback to set itas the current replica set config (sets _rsConfig and
+         * _thisMembersConfigIndex).
+         */
+        void _startLoadLocalConfig(OperationContext* txn);
+
+        /**
+         * Callback that finishes the work started in _startLoadLocalConfig.
+         */
+        void _finishLoadLocalConfig(const ReplicationExecutor::CallbackData& cbData,
+                                    const ReplicaSetConfig& localConfig);
+
+        // Handle for the callback that marks the end of startReplication()'s asynchronous
+        // work.  Used for testing, set in startReplication() and never changed.
+        ReplicationExecutor::CallbackHandle _startUpFinishedHandle;
+
+        // Handles to actively queued heartbeats.
+        // Only accessed serially in ReplicationExecutor callbacks, which makes it safe to access
+        // outside of _mutex.
         HeartbeatHandles _heartbeatHandles;
 
-        // Protects all member data of this ReplicationCoordinator.
-        mutable boost::mutex _mutex;
-
-        // list of information about clients waiting on replication.  Does *not* own the
-        // WaiterInfos.
-        std::vector<WaiterInfo*> _replicationWaiterList;
-
-        // Set to true when we are in the process of shutting down replication.
-        bool _inShutdown;
-
-        // Parsed command line arguments related to replication.
+        // Parsed command line arguments related to replication.  Set once at startup and then
+        // never modified again, which makes it safe to read outside of _mutex.
+        // TODO(spencer): Currently this actually is not true, there is global mutable state
+        // in ReplSettings, but we should be able to get rid of that after the legacy repl
+        // coordinator is gone. At that point we can make this const.
         ReplSettings _settings;
 
         // Our RID, used to identify us to our sync source when sending replication progress
-        // updates upstream.  Set once at startup and then never modified again.
+        // updates upstream.  Set once at startup and then never modified again, which makes it
+        // safe to read outside of _mutex.
+        // TODO(spencer): put behind _mutex
         OID _myRID;
 
         // Pointer to the TopologyCoordinator owned by this ReplicationCoordinator.
         boost::scoped_ptr<TopologyCoordinator> _topCoord;
 
-        // Pointer to the ReplicationExecutor owned by this ReplicationCoordinator.
-        boost::scoped_ptr<ReplicationExecutor> _replExecutor;
+        // Executor that drives the topology coordinator.
+        ReplicationExecutor _replExecutor;
 
         // Pointer to the ReplicationCoordinatorExternalState owned by this ReplicationCoordinator.
         boost::scoped_ptr<ReplicationCoordinatorExternalState> _externalState;
@@ -275,15 +309,23 @@ namespace repl {
         // Thread that drives actions in the topology coordinator
         boost::scoped_ptr<boost::thread> _topCoordDriverThread;
 
-        struct SlaveInfo {
-            OpTime opTime; // Our last known OpTime that this slave has replicated to.
-            HostAndPort hostAndPort; // Client address of the slave.
-            int memberID; // ID of the node in the replica set config, or -1 if we're not a replSet.
-            SlaveInfo() : memberID(-1) {}
-        };
+        // Protects member data of this ReplicationCoordinator.
+        mutable boost::mutex _mutex;
+
+        /// ============= All members below this line are guarded by _mutex ==================== ///
+
+        // list of information about clients waiting on replication.  Does *not* own the
+        // WaiterInfos.
+        std::vector<WaiterInfo*> _replicationWaiterList;
+
+        // Set to true when we are in the process of shutting down replication.
+        bool _inShutdown;
+
+        // Election ID of the last election that resulted in this node becoming primary.
+        OID _electionID;
+
         // Maps nodes in this replication group to information known about it such as its
         // replication progress and its ID in the replica set config.
-        typedef unordered_map<OID, SlaveInfo, OID::Hasher> SlaveInfoMap;
         SlaveInfoMap _slaveInfoMap;
 
         // Current ReplicaSet state.

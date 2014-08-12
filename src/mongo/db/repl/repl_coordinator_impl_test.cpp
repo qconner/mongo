@@ -30,6 +30,7 @@
 
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread.hpp>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -41,6 +42,7 @@
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
@@ -51,33 +53,172 @@ namespace mongo {
         s << ot.toString();
         return s;
     }
-    StringBuilder& operator<< (StringBuilder& s, const OpTime& ot) {
-        return (s << ot.toString());
+    // So that you can ASSERT_EQUALS two Date_ts
+    std::ostream& operator<<( std::ostream &s, const Date_t &t ) {
+        s << t.toString();
+        return s;
     }
 
 namespace repl {
 namespace {
 
-    TEST(ReplicationCoordinator, StartupShutdown) {
-        ReplSettings settings;
-        // Make sure we think we're a replSet
-        settings.replSet = "mySet/node1:12345,node2:54321";
-        ReplicationCoordinatorImpl coordinator(settings,
-                                               new ReplicationCoordinatorExternalStateMock);
-        ReplicaSetConfig config;
-        config.initialize((BSON("_id" << "mySet" <<
-                                "version" << 2 <<
-                                "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
-                                                             "_id" << 0 )))));
-        coordinator.setCurrentReplicaSetConfig(config, 0);
-        coordinator.startReplication(new TopologyCoordinatorImpl(0), new NetworkInterfaceMock);
-        coordinator.shutdown();
+    bool stringContains(const std::string &haystack, const std::string& needle) {
+        return haystack.find(needle) != std::string::npos;
     }
 
-    TEST(ReplicationCoordinator, AwaitReplicationNumberBaseCases) {
-        ReplSettings settings;
-        ReplicationCoordinatorImpl coordinator(settings,
-                                               new ReplicationCoordinatorExternalStateMock);
+    const Seconds zeroSecs(0);
+
+    class ReplCoordTest : public mongo::unittest::Test {
+    public:
+        ReplCoordTest() : _callShutdown(false) {}
+
+        virtual void setUp() {
+            _settings.replSet = "mySet/node1:12345,node2:54321";
+        }
+
+        virtual void tearDown() {
+            if (_callShutdown) {
+                shutdown();
+            }
+        }
+
+    protected:
+        ReplicationCoordinatorImpl* getReplCoord() {return _repl.get();}
+        TopologyCoordinatorImpl& getTopoCoord() {return *_topo;}
+
+        void init() {
+            invariant(!_repl);
+            invariant(!_callShutdown);
+            _topo = new TopologyCoordinatorImpl(zeroSecs);
+            _net = new NetworkInterfaceMock;
+            _externalState = new ReplicationCoordinatorExternalStateMock;
+            _repl.reset(new ReplicationCoordinatorImpl(_settings,
+                                                       _externalState,
+                                                       _net,
+                                                       _topo));
+        }
+
+        void init(ReplSettings settings) {
+            _settings = settings;
+            init();
+        }
+
+        void init(const std::string& replSet) {
+            _settings.replSet = replSet;
+            init();
+        }
+
+        void start() {
+            invariant(!_callShutdown);
+            // if we haven't initialized yet, do that first.
+            if (!_repl) {
+                init();
+            }
+
+            OperationContextNoop txn;
+            _repl->startReplication(&txn);
+            _repl->waitForStartUp();
+            _callShutdown = true;
+        }
+
+        void start(const BSONObj& configDoc, const HostAndPort& selfHost) {
+            if (!_repl) {
+                init();
+            }
+            _externalState->setLocalConfigDocument(StatusWith<BSONObj>(configDoc));
+            _externalState->addSelf(selfHost);
+            start();
+        }
+
+        void assertStart(ReplicationCoordinator::Mode expectedMode,
+                         const BSONObj& configDoc,
+                         const HostAndPort& selfHost) {
+            start(configDoc, selfHost);
+            ASSERT_EQUALS(expectedMode, getReplCoord()->getReplicationMode());
+        }
+
+        void assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost) {
+            assertStart(ReplicationCoordinator::modeReplSet, configDoc, selfHost);
+        }
+
+        void shutdown() {
+            invariant(_callShutdown);
+            _repl->shutdown();
+            _callShutdown = false;
+        }
+
+        int64_t countLogLinesContaining(const std::string& needle) {
+            return std::count_if(getCapturedLogMessages().begin(),
+                                 getCapturedLogMessages().end(),
+                                 stdx::bind(stringContains,
+                                            stdx::placeholders::_1,
+                                            needle));
+        }
+
+    private:
+        boost::scoped_ptr<ReplicationCoordinatorImpl> _repl;
+        // Owned by ReplicationCoordinatorImpl
+        TopologyCoordinatorImpl* _topo;
+        // Owned by ReplicationCoordinatorImpl
+        NetworkInterfaceMock* _net;
+        // Owned by ReplicationCoordinatorImpl
+        ReplicationCoordinatorExternalStateMock* _externalState;
+        ReplSettings _settings;
+        bool _callShutdown;
+    };
+
+    TEST_F(ReplCoordTest, StartupWithValidLocalConfig) {
+        assertStart(
+                ReplicationCoordinator::modeReplSet,
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("_id" << 1 << "host" << "node1:12345"))),
+                HostAndPort("node1", 12345));
+    }
+
+    TEST_F(ReplCoordTest, StartupWithInvalidLocalConfig) {
+        startCapturingLogMessages();
+        assertStart(ReplicationCoordinator::modeNone,
+                    BSON("_id" << "mySet"), HostAndPort("node1", 12345));
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(1, countLogLinesContaining("configuration does not parse"));
+    }
+
+    TEST_F(ReplCoordTest, StartupWithConfigMissingSelf) {
+        startCapturingLogMessages();
+        assertStart(
+                ReplicationCoordinator::modeNone,
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("_id" << 1 << "host" << "node1:12345") <<
+                                             BSON("_id" << 2 << "host" << "node2:54321"))),
+                HostAndPort("node3", 12345));
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(1, countLogLinesContaining("NodeNotFound"));
+    }
+
+    TEST_F(ReplCoordTest, StartupWithLocalConfigSetNameMismatch) {
+        init("mySet");
+        startCapturingLogMessages();
+        assertStart(ReplicationCoordinator::modeNone,
+                    BSON("_id" << "notMySet" <<
+                         "version" << 2 <<
+                         "members" << BSON_ARRAY(BSON("_id" << 1 << "host" << "node1:12345"))),
+                    HostAndPort("node1", 12345));
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(1, countLogLinesContaining("reports set name of notMySet,"));
+    }
+
+    TEST_F(ReplCoordTest, StartupWithNoLocalConfig) {
+        startCapturingLogMessages();
+        start();
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(1, countLogLinesContaining("Did not find local "));
+        ASSERT_EQUALS(ReplicationCoordinator::modeNone, getReplCoord()->getReplicationMode());
+    }
+
+    TEST_F(ReplCoordTest, AwaitReplicationNumberBaseCases) {
+        init("");
         OperationContextNoop txn;
         OpTime time(1, 1);
 
@@ -87,41 +228,35 @@ namespace {
 
         // Because we didn't set ReplSettings.replSet, it will think we're a standalone so
         // awaitReplication will always work.
-        ReplicationCoordinator::StatusAndDuration statusAndDur = coordinator.awaitReplication(
-                &txn, time, writeConcern);
+        ReplicationCoordinator::StatusAndDuration statusAndDur =
+                                        getReplCoord()->awaitReplication(&txn, time, writeConcern);
         ASSERT_OK(statusAndDur.status);
 
         // Now make us a master in master/slave
-        coordinator.getSettings().master = true;
+        getReplCoord()->getSettings().master = true;
 
         writeConcern.wNumNodes = 0;
         writeConcern.wMode = "majority";
         // w:majority always works on master/slave
-        statusAndDur = coordinator.awaitReplication(&txn, time, writeConcern);
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time, writeConcern);
         ASSERT_OK(statusAndDur.status);
 
         // Now make us a replica set
-        coordinator.getSettings().replSet = "mySet/node1:12345,node2:54321";
+        getReplCoord()->getSettings().replSet = "mySet/node1:12345,node2:54321";
 
         // Waiting for 1 nodes always works
         writeConcern.wNumNodes = 1;
         writeConcern.wMode = "";
-        statusAndDur = coordinator.awaitReplication(&txn, time, writeConcern);
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time, writeConcern);
         ASSERT_OK(statusAndDur.status);
     }
 
-    TEST(ReplicationCoordinator, AwaitReplicationNumberOfNodesNonBlocking) {
-        ReplSettings settings;
-        // Make sure we think we're a replSet
-        settings.replSet = "mySet/node1:12345,node2:54321";
-        ReplicationCoordinatorImpl coordinator(settings,
-                                               new ReplicationCoordinatorExternalStateMock);
-        ReplicaSetConfig config;
-        config.initialize((BSON("_id" << "mySet" <<
-                                "version" << 2 <<
-                                "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
-                                                             "_id" << 0 )))));
-        coordinator.setCurrentReplicaSetConfig(config, 0);
+    TEST_F(ReplCoordTest, AwaitReplicationNumberOfNodesNonBlocking) {
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0 ))),
+                HostAndPort("node1", 12345));
         OperationContextNoop txn;
 
         OID client1 = OID::gen();
@@ -135,32 +270,32 @@ namespace {
         writeConcern.wNumNodes = 2;
 
         // 2 nodes waiting for time1
-        ReplicationCoordinator::StatusAndDuration statusAndDur = coordinator.awaitReplication(
-                &txn, time1, writeConcern);
+        ReplicationCoordinator::StatusAndDuration statusAndDur =
+                                        getReplCoord()->awaitReplication(&txn, time1, writeConcern);
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, statusAndDur.status);
-        ASSERT_OK(coordinator.setLastOptime(&txn, client1, time1));
-        statusAndDur = coordinator.awaitReplication(&txn, time1, writeConcern);
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client1, time1));
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time1, writeConcern);
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, statusAndDur.status);
-        ASSERT_OK(coordinator.setLastOptime(&txn, client2, time1));
-        statusAndDur = coordinator.awaitReplication(&txn, time1, writeConcern);
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client2, time1));
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time1, writeConcern);
         ASSERT_OK(statusAndDur.status);
 
         // 2 nodes waiting for time2
-        statusAndDur = coordinator.awaitReplication(&txn, time2, writeConcern);
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time2, writeConcern);
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, statusAndDur.status);
-        ASSERT_OK(coordinator.setLastOptime(&txn, client2, time2));
-        statusAndDur = coordinator.awaitReplication(&txn, time2, writeConcern);
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client2, time2));
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time2, writeConcern);
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, statusAndDur.status);
-        ASSERT_OK(coordinator.setLastOptime(&txn, client3, time2));
-        statusAndDur = coordinator.awaitReplication(&txn, time2, writeConcern);
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client3, time2));
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time2, writeConcern);
         ASSERT_OK(statusAndDur.status);
 
         // 3 nodes waiting for time2
         writeConcern.wNumNodes = 3;
-        statusAndDur = coordinator.awaitReplication(&txn, time2, writeConcern);
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time2, writeConcern);
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, statusAndDur.status);
-        ASSERT_OK(coordinator.setLastOptime(&txn, client1, time2));
-        statusAndDur = coordinator.awaitReplication(&txn, time2, writeConcern);
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client1, time2));
+        statusAndDur = getReplCoord()->awaitReplication(&txn, time2, writeConcern);
         ASSERT_OK(statusAndDur.status);
     }
 
@@ -224,20 +359,15 @@ namespace {
         boost::scoped_ptr<boost::thread> _thread;
     };
 
-    TEST(ReplicationCoordinator, AwaitReplicationNumberOfNodesBlocking) {
-        ReplSettings settings;
-        // Make sure we think we're a replSet
-        settings.replSet = "mySet/node1:12345,node2:54321";
-        ReplicationCoordinatorImpl coordinator(settings,
-                                               new ReplicationCoordinatorExternalStateMock);
-        ReplicaSetConfig config;
-        config.initialize((BSON("_id" << "mySet" <<
-                                "version" << 2 <<
-                                "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
-                                                             "_id" << 0 )))));
-        coordinator.setCurrentReplicaSetConfig(config, 0);
+    TEST_F(ReplCoordTest, AwaitReplicationNumberOfNodesBlocking) {
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0 ))),
+                HostAndPort("node1", 12345));
+
         OperationContextNoop txn;
-        ReplicationAwaiter awaiter(&coordinator, &txn);
+        ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
         OID client1 = OID::gen();
         OID client2 = OID::gen();
@@ -253,8 +383,8 @@ namespace {
         awaiter.setOpTime(time1);
         awaiter.setWriteConcern(writeConcern);
         awaiter.start();
-        ASSERT_OK(coordinator.setLastOptime(&txn, client1, time1));
-        ASSERT_OK(coordinator.setLastOptime(&txn, client2, time1));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client1, time1));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client2, time1));
         ReplicationCoordinator::StatusAndDuration statusAndDur = awaiter.getResult();
         ASSERT_OK(statusAndDur.status);
         awaiter.reset();
@@ -262,8 +392,8 @@ namespace {
         // 2 nodes waiting for time2
         awaiter.setOpTime(time2);
         awaiter.start();
-        ASSERT_OK(coordinator.setLastOptime(&txn, client2, time2));
-        ASSERT_OK(coordinator.setLastOptime(&txn, client3, time2));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client2, time2));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client3, time2));
         statusAndDur = awaiter.getResult();
         ASSERT_OK(statusAndDur.status);
         awaiter.reset();
@@ -272,26 +402,20 @@ namespace {
         writeConcern.wNumNodes = 3;
         awaiter.setWriteConcern(writeConcern);
         awaiter.start();
-        ASSERT_OK(coordinator.setLastOptime(&txn, client1, time2));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client1, time2));
         statusAndDur = awaiter.getResult();
         ASSERT_OK(statusAndDur.status);
         awaiter.reset();
     }
 
-    TEST(ReplicationCoordinator, AwaitReplicationTimeout) {
-        ReplSettings settings;
-        // Make sure we think we're a replSet
-        settings.replSet = "mySet/node1:12345,node2:54321";
-        ReplicationCoordinatorImpl coordinator(settings,
-                                               new ReplicationCoordinatorExternalStateMock);
-        ReplicaSetConfig config;
-        config.initialize((BSON("_id" << "mySet" <<
-                                "version" << 2 <<
-                                "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
-                                                             "_id" << 0 )))));
-        coordinator.setCurrentReplicaSetConfig(config, 0);
+    TEST_F(ReplCoordTest, AwaitReplicationTimeout) {
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0 ))),
+                HostAndPort("node1", 12345));
         OperationContextNoop txn;
-        ReplicationAwaiter awaiter(&coordinator, &txn);
+        ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
         OID client1 = OID::gen();
         OID client2 = OID::gen();
@@ -306,28 +430,21 @@ namespace {
         awaiter.setOpTime(time2);
         awaiter.setWriteConcern(writeConcern);
         awaiter.start();
-        ASSERT_OK(coordinator.setLastOptime(&txn, client1, time1));
-        ASSERT_OK(coordinator.setLastOptime(&txn, client2, time1));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client1, time1));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client2, time1));
         ReplicationCoordinator::StatusAndDuration statusAndDur = awaiter.getResult();
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, statusAndDur.status);
         awaiter.reset();
     }
 
-    TEST(ReplicationCoordinator, AwaitReplicationShutdown) {
-        ReplSettings settings;
-        // Make sure we think we're a replSet
-        settings.replSet = "mySet/node1:12345,node2:54321";
-        ReplicationCoordinatorImpl coordinator(settings,
-                                               new ReplicationCoordinatorExternalStateMock);
-        ReplicaSetConfig config;
-        config.initialize((BSON("_id" << "mySet" <<
-                                "version" << 2 <<
-                                "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
-                                                             "_id" << 0 )))));
-        coordinator.setCurrentReplicaSetConfig(config, 0);
-        coordinator.startReplication(new TopologyCoordinatorImpl(0), new NetworkInterfaceMock);
+    TEST_F(ReplCoordTest, AwaitReplicationShutdown) {
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0 ))),
+                HostAndPort("node1", 12345));
         OperationContextNoop txn;
-        ReplicationAwaiter awaiter(&coordinator, &txn);
+        ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
         OID client1 = OID::gen();
         OID client2 = OID::gen();
@@ -342,117 +459,90 @@ namespace {
         awaiter.setOpTime(time2);
         awaiter.setWriteConcern(writeConcern);
         awaiter.start();
-        ASSERT_OK(coordinator.setLastOptime(&txn, client1, time1));
-        ASSERT_OK(coordinator.setLastOptime(&txn, client2, time1));
-        coordinator.shutdown();
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client1, time1));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, client2, time1));
+        shutdown();
         ReplicationCoordinator::StatusAndDuration statusAndDur = awaiter.getResult();
         ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, statusAndDur.status);
         awaiter.reset();
     }
 
-    TEST(ReplicationCoordinator, GetReplicationMode) {
-        // should default to modeNone
-        ReplSettings settings;
-        ReplicationCoordinatorImpl coordinator(settings,
-                                               new ReplicationCoordinatorExternalStateMock);
-        ASSERT_EQUALS(ReplicationCoordinator::modeNone, coordinator.getReplicationMode());
-
-        // modeMasterSlave if master set
-        ReplSettings settings2;
-        settings2.master = true;
-        ReplicationCoordinatorImpl coordinator2(settings2,
-                                                new ReplicationCoordinatorExternalStateMock);
-        ASSERT_EQUALS(ReplicationCoordinator::modeMasterSlave, coordinator2.getReplicationMode());
-
-        // modeMasterSlave if the slave flag was set
-        ReplSettings settings3;
-        settings3.slave = SimpleSlave;
-        ReplicationCoordinatorImpl coordinator3(settings3,
-                                                new ReplicationCoordinatorExternalStateMock);
-        ASSERT_EQUALS(ReplicationCoordinator::modeMasterSlave, coordinator3.getReplicationMode());
-
-        // modeReplSet only once config isInitialized
-        ReplSettings settings4;
-        settings4.replSet = "mySet/node1:12345";
-        ReplicationCoordinatorImpl coordinator4(settings4,
-                                                new ReplicationCoordinatorExternalStateMock);
-        ASSERT_EQUALS(ReplicationCoordinator::modeNone, coordinator4.getReplicationMode());
-        ReplicaSetConfig config;
-        config.initialize((BSON("_id" << "mySet" <<
-                                "version" << 2 <<
-                                "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
-                                                             "_id" << 0 )))));
-        coordinator4.setCurrentReplicaSetConfig(config, 0);
-        ASSERT_EQUALS(ReplicationCoordinator::modeReplSet, coordinator4.getReplicationMode());
-
-        // modeReplSet only once config isInitialized even if the slave flag was set
-        settings4.slave = SimpleSlave;
-        ReplicationCoordinatorImpl coordinator5(settings4,
-                                                new ReplicationCoordinatorExternalStateMock);
-        ASSERT_EQUALS(ReplicationCoordinator::modeMasterSlave, coordinator5.getReplicationMode());
-        coordinator5.setCurrentReplicaSetConfig(config, 0);
-        ASSERT_EQUALS(ReplicationCoordinator::modeReplSet, coordinator5.getReplicationMode());
-    }
-
-    TEST(ReplicationCoordinator, AwaitReplicationNamedModes) {
+    TEST_F(ReplCoordTest, AwaitReplicationNamedModes) {
         // TODO(spencer): Test awaitReplication with w:majority and tag groups
+        warning() << "Test ReplCoordTest.AwaitReplicationNamedModes needs to be written.";
     }
 
-    // This test fixture ensures that any tests that call startReplication on their coordinator
-    // will always call shutdown on the coordinator as well.
-    class ReplicationCoordinatorTestWithShutdown : public ::mongo::unittest::Test {
-    public:
-        virtual ~ReplicationCoordinatorTestWithShutdown() {
-            if (coordinator.get()) {
-                coordinator->shutdown();
-            }
-        }
-        boost::scoped_ptr<ReplicationCoordinatorImpl> coordinator;
-    };
+    TEST_F(ReplCoordTest, GetReplicationModeNone) {
+        init();
+        ASSERT_EQUALS(ReplicationCoordinator::modeNone, getReplCoord()->getReplicationMode());
+    }
 
-    TEST_F(ReplicationCoordinatorTestWithShutdown, TestPrepareReplSetUpdatePositionCommand) {
-
+    TEST_F(ReplCoordTest, GetReplicationModeMaster) {
+        // modeMasterSlave if master set
         ReplSettings settings;
-        settings.replSet = "mySet:/test1:1234,test2:1234,test3:1234";
-        BSONObj configObj =
+        settings.master = true;
+        init(settings);
+        ASSERT_EQUALS(ReplicationCoordinator::modeMasterSlave,
+                      getReplCoord()->getReplicationMode());
+    }
+
+    TEST_F(ReplCoordTest, GetReplicationModeSlave) {
+        // modeMasterSlave if the slave flag was set
+        ReplSettings settings;
+        settings.slave = SimpleSlave;
+        init(settings);
+        ASSERT_EQUALS(ReplicationCoordinator::modeMasterSlave,
+                      getReplCoord()->getReplicationMode());
+    }
+
+    TEST_F(ReplCoordTest, GetReplicationModeRepl) {
+        // modeReplSet only once config isInitialized
+        ReplSettings settings;
+        settings.replSet = "mySet/node1:12345";
+        init(settings);
+        ASSERT_EQUALS(ReplicationCoordinator::modeNone,
+                      getReplCoord()->getReplicationMode());
+        assertStart(
+                ReplicationCoordinator::modeReplSet,
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0 ))),
+                HostAndPort("node1", 12345));
+    }
+
+    TEST_F(ReplCoordTest, TestPrepareReplSetUpdatePositionCommand) {
+        OperationContextNoop txn;
+        init("mySet/test1:1234,test2:1234,test3:1234");
+        assertStartSuccess(
                 BSON("_id" << "mySet" <<
                      "version" << 1 <<
                      "members" << BSON_ARRAY(BSON("_id" << 0 << "host" << "test1:1234") <<
                                              BSON("_id" << 1 << "host" << "test2:1234") <<
-                                             BSON("_id" << 2 << "host" << "test3:1234")));
-        ReplicaSetConfig rsConfig;
-        ASSERT_OK(rsConfig.initialize(configObj));
-        coordinator.reset(new ReplicationCoordinatorImpl(
-                settings, new ReplicationCoordinatorExternalStateMock));
-        coordinator->startReplication(new TopologyCoordinatorImpl(0), new NetworkInterfaceMock);
-        coordinator->setCurrentReplicaSetConfig(rsConfig, 1);
-
-        OID rid1 = OID::gen();
+                                             BSON("_id" << 2 << "host" << "test3:1234"))),
+                HostAndPort("test1", 1234));
+        OID rid1 = getReplCoord()->getMyRID(&txn);
         OID rid2 = OID::gen();
         OID rid3 = OID::gen();
-        BSONObj handshake1 = BSON("handshake" << rid1 <<
-                                  "member" << 0 <<
-                                  "config" << BSON("_id" << 0 << "host" << "test1:1234"));
-        BSONObj handshake2 = BSON("handshake" << rid2 <<
-                                  "member" << 1 <<
-                                  "config" << BSON("_id" << 1 << "host" << "test2:1234"));
-        BSONObj handshake3 = BSON("handshake" << rid3 <<
-                                  "member" << 2 <<
-                                  "config" << BSON("_id" << 2 << "host" << "test3:1234"));
-        OperationContextNoop txn;
-        ASSERT_OK(coordinator->processHandshake(&txn, rid1, handshake1));
-        ASSERT_OK(coordinator->processHandshake(&txn, rid2, handshake2));
-        ASSERT_OK(coordinator->processHandshake(&txn, rid3, handshake3));
+        HandshakeArgs handshake2;
+        handshake2.initialize(BSON("handshake" << rid2 <<
+                                   "member" << 1 <<
+                                   "config" << BSON("_id" << 1 << "host" << "test2:1234")));
+        HandshakeArgs handshake3;
+        handshake3.initialize(BSON("handshake" << rid3 <<
+                                   "member" << 2 <<
+                                   "config" << BSON("_id" << 2 << "host" << "test3:1234")));
+        ASSERT_OK(getReplCoord()->processHandshake(&txn, handshake2));
+        ASSERT_OK(getReplCoord()->processHandshake(&txn, handshake3));
         OpTime optime1(1, 1);
         OpTime optime2(1, 2);
         OpTime optime3(2, 1);
-        ASSERT_OK(coordinator->setLastOptime(&txn, rid1, optime1));
-        ASSERT_OK(coordinator->setLastOptime(&txn, rid2, optime2));
-        ASSERT_OK(coordinator->setLastOptime(&txn, rid3, optime3));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, rid1, optime1));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, rid2, optime2));
+        ASSERT_OK(getReplCoord()->setLastOptime(&txn, rid3, optime3));
 
         // Check that the proper BSON is generated for the replSetUpdatePositionCommand
         BSONObjBuilder cmdBuilder;
-        coordinator->prepareReplSetUpdatePositionCommand(&txn, &cmdBuilder);
+        getReplCoord()->prepareReplSetUpdatePositionCommand(&txn, &cmdBuilder);
         BSONObj cmd = cmdBuilder.done();
 
         ASSERT_EQUALS(2, cmd.nFields());
@@ -475,48 +565,43 @@ namespace {
         ASSERT_EQUALS(3U, rids.size()); // Make sure we saw all 3 nodes
     }
 
-    TEST_F(ReplicationCoordinatorTestWithShutdown, TestHandshakes) {
-        ReplSettings settings;
-        settings.replSet = "mySet:/test1:1234,test2:1234,test3:1234";
-        BSONObj configObj =
+    TEST_F(ReplCoordTest, TestHandshakes) {
+        init("mySet/test1:1234,test2:1234,test3:1234");
+        assertStartSuccess(
                 BSON("_id" << "mySet" <<
                      "version" << 1 <<
                      "members" << BSON_ARRAY(BSON("_id" << 0 << "host" << "test1:1234") <<
                                              BSON("_id" << 1 << "host" << "test2:1234") <<
-                                             BSON("_id" << 2 << "host" << "test3:1234")));
-        ReplicaSetConfig rsConfig;
-        ASSERT_OK(rsConfig.initialize(configObj));
-        coordinator.reset(new ReplicationCoordinatorImpl(
-                settings, new ReplicationCoordinatorExternalStateMock));
-        coordinator->startReplication(new TopologyCoordinatorImpl(0), new NetworkInterfaceMock);
-        coordinator->setCurrentReplicaSetConfig(rsConfig, 1);
-
+                                             BSON("_id" << 2 << "host" << "test3:1234"))),
+                HostAndPort("test2", 1234));
         // Test generating basic handshake with no chaining
-        OperationContextNoop txn;
         std::vector<BSONObj> handshakes;
-        coordinator->prepareReplSetUpdatePositionCommandHandshakes(&txn, &handshakes);
+        OperationContextNoop txn;
+        getReplCoord()->prepareReplSetUpdatePositionCommandHandshakes(&txn, &handshakes);
         ASSERT_EQUALS(1U, handshakes.size());
         BSONObj handshakeCmd = handshakes[0];
         ASSERT_EQUALS(2, handshakeCmd.nFields());
         ASSERT_EQUALS("replSetUpdatePosition", handshakeCmd.firstElement().fieldNameStringData());
         BSONObj handshake = handshakeCmd["handshake"].Obj();
-        ASSERT_EQUALS(coordinator->getMyRID(&txn), handshake["handshake"].OID());
+        ASSERT_EQUALS(getReplCoord()->getMyRID(&txn), handshake["handshake"].OID());
         ASSERT_EQUALS(1, handshake["member"].Int());
         handshakes.clear();
 
         // Have other nodes handshake us and make sure we process it right.
         OID slave1RID = OID::gen();
         OID slave2RID = OID::gen();
-        BSONObj slave1Handshake = BSON("handshake" << slave1RID <<
-                                       "member" << 0 <<
-                                       "config" << BSON("_id" << 0 << "host" << "test1:1234"));
-        BSONObj slave2Handshake = BSON("handshake" << slave2RID <<
-                                       "member" << 2 <<
-                                       "config" << BSON("_id" << 2 << "host" << "test2:1234"));
-        ASSERT_OK(coordinator->processHandshake(&txn, slave1RID, slave1Handshake));
-        ASSERT_OK(coordinator->processHandshake(&txn, slave2RID, slave2Handshake));
+        HandshakeArgs slave1Handshake;
+        slave1Handshake.initialize(BSON("handshake" << slave1RID <<
+                                        "member" << 0 <<
+                                        "config" << BSON("_id" << 0 << "host" << "test1:1234")));
+        HandshakeArgs slave2Handshake;
+        slave2Handshake.initialize(BSON("handshake" << slave2RID <<
+                                        "member" << 2 <<
+                                        "config" << BSON("_id" << 2 << "host" << "test2:1234")));
+        ASSERT_OK(getReplCoord()->processHandshake(&txn, slave1Handshake));
+        ASSERT_OK(getReplCoord()->processHandshake(&txn, slave2Handshake));
 
-        coordinator->prepareReplSetUpdatePositionCommandHandshakes(&txn, &handshakes);
+        getReplCoord()->prepareReplSetUpdatePositionCommandHandshakes(&txn, &handshakes);
         ASSERT_EQUALS(3U, handshakes.size());
         std::set<OID> rids;
         for (std::vector<BSONObj>::iterator it = handshakes.begin(); it != handshakes.end(); ++it) {
@@ -528,7 +613,7 @@ namespace {
             BSONObj handshake = handshakeCmd["handshake"].Obj();
             OID rid = handshake["handshake"].OID();
             rids.insert(rid);
-            if (rid == coordinator->getMyRID(&txn)) {
+            if (rid == getReplCoord()->getMyRID(&txn)) {
                 ASSERT_EQUALS(1, handshake["member"].Int());
             } else if (rid == slave1RID) {
                 ASSERT_EQUALS(0, handshake["member"].Int());
@@ -540,7 +625,129 @@ namespace {
         ASSERT_EQUALS(3U, rids.size()); // Make sure we saw all 3 nodes
     }
 
-    // TODO(spencer): Unit test processReplSetGetStatus
+    TEST_F(ReplCoordTest, TestReplSetGetStatus) {
+        // This test starts by configuring a ReplicationCoordinator as a member of a 4 node replica
+        // set, with each node in a different state.
+        // The first node is DOWN, as if we tried heartbeating them and it failed in some way.
+        // The second node is in state SECONDARY, as if we've received a valid heartbeat from them.
+        // The third node is in state UNKNOWN, as if we've not yet had any heartbeating activity
+        // with them yet.  The fourth node is PRIMARY and corresponds to ourself, which gets its
+        // information for replSetGetStatus from a different source than the nodes that aren't
+        // ourself.  After this setup, we call replSetGetStatus and make sure that the fields
+        // returned for each member match our expectations.
+        init("mySet/test1:1234,test2:1234,test3:1234");
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(BSON("_id" << 0 << "host" << "test0:1234") <<
+                                             BSON("_id" << 1 << "host" << "test1:1234") <<
+                                             BSON("_id" << 2 << "host" << "test2:1234") <<
+                                             BSON("_id" << 3 << "host" << "test3:1234"))),
+                HostAndPort("test3", 1234));
+        Date_t startupTime(curTimeMillis64());
+        OpTime electionTime(1, 2);
+        OpTime oplogProgress(3, 4);
+        ReplicationExecutor::CallbackData cbd(NULL,
+                                              ReplicationExecutor::CallbackHandle(),
+                                              Status::OK());
+
+        // Now that the replica set is setup, put the members into the states we want them in.
+        MemberHeartbeatData member1hb(0);
+        member1hb.setDownValues(startupTime, "");
+        getTopoCoord().updateHeartbeatData(startupTime, member1hb, 0, oplogProgress);
+        MemberHeartbeatData member2hb(1);
+        member2hb.setUpValues(
+                startupTime, MemberState::RS_SECONDARY, electionTime, oplogProgress, "", "READY");
+        getTopoCoord().updateHeartbeatData(startupTime, member2hb, 1, oplogProgress);
+        sleepsecs(1); // so uptime will be non-zero
+
+        getTopoCoord()._changeMemberState(MemberState::RS_PRIMARY);
+        OperationContextNoop txn;
+        getReplCoord()->setLastOptime(&txn, getReplCoord()->getMyRID(&txn), oplogProgress);
+
+        // Now node 0 is down, node 1 is up, and for node 2 we have no heartbeat data yet.
+        BSONObjBuilder statusBuilder;
+        ASSERT_OK(getReplCoord()->processReplSetGetStatus(&statusBuilder));
+        BSONObj rsStatus = statusBuilder.obj();
+
+        // Test results for all non-self members
+        ASSERT_EQUALS("mySet", rsStatus["set"].String());
+        ASSERT_LESS_THAN(startupTime.asInt64(), rsStatus["date"].Date().asInt64());
+        std::vector<BSONElement> memberArray = rsStatus["members"].Array();
+        ASSERT_EQUALS(4U, memberArray.size());
+        BSONObj member0Status = memberArray[0].Obj();
+        BSONObj member1Status = memberArray[1].Obj();
+        BSONObj member2Status = memberArray[2].Obj();
+
+        // Test member 0, the node that's DOWN
+        ASSERT_EQUALS(0, member0Status["_id"].Int());
+        ASSERT_EQUALS("test0:1234", member0Status["name"].String());
+        ASSERT_EQUALS(0, member0Status["health"].Double());
+        ASSERT_EQUALS(MemberState::RS_DOWN, member0Status["state"].Int());
+        ASSERT_EQUALS("(not reachable/healthy)", member0Status["stateStr"].String());
+        ASSERT_EQUALS(0, member0Status["uptime"].Int());
+        ASSERT_EQUALS(OpTime(), OpTime(member0Status["optime"].timestampValue()));
+        ASSERT_EQUALS(OpTime().asDate(), member0Status["optimeDate"].Date().millis);
+        ASSERT_EQUALS(startupTime, member0Status["lastHeartbeat"].Date());
+        ASSERT_EQUALS(Date_t(), member0Status["lastHeartbeatRecv"].Date());
+
+        // Test member 1, the node that's SECONDARY
+        ASSERT_EQUALS(1, member1Status["_id"].Int());
+        ASSERT_EQUALS("test1:1234", member1Status["name"].String());
+        ASSERT_EQUALS(1, member1Status["health"].Double());
+        ASSERT_EQUALS(MemberState::RS_SECONDARY, member1Status["state"].Int());
+        ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY).toString(),
+                      member1Status["stateStr"].String());
+        ASSERT_LESS_THAN_OR_EQUALS(1, member1Status["uptime"].Int());
+        ASSERT_EQUALS(oplogProgress, OpTime(member1Status["optime"].timestampValue()));
+        ASSERT_EQUALS(oplogProgress.asDate(), member1Status["optimeDate"].Date().millis);
+        ASSERT_EQUALS(startupTime, member1Status["lastHeartbeat"].Date());
+        ASSERT_EQUALS(Date_t(), member1Status["lastHeartbeatRecv"].Date());
+        ASSERT_EQUALS("READY", member1Status["lastHeartbeatMessage"].String());
+
+        // Test member 2, the node that's UNKNOWN
+        ASSERT_EQUALS(2, member2Status["_id"].Int());
+        ASSERT_EQUALS("test2:1234", member2Status["name"].String());
+        ASSERT_EQUALS(-1, member2Status["health"].Double());
+        ASSERT_EQUALS(MemberState::RS_UNKNOWN, member2Status["state"].Int());
+        ASSERT_EQUALS(MemberState(MemberState::RS_UNKNOWN).toString(),
+                      member2Status["stateStr"].String());
+        ASSERT_FALSE(member2Status.hasField("uptime"));
+        ASSERT_FALSE(member2Status.hasField("optime"));
+        ASSERT_FALSE(member2Status.hasField("optimeDate"));
+        ASSERT_FALSE(member2Status.hasField("lastHearbeat"));
+        ASSERT_FALSE(member2Status.hasField("lastHearbeatRecv"));
+
+        // Now test results for ourself, the PRIMARY
+        ASSERT_EQUALS(MemberState::RS_PRIMARY, rsStatus["myState"].Int());
+        BSONObj selfStatus = memberArray[3].Obj();
+        ASSERT_TRUE(selfStatus["self"].Bool());
+        ASSERT_EQUALS(3, selfStatus["_id"].Int());
+        ASSERT_EQUALS("test3:1234", selfStatus["name"].String());
+        ASSERT_EQUALS(1, selfStatus["health"].Double());
+        ASSERT_EQUALS(MemberState::RS_PRIMARY, selfStatus["state"].Int());
+        ASSERT_EQUALS(MemberState(MemberState::RS_PRIMARY).toString(),
+                      selfStatus["stateStr"].String());
+        ASSERT_LESS_THAN_OR_EQUALS(1, selfStatus["uptime"].Int());
+        ASSERT_EQUALS(oplogProgress, OpTime(selfStatus["optime"].timestampValue()));
+        ASSERT_EQUALS(oplogProgress.asDate(), selfStatus["optimeDate"].Date().millis);
+
+        // TODO(spencer): Test electionTime and pingMs are set properly
+    }
+
+    TEST_F(ReplCoordTest, TestGetElectionId) {
+        init("mySet/test1:1234,test2:1234,test3:1234");
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("_id" << 1 << "host" << "test1:1234"))),
+                HostAndPort("test1", 1234));
+        OID electionID1 = getReplCoord()->getElectionId();
+        getTopoCoord()._changeMemberState(MemberState::RS_PRIMARY);
+        OID electionID2 = getReplCoord()->getElectionId();
+        ASSERT_NOT_EQUALS(electionID1, electionID2);
+    }
+
     // TODO(spencer): Unit test replSetFreeze
 
 }  // namespace

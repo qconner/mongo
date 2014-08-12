@@ -35,8 +35,6 @@
 namespace mongo {
 namespace repl {
 
-    unsigned int MemberHeartbeatData::numPings;
-
     MemberHeartbeatData::MemberHeartbeatData(int configIndex) :
         _configIndex(configIndex),
         _state(MemberState::RS_UNKNOWN), 
@@ -45,8 +43,7 @@ namespace repl {
         _lastHeartbeat(0),
         _lastHeartbeatRecv(0),
         _skew(INT_MIN), 
-        _authIssue(false), 
-        _ping(0) { 
+        _authIssue(false) {
     }
 
     void MemberHeartbeatData::updateFrom(const MemberHeartbeatData& newInfo) {
@@ -59,10 +56,36 @@ namespace repl {
         _opTime = newInfo.getOpTime();
         _skew = newInfo.getSkew();
         _authIssue = newInfo.hasAuthIssue();
-        _ping = newInfo.getPing();
         _electionTime = newInfo.getElectionTime();
     }
 
+    void MemberHeartbeatData::setUpValues(Date_t now,
+                                          MemberState state,
+                                          OpTime electionTime,
+                                          OpTime optime,
+                                          const std::string& syncingTo,
+                                          const std::string& heartbeatMessage) {
+        _authIssue = false;
+        _health = 1;
+
+        _lastHeartbeat = now;
+        _upSince = now;
+        _state = state;
+        _electionTime = electionTime;
+        _opTime = optime;
+        _syncSource = syncingTo;
+        _lastHeartbeatMsg = heartbeatMessage;
+    }
+
+    void MemberHeartbeatData::setDownValues(Date_t now,
+                                            const std::string& heartbeatMessage) {
+        _authIssue = false;
+        _health = 0;
+        _state = MemberState::RS_DOWN;
+
+        _lastHeartbeat = now;
+        _lastHeartbeatMsg = heartbeatMessage;
+    }
 
 } // namespace repl
 } // namespace mongo

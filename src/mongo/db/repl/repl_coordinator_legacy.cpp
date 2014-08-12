@@ -41,13 +41,16 @@
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h" // for newRepl()
+#include "mongo/db/repl/repl_coordinator_external_state_impl.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_set_seed_list.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/rs_config.h"
 #include "mongo/db/repl/rs_initiate.h"
+#include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/assert_util.h"
@@ -69,8 +72,7 @@ namespace repl {
     }
     LegacyReplicationCoordinator::~LegacyReplicationCoordinator() {}
 
-    void LegacyReplicationCoordinator::startReplication(TopologyCoordinator*,
-                                                        ReplicationExecutor::NetworkInterface*) {
+    void LegacyReplicationCoordinator::startReplication(OperationContext* txn) {
         // if we are going to be a replica set, we aren't doing other forms of replication.
         if (!_settings.replSet.empty()) {
             if (_settings.slave || _settings.master) {
@@ -78,9 +80,10 @@ namespace repl {
                 log() << "ERROR: can't use --slave or --master replication options with --replSet";
                 log() << "***" << endl;
             }
-            newRepl();
 
-            ReplSetSeedList *replSetSeedList = new ReplSetSeedList(_settings.replSet);
+            ReplicationCoordinatorExternalStateImpl externalState;
+            ReplSetSeedList *replSetSeedList = new ReplSetSeedList(&externalState,
+                                                                   _settings.replSet);
             boost::thread t(stdx::bind(&startReplSets, replSetSeedList));
         } else {
             startMasterSlave();
@@ -322,7 +325,7 @@ namespace {
     Status LegacyReplicationCoordinator::canServeReadsFor(OperationContext* txn,
                                                           const NamespaceString& ns,
                                                           bool slaveOk) {
-        if (txn->getClient()->isGod()) {
+        if (txn->isGod()) {
             return Status::OK();
         }
         if (canAcceptWritesForDatabase(ns.db())) {
@@ -382,13 +385,17 @@ namespace {
                 // Only update if ts is newer than what we have already
                 return Status::OK();
             }
-            BSONObj config = mapFindWithDefault(_ridConfigMap, rid, BSONObj());
-            LOG(2) << "received notification that node with RID " << rid << " and config " << config
-                    << " has reached optime: " << ts.toStringPretty();
 
             if (rid != getMyRID(txn)) {
-                // TODO(spencer): Remove this invariant for backwards compatibility
-                invariant(!config.isEmpty());
+                BSONObj config;
+                if (getReplicationMode() == modeReplSet) {
+                    Member* mem = _ridMemberMap[rid];
+                    invariant(mem);
+                    config = BSON("_id" << mem->id());
+                }
+                LOG(2) << "received notification that node with RID " << rid << " and config "
+                       << config << " has reached optime: " << ts.toStringPretty();
+
                 // This is what updates the progress information used for satisfying write concern
                 // and wakes up threads waiting for replication.
                 if (!updateSlaveTracking(BSON("_id" << rid), config, ts)) {
@@ -442,7 +449,6 @@ namespace {
             for (SlaveOpTimeMap::const_iterator itr = _slaveOpTimeMap.begin();
                     itr != _slaveOpTimeMap.end(); ++itr) {
                 const OID& rid = itr->first;
-                const BSONObj& config = mapFindWithDefault(_ridConfigMap, rid, BSONObj());
                 BSONObjBuilder entry(arrayBuilder.subobjStart());
                 entry.append("_id", rid);
                 entry.append("optime", itr->second);
@@ -453,6 +459,9 @@ namespace {
                     entry.append("config", theReplSet->myConfig().asBson());
                 }
                 else {
+                    Member* member = _ridMemberMap[rid];
+                    invariant(member);
+                    BSONObj config = member->config().asBson();
                     entry.append("config", config);
                 }
             }
@@ -753,10 +762,12 @@ namespace {
                 log() << "replSet info initiate : no configuration specified.  "
                         "Using a default configuration for the set" << rsLog;
 
+                ReplicationCoordinatorExternalStateImpl externalState;
                 string name;
                 vector<HostAndPort> seeds;
                 set<HostAndPort> seedSet;
-                parseReplSetSeedList(_settings.replSet, name, seeds, seedSet); // may throw...
+                parseReplSetSeedList(
+                        &externalState, _settings.replSet, name, seeds, seedSet); // may throw...
 
                 BSONObjBuilder b;
                 b.append("_id", name);
@@ -943,14 +954,14 @@ namespace {
         return theReplSet->forceSyncFrom(target, resultObj);
     }
 
-    Status LegacyReplicationCoordinator::processReplSetUpdatePosition(OperationContext* txn,
-                                                                      const BSONArray& updates,
-                                                                      BSONObjBuilder* resultObj) {
-        BSONForEach(elem, updates) {
-            BSONObj entry = elem.Obj();
-            OID id = entry["_id"].OID();
-            OpTime ot = entry["optime"]._opTime();
-            Status status = setLastOptime(txn, id, ot);
+    Status LegacyReplicationCoordinator::processReplSetUpdatePosition(
+            OperationContext* txn,
+            const UpdatePositionArgs& updates) {
+
+        for (UpdatePositionArgs::UpdateIterator update = updates.updatesBegin();
+                update != updates.updatesEnd();
+                ++update) {
+            Status status = setLastOptime(txn, update->rid, update->ts);
             if (!status.isOK()) {
                 return status;
             }
@@ -958,48 +969,16 @@ namespace {
         return Status::OK();
     }
 
-    Status LegacyReplicationCoordinator::processReplSetUpdatePositionHandshake(
-            const OperationContext* txn, const BSONObj& cmdObj, BSONObjBuilder* resultObj) {
-
-        OID rid = cmdObj["handshake"].OID();
-        Status status = processHandshake(txn, rid, cmdObj);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        // if we're a replset and aren't primary, pass the handshake along
-        if (theReplSet && !theReplSet->isPrimary()) {
-            theReplSet->syncSourceFeedback.forwardSlaveHandshake();
-        }
-        return Status::OK();
-    }
-
     Status LegacyReplicationCoordinator::processHandshake(const OperationContext* txn,
-                                                          const OID& remoteID,
-                                                          const BSONObj& handshake) {
-        LOG(2) << "Received handshake " << handshake << " from node with RID " << remoteID;
+                                                          const HandshakeArgs& handshake) {
+        LOG(2) << "Received handshake " << handshake.toBSON();
 
         boost::lock_guard<boost::mutex> lock(_mutex);
-        BSONObj configObj;
-        if (handshake.hasField("config")) {
-            configObj = handshake["config"].Obj().getOwned();
-        } else {
-            configObj = BSON("host" << txn->getClient()->clientAddress(true) <<
-                             "upgradeNeeded" << true);
-        }
-        _ridConfigMap[remoteID] = configObj;
-
         if (getReplicationMode() != modeReplSet) {
             return Status::OK();
         }
 
-        if (!handshake.hasField("member")) {
-            return Status(ErrorCodes::ProtocolError,
-                          str::stream() << "Handshake object did not contain \"member\" field.  "
-                                  "Handshake" << handshake);
-        }
-
-        int memberID = handshake["member"].Int();
+        int memberID = handshake.getMemberId();
         Member* member = theReplSet->getMutableMember(memberID);
         // it is possible that a node that was removed in a reconfig tried to handshake this node
         // in that case, the Member will no longer be in theReplSet's _members List and member
@@ -1010,7 +989,7 @@ namespace {
                                   " could not be found in replica set config during handshake");
         }
 
-        _ridMemberMap[remoteID] = member;
+        _ridMemberMap[handshake.getRid()] = member;
         theReplSet->syncSourceFeedback.forwardSlaveHandshake();
         return Status::OK();
     }

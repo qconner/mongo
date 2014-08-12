@@ -30,7 +30,9 @@
 
 #include "mongo/db/repl/repl_coordinator_hybrid.h"
 
+#include "mongo/db/repl/network_interface_impl.h"
 #include "mongo/db/repl/repl_coordinator_external_state_impl.h"
+#include "mongo/db/repl/topology_coordinator_impl.h"
 
 namespace mongo {
 
@@ -39,14 +41,18 @@ namespace mongo {
 namespace repl {
 
     HybridReplicationCoordinator::HybridReplicationCoordinator(const ReplSettings& settings) :
-            _legacy(settings), _impl(settings, new ReplicationCoordinatorExternalStateImpl()) {}
+        _legacy(settings),
+        _impl(settings,
+              new ReplicationCoordinatorExternalStateImpl,
+              new NetworkInterfaceImpl,
+              new TopologyCoordinatorImpl(Seconds(maxSyncSourceLagSecs))) {
+    }
+
     HybridReplicationCoordinator::~HybridReplicationCoordinator() {}
 
-    void HybridReplicationCoordinator::startReplication(
-            TopologyCoordinator* topCoord,
-            ReplicationExecutor::NetworkInterface* network) {
-        _legacy.startReplication(topCoord, network);
-        _impl.startReplication(topCoord, network);
+    void HybridReplicationCoordinator::startReplication(OperationContext* txn) {
+        _legacy.startReplication(txn);
+        _impl.startReplication(txn);
     }
 
     void HybridReplicationCoordinator::shutdown() {
@@ -277,37 +283,20 @@ namespace repl {
         return legacyStatus;
     }
 
-    Status HybridReplicationCoordinator::processReplSetUpdatePosition(OperationContext* txn,
-                                                                      const BSONArray& updates,
-                                                                      BSONObjBuilder* resultObj) {
-        Status legacyStatus = _legacy.processReplSetUpdatePosition(txn, updates, resultObj);
+    Status HybridReplicationCoordinator::processReplSetUpdatePosition(
+            OperationContext* txn,
+            const UpdatePositionArgs& updates) {
+        Status legacyStatus = _legacy.processReplSetUpdatePosition(txn, updates);
         // TODO(spencer): Can't uncomment this until we uncomment processHandshake below
-        //BSONObjBuilder implResult;
-        //Status implStatus = _impl.processReplSetUpdatePosition(txn, updates, &implResult);
-        return legacyStatus;
-    }
-
-    Status HybridReplicationCoordinator::processReplSetUpdatePositionHandshake(
-            const OperationContext* txn,
-            const BSONObj& handshake,
-            BSONObjBuilder* resultObj) {
-        Status legacyStatus = _legacy.processReplSetUpdatePositionHandshake(txn,
-                                                                            handshake,
-                                                                            resultObj);
-        // TODO(spencer): Can't call into the impl until it can load a valid config
-        //BSONObjBuilder implResult;
-        //Status implStatus = _impl.processReplSetUpdatePositionHandshake(txn,
-        //                                                                handshake,
-        //                                                                &implResult);
+        //Status implStatus = _impl.processReplSetUpdatePosition(txn, updates);
         return legacyStatus;
     }
 
     Status HybridReplicationCoordinator::processHandshake(const OperationContext* txn,
-                                                          const OID& remoteID,
-                                                          const BSONObj& handshake) {
-        Status legacyResponse = _legacy.processHandshake(txn, remoteID, handshake);
+                                                          const HandshakeArgs& handshake) {
+        Status legacyResponse = _legacy.processHandshake(txn, handshake);
         // TODO(spencer): Can't call into the impl until it can load a valid config
-        //_impl.processHandshake(txn, remoteID, handshake);
+        //_impl.processHandshake(txn, handshake);
         return legacyResponse;
     }
 

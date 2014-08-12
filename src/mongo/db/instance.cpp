@@ -34,7 +34,6 @@
 #include <fstream>
 
 #include "mongo/base/status.h"
-#include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -70,6 +69,7 @@
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage_options.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
@@ -150,6 +150,8 @@ namespace mongo {
                     verify( co );
                     if( all || co->displayInCurop() ) {
                         BSONObjBuilder infoBuilder;
+
+                        c->reportState(infoBuilder);
                         co->reportState(&infoBuilder);
 
                         const BSONObj info = infoBuilder.obj();
@@ -334,7 +336,7 @@ namespace mongo {
         DbMessage dbmsg(m);
 
         Client& c = cc();
-        if (!c.isGod()) {
+        if (!txn->isGod()) {
             c.getAuthorizationSession()->startRequest(txn);
 
             // We should not be holding any locks at this point
@@ -543,30 +545,6 @@ namespace mongo {
             LOG( found == n ? 1 : 0 ) << "killcursors: found " << found << " of " << n << endl;
         }
 
-    }
-
-    /*static*/ 
-    void Database::closeDatabase(OperationContext* txn, const StringData& db) {
-        // XXX? - Do we need to close database under global lock or just DB-lock is sufficient ?
-        invariant(txn->lockState()->isW());
-
-        Database* database = dbHolder().get(txn, db);
-        if ( !database )
-            return;
-
-        repl::oplogCheckCloseDatabase(txn, database); // oplog caches some things, dirty its caches
-
-        if( BackgroundOperation::inProgForDb(db) ) {
-            log() << "warning: bg op in prog during close db? " << db << endl;
-        }
-
-        // Before the files are closed, flush any potentially outstanding changes, which might
-        // reference this database. Otherwise we will assert when subsequent commit if needed
-        // is called and it happens to have write intents for the removed files.
-        txn->recoveryUnit()->commitIfNeeded(true);
-
-        dbHolder().erase(txn, db);
-        delete database; // closes files
     }
 
     void receivedUpdate(OperationContext* txn, Message& m, CurOp& op) {
@@ -1030,30 +1008,34 @@ namespace {
     void exitCleanly( ExitCode code ) {
         shutdownInProgress.store(1);
 
-        getGlobalEnvironment()->setKillAllOperations();
+        // Global storage engine may not be started in all cases before we exit
+        if (getGlobalEnvironment()->getGlobalStorageEngine() != NULL) {
 
-        repl::getGlobalReplicationCoordinator()->shutdown();
+            getGlobalEnvironment()->setKillAllOperations();
 
-        OperationContextImpl txn;
-        Lock::GlobalWrite lk(txn.lockState());
-        log() << "now exiting" << endl;
+            repl::getGlobalReplicationCoordinator()->shutdown();
 
-        // Execute the graceful shutdown tasks, such as flushing the outstanding journal and data 
-        // files, close sockets, etc.
-        try {
-            shutdownServer(&txn);
-        }
-        catch (const DBException& ex) {
-            severe() << "shutdown failed with DBException " << ex;
-            std::terminate();
-        }
-        catch (const std::exception& ex) {
-            severe() << "shutdown failed with std::exception: " << ex.what();
-            std::terminate();
-        }
-        catch (...) {
-            severe() << "shutdown failed with exception";
-            std::terminate();
+            OperationContextImpl txn;
+            Lock::GlobalWrite lk(txn.lockState());
+            log() << "now exiting" << endl;
+
+            // Execute the graceful shutdown tasks, such as flushing the outstanding journal 
+            // and data files, close sockets, etc.
+            try {
+                shutdownServer(&txn);
+            }
+            catch (const DBException& ex) {
+                severe() << "shutdown failed with DBException " << ex;
+                std::terminate();
+            }
+            catch (const std::exception& ex) {
+                severe() << "shutdown failed with std::exception: " << ex.what();
+                std::terminate();
+            }
+            catch (...) {
+                severe() << "shutdown failed with exception";
+                std::terminate();
+            }
         }
 
         dbexit( code );

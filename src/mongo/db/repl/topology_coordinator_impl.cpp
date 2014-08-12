@@ -45,7 +45,7 @@ namespace mongo {
 
 namespace repl {
 
-    TopologyCoordinatorImpl::TopologyCoordinatorImpl(int maxSyncSourceLagSecs) :
+    TopologyCoordinatorImpl::TopologyCoordinatorImpl(Seconds maxSyncSourceLagSecs) :
         _currentPrimaryIndex(-1),
         _syncSourceIndex(-1),
         _forceSyncSourceIndex(-1),
@@ -55,10 +55,6 @@ namespace repl {
         _blockSync(false),
         _maintenanceModeCalls(0)
     {
-    }
-
-    void TopologyCoordinatorImpl::setLastApplied(const OpTime& optime) {
-        _lastApplied = optime;
     }
 
     void TopologyCoordinatorImpl::setCommitOkayThrough(const OpTime& optime) {
@@ -75,11 +71,13 @@ namespace repl {
     }
 
     HostAndPort TopologyCoordinatorImpl::getSyncSourceAddress() const {
-        invariant(_syncSourceIndex >= 0);
+        if (_syncSourceIndex == -1) {
+            return HostAndPort();
+        }
         return _currentConfig.getMemberAt(_syncSourceIndex).getHostAndPort();
     }
 
-    void TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now) {
+    void TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now, const OpTime& lastOpApplied) {
         // if we have a target we've requested to sync from, use it
         if (_forceSyncSourceIndex != -1) {
             invariant(_forceSyncSourceIndex < _currentConfig.getNumMembers());
@@ -92,7 +90,7 @@ namespace repl {
         }
 
         // wait for 2N pings before choosing a sync target
-        int needMorePings = _hbdata.size()*2 - MemberHeartbeatData::numPings;
+        int needMorePings = _hbdata.size()*2 - _getTotalPings();
 
         if (needMorePings > 0) {
             OCCASIONALLY log() << "waiting for " << needMorePings 
@@ -102,8 +100,9 @@ namespace repl {
 
         // If we are only allowed to sync from the primary, set that
         if (!_currentConfig.isChainingAllowed()) {
-            // Sets NULL if we cannot reach the primary
+            // Sets -1 if there is no current primary
             _syncSourceIndex = _currentPrimaryIndex;
+            return;
         }
 
         // find the member with the lowest ping time that has more data than me
@@ -115,15 +114,16 @@ namespace repl {
             primaryOpTime = _hbdata[_currentPrimaryIndex].getOpTime();
         else
             // choose a time that will exclude no candidates, since we don't see a primary
-            primaryOpTime = OpTime(_maxSyncSourceLagSecs, 0);
+            primaryOpTime = OpTime(_maxSyncSourceLagSecs.total_seconds(), 0);
 
-        if (primaryOpTime.getSecs() < static_cast<unsigned int>(_maxSyncSourceLagSecs)) {
+        if (primaryOpTime.getSecs() < 
+            static_cast<unsigned int>(_maxSyncSourceLagSecs.total_seconds())) {
             // erh - I think this means there was just a new election
             // and we don't yet know the new primary's optime
-            primaryOpTime = OpTime(_maxSyncSourceLagSecs, 0);
+            primaryOpTime = OpTime(_maxSyncSourceLagSecs.total_seconds(), 0);
         }
 
-        OpTime oldestSyncOpTime(primaryOpTime.getSecs() - _maxSyncSourceLagSecs, 0);
+        OpTime oldestSyncOpTime(primaryOpTime.getSecs() - _maxSyncSourceLagSecs.total_seconds(), 0);
 
         int closestIndex = -1;
 
@@ -156,7 +156,7 @@ namespace repl {
 
                 if (it->getState() == MemberState::RS_SECONDARY) {
                     // only consider secondaries that are ahead of where we are
-                    if (it->getOpTime() <= _lastApplied)
+                    if (it->getOpTime() <= lastOpApplied)
                         continue;
                     // omit secondaries that are excessively behind, on the first attempt at least.
                     if (attempts == 0 &&
@@ -166,8 +166,10 @@ namespace repl {
 
                 // omit nodes that are more latent than anything we've already considered
                 if ((closestIndex != -1) &&
-                    (it->getPing() > _hbdata[closestIndex].getPing()))
+                    (_getPing(_currentConfig.getMemberAt(it->getConfigIndex()).getHostAndPort())
+                     > _getPing(_currentConfig.getMemberAt(closestIndex).getHostAndPort()))) {
                     continue;
+                }
 
                 if (attempts == 0 &&
                     (_selfConfig().getSlaveDelay() < 
@@ -184,7 +186,7 @@ namespace repl {
 
                     // if this was on the veto list, check if it was vetoed in the last "while".
                     // if it was, skip.
-                    if (vetoed->second >= now) {
+                    if (vetoed->second > now) {
                         if (now % 5 == 0) {
                             log() << "replSet not trying to sync from " << vetoed->first
                                   << ", it is vetoed for " << (vetoed->second - now) 
@@ -204,9 +206,10 @@ namespace repl {
         if (closestIndex == -1) {
             return;
         }
-
-        _sethbmsg( str::stream() << "syncing to: " << 
-                  _currentConfig.getMemberAt(closestIndex).getHostAndPort().toString(), 0);
+        std::string msg(str::stream() << "syncing to: " << 
+                        _currentConfig.getMemberAt(closestIndex).getHostAndPort().toString(), 0);
+        _sethbmsg(msg);
+        log() << msg;
         _syncSourceIndex = closestIndex;
     }
     
@@ -270,6 +273,7 @@ namespace repl {
     // The caller should validate that the message is for the correct set, and has the required data
     void TopologyCoordinatorImpl::prepareRequestVoteResponse(const Date_t now,
                                                              const BSONObj& cmdObj,
+                                                             const OpTime& lastOpApplied,
                                                              std::string& errmsg,
                                                              BSONObjBuilder& result) {
 
@@ -289,7 +293,7 @@ namespace repl {
                  opTime < _latestKnownOpTime())  {
             weAreFresher = true;
         }
-        result.appendDate("opTime", _lastApplied.asDate());
+        result.appendDate("opTime", lastOpApplied.asDate());
         result.append("fresher", weAreFresher);
 
         bool doVeto = _shouldVeto(cmdObj, errmsg);
@@ -447,6 +451,7 @@ namespace repl {
             Date_t now,
             const ReplSetHeartbeatArgs& args,
             const std::string& ourSetName,
+            const OpTime& lastOpApplied,
             ReplSetHeartbeatResponse* response,
             Status* result) {
         if (data.status == ErrorCodes::CallbackCanceled) {
@@ -497,7 +502,7 @@ namespace repl {
         // Heartbeat status message
         response->setHbMsg(_getHbmsg());
         response->setTime(now);
-        response->setOpTime(_lastApplied.asDate());
+        response->setOpTime(lastOpApplied.asDate());
 
         if (_syncSourceIndex != -1) {
             response->setSyncingTo(
@@ -547,7 +552,7 @@ namespace repl {
 
     // update internal state with heartbeat response, and run topology checks
     HeartbeatResultAction TopologyCoordinatorImpl::updateHeartbeatData(
-        Date_t now, const MemberHeartbeatData& newInfo, int id) {
+        Date_t now, const MemberHeartbeatData& newInfo, int id, const OpTime& lastOpApplied) {
         // Fill in the new heartbeat data for the appropriate member
         for (std::vector<MemberHeartbeatData>::iterator it = _hbdata.begin(); 
              it != _hbdata.end(); 
@@ -570,7 +575,7 @@ namespace repl {
             && (_stepDownUntil <= now)        // stepDown timer has expired
             && (_memberState == MemberState::RS_SECONDARY)
             // we are within 10 seconds of primary
-            && (latestOp == 0 || _lastApplied.getSecs() >= latestOp - 10)) {
+            && (latestOp == 0 || lastOpApplied.getSecs() >= latestOp - 10)) {
             _electableSet.insert(_selfConfig().getId());
         }
         else {
@@ -908,6 +913,7 @@ namespace repl {
             const ReplicationExecutor::CallbackData& data,
             Date_t now,
             unsigned uptime,
+            const OpTime& lastOpApplied,
             BSONObjBuilder* response,
             Status* result) {
         if (data.status == ErrorCodes::CallbackCanceled) {
@@ -932,8 +938,8 @@ namespace repl {
                 bb.append("stateStr", myState.toString());
                 bb.append("uptime", uptime);
                 if (!_selfConfig().isArbiter()) {
-                    bb.appendTimestamp("optime", _lastApplied.asDate());
-                    bb.appendDate("optimeDate", _lastApplied.getSecs() * 1000LL);
+                    bb.append("optime", lastOpApplied);
+                    bb.appendDate("optimeDate", lastOpApplied.asDate());
                 }
 
                 if (_maintenanceModeCalls) {
@@ -959,7 +965,8 @@ namespace repl {
                           .getHostAndPort().toString());
                 double h = it->getHealth();
                 bb.append("health", h);
-                bb.append("state", static_cast<int>(it->getState().s));
+                MemberState state = it->getState();
+                bb.append("state", static_cast<int>(state.s));
                 if( h == 0 ) {
                     // if we can't connect the state info is from the past
                     // and could be confusing to show
@@ -968,32 +975,40 @@ namespace repl {
                 else {
                     bb.append("stateStr", it->getState().toString());
                 }
-                bb.append("uptime",
-                          static_cast<unsigned int> ((it->getUpSince() ? 
-                                                      (now - it->getUpSince()) : 0)));
-                if (!_currentConfig.getMemberAt(it->getConfigIndex()).isArbiter()) {
-                    bb.appendTimestamp("optime", it->getOpTime().asDate());
-                    bb.appendDate("optimeDate", it->getOpTime().getSecs() * 1000LL);
-                }
-                bb.appendTimeT("lastHeartbeat", it->getLastHeartbeat());
-                bb.appendTimeT("lastHeartbeatRecv", it->getLastHeartbeatRecv());
-                bb.append("pingMs", static_cast<int>(it->getPing().total_milliseconds()));
-                std::string s = it->getLastHeartbeatMsg();
-                if( !s.empty() )
-                    bb.append("lastHeartbeatMessage", s);
 
-                if (it->hasAuthIssue()) {
-                    bb.append("authenticated", false);
-                }
+                if (state != MemberState::RS_UNKNOWN) {
+                    // If state is UNKNOWN we haven't received any heartbeats and thus don't have
+                    // meaningful values for these fields
 
-                std::string syncSource = it->getSyncSource();
-                if (!syncSource.empty()) {
-                    bb.append("syncingTo", syncSource);
-                }
+                    unsigned int uptime = static_cast<unsigned int> ((it->getUpSince() ?
+                            (now - it->getUpSince()) / 1000 /* convert millis to secs */ : 0));
+                    bb.append("uptime", uptime);
+                    if (!_currentConfig.getMemberAt(it->getConfigIndex()).isArbiter()) {
+                        bb.append("optime", it->getOpTime());
+                        bb.appendDate("optimeDate", it->getOpTime().asDate());
+                    }
+                    bb.appendDate("lastHeartbeat", it->getLastHeartbeat());
+                    bb.appendDate("lastHeartbeatRecv", it->getLastHeartbeatRecv());
+                    bb.append("pingMs",
+                              _getPing(_currentConfig.getMemberAt(
+                                      it->getConfigIndex()).getHostAndPort()));
+                    std::string s = it->getLastHeartbeatMsg();
+                    if( !s.empty() )
+                        bb.append("lastHeartbeatMessage", s);
 
-                if (it->getState() == MemberState::RS_PRIMARY) {
-                    bb.appendTimestamp("electionTime", it->getElectionTime().asDate());
-                    bb.appendDate("electionDate", it->getElectionTime().getSecs() * 1000LL);
+                    if (it->hasAuthIssue()) {
+                        bb.append("authenticated", false);
+                    }
+
+                    std::string syncSource = it->getSyncSource();
+                    if (!syncSource.empty()) {
+                        bb.append("syncingTo", syncSource);
+                    }
+
+                    if (state == MemberState::RS_PRIMARY) {
+                        bb.append("electionTime", it->getElectionTime());
+                        bb.appendDate("electionDate", it->getElectionTime().asDate());
+                    }
                 }
                 membersOut.push_back(bb.obj());
             }
@@ -1003,13 +1018,13 @@ namespace repl {
         sort(membersOut.begin(), membersOut.end());
 
         response->append("set", _currentConfig.getReplSetName());
-        response->appendTimeT("date", now);
+        response->append("date", now);
         response->append("myState", myState.s);
 
         // Add sync source info
         if ((_syncSourceIndex != -1) && 
             (myState != MemberState::RS_PRIMARY) &&
-            (myState != MemberState::RS_SHUNNED) ) {
+            (myState != MemberState::RS_REMOVED) ) {
             response->append("syncingTo", _currentConfig.getMemberAt(_syncSourceIndex)
                           .getHostAndPort().toString());
         }
@@ -1055,9 +1070,15 @@ namespace repl {
 
     // This function installs a new config object and recreates MemberHeartbeatData objects 
     // that reflect the new config.
-    void TopologyCoordinatorImpl::updateConfig(const ReplicaSetConfig& newConfig, 
+    void TopologyCoordinatorImpl::updateConfig(const ReplicationExecutor::CallbackData& cbData,
+                                               const ReplicaSetConfig& newConfig,
                                                int selfIndex,
-                                               Date_t now) {
+                                               Date_t now,
+                                               const OpTime& lastOpApplied) {
+
+        if (cbData.status == ErrorCodes::CallbackCanceled)
+            return;
+
         invariant(selfIndex < newConfig.getNumMembers());
         _currentConfig = newConfig;        
 
@@ -1075,7 +1096,7 @@ namespace repl {
             _hbdata.push_back(MemberHeartbeatData(index));
         }
 
-        chooseNewSyncSource(now);
+        chooseNewSyncSource(now, lastOpApplied);
 
         // call registered callbacks for config changes
         // TODO(emilkie): Applier should register a callback to reconnect its oplog reader.
@@ -1113,6 +1134,25 @@ namespace repl {
     
     const MemberConfig& TopologyCoordinatorImpl::_selfConfig() {
         return _currentConfig.getMemberAt(_selfIndex);
+    }
+
+    void TopologyCoordinatorImpl::recordPing(const HostAndPort& host, const int elapsedMillis) {
+        _pings[host].hit(elapsedMillis);
+    }
+
+    int TopologyCoordinatorImpl::_getPing(const HostAndPort& host) {
+        return _pings[host].getMillis();
+    }
+
+    int TopologyCoordinatorImpl::_getTotalPings() {
+        PingMap::iterator it = _pings.begin();
+        PingMap::iterator end = _pings.end();
+        int totalPings = 0;
+        while (it != end) {
+            totalPings += it->second.getCount();
+            it++;
+        }
+        return totalPings;
     }
 
 } // namespace repl

@@ -251,7 +251,7 @@ namespace mongo {
     }
 
     void BenchRunState::tellWorkersToFinish() {
-        _isShuttingDown.set( 1 );
+        _isShuttingDown.store( 1 );
     }
 
     void BenchRunState::assertFinished() {
@@ -260,7 +260,7 @@ namespace mongo {
     }
 
     bool BenchRunState::shouldWorkerFinish() {
-        return bool(_isShuttingDown.get());
+        return (_isShuttingDown.loadRelaxed() == 1);
     }
 
     void BenchRunState::onWorkerStarted() {
@@ -334,6 +334,13 @@ namespace mongo {
         BsonTemplateEvaluator bsonTemplateEvaluator;
         invariant(bsonTemplateEvaluator.setId(_id) == BsonTemplateEvaluator::StatusSuccess);
 
+        if (_config->username != "") {
+            string errmsg;
+            if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
+                uasserted(15931, "Authenticating to connection for _benchThread failed: " + errmsg);
+            }
+        }
+
         while ( !shouldStop() ) {
             BSONObjIterator i( _config->ops );
             while ( i.more() ) {
@@ -363,13 +370,6 @@ namespace mongo {
                 auto_ptr<Scope> scope;
                 ScriptingFunction scopeFunc = 0;
                 BSONObj scopeObj;
-
-                if (_config->username != "") {
-                    string errmsg;
-                    if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                        uasserted(15931, "Authenticating to connection for _benchThread failed: " + errmsg);
-                    }
-                }
 
                 bool check = ! e["check"].eoo();
                 if( check ){

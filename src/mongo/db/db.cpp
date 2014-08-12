@@ -72,10 +72,8 @@
 #include "mongo/db/repl/network_interface_impl.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_coordinator_hybrid.h"
-#include "mongo/db/repl/repl_coordinator_impl.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/rs.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/startup_warnings.h"
@@ -278,9 +276,10 @@ namespace mongo {
         server->setupSockets();
 
         logStartup();
-        repl::getGlobalReplicationCoordinator()->startReplication(
-            new repl::TopologyCoordinatorImpl(repl::maxSyncSourceLagSecs), 
-            new repl::NetworkInterfaceImpl());
+        {
+            OperationContextImpl txn;
+            repl::getGlobalReplicationCoordinator()->startReplication(&txn);
+        }
         if (serverGlobalParams.isHttpInterfaceEnabled)
             boost::thread web(stdx::bind(&webServerThread,
                                          new RestAdminAccess())); // takes ownership
@@ -289,14 +288,6 @@ namespace mongo {
         boost::thread thr(testExhaust);
 #endif
         server->run();
-
-        // If system is in shutdown, any network errors are from the sockets closing, so just block
-        // and wait for _exit to be called.
-        if (inShutdown()) {
-            sleepsecs(std::numeric_limits<int>::max());
-        }
-
-        exitCleanly(EXIT_NET_ERROR);
     }
 
     void checkForIdIndexes( OperationContext* txn, Database* db ) {
@@ -409,7 +400,7 @@ namespace mongo {
                     warning() << "Internal error while reading collection " << systemIndexes;
                 }
 
-                Database::closeDatabase(&txn, dbName.c_str());
+                dbHolder().close( &txn, dbName );
             }
         }
         wunit.commit();
@@ -680,35 +671,39 @@ namespace mongo {
         indexRebuilder.go(); 
 
         listen(listenPort);
+
+        // listen() will return when exit code closes its socket.
     }
 
-    static void initAndListen(int listenPort) {
+    ExitCode initAndListen(int listenPort) {
         try {
             _initAndListen(listenPort);
+
+            return inShutdown() ? EXIT_CLEAN : EXIT_NET_ERROR;
         }
         catch ( DBException &e ) {
             log() << "exception in initAndListen: " << e.toString() << ", terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
+            return EXIT_UNCAUGHT;
         }
         catch ( std::exception &e ) {
-            log() << "exception in initAndListen std::exception: " << e.what() << ", terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
+            log() << "exception in initAndListen std::exception: " << e.what() << ", terminating";
+            return EXIT_UNCAUGHT;
         }
         catch ( int& n ) {
             log() << "exception in initAndListen int: " << n << ", terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
+            return EXIT_UNCAUGHT;
         }
         catch(...) {
             log() << "exception in initAndListen, terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
+            return EXIT_UNCAUGHT;
         }
     }
 
 #if defined(_WIN32)
-    void initService() {
+    ExitCode initService() {
         ntservice::reportStatus( SERVICE_RUNNING );
         log() << "Service running" << endl;
-        initAndListen(serverGlobalParams.port);
+        return initAndListen(serverGlobalParams.port);
     }
 #endif
 
@@ -940,6 +935,7 @@ static int mongoDbMain(int argc, char* argv[], char **envp) {
 #endif
 
     StartupTest::runTests();
-    initAndListen(serverGlobalParams.port);
-    fassertFailed(18000);
+    ExitCode exitCode = initAndListen(serverGlobalParams.port);
+    exitCleanly(exitCode);
+    return 0;
 }
