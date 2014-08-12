@@ -413,6 +413,8 @@ namespace mongo {
 
         const BenchRunConfig &config() const { return *_config; } // TODO: Remove this function.
 
+        static double round(double d);
+
         // JS bindings
         static BSONObj benchFinish(const BSONObj& argsFake, void* data);
         static BSONObj benchStart(const BSONObj& argsFake, void* data);
@@ -425,6 +427,8 @@ namespace mongo {
 
         OID _oid;
         BenchRunState _brState;
+        Timer *_brTimer;
+        unsigned long long _microsElapsed;
         boost::scoped_ptr<BenchRunConfig> _config;
         std::vector<BenchRunWorker *> _workers;
 
