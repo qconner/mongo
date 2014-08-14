@@ -26,6 +26,10 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/range_deleter_db_env.h"
 
 #include "mongo/db/auth/authorization_manager.h"
@@ -37,6 +41,7 @@
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/d_logic.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 

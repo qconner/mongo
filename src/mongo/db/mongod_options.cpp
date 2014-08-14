@@ -41,6 +41,7 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -200,7 +201,6 @@ namespace mongo {
 
         general_options.addOptionChaining("storage.quota.enforced", "quota", moe::Switch,
                 "limits each database to a certain number of files (8 default)")
-                                         .setSources(moe::SourceAllLegacy)
                                          .incompatibleWith("keyFile");
 
         general_options.addOptionChaining("storage.quota.maxFilesPerDB", "quotaFiles", moe::Int,

@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
 #include "mongo/platform/basic.h"
 
 #include <boost/scoped_ptr.hpp>
@@ -45,6 +47,7 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -249,6 +252,70 @@ namespace {
         writeConcern.wMode = "";
         statusAndDur = getReplCoord()->awaitReplication(&txn, time, writeConcern);
         ASSERT_OK(statusAndDur.status);
+    }
+
+    TEST_F(ReplCoordTest, checkReplEnabledForCommandNotRepl) {
+        // pass in settings to avoid having a replSet
+        ReplSettings settings;
+        init(settings);
+        start();
+
+        // check status NoReplicationEnabled and empty result
+        BSONObjBuilder result;
+        Status status = getReplCoord()->checkReplEnabledForCommand(&result);
+        ASSERT_EQUALS(status, ErrorCodes::NoReplicationEnabled);
+        ASSERT_TRUE(result.obj().isEmpty());
+    }
+
+    TEST_F(ReplCoordTest, checkReplEnabledForCommandConfigSvr) {
+        ReplSettings settings;
+        serverGlobalParams.configsvr = true;
+        init(settings);
+        start();
+
+        // check status NoReplicationEnabled and result mentions configsrv
+        BSONObjBuilder result;
+        Status status = getReplCoord()->checkReplEnabledForCommand(&result);
+        ASSERT_EQUALS(status, ErrorCodes::NoReplicationEnabled);
+        ASSERT_EQUALS(result.obj()["info"].String(), "configsvr");
+        serverGlobalParams.configsvr = false;
+    }
+
+    TEST_F(ReplCoordTest, checkReplEnabledForCommandNoConfig) {
+        start();
+
+        // check status NotYetInitialized and result mentions rs.initiate
+        BSONObjBuilder result;
+        Status status = getReplCoord()->checkReplEnabledForCommand(&result);
+        ASSERT_EQUALS(status, ErrorCodes::NotYetInitialized);
+        ASSERT_TRUE(result.obj()["info"].String().find("rs.initiate") != std::string::npos);
+    }
+
+    TEST_F(ReplCoordTest, checkReplEnabledForCommandWorking) {
+        assertStartSuccess(BSON("_id" << "mySet" <<
+                                "version" << 2 <<
+                                "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
+                                                             "_id" << 0 ))),
+                    HostAndPort("node1", 12345));
+
+        // check status OK and result is empty
+        BSONObjBuilder result;
+        Status status = getReplCoord()->checkReplEnabledForCommand(&result);
+        ASSERT_EQUALS(status, Status::OK());
+        ASSERT_TRUE(result.obj().isEmpty());
+    }
+
+    TEST_F(ReplCoordTest, BasicRBIDUsage) {
+        start();
+        BSONObjBuilder result;
+        getReplCoord()->processReplSetGetRBID(&result);
+        long long initialValue = result.obj()["rbid"].Int();
+        getReplCoord()->incrementRollbackID();
+
+        BSONObjBuilder result2;
+        getReplCoord()->processReplSetGetRBID(&result2);
+        long long incrementedValue = result2.obj()["rbid"].Int();
+        ASSERT_EQUALS(incrementedValue, initialValue + 1);
     }
 
     TEST_F(ReplCoordTest, AwaitReplicationNumberOfNodesNonBlocking) {

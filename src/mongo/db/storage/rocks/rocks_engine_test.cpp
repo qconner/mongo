@@ -88,7 +88,7 @@ namespace mongo {
             MyOperationContext opCtx( &engine );
             DiskLoc loc;
             {
-                WriteUnitOfWork uow( opCtx.recoveryUnit() );
+                WriteUnitOfWork uow( &opCtx );
                 StatusWith<DiskLoc> res = rs->insertRecord( &opCtx, s.c_str(), s.size() + 1, -1 );
                 ASSERT_OK( res.getStatus() );
                 loc = res.getValue();
@@ -252,10 +252,12 @@ namespace mongo {
 
             {
                 MyOperationContext opCtx( &engine );
+                WriteUnitOfWork uow( &opCtx );
                 Status status = engine.createCollection( &opCtx,
                                                      "test.foo",
                                                      CollectionOptions() );
                 ASSERT_OK( status );
+                uow.commit();
             }
 
             RocksRecordStore* rs = engine.getEntry( "test.foo" )->recordStore.get();
@@ -264,13 +266,15 @@ namespace mongo {
                 MyOperationContext opCtx( &engine );
 
                 {
-                    WriteUnitOfWork uow( opCtx.recoveryUnit() );
+                    WriteUnitOfWork uow( &opCtx );
                     StatusWith<DiskLoc> res = rs->insertRecord( &opCtx, s.c_str(), s.size() + 1, -1 );
                     ASSERT_OK( res.getStatus() );
                     loc = res.getValue();
+                    uow.commit();
                 }
 
                 ASSERT_EQUALS( s, rs->dataFor( loc ).data() );
+                engine.cleanShutdown( &opCtx );
             }
         }
 
