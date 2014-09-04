@@ -355,18 +355,28 @@ namespace mongo {
 
                 int delay = e["delay"].eoo() ? 0 : e["delay"].Int();
 
-                // Let's default to writeCmd == false.
+                // writeCmd mode  (false by default)
                 bool useWriteCmd = e["writeCmd"].eoo() ? false : 
                     e["writeCmd"].Bool();
 
-                // fsyncFlag, w, j, wtimeout
+                // safe mode  (false by default)
                 bool safe = e["safe"].trueValue();
-                bool fsyncFlag = false;
-                bool j = e["j"].trueValue();
-                int w = e["w"].eoo() ? 0 : e["w"].numberInt();
-                int wTimeout = 0;
 
-                BSONObj context = e["context"].eoo() ? BSONObj() : e["context"].Obj();
+                // fsyncFlag  (false by default)
+                bool fsyncFlag = e["fsyncFlag"].trueValue();
+
+                // j  (false by default)
+                bool j = e["j"].trueValue();
+
+                // w  (0 by default)
+                int w = e["w"].eoo() ? 0 : e["w"].numberInt();
+
+                // wTimeout  (0 by default)
+                int wTimeout = e["wTimeout"].eoo() ? 0 :
+                    e["wTimeout"].numberInt();
+
+                BSONObj context = e["context"].eoo() ? BSONObj() :
+                    e["context"].Obj();
 
                 auto_ptr<Scope> scope;
                 ScriptingFunction scopeFunc = 0;
