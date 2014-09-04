@@ -354,11 +354,28 @@ namespace mongo {
 
                 int delay = e["delay"].eoo() ? 0 : e["delay"].Int();
 
-                // Let's default to writeCmd == false.
+                // writeCmd mode  (false by default)
                 bool useWriteCmd = e["writeCmd"].eoo() ? false : 
                     e["writeCmd"].Bool();
 
-                BSONObj context = e["context"].eoo() ? BSONObj() : e["context"].Obj();
+                // safe mode  (false by default)
+                bool safe = e["safe"].trueValue();
+
+                // fsyncFlag  (false by default)
+                bool fsyncFlag = e["fsyncFlag"].trueValue();
+
+                // j  (false by default)
+                bool j = e["j"].trueValue();
+
+                // w  (0 by default)
+                int w = e["w"].eoo() ? 0 : e["w"].numberInt();
+
+                // wTimeout  (0 by default)
+                int wTimeout = e["wTimeout"].eoo() ? 0 :
+                    e["wTimeout"].numberInt();
+
+                BSONObj context = e["context"].eoo() ? BSONObj() :
+                    e["context"].Obj();
 
                 auto_ptr<Scope> scope;
                 ScriptingFunction scopeFunc = 0;
@@ -486,7 +503,6 @@ namespace mongo {
                         BSONObj query = e["query"].eoo() ? BSONObj() : e["query"].Obj();
                         BSONObj update = e["update"].Obj();
                         BSONObj result;
-                        bool safe = e["safe"].trueValue();
 
                         {
                             BenchRunEventTrace _bret(&_stats.updateCounter);
@@ -512,7 +528,7 @@ namespace mongo {
                                             bsonTemplateEvaluator), update,
                                             upsert , multi);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -536,7 +552,6 @@ namespace mongo {
                         }
                     }
                     else if( op == "insert" ) {
-                        bool safe = e["safe"].trueValue();
                         BSONObj result;
 
                         {
@@ -560,7 +575,7 @@ namespace mongo {
                             else {
                                 conn->insert(ns, insertDoc);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -587,7 +602,6 @@ namespace mongo {
 
                         bool multi = e["multi"].eoo() ? true : e["multi"].trueValue();
                         BSONObj query = e["query"].eoo() ? BSONObj() : e["query"].Obj();
-                        bool safe = e["safe"].trueValue();
                         BSONObj result;
 
                         {
@@ -613,7 +627,7 @@ namespace mongo {
                                 conn->remove(ns, fixQuery(query,
                                     bsonTemplateEvaluator), !multi);
                                 if (safe)
-                                    result = conn->getLastErrorDetailed();
+                                    result = conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                             }
                         }
 
@@ -683,7 +697,7 @@ namespace mongo {
                 }
 
                 if (++count % 100 == 0 && !useWriteCmd) {
-                    conn->getLastError();
+                    conn->getLastErrorDetailed(fsyncFlag, j, w, wTimeout);
                 }
 
                 sleepmillis( delay );
