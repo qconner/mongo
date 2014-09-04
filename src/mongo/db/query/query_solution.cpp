@@ -26,8 +26,10 @@
  *    it in the license file.
  */
 
+#include "mongo/db/index_names.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/matcher/expression_geo.h"
 
 namespace mongo {
 
@@ -411,6 +413,10 @@ namespace mongo {
         // in the key was extracted from an array in the original document.
         if (indexIsMultiKey) { return false; }
 
+        // Custom index access methods may return non-exact key data - this function is currently
+        // used for covering exact key data only.
+        if (IndexNames::BTREE != IndexNames::findPluginName(indexKeyPattern)) { return false; }
+
         BSONObjIterator it(indexKeyPattern);
         while (it.more()) {
             if (field == it.next().fieldName()) {
@@ -695,7 +701,7 @@ namespace mongo {
         addIndent(ss, indent + 1);
         *ss << "keyPattern = " << indexKeyPattern.toString() << '\n';
         addCommon(ss, indent);
-        *ss << "nearQuery = " << nq.toString() << '\n';
+        *ss << "nearQuery = " << nq->toString() << '\n';
         if (NULL != filter) {
             addIndent(ss, indent + 1);
             *ss << " filter = " << filter->toString();
@@ -728,7 +734,7 @@ namespace mongo {
         addCommon(ss, indent);
         *ss << "baseBounds = " << baseBounds.toString() << '\n';
         addIndent(ss, indent + 1);
-        *ss << "nearQuery = " << nq.toString() << '\n';
+        *ss << "nearQuery = " << nq->toString() << '\n';
         if (NULL != filter) {
             addIndent(ss, indent + 1);
             *ss << " filter = " << filter->toString();

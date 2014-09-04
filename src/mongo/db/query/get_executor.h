@@ -52,7 +52,8 @@ namespace mongo {
      * Fill out the provided 'plannerParams' for the 'canonicalQuery' operating on the collection
      * 'collection'.  Exposed for testing.
      */
-    void fillOutPlannerParams(Collection* collection,
+    void fillOutPlannerParams(OperationContext* txn,
+                              Collection* collection,
                               CanonicalQuery* canonicalQuery,
                               QueryPlannerParams* plannerParams);
 
@@ -144,6 +145,7 @@ namespace mongo {
                              CanonicalQuery* rawCanonicalQuery,
                              bool isMulti,
                              bool shouldCallLogOp,
+                             bool fromMigrate,
                              PlanExecutor** execOut);
 
     /**
@@ -161,6 +163,7 @@ namespace mongo {
                              const BSONObj& unparsedQuery,
                              bool isMulti,
                              bool shouldCallLogOp,
+                             bool fromMigrate,
                              PlanExecutor** execOut);
 
     //

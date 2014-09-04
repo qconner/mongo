@@ -54,6 +54,7 @@
 #include "mongo/db/repair_database.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -207,17 +208,19 @@ namespace mongo {
             if ( !options.temp )
                 continue;
 
+            WriteUnitOfWork wunit(txn);
             Status status = dropCollection( txn, ns );
             if ( !status.isOK() ) {
                 warning() << "could not drop temp collection '" << ns << "': " << status;
+                continue;
             }
-            else {
-                string cmdNs = _name + ".$cmd";
-                repl::logOp( txn,
-                             "c",
-                             cmdNs.c_str(),
-                             BSON( "drop" << nsToCollectionSubstring( ns ) ) );
-            }
+
+            string cmdNs = _name + ".$cmd";
+            repl::logOp( txn,
+                         "c",
+                         cmdNs.c_str(),
+                         BSON( "drop" << nsToCollectionSubstring( ns ) ) );
+            wunit.commit();
         }
     }
 
@@ -251,7 +254,7 @@ namespace mongo {
 
         IndexCatalog* idxCatalog = coll->getIndexCatalog();
 
-        IndexCatalog::IndexIterator ii = idxCatalog->getIndexIterator( true );
+        IndexCatalog::IndexIterator ii = idxCatalog->getIndexIterator( opCtx, true );
 
         long long totalSize = 0;
 
@@ -290,14 +293,14 @@ namespace mongo {
                 continue;
 
             ncollections += 1;
-            objects += collection->numRecords();
-            size += collection->dataSize();
+            objects += collection->numRecords(opCtx);
+            size += collection->dataSize(opCtx);
 
             BSONObjBuilder temp;
             storageSize += collection->getRecordStore()->storageSize( opCtx, &temp );
             numExtents += temp.obj()["numExtents"].numberInt(); // XXX
 
-            indexes += collection->getIndexCatalog()->numIndexesTotal();
+            indexes += collection->getIndexCatalog()->numIndexesTotal( opCtx );
             indexSize += getIndexSizeForCollection(opCtx, collection);
         }
 
@@ -362,7 +365,7 @@ namespace mongo {
             return Status( ErrorCodes::InternalError, ss.str() );
         }
 
-        verify( collection->_details->getTotalIndexCount() == 0 );
+        verify( collection->_details->getTotalIndexCount( txn ) == 0 );
         LOG(1) << "\t dropIndexes done" << endl;
 
         Top::global.collectionDropped( fullns );
@@ -443,7 +446,7 @@ namespace mongo {
             Collection* coll = getCollection( txn, fromNS );
             if ( !coll )
                 return Status( ErrorCodes::NamespaceNotFound, "collection not found to rename" );
-            IndexCatalog::IndexIterator ii = coll->getIndexCatalog()->getIndexIterator( true );
+            IndexCatalog::IndexIterator ii = coll->getIndexCatalog()->getIndexIterator( txn, true );
             while ( ii.more() ) {
                 IndexDescriptor* desc = ii.next();
                 _clearCollectionCache( desc->indexNamespace() );

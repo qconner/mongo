@@ -34,10 +34,12 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs_config.h"
+#include "mongo/db/repl/rslog.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/util/log.h"
@@ -339,10 +341,14 @@ namespace repl {
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 
-            string newTarget = cmdObj["replSetSyncFrom"].valuestrsafe();
+            HostAndPort targetHostAndPort;
+            status = targetHostAndPort.initialize(cmdObj["replSetSyncFrom"].valuestrsafe());
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
+
             return appendCommandStatus(
                     result,
-                    getGlobalReplicationCoordinator()->processReplSetSyncFrom(newTarget,
+                    getGlobalReplicationCoordinator()->processReplSetSyncFrom(targetHostAndPort,
                                                                               &result));
         }
     } cmdReplSetSyncFrom;

@@ -34,14 +34,25 @@ env.Library('authcore', ['action_set.cpp',
                      '$BUILD_DIR/mongo/db/common',
                      '$BUILD_DIR/mongo/db/ops/update_driver',
                      '$BUILD_DIR/mongo/md5',
+                     '$BUILD_DIR/mongo/signal_handlers_synchronous',
                      '$BUILD_DIR/mongo/stringutils'])
 
 env.Library('authservercommon',
             ['authorization_manager_global.cpp',
              'authz_session_external_state_server_common.cpp',
-             'mechanism_scram.cpp',
+             'sasl_commands.cpp',
              'security_key.cpp'],
-            LIBDEPS=['authcore'])
+            LIBDEPS=['authcore', 'authmocks', 'saslauth'])
+
+env.Library('saslauth',
+            ['mechanism_scram.cpp',
+             'native_sasl_authentication_session.cpp',
+             'sasl_authentication_session.cpp',
+             'sasl_conversation.cpp',
+             'sasl_options.cpp',
+             'sasl_plain_server_conversation.cpp',
+             'sasl_scramsha1_server_conversation.cpp'],
+             LIBDEPS=['authcore'])
 
 env.Library('authmongod',
             ['authz_manager_external_state_d.cpp',

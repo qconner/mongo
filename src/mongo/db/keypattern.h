@@ -35,6 +35,7 @@
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/db/query/index_bounds.h"
+#include "mongo/db/matcher/matchable.h"
 
 namespace mongo {
 
@@ -72,25 +73,16 @@ namespace mongo {
          */
         BSONObj toBSON() const { return _pattern; }
 
-        /*
-         * Returns true if the given fieldname is the (dotted prefix of the) name of one
-         * element of the (potentially) compound key described by this KeyPattern.
-         */
-        bool hasField( const StringData& fieldname ) const {
-            return _prefixes.find( fieldname ) != _prefixes.end();
-        }
-
-        /*
-         * Gets the element of this pattern corresponding to the given fieldname.
-         * Returns eoo if none exists.
-         */
-        BSONElement getField( const char* fieldname ) const { return _pattern[ fieldname ]; }
-
         /**
          * Is the provided key pattern the index over the ID field?
          * The always required ID index is always {_id: 1} or {_id: -1}.
          */
         static bool isIdKeyPattern(const BSONObj& pattern);
+
+        /**
+         * Is the provided key pattern ordered increasing or decreasing or not?
+         */
+        static bool isOrderedKeyPattern(const BSONObj& pattern);
 
         /* Takes a BSONObj whose field names are a prefix of the fields in this keyPattern, and
          * outputs a new bound with MinKey values appended to match the fields in this keyPattern
@@ -117,24 +109,10 @@ namespace mongo {
          */
         BSONObj extendRangeBound( const BSONObj& bound , bool makeUpperInclusive ) const;
 
-        /**
-         * Returns true if this KeyPattern contains any computed values, (e.g. {a : "hashed"}),
-         * and false if this KeyPattern consists of only ascending/descending fields
-         * (e.g. {a : 1, b : -1}). With our current index expression language, "special" patterns
-         * are any patterns that are not a simple list of field names and 1/-1 values.
-         */
-        bool isSpecial() const;
-
-        /**
-         * Returns true if the quantities stored in this KeyPattern can be used to compute all the
-         * quantities in "other". Useful for determining whether an index based on one KeyPattern
-         * can be used as a covered index for a query based on another.
-         */
-        bool isCoveredBy( const KeyPattern& other ) const;
-
         std::string toString() const{ return toBSON().toString(); }
 
-        /* Given a document, extracts the index key corresponding to this KeyPattern
+        /**
+         * Given a document, extracts the shard key corresponding to the key pattern.
          * Warning: assumes that there is a *single* key to be extracted!
          *
          * Examples:
@@ -143,11 +121,33 @@ namespace mongo {
          *   { c : 4 , a : 2 } -->  returns { a : 2 }
          *   { b : 2 }  (bad input, don't call with this)
          *   { a : [1,2] }  (bad input, don't call with this)
-         *
          *  If 'this' KeyPattern is { a  : "hashed" }
          *   { a: 1 } --> returns { a : NumberLong("5902408780260971510")  }
+         *  If 'this' KeyPattern is { 'a.b' : 1 }
+         *   { a : { b : "hi" } } --> returns { a : "hi" }
          */
-        BSONObj extractSingleKey( const BSONObj& doc ) const;
+        BSONObj extractShardKeyFromDoc(const BSONObj& doc) const;
+
+        /**
+         * Given a MatchableDocument, extracts the shard key corresponding to the key pattern.
+         * See above.
+         */
+        BSONObj extractShardKeyFromMatchable(const MatchableDocument& matchable) const;
+
+        /**
+         * Given a query expression, extracts the shard key corresponding to the key pattern.
+         *
+         * NOTE: This generally is similar to the above, however "a.b" fields in the query (which
+         * are invalid document fields) may match "a.b" fields in the shard key pattern.
+         *
+         * Examples:
+         *  If the key pattern is { a : 1 }
+         *   { a : "hi", b : 4 } --> returns { a : "hi" }
+         *  If the key pattern is { 'a.b' : 1 }
+         *   { a : { b : "hi" } } --> returns { 'a.b' : "hi" }
+         *   { 'a.b' : "hi" } --> returns { 'a.b' : "hi" }
+         */
+        BSONObj extractShardKeyFromQuery(const BSONObj& query) const;
 
         /**
          * Return an ordered list of bounds generated using this KeyPattern and the
@@ -168,41 +168,10 @@ namespace mongo {
          * means some fields are unsatisfied, an empty BoundList could return.
          *
          */
-        static BoundList keyBounds( const BSONObj& keyPattern, const IndexBounds& indexBounds );
-
-        static bool isHashed( const BSONElement& fieldExpression ) {
-            return mongoutils::str::equals( fieldExpression.valuestrsafe() , "hashed" );
-        }
+        static BoundList flattenBounds( const BSONObj& keyPattern, const IndexBounds& indexBounds );
 
     private:
         BSONObj _pattern;
-
-        // Each field in the '_pattern' may be itself a dotted field. We store all the prefixes
-        // of each field here. For instance, if a pattern is { 'a.b.c': 1, x: 1 }, we'll store
-        // here 'a', 'a.b', 'a.b.c', and 'x'.
-        //
-        // Since we're indexing into '_pattern's field names, it must stay constant after
-        // constructed.
-        struct PrefixHasher {
-            size_t operator()( const StringData& strData ) const {
-                size_t result = 0;
-                const char* p = strData.rawData();
-                for (size_t len = strData.size(); len > 0; len-- ) {
-                    result = ( result * 131 ) + *p++;
-                }
-                return result;
-            }
-        };
-        unordered_set<StringData, PrefixHasher> _prefixes;
-
-        bool isAscending( const BSONElement& fieldExpression ) const {
-            return ( fieldExpression.isNumber()  && fieldExpression.numberInt() == 1 );
-        }
-
-        bool isDescending( const BSONElement& fieldExpression ) const {
-            return ( fieldExpression.isNumber()  && fieldExpression.numberInt() == -1 );
-        }
-
     };
 
 } // namespace mongo

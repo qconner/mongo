@@ -34,7 +34,7 @@
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_access_method.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 
 namespace mongo {
 
@@ -88,7 +88,7 @@ namespace mongo {
         const IndexCatalog* catalog = _collection->getIndexCatalog();
 
         // Find the index we use.
-        IndexDescriptor* idDesc = catalog->findIdIndex();
+        IndexDescriptor* idDesc = catalog->findIdIndex(_txn);
         if (NULL == idDesc) {
             _done = true;
             return PlanStage::IS_EOF;
@@ -114,7 +114,7 @@ namespace mongo {
         WorkingSetID id = _workingSet->allocate();
         WorkingSetMember* member = _workingSet->get(id);
         member->loc = loc;
-        member->obj = _collection->docFor(loc);
+        member->obj = _collection->docFor(_txn, loc);
         member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
 
         if (_addKeyMetadata) {

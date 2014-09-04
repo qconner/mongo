@@ -33,7 +33,6 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/query/explain.h"
 #include "mongo/util/log.h"
 
 namespace {
@@ -77,13 +76,13 @@ namespace mongo {
             _shouldDedup = false;
         }
         else {
-            _shouldDedup = _params.descriptor->isMultikey();
+            _shouldDedup = _params.descriptor->isMultikey(_txn);
         }
 
         // We can't always access the descriptor in the call to getStats() so we pull
         // the status-only information we need out here.
         _specificStats.indexName = _params.descriptor->infoObj()["name"].String();
-        _specificStats.isMultiKey = _params.descriptor->isMultikey();
+        _specificStats.isMultiKey = _params.descriptor->isMultikey(_txn);
 
         // Set up the index cursor.
         CursorOptions cursorOptions;
@@ -140,21 +139,10 @@ namespace mongo {
         // Adds the amount of time taken by work() to executionTimeMillis.
         ScopedTimer timer(&_commonStats.executionTimeMillis);
 
-        // If we examined multiple keys in a prior work cycle, make up for it here by returning
-        // NEED_TIME. This is done for plan ranking. Refer to the comment for '_checkEndKeys'
-        // in the .h for details.
-        if (_checkEndKeys > 0) {
-            --_checkEndKeys;
-            ++_commonStats.needTime;
-            return PlanStage::NEED_TIME;
-        }
-
         if (NULL == _indexCursor.get()) {
             // First call to work().  Perform possibly heavy init.
             initIndexScan();
             checkEnd();
-            ++_commonStats.needTime;
-            return PlanStage::NEED_TIME;
         }
         else if (_yieldMovedCursor) {
             _yieldMovedCursor = false;
@@ -163,6 +151,15 @@ namespace mongo {
         }
 
         if (isEOF()) { return PlanStage::IS_EOF; }
+
+        // If we examined multiple keys in a prior work cycle, make up for it here by returning
+        // NEED_TIME. This is done for plan ranking. Refer to the comment for '_checkEndKeys'
+        // in the .h for details.
+        if (_checkEndKeys > 0) {
+            --_checkEndKeys;
+            ++_commonStats.needTime;
+            return PlanStage::NEED_TIME;
+        }
 
         // Grab the next (key, value) from the index.
         BSONObj keyObj = _indexCursor->getKey();
@@ -383,14 +380,7 @@ namespace mongo {
         if (_specificStats.indexType.empty()) {
             _specificStats.indexType = "BtreeCursor"; // TODO amName;
 
-            // TODO this can be simplified once the new explain format is
-            // the default. Probably won't need to include explain.h here either.
-            if (enableNewExplain) {
-                _specificStats.indexBounds = _params.bounds.toBSON();
-            }
-            else {
-                _specificStats.indexBounds = _params.bounds.toLegacyBSON();
-            }
+            _specificStats.indexBounds = _params.bounds.toBSON();
 
             _specificStats.indexBoundsVerbose = _params.bounds.toString();
             _specificStats.direction = _params.direction;

@@ -36,6 +36,7 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
@@ -43,7 +44,11 @@
 
 namespace mongo {
     long long Scope::_lastVersion = 1;
-    static const unsigned kMaxJsFileLength = std::numeric_limits<unsigned>::max() - 1;
+
+namespace {
+    // 2 GB is the largest support Javascript file size.
+    const fileofs kMaxJsFileLength = fileofs(2) * 1024 * 1024 * 1024;
+}  // namespace
 
     ScriptEngine::ScriptEngine() : _scopeInitCallback() {
     }

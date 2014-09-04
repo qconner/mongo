@@ -63,18 +63,6 @@ namespace mongo {
          */
         BSONObj globalMax() const { return gMax; }
 
-        bool isGlobalMin( const BSONObj& k ) const {
-            return k.woCompare( globalMin() ) == 0;
-        }
-
-        bool isGlobalMax( const BSONObj& k ) const {
-            return k.woCompare( globalMax() ) == 0;
-        }
-
-        bool isGlobal( const BSONObj& k ) const {
-            return isGlobalMin( k ) || isGlobalMax( k );
-        }
-
         /**
            @return whether or not obj has all fields in this shard key pattern
            e.g.
@@ -99,11 +87,12 @@ namespace mongo {
 
         std::string toString() const;
 
-        BSONObj extractKey(const BSONObj& from) const;
-
-        bool partOfShardKey(const StringData& key ) const {
-            return pattern.hasField(key);
-        }
+        /**
+         * DEPRECATED function to return a shard key from either a document or a query expression.
+         * Always prefer the more specific keypattern.h extractKeyFromXXX functions instead.
+         * TODO: Eliminate completely.
+         */
+        BSONObj extractKeyFromQueryOrDoc(const BSONObj& from) const;
 
         BSONObj extendRangeBound( const BSONObj& bound , bool makeUpperInclusive ) const {
             return pattern.extendRangeBound( bound , makeUpperInclusive );
@@ -132,20 +121,6 @@ namespace mongo {
          */
         bool isUniqueIndexCompatible( const KeyPattern& uniqueIndexPattern ) const;
 
-        /**
-         * @return
-         * true if keyPattern contains any computed values, (e.g. {a : "hashed"})
-         * false if keyPattern consists of only ascending/descending fields (e.g. {a : 1, b : -1})
-         *       With our current index expression language, "special" shard keys are any keys
-         *       that are not a simple list of field names and 1/-1 values.
-         */
-        bool isSpecial() const { return pattern.isSpecial(); }
-
-        /**
-         * @return BSONObj with _id and shardkey at front. May return original object.
-         */
-        BSONObj moveToFront(const BSONObj& obj) const;
-
     private:
         KeyPattern pattern;
         BSONObj gMin;
@@ -155,8 +130,9 @@ namespace mongo {
         std::set<std::string> patternfields;
     };
 
-    inline BSONObj ShardKeyPattern::extractKey(const BSONObj& from) const {
-        BSONObj k = pattern.extractSingleKey( from );
+    // See note above - do not use in new code
+    inline BSONObj ShardKeyPattern::extractKeyFromQueryOrDoc(const BSONObj& from) const {
+        BSONObj k = pattern.extractShardKeyFromQuery( from );
         uassert(13334, "Shard Key must be less than 512 bytes", k.objsize() < kMaxShardKeySize);
         return k;
     }

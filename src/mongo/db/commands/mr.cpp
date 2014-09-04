@@ -37,12 +37,14 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
@@ -54,7 +56,7 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/s/collection_metadata.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
@@ -376,7 +378,7 @@ namespace mongo {
                     finalCtx.ctx().db()->getCollection(_txn, _config.outputOptions.finalNamespace);
                 if ( finalColl ) {
                     IndexCatalog::IndexIterator ii =
-                        finalColl->getIndexCatalog()->getIndexIterator( true );
+                        finalColl->getIndexCatalog()->getIndexIterator( _txn, true );
                     // Iterate over finalColl's indexes.
                     while ( ii.more() ) {
                         IndexDescriptor* currIndex = ii.next();
@@ -588,7 +590,6 @@ namespace mongo {
                     WriteUnitOfWork wunit(_txn);
                     BSONObj o = cursor->nextSafe();
                     Helpers::upsert( _txn, _config.outputOptions.finalNamespace , o );
-                    _txn->recoveryUnit()->commitIfNeeded();
                     wunit.commit();
                     pm.hit();
                 }
@@ -635,7 +636,6 @@ namespace mongo {
                         Helpers::upsert( _txn, _config.outputOptions.finalNamespace , temp );
                     }
                     wunit.commit();
-                    _txn->recoveryUnit()->commitIfNeeded();
                     pm.hit();
                 }
                 pm.finished();
@@ -690,7 +690,6 @@ namespace mongo {
 
             coll->insertDocument( _txn, o, true );
             ctx.commit();
-            _txn->recoveryUnit()->commitIfNeeded();
         }
 
         State::State(OperationContext* txn, const Config& c) :
@@ -964,7 +963,7 @@ namespace mongo {
 
                 bool foundIndex = false;
                 IndexCatalog::IndexIterator ii =
-                    incColl->getIndexCatalog()->getIndexIterator( true );
+                    incColl->getIndexCatalog()->getIndexIterator( _txn, true );
                 // Iterate over incColl's indexes.
                 while ( ii.more() ) {
                     IndexDescriptor* currIndex = ii.next();
@@ -1370,7 +1369,7 @@ namespace mongo {
                             // because of a chunk migration
                             if ( collMetadata ) {
                                 KeyPattern kp( collMetadata->getKeyPattern() );
-                                if ( !collMetadata->keyBelongsToMe( kp.extractSingleKey( o ) ) ) {
+                                if (!collMetadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
                                     continue;
                                 }
                             }

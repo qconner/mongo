@@ -29,6 +29,7 @@
 #pragma once
 
 #include <set>
+#include <vector>
 
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/util/concurrency/mutex.h"
@@ -44,6 +45,11 @@ namespace mongo {
 
         StorageEngine* getGlobalStorageEngine();
 
+        void setGlobalStorageEngine(const std::string& name);
+
+        void registerStorageEngine(const std::string& name,
+                                   const StorageEngine::Factory* factory);
+
         void setKillAllOperations();
 
         void unsetKillAllOperations();
@@ -51,6 +57,8 @@ namespace mongo {
         bool getKillAllOperations();
 
         bool killOperation(unsigned int opId);
+
+        void registerKillOpListener(KillOpListenerInterface* listener);
 
         void registerOperationContext(OperationContext* txn);
 
@@ -67,6 +75,15 @@ namespace mongo {
 
         mongo::mutex _registeredOpContextsMutex;
         OperationContextSet _registeredOpContexts;
+
+        // protected by Client::clientsMutex
+        std::vector<KillOpListenerInterface*> _killOpListeners;
+
+        // logically owned here, but never deleted by anyone.
+        StorageEngine* _storageEngine;
+
+        // All possible storage engines are registered here through MONGO_INIT.
+        std::map<std::string, const StorageEngine::Factory*> _storageFactories;
     };
 
 }  // namespace mongo

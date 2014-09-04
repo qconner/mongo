@@ -58,6 +58,7 @@
 #include "mongo/s/config.h"
 #include "mongo/s/dbclient_multi_command.h"
 #include "mongo/s/dbclient_shard_resolver.h"
+#include "mongo/s/distlock.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/strategy.h"
 #include "mongo/s/type_chunk.h"
@@ -1911,7 +1912,7 @@ namespace mongo {
     }
 
     bool CmdShutdown::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-        return shutdownHelper();
+        return shutdownHelper(txn);
     }
 
 } // namespace mongo

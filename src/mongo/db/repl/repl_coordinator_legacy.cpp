@@ -40,6 +40,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h" // for newRepl()
@@ -52,6 +53,7 @@
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_config.h"
 #include "mongo/db/repl/rs_initiate.h"
+#include "mongo/db/repl/rslog.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/db/write_concern_options.h"
@@ -73,6 +75,13 @@ namespace repl {
     LegacyReplicationCoordinator::~LegacyReplicationCoordinator() {}
 
     void LegacyReplicationCoordinator::startReplication(OperationContext* txn) {
+        if (!isReplEnabled()) {
+            return;
+        }
+
+        ReplicationCoordinatorExternalStateImpl externalState;
+        _myRID = externalState.ensureMe(txn);
+
         // if we are going to be a replica set, we aren't doing other forms of replication.
         if (!_settings.replSet.empty()) {
             if (_settings.slave || _settings.master) {
@@ -81,7 +90,6 @@ namespace repl {
                 log() << "***" << endl;
             }
 
-            ReplicationCoordinatorExternalStateImpl externalState;
             ReplSetSeedList *replSetSeedList = new ReplSetSeedList(&externalState,
                                                                    _settings.replSet);
             boost::thread t(stdx::bind(&startReplSets, replSetSeedList));
@@ -376,6 +384,10 @@ namespace {
         return true;
     }
 
+    Status LegacyReplicationCoordinator::setMyLastOptime(OperationContext* txn, const OpTime& ts) {
+        return setLastOptime(txn, getMyRID(), ts);
+    }
+
     Status LegacyReplicationCoordinator::setLastOptime(OperationContext* txn,
                                                        const OID& rid,
                                                        const OpTime& ts) {
@@ -386,7 +398,7 @@ namespace {
                 return Status::OK();
             }
 
-            if (rid != getMyRID(txn)) {
+            if (rid != getMyRID()) {
                 BSONObj config;
                 if (getReplicationMode() == modeReplSet) {
                     invariant(_ridMemberMap.count(rid));
@@ -395,7 +407,7 @@ namespace {
                     config = BSON("_id" << mem->id());
                 }
                 LOG(2) << "received notification that node with RID " << rid << " and config "
-                       << config << " has reached optime: " << ts.toStringPretty();
+                       << config << " has reached optime: " << ts;
 
                 // This is what updates the progress information used for satisfying write concern
                 // and wakes up threads waiting for replication.
@@ -426,15 +438,8 @@ namespace {
     }
 
 
-    OID LegacyReplicationCoordinator::getMyRID(OperationContext* txn) {
-        Mode mode = getReplicationMode();
-        if (mode == modeReplSet) {
-            return theReplSet->syncSourceFeedback.getMyRID();
-        } else if (mode == modeMasterSlave) {
-            ReplSource source(txn);
-            return source.getMyRID();
-        }
-        invariant(false); // Don't have an RID if no replication is enabled
+    OID LegacyReplicationCoordinator::getMyRID() {
+        return _myRID;
     }
 
     void LegacyReplicationCoordinator::prepareReplSetUpdatePositionCommand(
@@ -445,7 +450,7 @@ namespace {
         cmdBuilder->append("replSetUpdatePosition", 1);
         // create an array containing objects each member connected to us and for ourself
         BSONArrayBuilder arrayBuilder(cmdBuilder->subarrayStart("optimes"));
-        OID myID = getMyRID(txn);
+        OID myID = getMyRID();
         {
             for (SlaveOpTimeMap::const_iterator itr = _slaveOpTimeMap.begin();
                     itr != _slaveOpTimeMap.end(); ++itr) {
@@ -478,7 +483,7 @@ namespace {
         BSONObjBuilder cmd;
         cmd.append("replSetUpdatePosition", 1);
         BSONObjBuilder sub (cmd.subobjStart("handshake"));
-        sub.append("handshake", getMyRID(txn));
+        sub.append("handshake", getMyRID());
         sub.append("member", theReplSet->selfId());
         sub.append("config", theReplSet->myConfig().asBson());
         sub.doneFast();
@@ -553,7 +558,7 @@ namespace {
 
         response->setElectable(theReplSet->iAmElectable());
         response->setHbMsg(theReplSet->hbmsg());
-        response->setTime((long long) time(0));
+        response->setTime(Seconds(time(0)));
         response->setOpTime(theReplSet->lastOpTimeWritten.asDate());
         const Member *syncTarget = BackgroundSync::get()->getSyncTarget();
         if (syncTarget) {
@@ -678,33 +683,8 @@ namespace {
         return Status::OK();
     }
 
-    static HostAndPort someHostAndPortForMe() {
-        const char* ips = serverGlobalParams.bind_ip.c_str();
-        while (*ips) {
-            std::string ip;
-            const char* comma = strchr(ips, ',');
-            if (comma) {
-                ip = std::string(ips, comma - ips);
-                ips = comma + 1;
-            }
-            else {
-                ip = std::string(ips);
-                ips = "";
-            }
-            HostAndPort h = HostAndPort(ip, serverGlobalParams.port);
-            if (!h.isLocalHost()) {
-                return h;
-            }
-        }
-
-        std::string h = getHostName();
-        verify(!h.empty());
-        verify(h != "localhost");
-        return HostAndPort(h, serverGlobalParams.port);
-    }
-
     Status LegacyReplicationCoordinator::processReplSetInitiate(OperationContext* txn,
-                                                                const BSONObj& givenConfig,
+                                                                const BSONObj& configObj,
                                                                 BSONObjBuilder* resultObj) {
 
         log() << "replSet replSetInitiate admin command received from client" << rsLog;
@@ -753,37 +733,6 @@ namespace {
                 resultObj->append("info", _settings.replSet);
                 return Status(ErrorCodes::InvalidReplicaSetConfig,
                               "all members and seeds must be reachable to initiate set");
-            }
-
-            BSONObj configObj;
-            if (!givenConfig.isEmpty()) {
-                configObj = givenConfig;
-            } else {
-                resultObj->append("info2", "no configuration explicitly specified -- making one");
-                log() << "replSet info initiate : no configuration specified.  "
-                        "Using a default configuration for the set" << rsLog;
-
-                ReplicationCoordinatorExternalStateImpl externalState;
-                string name;
-                vector<HostAndPort> seeds;
-                set<HostAndPort> seedSet;
-                parseReplSetSeedList(
-                        &externalState, _settings.replSet, name, seeds, seedSet); // may throw...
-
-                BSONObjBuilder b;
-                b.append("_id", name);
-                BSONObjBuilder members;
-                HostAndPort me = someHostAndPortForMe();
-                members.append("0", BSON( "_id" << 0 << "host" << me.toString() ));
-                resultObj->append("me", me.toString());
-                for( unsigned i = 0; i < seeds.size(); i++ ) {
-                    members.append(BSONObjBuilder::numStr(i+1),
-                                   BSON( "_id" << i+1 << "host" << seeds[i].toString()));
-                }
-                b.appendArray("members", members.obj());
-                configObj = b.obj();
-                log() << "replSet created this configuration for initiation : " <<
-                        configObj.toString() << rsLog;
             }
 
             scoped_ptr<ReplSetConfig> newConfig;
@@ -948,11 +897,11 @@ namespace {
         return Status::OK();
     }
 
-    Status LegacyReplicationCoordinator::processReplSetSyncFrom(const std::string& target,
+    Status LegacyReplicationCoordinator::processReplSetSyncFrom(const HostAndPort& target,
                                                                 BSONObjBuilder* resultObj) {
-        resultObj->append("syncFromRequested", target);
+        resultObj->append("syncFromRequested", target.toString());
 
-        return theReplSet->forceSyncFrom(target, resultObj);
+        return theReplSet->forceSyncFrom(target.toString(), resultObj);
     }
 
     Status LegacyReplicationCoordinator::processReplSetUpdatePosition(

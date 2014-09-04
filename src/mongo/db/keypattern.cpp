@@ -31,25 +31,12 @@
 #include "mongo/db/keypattern.h"
 
 #include "mongo/db/hasher.h"
+#include "mongo/db/index_names.h"
 #include "mongo/util/mongoutils/str.h"
-
-using namespace mongoutils;
 
 namespace mongo {
 
-    KeyPattern::KeyPattern( const BSONObj& pattern ): _pattern( pattern ) {
-
-        // Extract all prefixes of each field in pattern.
-        BSONForEach( field, _pattern ) {
-            StringData fieldName = field.fieldName();
-            size_t pos = fieldName.find( '.' );
-            while ( pos != string::npos ) {
-                _prefixes.insert( StringData( field.fieldName(), pos ) );
-                pos = fieldName.find( '.', pos+1 );
-            }
-            _prefixes.insert( fieldName );
-        }
-    }
+    KeyPattern::KeyPattern( const BSONObj& pattern ): _pattern( pattern ) {}
 
     bool KeyPattern::isIdKeyPattern(const BSONObj& pattern) {
         BSONObjIterator i(pattern);
@@ -62,42 +49,64 @@ namespace mongo {
                && i.next().eoo();
     }
 
-    BSONObj KeyPattern::extractSingleKey(const BSONObj& doc ) const {
+    BSONObj KeyPattern::extractShardKeyFromQuery(const BSONObj& query) const {
+
+        if (_pattern.isEmpty())
+            return BSONObj();
+
+        if (mongoutils::str::equals(_pattern.firstElement().valuestrsafe(), "hashed")) {
+            BSONElement fieldVal = query.getFieldDotted(_pattern.firstElementFieldName());
+            return BSON(_pattern.firstElementFieldName() <<
+                        BSONElementHasher::hash64(fieldVal , BSONElementHasher::DEFAULT_HASH_SEED));
+        }
+
+        return query.extractFields(_pattern);
+    }
+
+    bool KeyPattern::isOrderedKeyPattern(const BSONObj& pattern) {
+        return IndexNames::BTREE == IndexNames::findPluginName(pattern);
+    }
+
+    BSONObj KeyPattern::extractShardKeyFromDoc(const BSONObj& doc) const {
+        BSONMatchableDocument matchable(doc);
+        return extractShardKeyFromMatchable(matchable);
+    }
+
+    BSONObj KeyPattern::extractShardKeyFromMatchable(const MatchableDocument& matchable) const {
+
         if ( _pattern.isEmpty() )
             return BSONObj();
 
-        if ( mongoutils::str::equals( _pattern.firstElement().valuestrsafe() , "hashed" ) ){
-            BSONElement fieldVal = doc.getFieldDotted( _pattern.firstElementFieldName() );
-            return BSON( _pattern.firstElementFieldName() <<
-                         BSONElementHasher::hash64( fieldVal ,
-                                                    BSONElementHasher::DEFAULT_HASH_SEED ) );
-        }
+        BSONObjBuilder keyBuilder;
 
-        return doc.extractFields( _pattern );
-    }
+        BSONObjIterator patternIt(_pattern);
+        while (patternIt.more()) {
 
-    bool KeyPattern::isSpecial() const {
-        BSONForEach(e, _pattern) {
-            int fieldVal = e.numberInt();
-            if ( fieldVal != 1 && fieldVal != -1 ){
-                return true;
+            BSONElement patternEl = patternIt.next();
+            ElementPath path;
+            path.init(patternEl.fieldName());
+
+            MatchableDocument::IteratorHolder matchIt(&matchable, &path);
+            if (!matchIt->more())
+                return BSONObj();
+            BSONElement matchEl = matchIt->next().element();
+            // We sometimes get eoo(), apparently
+            if (matchEl.eoo() || matchIt->more())
+                return BSONObj();
+
+            if (mongoutils::str::equals(patternEl.valuestrsafe(), "hashed")) {
+                keyBuilder.append(patternEl.fieldName(),
+                                  BSONElementHasher::hash64(matchEl,
+                                                            BSONElementHasher::DEFAULT_HASH_SEED));
+            }
+            else {
+                // NOTE: The matched element may *not* have the same field name as the path -
+                // index keys don't contain field names, for example
+                keyBuilder.appendAs(matchEl, patternEl.fieldName());
             }
         }
-        return false;
-    }
 
-    bool KeyPattern::isCoveredBy( const KeyPattern& other ) const {
-        BSONForEach( e, _pattern ) {
-            BSONElement otherfield = other.getField( e.fieldName() );
-            if ( otherfield.eoo() ){
-                return false;
-            }
-
-            if ( otherfield.numberInt() != 1 && otherfield.numberInt() != -1 && otherfield != e ){
-                return false;
-            }
-        }
-        return true;
+        return keyBuilder.obj();
     }
 
     BSONObj KeyPattern::extendRangeBound( const BSONObj& bound , bool makeUpperInclusive ) const {
@@ -135,7 +144,7 @@ namespace mongo {
         return newBound.obj();
     }
 
-    BoundList KeyPattern::keyBounds( const BSONObj& keyPattern, const IndexBounds& indexBounds ) {
+    BoundList KeyPattern::flattenBounds( const BSONObj& keyPattern, const IndexBounds& indexBounds ) {
         invariant(indexBounds.fields.size() == (size_t)keyPattern.nFields());
 
         // If any field is unsatisfied, return empty bound list.

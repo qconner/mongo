@@ -34,10 +34,11 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/thread/thread.hpp>
+#include <iomanip>
 #include <fstream>
 
 #include "mongo/db/db.h"
@@ -50,6 +51,7 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
+#include "mongo/util/allocator.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
 #include "mongo/util/concurrency/qlock.h"
@@ -135,7 +137,7 @@ namespace PerfTests {
 
                 boost::shared_ptr<DBClientConnection> c(new DBClientConnection(false, 0, 60));
                 string err;
-                if( c->connect("perfdb.10gen.cc", err) ) {
+                if( c->connect(HostAndPort("perfdb.10gen.cc"), err) ) {
                     if( !c->auth("perf", "perf", pwd, err) ) {
                         cout << "info: authentication with stats db failed: " << err << endl;
                         verify(false);
@@ -896,7 +898,7 @@ namespace PerfTests {
         virtual bool showDurStats() { return false; }
         virtual int howLongMillis() { return 4000; }
         void prep() {
-            p = malloc(sz);
+            p = mongoMalloc(sz);
             // this isn't a fair test as it is mostly rands but we just want a rough perf check
             static int last;
             for (unsigned i = 0; i<sz; i++) {

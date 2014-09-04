@@ -33,7 +33,7 @@
 #include "mongo/db/field_ref.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 
 namespace mongo {
     namespace {
@@ -61,9 +61,9 @@ namespace mongo {
         return _collection;
     }
 
-    const UpdateIndexData* UpdateLifecycleImpl::getIndexKeys() const {
+    const UpdateIndexData* UpdateLifecycleImpl::getIndexKeys(OperationContext* opCtx) const {
         if (_collection)
-            return &_collection->infoCache()->indexKeys();
+            return &_collection->infoCache()->indexKeys(opCtx);
         return NULL;
     }
 

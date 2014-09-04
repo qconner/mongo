@@ -62,7 +62,7 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/file.h"
@@ -162,6 +162,8 @@ namespace repl {
                 theReplSet->lastH = h;
                 ctx.getClient()->setLastOp( ts );
 
+                ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+                replCoord->setMyLastOptime(txn, ts);
                 BackgroundSync::notify();
             }
         }
@@ -322,6 +324,9 @@ namespace repl {
             theReplSet->lastOpTimeWritten = ts;
             theReplSet->lastH = hashNew;
             ctx.getClient()->setLastOp( ts );
+
+            ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+            replCoord->setMyLastOptime(txn, ts);
         }
         wunit.commit();
 
@@ -385,6 +390,9 @@ namespace repl {
         checkOplogInsert( localOplogMainCollection->insertDocument( txn, &writer, false ) );
 
         ctx.getClient()->setLastOp( ts );
+
+        ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+        replCoord->setMyLastOptime(txn, ts);
         wunit.commit();
     }
 
@@ -635,7 +643,7 @@ namespace repl {
                     // but keep it just in case
                     RARELY if ( indexCatalog
                                  && !collection->isCapped()
-                                 && !indexCatalog->haveIdIndex() ) {
+                                 && !indexCatalog->haveIdIndex(txn) ) {
                         try {
                             Helpers::ensureIndex(txn, collection, BSON("_id" << 1), true, "_id_");
                         }
@@ -670,7 +678,7 @@ namespace repl {
 
             // probably don't need this since all replicated colls have _id indexes now
             // but keep it just in case
-            RARELY if ( indexCatalog && !collection->isCapped() && !indexCatalog->haveIdIndex() ) {
+            RARELY if ( indexCatalog && !collection->isCapped() && !indexCatalog->haveIdIndex(txn) ) {
                 try {
                     Helpers::ensureIndex(txn, collection, BSON("_id" << 1), true, "_id_");
                 }
@@ -710,9 +718,9 @@ namespace repl {
                     // thus this is not ideal.
                     else {
                         if (collection == NULL ||
-                            (indexCatalog->haveIdIndex() && Helpers::findById(txn, collection, updateCriteria).isNull()) ||
+                            (indexCatalog->haveIdIndex(txn) && Helpers::findById(txn, collection, updateCriteria).isNull()) ||
                             // capped collections won't have an _id index
-                            (!indexCatalog->haveIdIndex() && Helpers::findOne(txn, collection, updateCriteria, false).isNull())) {
+                            (!indexCatalog->haveIdIndex(txn) && Helpers::findOne(txn, collection, updateCriteria, false).isNull())) {
                             failedUpdate = true;
                             log() << "replication couldn't find doc: " << op.toString() << endl;
                         }

@@ -30,6 +30,8 @@
 
 #include <set>
 
+#include "mongo/base/init.h"
+#include "mongo/base/initializer.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/operation_context_impl.h"
@@ -39,11 +41,15 @@
 
 namespace mongo {
 
+    MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
+        setGlobalEnvironment(new GlobalEnvironmentMongoD());
+        return Status::OK();
+    }
+
     GlobalEnvironmentMongoD::GlobalEnvironmentMongoD()
         : _globalKill(false),
-          _registeredOpContextsMutex("RegisteredOpContextsMutex") {
-
-    }
+          _registeredOpContextsMutex("RegisteredOpContextsMutex"),
+          _storageEngine(NULL) { }
 
     GlobalEnvironmentMongoD::~GlobalEnvironmentMongoD() {
         if (!_registeredOpContexts.empty()) {
@@ -52,27 +58,48 @@ namespace mongo {
     }
 
     StorageEngine* GlobalEnvironmentMongoD::getGlobalStorageEngine() {
-        return globalStorageEngine;
+        // We don't check that globalStorageEngine is not-NULL here intentionally.  We can encounter
+        // an error before it's initialized and proceed to exitCleanly which is equipped to deal
+        // with a NULL storage engine.
+        return _storageEngine;
     }
 
-    namespace {
-        void interruptJs(unsigned int op) {
-            if (!globalScriptEngine) {
-                return;
-            }
+    void GlobalEnvironmentMongoD::setGlobalStorageEngine(const std::string& name) {
+        // This should be set once.
+        invariant(!_storageEngine);
 
-            if (!op) {
-                globalScriptEngine->interruptAll();
-            }
-            else {
-                globalScriptEngine->interrupt(op);
-            }
-        }
-    }  // namespace
+        const StorageEngine::Factory* factory = _storageFactories[name];
+
+        uassert(18656, "cannot start database with an unknown storage engine: " + name, factory);
+        _storageEngine = factory->create(storageGlobalParams);
+        _storageEngine->finishInit();
+    }
+
+    void GlobalEnvironmentMongoD::registerStorageEngine(const std::string& name,
+                                                        const StorageEngine::Factory* factory) {
+        // No double-registering.
+        invariant(0 == _storageFactories.count(name));
+
+        // Some sanity checks: the factory must exist,
+        invariant(factory);
+
+        // and all factories should be added before we pick a storage engine.
+        invariant(NULL == _storageEngine);
+
+        _storageFactories[name] = factory;
+    }
 
     void GlobalEnvironmentMongoD::setKillAllOperations() {
+        scoped_lock clientLock(Client::clientsMutex);
         _globalKill = true;
-        interruptJs(0);
+        for (size_t i = 0; i < _killOpListeners.size(); i++) {
+            try {
+                _killOpListeners[i]->interruptAll();
+            }
+            catch (...) {
+                std::terminate();
+            }
+        }
     }
 
     bool GlobalEnvironmentMongoD::getKillAllOperations() {
@@ -102,14 +129,27 @@ namespace mongo {
                 }
             }
         }
-        if ( found ) {
-            interruptJs( opId );
+
+        if (found) {
+            for (size_t i = 0; i < _killOpListeners.size(); i++) {
+                try {
+                    _killOpListeners[i]->interrupt(opId);
+                }
+                catch (...) {
+                    std::terminate();
+                }
+            }
         }
         return found;
     }
 
     void GlobalEnvironmentMongoD::unsetKillAllOperations() {
         _globalKill = false;
+    }
+
+    void GlobalEnvironmentMongoD::registerKillOpListener(KillOpListenerInterface* listener) {
+        scoped_lock clientLock(Client::clientsMutex);
+        _killOpListeners.push_back(listener);
     }
 
     void GlobalEnvironmentMongoD::registerOperationContext(OperationContext* txn) {

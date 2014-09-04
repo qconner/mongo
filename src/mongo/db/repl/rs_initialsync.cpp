@@ -47,6 +47,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/rslog.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -121,7 +122,6 @@ namespace repl {
 
             // Make database stable
             Lock::DBWrite dbWrite(txn->lockState(), db);
-            WriteUnitOfWork wunit(txn);
 
             if (!cloner.go(txn, db, master, options, NULL, err, &errCode)) {
                 sethbmsg(str::stream() << "initial sync: error while "
@@ -130,7 +130,6 @@ namespace repl {
                                        << "sleeping 5 minutes" ,0);
                 return false;
             }
-            wunit.commit();
         }
 
         return true;
@@ -142,7 +141,7 @@ namespace repl {
         Collection* collection = ctx.ctx().db()->getCollection(txn, rsoplog);
 
         // temp
-        if( collection->numRecords() == 0 )
+        if( collection->numRecords(txn) == 0 )
             return; // already empty, ok.
 
         LOG(1) << "replSet empty oplog" << rsLog;
@@ -298,7 +297,7 @@ namespace repl {
             minValid = r->getLastOp(rsoplog);
         } catch ( SocketException & ) {
             log() << "connection lost to " << source->h().toString() << "; is your tcp keepalive interval set appropriately?";
-            if( !r->connect(source->h().toString()) ) {
+            if( !r->connect(source->h()) ) {
                 sethbmsg( str::stream() << "initial sync couldn't connect to " << source->h().toString() , 0);
                 throw;
             }
@@ -381,7 +380,7 @@ namespace repl {
         string sourceHostname = source->h().toString();
         init.setHostname(sourceHostname);
         OplogReader r;
-        if( !r.connect(sourceHostname) ) {
+        if( !r.connect(source->h()) ) {
             sethbmsg( str::stream() << "initial sync couldn't connect to " << source->h().toString() , 0);
             sleepsecs(15);
             return;

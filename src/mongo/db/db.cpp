@@ -52,7 +52,6 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/d_globals.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/dbwebserver.h"
@@ -85,7 +84,6 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/db/ttl.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/d_writeback.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/background.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
@@ -237,7 +235,7 @@ namespace mongo {
     static void logStartup() {
         BSONObjBuilder toLog;
         stringstream id;
-        id << getHostNameCached() << "-" << jsTime();
+        id << getHostNameCached() << "-" << jsTime().asInt64();
         toLog.append( "_id", id.str() );
         toLog.append( "hostname", getHostNameCached() );
 
@@ -313,7 +311,7 @@ namespace mongo {
             if ( !coll )
                 continue;
 
-            if ( coll->getIndexCatalog()->findIdIndex() )
+            if ( coll->getIndexCatalog()->findIdIndex( txn ) )
                 continue;
 
             log() << "WARNING: the collection '" << *i
@@ -332,7 +330,6 @@ namespace mongo {
 
         OperationContextImpl txn;
         Lock::GlobalWrite lk(txn.lockState());
-        WriteUnitOfWork wunit(&txn);
 
         vector< string > dbNames;
 
@@ -405,7 +402,6 @@ namespace mongo {
                 dbHolder().close( &txn, dbName );
             }
         }
-        wunit.commit();
 
         LOG(1) << "done repairDatabases" << endl;
     }
@@ -588,7 +584,7 @@ namespace mongo {
             snmpInit();
         }
 
-        initGlobalStorageEngine();
+        getGlobalEnvironment()->setGlobalStorageEngine(storageGlobalParams.engine);
 
         boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
 
@@ -643,7 +639,8 @@ namespace mongo {
         if (serverGlobalParams.isHttpInterfaceEnabled)
             snapshotThread.go();
 
-        d.clientCursorMonitor.go();
+        startClientCursorMonitor();
+
         PeriodicTask::startRunningPeriodicTasks();
         if (missingRepl) {
             // a warning was logged earlier
@@ -834,11 +831,6 @@ MONGO_INITIALIZER_GENERAL(CreateAuthorizationManager,
     return Status::OK();
 }
 
-MONGO_INITIALIZER(SetGlobalConfigExperiment)(InitializerContext* context) {
-    setGlobalEnvironment(new GlobalEnvironmentMongoD());
-    return Status::OK();
-}
-
 namespace {
     repl::ReplSettings replSettings;
 } // namespace
@@ -849,7 +841,8 @@ namespace mongo {
     }
 } // namespace mongo
 
-MONGO_INITIALIZER(CreateReplicationManager)(InitializerContext* context) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager, ("SetGlobalEnvironment"))
+        (InitializerContext* context) {
     repl::setGlobalReplicationCoordinator(new repl::HybridReplicationCoordinator(replSettings));
     return Status::OK();
 }

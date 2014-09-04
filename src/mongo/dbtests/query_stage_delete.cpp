@@ -30,6 +30,7 @@
  * This file tests db/exec/delete.cpp.
  */
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/delete.h"
@@ -143,7 +144,7 @@ namespace QueryStageDelete {
             // Remove locs[targetDocIndex];
             deleteStage.saveState();
             deleteStage.invalidate(locs[targetDocIndex], INVALIDATION_DELETION);
-            BSONObj targetDoc = coll->docFor(locs[targetDocIndex]);
+            BSONObj targetDoc = coll->docFor(&_txn, locs[targetDocIndex]);
             ASSERT(!targetDoc.isEmpty());
             remove(targetDoc);
             deleteStage.restoreState(&_txn);

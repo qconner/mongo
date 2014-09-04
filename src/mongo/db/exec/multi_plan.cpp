@@ -52,8 +52,11 @@ namespace mongo {
     // static
     const char* MultiPlanStage::kStageType = "MULTI_PLAN";
 
-    MultiPlanStage::MultiPlanStage(const Collection* collection, CanonicalQuery* cq)
-        : _collection(collection),
+    MultiPlanStage::MultiPlanStage(OperationContext* txn,
+                                   const Collection* collection,
+                                   CanonicalQuery* cq)
+        : _txn(txn),
+          _collection(collection),
           _query(cq),
           _bestPlanIdx(kNoSuchPlan),
           _backupPlanIdx(kNoSuchPlan),
@@ -107,6 +110,7 @@ namespace mongo {
         if (!bestPlan.results.empty()) {
             *out = bestPlan.results.front();
             bestPlan.results.pop_front();
+            _commonStats.advanced++;
             return PlanStage::ADVANCED;
         }
 
@@ -137,10 +141,23 @@ namespace mongo {
             _backupPlanIdx = kNoSuchPlan;
         }
 
+        // Increment stats.
+        if (PlanStage::ADVANCED == state) {
+            _commonStats.advanced++;
+        }
+        else if (PlanStage::NEED_TIME == state) {
+            _commonStats.needTime++;
+        }
+
         return state;
     }
 
     void MultiPlanStage::pickBestPlan() {
+        // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
+        // execution work that happens here, so this is needed for the time accounting to
+        // make sense.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         // Run each plan some number of times. This number is at least as great as
         // 'internalQueryPlanEvaluationWorks', but may be larger for big collections.
         size_t numWorks = internalQueryPlanEvaluationWorks;
@@ -150,7 +167,7 @@ namespace mongo {
             double fraction = internalQueryPlanEvaluationCollFraction;
 
             numWorks = std::max(size_t(internalQueryPlanEvaluationWorks),
-                                size_t(fraction * _collection->numRecords()));
+                                size_t(fraction * _collection->numRecords(_txn)));
         }
 
         // We treat ntoreturn as though it is a limit during plan ranking.
@@ -414,7 +431,8 @@ namespace mongo {
 
     namespace {
 
-        void invalidateHelper(WorkingSet* ws, // may flag for review
+        void invalidateHelper(OperationContext* txn,
+                              WorkingSet* ws, // may flag for review
                               const DiskLoc& dl,
                               list<WorkingSetID>* idsToInvalidate,
                               const Collection* collection) {
@@ -424,7 +442,7 @@ namespace mongo {
                 if (member->hasLoc() && member->loc == dl) {
                     list<WorkingSetID>::iterator next = it;
                     next++;
-                    WorkingSetCommon::fetchAndInvalidateLoc(member, collection);
+                    WorkingSetCommon::fetchAndInvalidateLoc(txn, member, collection);
                     ws->flagForReview(*it);
                     idsToInvalidate->erase(it);
                     it = next;
@@ -442,17 +460,17 @@ namespace mongo {
         if (bestPlanChosen()) {
             CandidatePlan& bestPlan = _candidates[_bestPlanIdx];
             bestPlan.root->invalidate(dl, type);
-            invalidateHelper(bestPlan.ws, dl, &bestPlan.results, _collection);
+            invalidateHelper(_txn, bestPlan.ws, dl, &bestPlan.results, _collection);
             if (hasBackupPlan()) {
                 CandidatePlan& backupPlan = _candidates[_backupPlanIdx];
                 backupPlan.root->invalidate(dl, type);
-                invalidateHelper(backupPlan.ws, dl, &backupPlan.results, _collection);
+                invalidateHelper(_txn, backupPlan.ws, dl, &backupPlan.results, _collection);
             }
         }
         else {
             for (size_t ix = 0; ix < _candidates.size(); ++ix) {
                 _candidates[ix].root->invalidate(dl, type);
-                invalidateHelper(_candidates[ix].ws, dl, &_candidates[ix].results, _collection);
+                invalidateHelper(_txn, _candidates[ix].ws, dl, &_candidates[ix].results, _collection);
             }
         }
     }

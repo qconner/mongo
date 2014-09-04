@@ -36,6 +36,8 @@
 namespace mongo {
 namespace repl {
 
+    class ReplSetConfig;
+
     /**
      * An implementation of ReplicationCoordinator that will evolve with ReplicationCoordinatorImpl
      * to aid in the transition from LegacyReplicationCoordinator to ReplicationCoordinatorImpl and
@@ -93,9 +95,11 @@ namespace repl {
 
         virtual Status setLastOptime(OperationContext* txn, const OID& rid, const OpTime& ts);
 
+        virtual Status setMyLastOptime(OperationContext* txn, const OpTime& ts);
+
         virtual OID getElectionId();
 
-        virtual OID getMyRID(OperationContext* txn);
+        virtual OID getMyRID();
 
         virtual void prepareReplSetUpdatePositionCommand(OperationContext* txn,
                                                          BSONObjBuilder* cmdBuilder);
@@ -114,7 +118,7 @@ namespace repl {
                                                  bool activate,
                                                  BSONObjBuilder* resultObj);
 
-        virtual Status processReplSetSyncFrom(const std::string& target,
+        virtual Status processReplSetSyncFrom(const HostAndPort& target,
                                               BSONObjBuilder* resultObj);
 
         virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj);
@@ -157,6 +161,13 @@ namespace repl {
         virtual Status checkReplEnabledForCommand(BSONObjBuilder* result);
 
         virtual bool isReplEnabled() const;
+
+        /**
+         * This is a temporary hack to force _impl to set its replset config to the one loaded by
+         * _legacy.
+         * TODO(spencer): Remove this once ReplicationCoordinatorImpl can load its own config.
+         */
+        void setImplConfigHack(const ReplSetConfig* config);
 
     private:
         LegacyReplicationCoordinator _legacy;

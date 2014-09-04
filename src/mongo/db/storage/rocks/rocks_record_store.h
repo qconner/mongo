@@ -64,9 +64,9 @@ namespace mongo {
         // name of the RecordStore implementation
         virtual const char* name() const { return "rocks"; }
 
-        virtual long long dataSize() const { return _dataSize; }
+        virtual long long dataSize( OperationContext* txn ) const { return _dataSize; }
 
-        virtual long long numRecords() const { return _numRecords; }
+        virtual long long numRecords( OperationContext* txn ) const { return _numRecords; }
 
         virtual bool isCapped() const { return _isCapped; }
 
@@ -76,7 +76,7 @@ namespace mongo {
 
         // CRUD related
 
-        virtual RecordData dataFor( const DiskLoc& loc ) const;
+        virtual RecordData dataFor( OperationContext* txn, const DiskLoc& loc ) const;
 
         virtual void deleteRecord( OperationContext* txn, const DiskLoc& dl );
 
@@ -145,12 +145,18 @@ namespace mongo {
         bool cappedMaxDocs() const { invariant(_isCapped); return _cappedMaxDocs; }
         bool cappedMaxSize() const { invariant(_isCapped); return _cappedMaxSize; }
 
+        /**
+         * Drops metadata held by the record store
+         */
+        void dropRsMetaData( OperationContext* opCtx );
+
         static rocksdb::Comparator* newRocksCollectionComparator();
     private:
 
         class Iterator : public RecordIterator {
         public:
-            Iterator( const RocksRecordStore* rs,
+            Iterator( OperationContext* txn,
+                      const RocksRecordStore* rs,
                       const CollectionScanParams::Direction& dir,
                       const DiskLoc& start );
 
@@ -166,8 +172,11 @@ namespace mongo {
             bool _forward() const;
             void _checkStatus();
 
+            OperationContext* _txn;
             const RocksRecordStore* _rs;
             CollectionScanParams::Direction _dir;
+            bool _reseekKeyValid;
+            std::string _reseekKey;
             boost::scoped_ptr<rocksdb::Iterator> _iterator;
         };
 
@@ -203,8 +212,14 @@ namespace mongo {
         AtomicUInt64 _nextIdNum;
         long long _dataSize;
         long long _numRecords;
-        rocksdb::ReadOptions _defaultReadOptions;
-        mutable boost::mutex _numRecordsLock;
-        mutable boost::mutex _dataSizeLock;
+
+        const string _dataSizeKey;
+        const string _numRecordsKey;
+
+        // locks
+        // TODO I think that when you get one of these, you generally need to acquire the other.
+        // These could probably be moved into a single lock.
+        boost::mutex _numRecordsLock;
+        boost::mutex _dataSizeLock;
     };
 }

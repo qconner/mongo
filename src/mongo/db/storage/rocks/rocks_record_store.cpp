@@ -58,11 +58,12 @@ namespace mongo {
           _cappedMaxSize( cappedMaxSize ),
           _cappedMaxDocs( cappedMaxDocs ),
           _cappedDeleteCallback( cappedDeleteCallback ),
-          // Set default options (XXX should custom options be persistent?)
-          _defaultReadOptions( ) {
+          _dataSizeKey( ns.toString() + "-dataSize" ),
+          _numRecordsKey( ns.toString() + "-numRecords" ) {
         invariant( _db );
         invariant( _columnFamily );
         invariant( _metadataColumnFamily );
+        invariant( _columnFamily != _metadataColumnFamily );
 
         if (_isCapped) {
             invariant(_cappedMaxSize > 0);
@@ -94,7 +95,7 @@ namespace mongo {
         // XXX not using a Snapshot here
         if (!_db->Get( _readOptions(),
                        _metadataColumnFamily,
-                       rocksdb::Slice("numRecords"),
+                       rocksdb::Slice( _numRecordsKey ),
                        &value ).ok()) {
             _numRecords = 0;
             metadataPresent = false;
@@ -106,7 +107,7 @@ namespace mongo {
         // XXX not using a Snapshot here
         if (!_db->Get( _readOptions(),
                        _metadataColumnFamily,
-                       rocksdb::Slice("dataSize"),
+                       rocksdb::Slice( _dataSizeKey ),
                        &value ).ok()) {
             _dataSize = 0;
             invariant(!metadataPresent);
@@ -126,7 +127,7 @@ namespace mongo {
         return static_cast<int64_t>( storageSize );
     }
 
-    RecordData RocksRecordStore::dataFor( const DiskLoc& loc) const {
+    RecordData RocksRecordStore::dataFor( OperationContext* txn, const DiskLoc& loc) const {
         // TODO investigate using cursor API to get a Slice and avoid double copying.
         std::string value;
 
@@ -306,7 +307,7 @@ namespace mongo {
                                                    ) const {
         invariant( !tailable );
 
-        return new Iterator( this, dir, start );
+        return new Iterator( txn, this, dir, start );
     }
 
 
@@ -354,9 +355,11 @@ namespace mongo {
         // TODO validate that _numRecords and _dataSize are correct in scanData mode
         if ( scanData ) {
             bool invalidObject = false;
+            size_t numRecords = 0;
             boost::scoped_ptr<RecordIterator> iter( getIterator( txn ) );
             while( !iter->isEOF() ) {
-                RecordData data = dataFor( iter->curr() );
+                numRecords++;
+                RecordData data = dataFor( txn, iter->curr() );
                 size_t dataSize;
                 const Status status = adaptor->validate( data, &dataSize );
                 if (!status.isOK()) {
@@ -369,7 +372,11 @@ namespace mongo {
                 }
                 iter->getNext();
             }
+            output->appendNumber("nrecords", numRecords);
         }
+        else
+            output->appendNumber("nrecords", _numRecords);
+
         return Status::OK();
     }
 
@@ -391,27 +398,12 @@ namespace mongo {
     Status RocksRecordStore::setCustomOption( OperationContext* txn,
                                               const BSONElement& option,
                                               BSONObjBuilder* info ) {
-        // TODO make these options persistent
-        // NOTE can't do write options here as writes are done in a write batch which is held in
-        // a recovery unit
         string optionName = option.fieldName();
-        if ( !option.isBoolean() ) {
-            return Status( ErrorCodes::BadValue, "Invalid Value" );
-        }
-        if ( optionName.compare( "verify_checksums" ) == 0 ) {
-            _defaultReadOptions.verify_checksums = option.boolean();
-        }
-        else if ( optionName.compare( "fill_cache" ) == 0 ) {
-            _defaultReadOptions.fill_cache = option.boolean();
-        }
-        else if ( optionName.compare("tailing") == 0 ) {
-            _defaultReadOptions.tailing = option.boolean();
-        }
-        else {
-            return Status( ErrorCodes::BadValue, "Invalid Option" );
+        if ( optionName == "usePowerOf2Sizes" ) {
+            return Status::OK();
         }
 
-        return Status::OK();
+        return Status( ErrorCodes::BadValue, "Invalid option: " + optionName );
     }
 
     namespace {
@@ -456,7 +448,7 @@ namespace mongo {
                 getIterator( txn, maxDiskLoc, false, CollectionScanParams::BACKWARD ) );
 
         while( !iter->isEOF() ) {
-            WriteUnitOfWork wu( _getRecoveryUnit( txn ) );
+            WriteUnitOfWork wu( txn );
             DiskLoc loc = iter->getNext();
             if ( loc < end || ( !inclusive && loc == end))
                 return;
@@ -466,8 +458,18 @@ namespace mongo {
         }
     }
 
+    void RocksRecordStore::dropRsMetaData( OperationContext* opCtx ) {
+        RocksRecoveryUnit* ru = _getRecoveryUnit( opCtx );
+
+        boost::mutex::scoped_lock dataSizeLk( _dataSizeLock );
+        ru->writeBatch()->Delete( _metadataColumnFamily, _dataSizeKey );
+
+        boost::mutex::scoped_lock numRecordsLk( _numRecordsLock );
+        ru->writeBatch()->Delete( _metadataColumnFamily, _numRecordsKey );
+    }
+
     rocksdb::ReadOptions RocksRecordStore::_readOptions( OperationContext* opCtx ) const {
-        rocksdb::ReadOptions options( _defaultReadOptions );
+        rocksdb::ReadOptions options;
         if ( opCtx ) {
             options.snapshot = _getRecoveryUnit( opCtx )->snapshot();
         }
@@ -507,10 +509,9 @@ namespace mongo {
         }
         RocksRecoveryUnit* ru = _getRecoveryUnit( txn );
         const char* nr_ptr = reinterpret_cast<char*>( &_numRecords );
-        const std::string nr_key_string = "numRecords";
 
         ru->writeBatch()->Put( _metadataColumnFamily,
-                               rocksdb::Slice( nr_key_string ),
+                               rocksdb::Slice( _numRecordsKey ),
                                rocksdb::Slice( nr_ptr, sizeof(long long) ) );
     }
 
@@ -521,20 +522,22 @@ namespace mongo {
         _dataSize += amount;
         RocksRecoveryUnit* ru = _getRecoveryUnit( txn );
         const char* ds_ptr = reinterpret_cast<char*>( &_dataSize );
-        const std::string ds_key_string = "dataSize";
 
         ru->writeBatch()->Put( _metadataColumnFamily,
-                               rocksdb::Slice( ds_key_string ),
+                               rocksdb::Slice( _dataSizeKey ),
                                rocksdb::Slice( ds_ptr, sizeof(long long) ) );
     }
 
     // --------
 
-    RocksRecordStore::Iterator::Iterator( const RocksRecordStore* rs,
+    RocksRecordStore::Iterator::Iterator( OperationContext* txn,
+                                          const RocksRecordStore* rs,
                                           const CollectionScanParams::Direction& dir,
                                           const DiskLoc& start )
-        : _rs( rs ),
+        : _txn( txn ),
+          _rs( rs ),
           _dir( dir ),
+          _reseekKeyValid( false ),
           // XXX not using a snapshot here
           _iterator( _rs->_db->NewIterator( rs->_readOptions(), rs->_columnFamily ) ) {
         if (start.isNull()) {
@@ -594,16 +597,32 @@ namespace mongo {
     }
 
     void RocksRecordStore::Iterator::saveState() {
-        // TODO delete iterator, store information
+        if ( !_iterator ) {
+            return;
+        }
+        if ( _iterator->Valid() ) {
+            _reseekKey = _iterator->key().ToString();
+            _reseekKeyValid = true;
+        }
     }
 
     bool RocksRecordStore::Iterator::restoreState() {
-        // TODO set iterator to same place as before, but with new snapshot
+        if ( !_reseekKeyValid ) {
+          _iterator.reset( NULL );
+          return true;
+        }
+        _iterator.reset( _rs->_db->NewIterator( _rs->_readOptions(),
+                                                _rs->_columnFamily ) );
+        _checkStatus();
+        _iterator->Seek( _reseekKey );
+        _checkStatus();
+        _reseekKeyValid = false;
+
         return true;
     }
 
     RecordData RocksRecordStore::Iterator::dataFor( const DiskLoc& loc ) const {
-        return _rs->dataFor( loc );
+        return _rs->dataFor( _txn, loc );
     }
 
     bool RocksRecordStore::Iterator::_forward() const {

@@ -42,7 +42,7 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
@@ -144,10 +144,13 @@ namespace mongo {
                 WriteUnitOfWork wunit(txn);
                 collection = db->createCollection( txn, ns.ns() );
                 invariant( collection );
+                if (!fromRepl) {
+                    repl::logOp(txn, "c", (dbname + ".$cmd").c_str(), BSON("create" << ns.coll()));
+                }
                 wunit.commit();
             }
 
-            result.append( "numIndexesBefore", collection->getIndexCatalog()->numIndexesTotal() );
+            result.append( "numIndexesBefore", collection->getIndexCatalog()->numIndexesTotal(txn) );
 
             MultiIndexBlock indexer(txn, collection);
             indexer.allowBackgroundBuilding();
@@ -195,7 +198,7 @@ namespace mongo {
                 wunit.commit();
             }
 
-            result.append( "numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal() );
+            result.append( "numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal(txn) );
 
             return true;
         }

@@ -37,6 +37,7 @@
 #include "mongo/base/counter.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -133,7 +134,7 @@ namespace mongo {
                         break;
                     }
 
-                    if ( collection->getIndexCatalog()->findIndexByKeyPattern( key ) == NULL ) {
+                    if ( collection->getIndexCatalog()->findIndexByKeyPattern( txn, key ) == NULL ) {
                         // index not finished yet
                         LOG(1) << " skipping index because not finished";
                         continue;

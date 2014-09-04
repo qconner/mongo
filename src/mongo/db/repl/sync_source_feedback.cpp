@@ -42,6 +42,7 @@
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/rslog.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/log.h"
 
@@ -135,15 +136,15 @@ namespace repl {
         return true;
     }
 
-    bool SyncSourceFeedback::_connect(OperationContext* txn, const std::string& hostName) {
+    bool SyncSourceFeedback::_connect(OperationContext* txn, const HostAndPort& host) {
         if (hasConnection()) {
             return true;
         }
-        log() << "replset setting syncSourceFeedback to " << hostName << rsLog;
+        log() << "replset setting syncSourceFeedback to " << host.toString() << rsLog;
         _connection.reset(new DBClientConnection(false, 0, OplogReader::tcp_timeout));
         string errmsg;
         try {
-            if (!_connection->connect(hostName.c_str(), errmsg) ||
+            if (!_connection->connect(host, errmsg) ||
                 (getGlobalAuthorizationManager()->isAuthEnabled() && !replAuthenticate())) {
                 _resetConnection();
                 log() << "repl: " << errmsg << endl;
@@ -151,7 +152,7 @@ namespace repl {
             }
         }
         catch (const DBException& e) {
-            log() << "Error connecting to " << hostName << ": " << e.what();
+            log() << "Error connecting to " << host.toString() << ": " << e.what();
             _resetConnection();
             return false;
         }
@@ -238,6 +239,7 @@ namespace repl {
 
             MemberState state = replCoord->getCurrentMemberState();
             if (state.primary() || state.fatal() || state.startup()) {
+                _resetConnection();
                 continue;
             }
             const Member* target = BackgroundSync::get()->getSyncTarget();
@@ -251,7 +253,7 @@ namespace repl {
                     sleepmillis(500);
                     continue;
                 }
-                if (!_connect(&txn, target->fullName())) {
+                if (!_connect(&txn, target->h())) {
                     sleepmillis(500);
                     continue;
                 }

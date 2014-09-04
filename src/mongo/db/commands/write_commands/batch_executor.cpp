@@ -58,7 +58,7 @@
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/collection_metadata.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/write_ops/batched_upsert_detail.h"
 #include "mongo/s/write_ops/write_error_detail.h"
@@ -942,6 +942,10 @@ namespace mongo {
                                             request->getTargetingNS())));
                 return false;
             }
+            repl::logOp(txn,
+                        "c",
+                        (database->name() + ".$cmd").c_str(),
+                        BSON("create" << nsToCollectionSubstring(request->getTargetingNS())));
             wunit.commit();
         }
         return true;
@@ -1116,7 +1120,7 @@ namespace mongo {
         }
 
         ///////////////////////////////////////////
-        Lock::DBWrite writeLock(txn->lockState(), nsString.ns(), useExperimentalDocLocking);
+        Lock::DBWrite writeLock(txn->lockState(), nsString.ns());
         ///////////////////////////////////////////
 
         if (!checkShardVersion(txn, &shardingState, *updateItem.getRequest(), result))

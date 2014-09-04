@@ -74,7 +74,7 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
@@ -112,7 +112,6 @@ namespace mongo {
 #define LOGWITHRATELIMIT if( ++nloggedsome < 1000 || nloggedsome % 100 == 0 )
 
     string dbExecCommand;
-
 
     MONGO_FP_DECLARE(rsStopGetMore);
 
@@ -432,7 +431,7 @@ namespace mongo {
         bool shouldLog = logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1));
 
         if ( op == dbQuery ) {
-            if ( handlePossibleShardedMessage( m , &dbresponse ) )
+            if (!checkShardVersion(m, &dbresponse))
                 return;
             receivedQuery(txn, c , dbresponse, m );
         }
@@ -476,6 +475,17 @@ namespace mongo {
                 else {
                     const char* ns = dbmsg.getns();
                     const NamespaceString nsString(ns);
+
+                    if (remote != DBDirectClient::dummyHost) {
+                        const ShardedConnectionInfo* connInfo = ShardedConnectionInfo::get(false);
+                        uassert(18663,
+                                str::stream() << "legacy writeOps not longer supported for "
+                                              << "versioned connections, ns: " << string(ns)
+                                              << ", op: " << opToString(op)
+                                              << ", remote: " << remote.toString()
+                                              << ", serverId: " << connInfo->getID(),
+                                connInfo == NULL);
+                    }
 
                     if (!nsString.isValid()) {
                         uassert(16257, str::stream() << "Invalid ns [" << ns << "]", false);
@@ -603,13 +613,7 @@ namespace mongo {
         UpdateExecutor executor(&request, &op.debug());
         uassertStatusOK(executor.prepare());
 
-        Lock::DBWrite lk(txn->lockState(), ns.ns(), useExperimentalDocLocking);
-
-        // if this ever moves to outside of lock, need to adjust check
-        // Client::Context::_finishInit
-        if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
-            return;
-
+        Lock::DBWrite lk(txn->lockState(), ns.ns());
         Client::Context ctx(txn,  ns );
 
         UpdateResult res = executor.execute(ctx.db());
@@ -626,7 +630,6 @@ namespace mongo {
         op.debug().ns = ns.ns().c_str();
         int flags = d.pullInt();
         bool justOne = flags & RemoveOption_JustOne;
-        bool broadcast = flags & RemoveOption_Broadcast;
         verify( d.moreJSObjs() );
         BSONObj pattern = d.nextJsObj();
 
@@ -643,12 +646,8 @@ namespace mongo {
         request.setUpdateOpLog(true);
         DeleteExecutor executor(&request);
         uassertStatusOK(executor.prepare());
+
         Lock::DBWrite lk(txn->lockState(), ns.ns());
-
-        // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
-        if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
-            return;
-
         Client::Context ctx(txn, ns);
 
         long long n = executor.execute(ctx.db());
@@ -798,6 +797,10 @@ namespace mongo {
                 WriteUnitOfWork wunit(txn);
                 collection = ctx.db()->createCollection( txn, targetNS );
                 verify( collection );
+                repl::logOp(txn,
+                            "c",
+                            (ctx.db()->name() + ".$cmd").c_str(),
+                            BSON("create" << nsToCollectionSubstring(targetNS)));
                 wunit.commit();
             }
 
@@ -838,6 +841,10 @@ namespace mongo {
         if ( !collection ) {
             collection = ctx.db()->createCollection( txn, ns );
             verify( collection );
+            repl::logOp(txn,
+                        "c",
+                        (ctx.db()->name() + ".$cmd").c_str(),
+                        BSON("create" << nsToCollectionSubstring(ns)));
         }
 
         StatusWith<DiskLoc> status = collection->insertDocument( txn, js, true );
@@ -902,9 +909,6 @@ namespace mongo {
         uassert(10058 , "not master",
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(nsString.db()));
 
-        if ( handlePossibleShardedMessage( m , 0 ) )
-            return;
-
         Client::Context ctx(txn, ns);
 
         if (multi.size() > 1) {
@@ -949,11 +953,10 @@ namespace {
         if ( lastError._get() )
             lastError.startRequest( toSend, lastError._get() );
         DbResponse dbResponse;
-        assembleResponse( _txn, toSend, dbResponse , _clientHost );
+        assembleResponse(_txn, toSend, dbResponse, dummyHost);
         verify( dbResponse.response );
         dbResponse.response->concat(); // can get rid of this if we make response handling smarter
         response = *dbResponse.response;
-        _txn->recoveryUnit()->commitIfNeeded();
         return true;
     }
 
@@ -962,8 +965,7 @@ namespace {
         if ( lastError._get() )
             lastError.startRequest( toSend, lastError._get() );
         DbResponse dbResponse;
-        assembleResponse( _txn, toSend, dbResponse , _clientHost );
-        _txn->recoveryUnit()->commitIfNeeded();
+        assembleResponse(_txn, toSend, dbResponse, dummyHost);
     }
 
     auto_ptr<DBClientCursor> DBDirectClient::query(const string &ns, Query query, int nToReturn , int nToSkip ,
@@ -982,7 +984,7 @@ namespace {
         verify(!"killCursor should not be used in MongoD");
     }
 
-    HostAndPort DBDirectClient::_clientHost = HostAndPort( "0.0.0.0" , 0 );
+    const HostAndPort DBDirectClient::dummyHost("0.0.0.0", 0);
 
     unsigned long long DBDirectClient::count(const string &ns, const BSONObj& query, int options, int limit, int skip ) {
         if ( skip < 0 ) {
@@ -1032,7 +1034,7 @@ namespace {
         storageEngine->cleanShutdown(txn);
     }
 
-    void exitCleanly( ExitCode code ) {
+    void exitCleanly( ExitCode code, OperationContext* txn ) {
         shutdownInProgress.store(1);
 
         // Global storage engine may not be started in all cases before we exit
@@ -1042,14 +1044,18 @@ namespace {
 
             repl::getGlobalReplicationCoordinator()->shutdown();
 
-            OperationContextImpl txn;
-            Lock::GlobalWrite lk(txn.lockState());
+            if (!txn) {
+                // leaked, but we are exiting so doesn't matter
+                txn = new OperationContextImpl();
+            }
+
+            Lock::GlobalWrite lk(txn->lockState());
             log() << "now exiting" << endl;
 
             // Execute the graceful shutdown tasks, such as flushing the outstanding journal 
             // and data files, close sockets, etc.
             try {
-                shutdownServer(&txn);
+                shutdownServer(txn);
             }
             catch (const DBException& ex) {
                 severe() << "shutdown failed with DBException " << ex;

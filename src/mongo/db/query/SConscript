@@ -24,6 +24,7 @@ env.Library(
         "lite_parsed_query",
         "$BUILD_DIR/mongo/bson",
         "$BUILD_DIR/mongo/expressions",
+        "$BUILD_DIR/mongo/expressions_text",
         "$BUILD_DIR/mongo/index_names",
         "$BUILD_DIR/mongo/server_parameters",
     ],
@@ -33,13 +34,11 @@ env.Library(
     target='query',
     source=[
         "explain.cpp",
-        "explain_plan.cpp",
         "get_executor.cpp",
         "new_find.cpp",
         "plan_executor.cpp",
         "plan_ranker.cpp",
         "stage_builder.cpp",
-        "type_explain.cpp",
     ],
     LIBDEPS=[
         "query_planner",

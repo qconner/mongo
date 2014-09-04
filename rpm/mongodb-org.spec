@@ -2,7 +2,7 @@ Name: mongodb-org
 Conflicts: mongo-10gen-enterprise, mongo-10gen-enterprise-server, mongo-10gen-unstable, mongo-10gen-unstable-enterprise, mongo-10gen-unstable-enterprise-mongos, mongo-10gen-unstable-enterprise-server, mongo-10gen-unstable-enterprise-shell, mongo-10gen-unstable-enterprise-tools, mongo-10gen-unstable-mongos, mongo-10gen-unstable-server, mongo-10gen-unstable-shell, mongo-10gen-unstable-tools, mongo18-10gen, mongo18-10gen-server, mongo20-10gen, mongo20-10gen-server, mongodb, mongodb-server, mongodb-dev, mongodb-clients, mongodb-10gen, mongodb-10gen-enterprise, mongodb-10gen-unstable, mongodb-10gen-unstable-enterprise, mongodb-10gen-unstable-enterprise-mongos, mongodb-10gen-unstable-enterprise-server, mongodb-10gen-unstable-enterprise-shell, mongodb-10gen-unstable-enterprise-tools, mongodb-10gen-unstable-mongos, mongodb-10gen-unstable-server, mongodb-10gen-unstable-shell, mongodb-10gen-unstable-tools, mongodb-enterprise, mongodb-enterprise-mongos, mongodb-enterprise-server, mongodb-enterprise-shell, mongodb-enterprise-tools, mongodb-nightly, mongodb-org-unstable, mongodb-org-unstable-mongos, mongodb-org-unstable-server, mongodb-org-unstable-shell, mongodb-org-unstable-tools, mongodb-stable, mongodb18-10gen, mongodb20-10gen, mongodb-enterprise-unstable, mongodb-enterprise-unstable-mongos, mongodb-enterprise-unstable-server, mongodb-enterprise-unstable-shell, mongodb-enterprise-unstable-tools
 Obsoletes: mongo-10gen
 Provides: mongo-10gen
-Version: 2.7.5-pre-
+Version: 2.7.6-pre-
 Release: 1%{?dist}
 Summary: MongoDB open source document-oriented database system (metapackage)
 License: AGPL 3.0
@@ -163,9 +163,9 @@ mkdir -p $RPM_BUILD_ROOT/usr/share/man/man1
 cp debian/*.1 $RPM_BUILD_ROOT/usr/share/man/man1/
 # FIXME: remove this rm when mongosniff is back in the package
 rm -v $RPM_BUILD_ROOT/usr/share/man/man1/mongosniff.1*
-mkdir -p $RPM_BUILD_ROOT/etc/rc.d/init.d
-cp -v rpm/init.d-mongod $RPM_BUILD_ROOT/etc/rc.d/init.d/mongod
-chmod a+x $RPM_BUILD_ROOT/etc/rc.d/init.d/mongod
+mkdir -p $RPM_BUILD_ROOT/etc/init.d
+cp -v rpm/init.d-mongod $RPM_BUILD_ROOT/etc/init.d/mongod
+chmod a+x $RPM_BUILD_ROOT/etc/init.d/mongod
 mkdir -p $RPM_BUILD_ROOT/etc
 cp -v rpm/mongod.conf $RPM_BUILD_ROOT/etc/mongod.conf
 mkdir -p $RPM_BUILD_ROOT/etc/sysconfig
@@ -211,7 +211,7 @@ fi
 %config(noreplace) /etc/mongod.conf
 %{_bindir}/mongod
 %{_mandir}/man1/mongod.1*
-/etc/rc.d/init.d/mongod
+/etc/init.d/mongod
 /etc/sysconfig/mongod
 %attr(0755,mongod,mongod) %dir /var/lib/mongo
 %attr(0755,mongod,mongod) %dir /var/log/mongodb

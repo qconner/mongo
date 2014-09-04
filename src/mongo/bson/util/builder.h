@@ -38,6 +38,7 @@
 
 #include "mongo/bson/inline_decls.h"
 #include "mongo/base/string_data.h"
+#include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -74,8 +75,8 @@ namespace mongo {
 
     class TrivialAllocator { 
     public:
-        void* Malloc(size_t sz) { return malloc(sz); }
-        void* Realloc(void *p, size_t sz) { return realloc(p, sz); }
+        void* Malloc(size_t sz) { return mongoMalloc(sz); }
+        void* Realloc(void *p, size_t sz) { return mongoRealloc(p, sz); }
         void Free(void *p) { free(p); }
     };
 
@@ -84,18 +85,18 @@ namespace mongo {
         enum { SZ = 512 };
         void* Malloc(size_t sz) {
             if( sz <= SZ ) return buf;
-            return malloc(sz); 
+            return mongoMalloc(sz);
         }
         void* Realloc(void *p, size_t sz) { 
             if( p == buf ) {
                 if( sz <= SZ ) return buf;
-                void *d = malloc(sz);
+                void *d = mongoMalloc(sz);
                 if ( d == 0 )
                     msgasserted( 15912 , "out of memory StackAllocator::Realloc" );
                 memcpy(d, p, SZ);
                 return d;
             }
-            return realloc(p, sz); 
+            return mongoRealloc(p, sz);
         }
         void Free(void *p) { 
             if( p != buf )
@@ -268,12 +269,14 @@ namespace mongo {
     template <typename Allocator>
     class StringBuilderImpl {
     public:
-        static const size_t MONGO_DBL_SIZE = 3 + DBL_MANT_DIG - DBL_MIN_EXP;
+        // Sizes are determined based on the number of characters in 64-bit + the trailing '\0'
+        static const size_t MONGO_DBL_SIZE = 3 + DBL_MANT_DIG - DBL_MIN_EXP + 1;
         static const size_t MONGO_S32_SIZE = 12;
         static const size_t MONGO_U32_SIZE = 11;
         static const size_t MONGO_S64_SIZE = 23;
         static const size_t MONGO_U64_SIZE = 22;
         static const size_t MONGO_S16_SIZE = 7;
+        static const size_t MONGO_PTR_SIZE = 19;    // Accounts for the 0x prefix
 
         StringBuilderImpl() { }
 
@@ -301,8 +304,23 @@ namespace mongo {
         StringBuilderImpl& operator<<( short x ) {
             return SBNUM( x , MONGO_S16_SIZE , "%hd" );
         }
+        StringBuilderImpl& operator<<(const void* x) {
+            if (sizeof(x) == 8) {
+                return SBNUM(x, MONGO_PTR_SIZE, "0x%llX");
+            }
+            else {
+                return SBNUM(x, MONGO_PTR_SIZE, "0x%lX");
+            }
+        }
         StringBuilderImpl& operator<<( char c ) {
             _buf.grow( 1 )[0] = c;
+            return *this;
+        }
+        StringBuilderImpl& operator<<(const char* str) {
+            return *this << StringData(str);
+        }
+        StringBuilderImpl& operator<<(const StringData& str) {
+            append(str);
             return *this;
         }
 
@@ -322,11 +340,6 @@ namespace mongo {
         void write( const char* buf, int len) { memcpy( _buf.grow( len ) , buf , len ); }
 
         void append( const StringData& str ) { str.copyTo( _buf.grow( str.size() ), false ); }
-
-        StringBuilderImpl& operator<<( const StringData& str ) {
-            append( str );
-            return *this;
-        }
 
         void reset( int maxSize = 0 ) { _buf.reset( maxSize ); }
 
