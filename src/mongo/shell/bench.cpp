@@ -934,7 +934,7 @@ namespace mongo {
 
         OID oid = OID( argsFake.firstElement().String() );
 
-        // Get old BenchRunner object
+        // retrieve matching BenchRunner object from start of this test
         BenchRunner* runner = BenchRunner::get( oid );
 
         BSONObj finalObj = BenchRunner::finish( runner );
