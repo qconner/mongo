@@ -151,7 +151,7 @@ namespace mongo {
             "name" is the fieldname
         */
         const char * fieldName() const {
-            if ( eoo() ) return "FIELD_NOT_FOUND"; // no fieldname for it.
+            if ( eoo() ) return ""; // no fieldname for it.
             return data + 1;
         }
 

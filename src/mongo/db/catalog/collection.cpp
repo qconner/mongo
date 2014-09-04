@@ -408,14 +408,14 @@ namespace mongo {
 
     Status Collection::updateDocumentWithDamages( OperationContext* txn,
                                                   const DiskLoc& loc,
-                                                  const char* damageSource,
+                                                  const char* damangeSource,
                                                   const mutablebson::DamageVector& damages ) {
 
         // Broadcast the mutation so that query results stay correct.
         _cursorCache.invalidateDocument(loc, INVALIDATION_MUTATION);
 
         ExclusiveResourceLock lk(txn->getTransaction(), *(size_t*)&loc);
-        return _recordStore->updateWithDamages( txn, loc, damageSource, damages );
+        return _recordStore->updateWithDamages( txn, loc, damangeSource, damages );
     }
 
     bool Collection::_enforceQuota( bool userEnforeQuota ) const {
