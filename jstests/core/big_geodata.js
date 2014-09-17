@@ -80,3 +80,4 @@ coll.insert(curve);
 assert.eq(coll.count(), 8, 'test data (line strings) insert failed');
 
 
+
