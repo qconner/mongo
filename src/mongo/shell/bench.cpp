@@ -942,18 +942,4 @@ namespace mongo {
         return BSON( "" << finalObj );
     }
 
-    //  TODO: remove this code after Visual Studio 2012 is a distant memory.
-    //
-    //  MSVC as of VS2012 is missing the round() function.
-    //  floor() and ceil() are still available in VS2012.
-    //  C89 does not define round().  MSVC is on C89.
-    //  C99 does have round.
-    //  Visual C++ 2012 does not define the round function, which is not part of C90 or C++03.
-    //  round() is part of C++11 by way of the C99 Standard Library, which Visual C++ (VS2012) does not yet implement
-    //  round() may be back in VS2013.
-	double BenchRunner::round(double d)
-    {
-        return (d < 0.0 ? ceil(d - 0.5) : floor(d + 0.5) );
-    }
-
 } // namespace mongo
