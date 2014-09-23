@@ -51,7 +51,7 @@ curve.geo.coordinates = [
               [ -97.904187, 30.395457 ],
               [ -86.600836, 30.398147 ],
               [ -77.357837, 38.9589935 ],
-              [ -73.987723, 40.7575074 ],
+              [ -73.987723, 40.7575074 ]
 ];
 coll.insert(curve);
 
@@ -246,5 +246,56 @@ coll.insert(poly);
 
 // sanity check
 assert.eq(coll.count(), 20, 'test data (Polygons 3) insert failed');
+
+
+// MultiPoint
+var multiPoint = {};
+multiPoint.geo = {};
+multiPoint.name = 'multiple points (MultiPoint): PA, LA, 4corners, ATX, Mansfield, FL, Reston, NYC';
+multiPoint.geo.type = 'MultiPoint';
+multiPoint.geo.coordinates = [
+              [ -122.1611953, 37.4420407 ],
+              [ -118.283638, 34.028517 ],
+              [ -109.045223, 36.9990835 ],
+              [ -97.850404, 30.3921555 ],
+              [ -97.904187, 30.395457 ],
+              [ -86.600836, 30.398147 ],
+              [ -77.357837, 38.9589935 ],
+              [ -73.987723, 40.7575074 ]
+];
+coll.insert(multiPoint);
+
+// MultiPoint w/ single point
+multiPoint.name = 'single point (MultiPoint): PA';
+multiPoint.geo.type = 'MultiPoint';
+multiPoint.geo.coordinates = [
+              [ -122.1611953, 37.4420407 ]
+];
+coll.insert(multiPoint);
+
+
+// MultiPoint w/ two points in Shenzhen
+multiPoint.name = 'two points (MultiPoint): Shenzhen, Guangdong, China';
+multiPoint.geo.type = 'MultiPoint';
+multiPoint.geo.coordinates = [
+              [ 114.0538788, 22.5551603 ],
+              [ 114.022837, 22.44395 ]
+];
+coll.insert(multiPoint);
+
+
+// MultiPoint w/ two points, one in Shenzhen
+multiPoint.name = 'two points (MultiPoint) but only one in: Shenzhen, Guangdong, China';
+multiPoint.geo.type = 'MultiPoint';
+multiPoint.geo.coordinates = [
+              [ 114.0538788, 22.5551603 ],
+              [ 113.743858, 23.025815 ]
+
+];
+coll.insert(multiPoint);
+
+
+// sanity check
+assert.eq(coll.count(), 24, 'test data (MultiPoint) insert failed');
 
 

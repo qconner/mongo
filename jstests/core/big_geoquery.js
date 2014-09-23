@@ -15,15 +15,22 @@ shenzhenPoly.coordinates = [
                            ];
 
 
-
+// expect one doc, MultiPoint with two points
+// inside Shenzhen triangle
 var curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
-assert.eq(0, curs.count(), 'expected no docs within shenzhen triangle');
+assert.eq(1, curs.count(), 'expected only one doc within shenzhen triangle');
+
+// expect three docs intersecting with Shenzhen triangle:
+//   northern hemisphere poly
+//   Two point MultiPoint with two points in triangle
+//   Two point MultiPoint with one point in triangle
+var curs = coll.find({geo: {$geoIntersects: {$geometry: shenzhenPoly}}});
+assert.eq(3, curs.count(), 'expected three docs intersecting with shenzhen triangle');
 
 
 var CRS = {};
 CRS.type = 'name';
 CRS.properties = {};
-
 
 // this CRS string no good but referenced at
 // https://wiki.mongodb.com/display/10GEN/Multi-hemisphere+%28BigPolygon%29+queries
@@ -40,11 +47,13 @@ assert.throws(function(c){
 CRS.properties.name = 'urn:mongodb:strictwindingcrs:EPSG:4326';
 shenzhenPoly.crs = CRS;
 curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
-assert.eq(0, curs.count(), 'expected no docs within shenzhen triangle');
+assert.eq(1, curs.count(), 'expected only doc within Big Poly shenzhen triangle');
+
+curs = coll.find({geo: {$geoIntersects: {$geometry: shenzhenPoly}}});
+assert.eq(3, curs.count(), 'expected three docs intersecting with Big Poly shenzhen triangle');
 
 
-
-// now query for objects outside the triangle.  reverse the coordinate traversal direction.
+// now query for objects outside the Big Poly triangle.  reverse the coordinate traversal direction.
 // left foot walking traversal where left foot is inside the polygon
 shenzhenPoly.coordinates = [
                              [
@@ -56,9 +65,10 @@ shenzhenPoly.coordinates = [
                            ];
 
 curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
-// all geos should be found except the polygon just inside the northern hemisphere
+// all geos should be found except the polygon just inside the northern hemisphere,
+// and two MultiPoints within the Shenzhen triangle
 // that (rather large) polygon covers the shenzhen triangle
-assert.eq(19, curs.count(), 'expected 19 docs outside shenzhen triangle');
+assert.eq(21, curs.count(), 'expected 21 docs outside shenzhen triangle');
 
 
 
