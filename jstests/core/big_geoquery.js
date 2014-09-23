@@ -3,8 +3,8 @@ var coll = db.big_geodata;
 
 
 // Triangle around Shenzhen, China
-var shenzhenPoly = {}
-shenzhenPoly.type = 'Polygon',
+var shenzhenPoly = {};
+shenzhenPoly.type = 'Polygon';
 shenzhenPoly.coordinates = [
                              [
                                [ 114.0834046, 22.6648202 ],
@@ -16,30 +16,31 @@ shenzhenPoly.coordinates = [
 
 
 
-var curs = coll.find({loc: {$geoWithin: {$geometry: shenzhenPoly}}});
+var curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
 assert.eq(0, curs.count(), 'expected no docs within shenzhen triangle');
 
-var CRS = {}
+
+var CRS = {};
 CRS.type = 'name';
-CRS.properties = {}
+CRS.properties = {};
 // no good but referenced at
 // https://wiki.mongodb.com/display/10GEN/Multi-hemisphere+%28BigPolygon%29+queries
 CRS.properties.name = 'urn:mongodb:crs:strictwinding:EPSG:4326';
 
 shenzhenPoly.crs = CRS;
-curs = coll.find({loc: {$geoWithin: {$geometry: shenzhenPoly}}});
+curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
 
-// this form works
+// this form works for a Big Polygon geo query
 CRS.properties.name = 'urn:mongodb:strictwindingcrs:EPSG:4326';
 shenzhenPoly.crs = CRS;
-curs = coll.find({loc: {$geoWithin: {$geometry: shenzhenPoly}}});
+curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
 
 assert.eq(0, curs.count(), 'expected no docs within shenzhen triangle');
 
 
 
 
-// now query for objects outside the triangle.  reverse coordinate traversal direction
+// now query for objects outside the triangle.  reverse the coordinate traversal direction.
 shenzhenPoly.coordinates = [
                              [
                                [ 114.0834046, 22.6648202 ],
@@ -49,5 +50,9 @@ shenzhenPoly.coordinates = [
                              ]
                            ];
 
-curs = coll.find({loc: {$geoWithin: {$geometry: shenzhenPoly}}});
-assert.eq(8, curs.count(), 'expected 8 docs outside shenzhen triangle');
+curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
+assert.eq(12, curs.count(), 'expected 12 docs outside shenzhen triangle');
+
+// debug
+//db.big_geodata.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}}, {name: 1, 'geo.type': 1}).sort({'geo.type': 1, name: 1})
+
