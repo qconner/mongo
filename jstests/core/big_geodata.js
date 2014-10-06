@@ -345,7 +345,7 @@ multiPolygon.geo = {};
 multiPolygon.name = 'multi polygon: new zealand north and south islands';
 multiPolygon.geo.type = 'MultiPolygon';
 multiPolygon.geo.coordinates = [
-[
+  [
     [
       [ 165.773255, -45.902933 ],
       [ 169.398419, -47.261538 ],
@@ -370,5 +370,38 @@ coll.insert(multiPolygon);
 assert.eq(coll.count(), 26, 'test data (MultiPolygon) insert failed');
 
 
-// GeometryCollection
+// geometry collection point
+var gcPoint = {};
+gcPoint.name = 'center of Australia';
+gcPoint.type = 'Point';
+gcPoint.coordinates = [ 133.985885, -27.240790 ];
+ 
+// geometry collection triangle
+var gcTriangle = {};
+gcTriangle.name = 'Triangle around Australia';
+gcTriangle.type = 'Polygon';
+gcTriangle.coordinates = [
+              [
+                [ 97.423178, -44.735405 ],
+                [ 169.845050, -38.432287 ],
+                [ 143.824366, 15.966509 ],
+                [ 97.423178, -44.735405 ]
+              ]
+            ];
+
+// GeometryCollection of the two preceedingGeoJSON objects
+var geometryCollection = {};
+geometryCollection.geo = {};
+geometryCollection.name = 'geometry collection: point in Australia and triangle around Australia';
+geometryCollection.geo.type = 'GeometryCollection';
+geometryCollection.geo.geometries = [
+  gcPoint, gcTriangle
+];
+coll.insert(geometryCollection);
+
+// sanity check
+assert.eq(coll.count(), 27, 'test data (GeometryCollection) insert failed');
+
+
+
 

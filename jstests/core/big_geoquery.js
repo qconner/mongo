@@ -74,7 +74,7 @@ curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
 // all geos should be found except the polygon just inside the northern hemisphere,
 // and two MultiPoints within the Shenzhen triangle
 // that (rather large) polygon covers the shenzhen triangle
-assert.eq(23, curs.count(), 'expected 23 docs outside shenzhen triangle');
+assert.eq(24, curs.count(), 'expected 24 docs outside shenzhen triangle');
 
 
 
