@@ -1,3 +1,9 @@
+//
+//  this test is related to the Big Polygon (multi-hemisphere)
+//  GEO query feature in mongod
+//  see:  https://jira.mongodb.org/browse/CAP-1099
+//  and:  https://jira.mongodb.org/browse/SERVER-14510
+//
 
 var coll = db.big_geodata;
 coll.drop();
@@ -157,6 +163,7 @@ CRS.properties.name = 'urn:mongodb:strictwindingcrs:EPSG:4326';
 
 
 
+
 // Big Polygon covering both poles
 // this document will NOT be found in the 2.8 release
 // b/c this feature does not allow storage of big polygon objects
@@ -168,7 +175,10 @@ bigPoly.geo.crs = CRS;
 bigPoly.geo.coordinates = [
               [ [ -130.0, 89.0 ], [ -120.0, 89.0 ], [ -120.0, -89.0 ], [ -130.0, -89.0 ], [ -130.0, 89.0 ] ]
             ];
-coll.insert(bigPoly);
+var result = coll.insert(bigPoly);
+// will not work in legacy mode (non-WriteCommand)
+assert.eq(0, result.nInserted);
+
 
 // sanity check
 assert.eq(coll.count(), 14, 'test data (Polygons 2) insert failed');
@@ -298,4 +308,67 @@ coll.insert(multiPoint);
 // sanity check
 assert.eq(coll.count(), 24, 'test data (MultiPoint) insert failed');
 
+// MultiLineString
+var multiLineString = {};
+multiLineString.geo = {};
+multiLineString.name = 'multi line string: new zealand bays';
+multiLineString.geo.type = 'MultiLineString';
+multiLineString.geo.coordinates = [
+  [
+    [ 172.803869, -43.592789 ],
+    [ 172.659335, -43.620348 ],
+    [ 172.684038, -43.636528 ],
+    [ 172.820922, -43.605325 ]
+  ],
+  [
+    [ 172.830497, -43.607768 ],
+    [ 172.813263, -43.656319 ],
+    [ 172.823096, -43.660996 ],
+    [ 172.850943, -43.607609 ]
+  ],
+  [
+    [ 172.912056, -43.623148 ],
+    [ 172.887696, -43.670897 ],
+    [ 172.900469, -43.676178 ],
+    [ 172.931735, -43.622839 ]
+  ]
+];
+coll.insert(multiLineString);
+
+// sanity check
+assert.eq(coll.count(), 25, 'test data (MultiLineString) insert failed');
+
+
+// MultiPolygon
+var multiPolygon = {};
+multiPolygon.geo = {};
+multiPolygon.name = 'multi polygon: new zealand north and south islands';
+multiPolygon.geo.type = 'MultiPolygon';
+multiPolygon.geo.coordinates = [
+[
+    [
+      [ 165.773255, -45.902933 ],
+      [ 169.398419, -47.261538 ],
+      [ 174.672744, -41.767722 ],
+      [ 172.288845, -39.897992 ],
+      [ 165.773255, -45.902933 ]
+    ]
+  ],
+  [
+    [
+      [ 173.166448, -39.778262 ],
+      [ 175.342744, -42.677333 ],
+      [ 179.913373, -37.224362 ],
+      [ 171.475953, -32.688871 ],
+      [ 173.166448, -39.778262 ]
+    ]
+  ]
+];
+coll.insert(multiPolygon);
+
+// sanity check
+assert.eq(coll.count(), 26, 'test data (MultiPolygon) insert failed');
+
+
+// GeometryCollection
 

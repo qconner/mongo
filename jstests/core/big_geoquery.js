@@ -1,3 +1,9 @@
+//
+//  this test is related to the Big Polygon (multi-hemisphere)
+//  GEO query feature in mongod
+//  see:  https://jira.mongodb.org/browse/CAP-1099
+//  and:  https://jira.mongodb.org/browse/SERVER-14510
+//
 
 var coll = db.big_geodata;
 
@@ -68,7 +74,7 @@ curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
 // all geos should be found except the polygon just inside the northern hemisphere,
 // and two MultiPoints within the Shenzhen triangle
 // that (rather large) polygon covers the shenzhen triangle
-assert.eq(21, curs.count(), 'expected 21 docs outside shenzhen triangle');
+assert.eq(23, curs.count(), 'expected 23 docs outside shenzhen triangle');
 
 
 
