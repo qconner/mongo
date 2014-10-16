@@ -5,6 +5,9 @@
 //  and:  https://jira.mongodb.org/browse/SERVER-14510
 //
 
+//coll.getMongo().getDB("admin").runCommand({ setParameter : 1, help: true})
+coll.getMongo().getDB("admin").runCommand({ setParameter : 1, logLevel: 1})
+
 var coll = db.big_geodata;
 
 
@@ -49,7 +52,7 @@ assert.throws(function(c){
 }, curs, 'expected error with bad CRS');
 
 
-// this CRS form works for a Big Polygon geo query
+// this CRS string works for a Big Polygon geo query
 CRS.properties.name = 'urn:mongodb:strictwindingcrs:EPSG:4326';
 shenzhenPoly.crs = CRS;
 curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
@@ -59,6 +62,7 @@ curs = coll.find({geo: {$geoIntersects: {$geometry: shenzhenPoly}}});
 assert.eq(3, curs.count(), 'expected three docs intersecting with Big Poly shenzhen triangle');
 
 
+// sanity check
 // now query for objects outside the Big Poly triangle.  reverse the coordinate traversal direction.
 // left foot walking traversal where left foot is inside the polygon
 shenzhenPoly.coordinates = [
@@ -71,6 +75,8 @@ shenzhenPoly.coordinates = [
                            ];
 
 curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
+
+// sanity check
 // all geos should be found except the polygon just inside the northern hemisphere,
 // and two MultiPoints within the Shenzhen triangle
 // that (rather large) polygon covers the shenzhen triangle
@@ -88,3 +94,5 @@ assert.eq(24, curs.count(), 'expected 24 docs outside shenzhen triangle');
 db.big_geodata.count()
 db.big_geodata.find({}, {name: 1, 'geo.type': 1}).sort({'geo.type': 1, name: 1})
 db.big_geodata.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}}, {name: 1, 'geo.type': 1}).sort({'geo.type': 1, name: 1})
+
+
