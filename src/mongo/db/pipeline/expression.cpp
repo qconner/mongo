@@ -1997,6 +1997,37 @@ namespace {
         return "$not";
     }
 
+    /* ------------------------- ExpressionROT13 ----------------------------- */
+
+    Value ExpressionROT13::evaluateInternal(Variables* vars) const {
+
+        Value input = vpOperand[0]->evaluateInternal(vars);
+
+        // handle undefined and null
+        if (input.nullish())
+          return Value(BSONNULL);
+
+        uassert(30000, str::stream() << "$rot13 only takes strings not " << typeName(input.getType()), (input.getType() == String) );
+
+        string s = input.getString();
+
+        for (auto&& c : s) {
+            if (c >= 'A' && c <= 'Z') {
+                c = 'A' + (((c - 'A') + 13) % 26);
+            }
+            if (c >= 'a' && c <= 'z') {
+                c = 'a' + (((c - 'a') + 13) % 26);
+            }
+        }
+
+        return Value(s);
+    }
+
+    REGISTER_EXPRESSION("$rot13", ExpressionROT13::parse);
+    const char *ExpressionROT13::getOpName() const {
+        return "$rot13";
+    }
+
     /* -------------------------- ExpressionOr ----------------------------- */
 
     Value ExpressionOr::evaluateInternal(Variables* vars) const {

@@ -463,6 +463,7 @@ coredbEnv.Library("coredb", [
         "db/pipeline/accumulator_min_max.cpp",
         "db/pipeline/accumulator_push.cpp",
         "db/pipeline/accumulator_sum.cpp",
+        "db/pipeline/accumulator_count_cows.cpp",
         "db/pipeline/dependencies.cpp",
         "db/pipeline/document.cpp",
         "db/pipeline/document_source.cpp",
