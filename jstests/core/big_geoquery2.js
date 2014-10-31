@@ -225,38 +225,68 @@ polys.forEach(
 
 
 // 4.2.1.1.8 closed polygon (101, 1001, 25000-sided)
-// compute points on a circle centered at 0,0
-// with diameter = D
-// and lat*lat + lon*lon = (D/2)*(D/2)
-// lat range is -10 to +10
-// lon = sqrt( (D/2)*(D/2) - lat*lat )
-// and N = number of points
-var D = 20;
-var N = 101;
-var eps = D / Math.ceil((N+1)/2)
-print(N,"-sided polygon GEO points");
-var lat=0;
-var lon=0;
-var pts = [];
-var i = 0;
-var j = N;
-// produce longitude values in pairs
-// and toss out last point if an odd number requested
-for (lat=-(D/2); lat < (D/2); lat+=eps) {
-    lon = Math.sqrt( (D/2)*(D/2) - lat*lat );
-    print('i:', i)
-    pts[i++] = {lat: lat, lon: lon};
-    pts[--j] = {lat: lat, lon: -lon};
-    print('j:', j)
-    print('lat:', lat)
-    print('lon:', lon)
+// helper function
+function nGon(N, D){
+    // compute N+1 points on a circle centered at 0,0
+    // with diameter = D
+    // and lat*lat + lon*lon = (D/2)*(D/2)
+    // lat range is -10 to +10
+    // lon = sqrt( (D/2)*(D/2) - lat*lat )
+    // and N = number of sides = number of vertices
+    var eps = D / Math.ceil((N+1)/2)
+    print("generating a", N, "-sided polygon");
+    var lat=0;
+    var lon=0;
+    var pts = [];
+    var i = 0;
+    var j = N+1;
+    // produce longitude values in pairs
+    // and toss out last point if an odd number requested
+    for (lat=-(D/2); lat < (D/2); lat+=eps) {
+        lon = Math.sqrt( (D/2)*(D/2) - lat*lat );
+        pts[i++] = [lon, lat];
+        pts[--j] = [-lon, lat];
+    }
+    // ensure we connect the dots
+    assert(tojson(pts[0]) == tojson(pts[N]));
+    return pts
 }
-// ensure we connect the dots
-assert(tojson(pts[0]) == tojson(pts[N-1]));
+
+var poly101 = {
+    type: 'Polygon',
+    coordinates: [
+        nGon(101, 20)
+    ],
+    crs: goodCRS
+}
+// within
+curs = coll.find({geo: {$geoWithin: {$geometry: poly101}}});
+assert.eq(curs.count(), 0);
+// intersection
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly101}}});
+assert.eq(curs.count(), 3);
+
+var poly1001 = {
+    type: 'Polygon',
+    coordinates: [ nGon(1001, 20) ],
+    crs: goodCRS
+}
+// within
+curs = coll.find({geo: {$geoWithin: {$geometry: poly1001}}});
+assert.eq(curs.count(), 0);
+// intersection
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly1001}}});
+assert.eq(curs.count(), 3);
 
 
-
-
-
-
-
+var poly5k = {
+    type: 'Polygon',
+    coordinates: [ nGon(4970, 100) ],
+    crs: goodCRS
+}
+// within
+curs = coll.find({geo: {$geoWithin: {$geometry: poly5k}}});
+assert.eq(curs.count(), 0);
+// intersection
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly5k}}});
+assert.eq(curs.count(), 3);
