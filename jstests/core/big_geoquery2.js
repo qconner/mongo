@@ -252,7 +252,7 @@ function nGon(N, D){
     return pts
 }
 
-var poly101 = {
+poly = {
     type: 'Polygon',
     coordinates: [
         nGon(101, 20)
@@ -260,33 +260,58 @@ var poly101 = {
     crs: goodCRS
 }
 // within
-curs = coll.find({geo: {$geoWithin: {$geometry: poly101}}});
+curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
 assert.eq(curs.count(), 0);
 // intersection
-curs = coll.find({geo: {$geoIntersects: {$geometry: poly101}}});
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
 assert.eq(curs.count(), 3);
 
-var poly1001 = {
+poly = {
     type: 'Polygon',
     coordinates: [ nGon(1001, 20) ],
     crs: goodCRS
 }
 // within
-curs = coll.find({geo: {$geoWithin: {$geometry: poly1001}}});
+curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
 assert.eq(curs.count(), 0);
 // intersection
-curs = coll.find({geo: {$geoIntersects: {$geometry: poly1001}}});
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
 assert.eq(curs.count(), 3);
 
 
-var poly5k = {
+//debugger;
+poly = {
     type: 'Polygon',
-    coordinates: [ nGon(4970, 100) ],
+    coordinates: [ nGon(5000, 89) ],
     crs: goodCRS
-}
+};
 // within
-curs = coll.find({geo: {$geoWithin: {$geometry: poly5k}}});
+curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
 assert.eq(curs.count(), 0);
 // intersection
-curs = coll.find({geo: {$geoIntersects: {$geometry: poly5k}}});
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
+assert.eq(curs.count(), 3);
+
+poly = {
+    type: 'Polygon',
+    coordinates: [ nGon(6000, 89.99) ],
+    crs: goodCRS
+};
+// within
+curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
+assert.eq(curs.count(), 0);
+// intersection
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
+assert.eq(curs.count(), 3);
+
+poly = {
+    type: 'Polygon',
+    coordinates: [ nGon(6200, 89.99) ],
+    crs: goodCRS
+};
+// within
+curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
+assert.eq(curs.count(), 0);
+// intersection
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
 assert.eq(curs.count(), 3);
