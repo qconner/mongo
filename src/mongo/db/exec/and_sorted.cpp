@@ -30,6 +30,7 @@
 
 #include "mongo/db/exec/and_common-inl.h"
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -140,6 +141,10 @@ namespace mongo {
             if (PlanStage::NEED_TIME == state) {
                 ++_commonStats.needTime;
             }
+            else if (PlanStage::NEED_FETCH == state) {
+                ++_commonStats.needFetch;
+                *out = id;
+            }
 
             // NEED_TIME, NEED_YIELD.
             return state;
@@ -220,7 +225,7 @@ namespace mongo {
                 _targetNode = workingChildNumber;
                 _targetLoc = member->loc;
                 _targetId = id;
-                _workingTowardRep = queue<size_t>();
+                _workingTowardRep = std::queue<size_t>();
                 for (size_t i = 0; i < _children.size(); ++i) {
                     if (workingChildNumber != i) {
                         _workingTowardRep.push(i);
@@ -255,6 +260,11 @@ namespace mongo {
             if (PlanStage::NEED_TIME == state) {
                 ++_commonStats.needTime;
             }
+            else if (PlanStage::NEED_FETCH == state) {
+                ++_commonStats.needFetch;
+                *out = id;
+            }
+
             return state;
         }
     }
@@ -268,6 +278,7 @@ namespace mongo {
     }
 
     void AndSortedStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
 
         for (size_t i = 0; i < _children.size(); ++i) {
@@ -298,7 +309,7 @@ namespace mongo {
             _targetId = WorkingSet::INVALID_ID;
             _targetNode = numeric_limits<size_t>::max();
             _targetLoc = DiskLoc();
-            _workingTowardRep = queue<size_t>();
+            _workingTowardRep = std::queue<size_t>();
         }
     }
 

@@ -53,12 +53,6 @@ namespace repl {
     // open during stepdowns
     const unsigned ScopedConn::keepOpen = 1;
 
-    void sethbmsg(const string& s, const int level) {
-        if (theReplSet) {
-            theReplSet->sethbmsg(s, level);
-        }
-    }
-
     ReplSet::ReplSet() {
     }
 
@@ -88,13 +82,12 @@ namespace repl {
                 log() << "replSet replSetReconfig new config saved locally" << rsLog;
             }
         }
-        catch(DBException& e) {
+        catch (const DBException& e) {
             log() << "replSet error unexpected exception in haveNewConfig() : " << e.toString() << rsLog;
-            _fatal();
+            fassertFailedNoTrace(18755);
         }
-        catch(...) {
-            log() << "replSet error unexpected exception in haveNewConfig()" << rsLog;
-            _fatal();
+        catch (...) {
+            std::terminate();
         }
     }
 
@@ -102,7 +95,7 @@ namespace repl {
         OperationContextImpl txn;
 
         log() << "replset msgReceivedNewConfig version: " << o["version"].toString() << rsLog;
-        scoped_ptr<ReplSetConfig> config(ReplSetConfig::make(o));
+        scoped_ptr<ReplSetConfig> config(ReplSetConfig::make(&txn, o));
         if( config->version > rs->config().version )
             theReplSet->haveNewConfig(&txn, *config, false);
         else {
@@ -131,77 +124,14 @@ namespace repl {
         catch(std::exception& e) {
             log() << "replSet caught exception in startReplSets thread: " << e.what() << rsLog;
             if( theReplSet )
-                theReplSet->fatal();
+                fassertFailedNoTrace(18756);
         }
         cc().shutdown();
-    }
-
-    void ReplSet::shutdown() {
-        BackgroundSync::shutdown();
     }
 
     void replLocalAuth() {
         cc().getAuthorizationSession()->grantInternalAuthorization();
     }
 
-    class ReplIndexPrefetch : public ServerParameter {
-    public:
-        ReplIndexPrefetch()
-            : ServerParameter( ServerParameterSet::getGlobal(), "replIndexPrefetch" ) {
-        }
-
-        virtual ~ReplIndexPrefetch() {
-        }
-
-        const char * _value() {
-            if (!theReplSet)
-                return "uninitialized";
-            ReplSetImpl::IndexPrefetchConfig ip = theReplSet->getIndexPrefetchConfig();
-            switch (ip) {
-            case ReplSetImpl::PREFETCH_NONE:
-                return "none";
-            case ReplSetImpl::PREFETCH_ID_ONLY:
-                return "_id_only";
-            case ReplSetImpl::PREFETCH_ALL:
-                return "all";
-            default:
-                return "invalid";
-            }
-        }
-
-        virtual void append(OperationContext* txn, BSONObjBuilder& b, const string& name) {
-            b.append( name, _value() );
-        }
-
-        virtual Status set( const BSONElement& newValueElement ) {
-            if (!theReplSet) {
-                return Status( ErrorCodes::BadValue, "replication is not enabled" );
-            }
-
-            std::string prefetch = newValueElement.valuestrsafe();
-            return setFromString( prefetch );
-        }
-
-        virtual Status setFromString( const string& prefetch ) {
-            log() << "changing replication index prefetch behavior to " << prefetch << endl;
-
-            ReplSetImpl::IndexPrefetchConfig prefetchConfig;
-
-            if (prefetch == "none")
-                prefetchConfig = ReplSetImpl::PREFETCH_NONE;
-            else if (prefetch == "_id_only")
-                prefetchConfig = ReplSetImpl::PREFETCH_ID_ONLY;
-            else if (prefetch == "all")
-                prefetchConfig = ReplSetImpl::PREFETCH_ALL;
-            else {
-                return Status( ErrorCodes::BadValue,
-                               str::stream() << "unrecognized indexPrefetch setting: " << prefetch );
-            }
-
-            theReplSet->setIndexPrefetchConfig(prefetchConfig);
-            return Status::OK();
-        }
-
-    } replIndexPrefetch;
 } // namespace repl
 } // namespace mongo

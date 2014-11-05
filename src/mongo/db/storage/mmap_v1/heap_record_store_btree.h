@@ -34,6 +34,7 @@
 #include <map>
 
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
 
 namespace mongo {
 
@@ -49,6 +50,8 @@ namespace mongo {
         explicit HeapRecordStoreBtree(const StringData& ns): RecordStore(ns), _nextId(1) { }
 
         virtual RecordData dataFor(OperationContext* txn, const DiskLoc& loc) const;
+
+        virtual bool findRecord(OperationContext* txn, const DiskLoc& loc, RecordData* out) const;
 
         virtual void deleteRecord(OperationContext* txn, const DiskLoc& dl);
 
@@ -82,14 +85,14 @@ namespace mongo {
 
         virtual Status updateWithDamages(OperationContext* txn,
                                          const DiskLoc& loc,
-                                         const char* damangeSource,
+                                         const RecordData& oldRec,
+                                         const char* damageSource,
                                          const mutablebson::DamageVector& damages) {
             invariant(false);
         }
 
         virtual RecordIterator* getIterator(OperationContext* txn,
                                             const DiskLoc& start,
-                                            bool tailable,
                                             const CollectionScanParams::Direction& dir) const {
             invariant(false);
         }
@@ -171,6 +174,51 @@ namespace mongo {
 
         Records _records;
         int64_t _nextId;
+    };
+
+    /**
+     * A RecoveryUnit for HeapRecordStoreBtree, this is for testing btree only.
+     */
+    class HeapRecordStoreBtreeRecoveryUnit : public RecoveryUnit {
+    public:
+        HeapRecordStoreBtreeRecoveryUnit() {
+            _depth = 0;
+        }
+
+        virtual ~HeapRecordStoreBtreeRecoveryUnit();
+
+        virtual void beginUnitOfWork();
+        virtual void commitUnitOfWork();
+        virtual void endUnitOfWork();
+
+        virtual bool awaitCommit() { return true; }
+
+        virtual void commitAndRestart() {}
+
+        virtual void registerChange(Change* change) {}
+
+        virtual void* writingPtr(void* data, size_t len);
+
+        // -----------------------
+
+        void notifyInsert( HeapRecordStoreBtree* rs, const DiskLoc& loc );
+        static void notifyInsert( OperationContext* ctx,
+                                  HeapRecordStoreBtree* rs, const DiskLoc& loc );
+
+    private:
+        int _depth;
+        struct InsertEntry {
+            HeapRecordStoreBtree* rs;
+            DiskLoc loc;
+        };
+        std::vector<InsertEntry> _insertions;
+
+        struct ModEntry {
+            void* data;
+            size_t len;
+            boost::shared_array<char> old;
+        };
+        std::vector<ModEntry> _mods;
     };
 
 } // namespace mongo

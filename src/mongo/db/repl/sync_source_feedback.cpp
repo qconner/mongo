@@ -37,14 +37,17 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/security_key.h"
+#include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/member.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -53,8 +56,7 @@ namespace repl {
     // used in replAuthenticate
     static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
-    SyncSourceFeedback::SyncSourceFeedback() : _syncTarget(NULL),
-                                               _positionChanged(false),
+    SyncSourceFeedback::SyncSourceFeedback() : _positionChanged(false),
                                                _handshakeNeeded(false),
                                                _shutdownSignaled(false) {}
     SyncSourceFeedback::~SyncSourceFeedback() {}
@@ -76,12 +78,15 @@ namespace repl {
     void SyncSourceFeedback::ensureMe(OperationContext* txn) {
         string myname = getHostName();
         {
-            Client::WriteContext ctx(txn, "local");
+            Lock::DBLock dlk(txn->lockState(), "local", MODE_X);
+            Client::Context ctx(txn, "local");
 
             // local.me is an identifier for a server for getLastError w:2+
             if (!Helpers::getSingleton(txn, "local.me", _me) ||
                 !_me.hasField("host") ||
                 _me["host"].String() != myname) {
+
+                WriteUnitOfWork wunit(txn);
 
                 // clean out local.me
                 Helpers::emptyCollection(txn, "local.me");
@@ -92,8 +97,9 @@ namespace repl {
                 b.append("host", myname);
                 _me = b.obj();
                 Helpers::putSingleton(txn, "local.me", _me);
+
+                wunit.commit();
             }
-            ctx.commit();
             // _me is used outside of a read lock, so we must copy it out of the mmap
             _me = _me.getOwned();
         }
@@ -117,11 +123,25 @@ namespace repl {
                 LOG(2) << "Sending to " << _connection.get()->toString() << " the replication "
                         "handshake: " << *it;
                 if (!_connection->runCommand("admin", *it, res)) {
+                    std::string errMsg = res["errmsg"].valuestrsafe();
                     massert(17447, "upstream updater is not supported by the member from which we"
                             " are syncing, please update all nodes to 2.6 or later.",
-                            res["errmsg"].str().find("no such cmd") == std::string::npos);
+                            errMsg.find("no such cmd") == std::string::npos);
+
                     log() << "replSet error while handshaking the upstream updater: "
-                        << res["errmsg"].valuestrsafe();
+                        << errMsg;
+
+                    // sleep half a second if we are not in our sync source's config
+                    // TODO(dannenberg) after 2.8, remove the string comparison 
+                    if (res["code"].numberInt() == ErrorCodes::NodeNotFound ||
+                            errMsg.find("could not be found in replica set config while attempting "
+                                        "to associate it with") != std::string::npos) {
+
+                        // black list sync target for 10 seconds and find a new one
+                        replCoord->blacklistSyncSource(_syncTarget,
+                                                       Date_t(curTimeMillis64() + 10*1000));
+                        BackgroundSync::get()->clearSyncTarget();
+                    }
 
                     _resetConnection();
                     return false;
@@ -172,39 +192,40 @@ namespace repl {
         _cond.notify_all();
     }
 
-    bool SyncSourceFeedback::updateUpstream(OperationContext* txn) {
+    Status SyncSourceFeedback::updateUpstream(OperationContext* txn) {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
         if (replCoord->getCurrentMemberState().primary()) {
             // primary has no one to update to
-            return true;
+            return Status::OK();
         }
         BSONObjBuilder cmd;
         {
             boost::unique_lock<boost::mutex> lock(_mtx);
             if (_handshakeNeeded) {
                 // Don't send updates if there are nodes that haven't yet been handshaked
-                return false;
+                return Status(ErrorCodes::NodeNotFound,
+                              "Need to send handshake before updating position upstream");
             }
             replCoord->prepareReplSetUpdatePositionCommand(txn, &cmd);
         }
         BSONObj res;
 
         LOG(2) << "Sending slave oplog progress to upstream updater: " << cmd.done();
-        bool ok;
         try {
-            ok = _connection->runCommand("admin", cmd.obj(), res);
+            _connection->runCommand("admin", cmd.obj(), res);
         }
         catch (const DBException& e) {
             log() << "SyncSourceFeedback error sending update: " << e.what() << endl;
             _resetConnection();
-            return false;
+            return e.toStatus();
         }
-        if (!ok) {
+
+        Status status = Command::getStatusFromCommandResult(res);
+        if (!status.isOK()) {
             log() << "SyncSourceFeedback error sending update, response: " << res.toString() <<endl;
             _resetConnection();
-            return false;
         }
-        return true;
+        return status;
     }
 
     void SyncSourceFeedback::shutdown() {
@@ -214,7 +235,7 @@ namespace repl {
     }
 
     void SyncSourceFeedback::run() {
-        Client::initThread("SyncSourceFeedbackThread");
+        Client::initThread("SyncSourceFeedback");
         OperationContextImpl txn;
 
         bool positionChanged = false;
@@ -238,28 +259,29 @@ namespace repl {
             }
 
             MemberState state = replCoord->getCurrentMemberState();
-            if (state.primary() || state.fatal() || state.startup()) {
+            if (state.primary() || state.startup()) {
                 _resetConnection();
                 continue;
             }
-            const Member* target = BackgroundSync::get()->getSyncTarget();
+            const HostAndPort target = BackgroundSync::get()->getSyncTarget();
             if (_syncTarget != target) {
                 _resetConnection();
                 _syncTarget = target;
             }
             if (!hasConnection()) {
                 // fix connection if need be
-                if (!target) {
+                if (target.empty()) {
                     sleepmillis(500);
                     continue;
                 }
-                if (!_connect(&txn, target->h())) {
+                if (!_connect(&txn, target)) {
                     sleepmillis(500);
                     continue;
                 }
                 handshakeNeeded = true;
             }
             if (handshakeNeeded) {
+                positionChanged = true;
                 if (!replHandshake(&txn)) {
                     boost::unique_lock<boost::mutex> lock(_mtx);
                     _handshakeNeeded = true;
@@ -267,9 +289,13 @@ namespace repl {
                 }
             }
             if (positionChanged) {
-                if (!updateUpstream(&txn)) {
+                Status status = updateUpstream(&txn);
+                if (!status.isOK()) {
                     boost::unique_lock<boost::mutex> lock(_mtx);
                     _positionChanged = true;
+                    if (status == ErrorCodes::NodeNotFound) {
+                        _handshakeNeeded = true;
+                    }
                 }
             }
         }

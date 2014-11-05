@@ -26,13 +26,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrites
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/update.h"
 
 #include "mongo/bson/mutable/algorithm.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
@@ -346,8 +348,7 @@ namespace mongo {
                         return Status(ErrorCodes::ImmutableField,
                                       mongoutils::str::stream()
                                       << "After applying the update to the document {"
-                                      << (oldIdElem.ok() ? oldIdElem.toString() :
-                                                           newIdElem.toString())
+                                      << oldElem.toString()
                                       << " , ...}, the (immutable) field '" << current.dottedField()
                                       << "' was found to have been altered to "
                                       << newElem.toString());
@@ -488,71 +489,75 @@ namespace mongo {
             }
         }
 
-        WriteUnitOfWork wunit(request->getOpCtx());
+        {
+            WriteUnitOfWork wunit(request->getOpCtx());
 
-        // Save state before making changes
-        saveState();
+            if (inPlace && !driver->modsAffectIndices()) {
+                // If a set of modifiers were all no-ops, we are still 'in place', but there
+                // is no work to do, in which case we want to consider the object unchanged.
+                if (!_damages.empty() ) {
+                    // Don't actually do the write if this is an explain.
+                    if (!request->isExplain()) {
+                        invariant(_collection);
+                        const RecordData oldRec(oldObj.objdata(), oldObj.objsize());
+                        _collection->updateDocumentWithDamages(request->getOpCtx(), loc,
+                                                               oldRec, source, _damages);
+                    }
+                    docWasModified = true;
+                    _specificStats.fastmod = true;
+                }
 
-        if (inPlace && !driver->modsAffectIndices()) {
-            // If a set of modifiers were all no-ops, we are still 'in place', but there is
-            // no work to do, in which case we want to consider the object unchanged.
-            if (!_damages.empty() ) {
-                _collection->updateDocumentWithDamages(request->getOpCtx(), loc, source, _damages);
+                newObj = oldObj;
+            }
+            else {
+                // The updates were not in place. Apply them through the file manager.
+
+                newObj = _doc.getObject();
+                uassert(17419,
+                        str::stream() << "Resulting document after update is larger than "
+                        << BSONObjMaxUserSize,
+                        newObj.objsize() <= BSONObjMaxUserSize);
                 docWasModified = true;
-                _specificStats.fastmod = true;
+
+                // Don't actually do the write if this is an explain.
+                if (!request->isExplain()) {
+                    invariant(_collection);
+                    StatusWith<DiskLoc> res = _collection->updateDocument(request->getOpCtx(),
+                                                                          loc,
+                                                                          newObj,
+                                                                          true,
+                                                                          _params.opDebug);
+                    uassertStatusOK(res.getStatus());
+                    DiskLoc newLoc = res.getValue();
+
+                    // If the document moved, we might see it again in a collection scan (maybe it's
+                    // a document after our current document).
+                    //
+                    // If the document is indexed and the mod changes an indexed value, we might see
+                    // it again.  For an example, see the comment above near declaration of
+                    // updatedLocs.
+                    if (_updatedLocs && (newLoc != loc || driver->modsAffectIndices())) {
+                        _updatedLocs->insert(newLoc);
+                    }
+                }
             }
 
-            newObj = oldObj;
-        }
-        else {
-            // The updates were not in place. Apply them through the file manager.
-
-            // XXX: With experimental document-level locking, we do not hold the sufficient
-            // locks, so this would cause corruption.
-            fassert(18516, !useExperimentalDocLocking);
-
-            newObj = _doc.getObject();
-            uassert(17419,
-                    str::stream() << "Resulting document after update is larger than "
-                                  << BSONObjMaxUserSize,
-                    newObj.objsize() <= BSONObjMaxUserSize);
-            StatusWith<DiskLoc> res = _collection->updateDocument(request->getOpCtx(),
-                                                                  loc,
-                                                                  newObj,
-                                                                  true,
-                                                                  _params.opDebug);
-            uassertStatusOK(res.getStatus());
-            DiskLoc newLoc = res.getValue();
-            docWasModified = true;
-
-            // If the document moved, we might see it again in a collection scan (maybe it's
-            // a document after our current document).
-            //
-            // If the document is indexed and the mod changes an indexed value, we might see it
-            // again.  For an example, see the comment above near declaration of updatedLocs.
-            if (_updatedLocs && (newLoc != loc || driver->modsAffectIndices())) {
-                _updatedLocs->insert(newLoc);
+            // Call logOp if requested, and we're not an explain.
+            if (request->shouldCallLogOp() && !logObj.isEmpty() && !request->isExplain()) {
+                BSONObj idQuery = driver->makeOplogEntryQuery(newObj, request->isMulti());
+                repl::logOp(request->getOpCtx(),
+                            "u",
+                            request->getNamespaceString().ns().c_str(),
+                            logObj,
+                            &idQuery,
+                            NULL,
+                            request->isFromMigration());
             }
+            wunit.commit();
         }
 
-        // Restore state after modification
-        restoreState(request->getOpCtx());
-
-        // Call logOp if requested.
-        if (request->shouldCallLogOp() && !logObj.isEmpty()) {
-            BSONObj idQuery = driver->makeOplogEntryQuery(newObj, request->isMulti());
-            repl::logOp(request->getOpCtx(),
-                        "u",
-                        request->getNamespaceString().ns().c_str(),
-                        logObj,
-                        &idQuery,
-                        NULL,
-                        request->isFromMigration());
-        }
-
-        wunit.commit();
-
-        // Only record doc modifications if they wrote (exclude no-ops)
+        // Only record doc modifications if they wrote (exclude no-ops). Explains get
+        // recorded as if they wrote.
         if (docWasModified) {
             _specificStats.nModified++;
         }
@@ -576,24 +581,23 @@ namespace mongo {
         // Reset the document we will be writing to
         _doc.reset();
 
-        // This remains the empty object in the case of an object replacement, but in the case
-        // of an upsert where we are creating a base object from the query and applying mods,
-        // we capture the query as the original so that we can detect immutable field mutations.
-        BSONObj original = BSONObj();
+        // The original document we compare changes to - immutable paths must not change
+        BSONObj original;
+
+        bool isInternalRequest = request->isFromReplication() || request->isFromMigration();
+
+        const vector<FieldRef*>* immutablePaths = NULL;
+        if (!isInternalRequest && lifecycle)
+            immutablePaths = lifecycle->getImmutableFields();
 
         // Calling populateDocumentWithQueryFields will populate the '_doc' with fields from the
         // query which creates the base of the update for the inserted doc (because upsert
         // was true).
         if (cq) {
-            uassertStatusOK(driver->populateDocumentWithQueryFields(cq, _doc));
-            if (!driver->isDocReplacement()) {
+            uassertStatusOK(driver->populateDocumentWithQueryFields(cq, immutablePaths, _doc));
+            if (driver->isDocReplacement())
                 _specificStats.fastmodinsert = true;
-                // We need all the fields from the query to compare against for validation below.
-                original = _doc.getObject();
-            }
-            else {
-                original = request->getQuery();
-            }
+            original = _doc.getObject();
         }
         else {
             fassert(17354, CanonicalQuery::isSimpleIdQuery(request->getQuery()));
@@ -614,17 +618,13 @@ namespace mongo {
         // Validate that the object replacement or modifiers resulted in a document
         // that contains all the immutable keys and can be stored if it isn't coming
         // from a migration or via replication.
-        if (!(request->isFromReplication() || request->isFromMigration())){
-            const std::vector<FieldRef*>* immutableFields = NULL;
-            if (lifecycle)
-                immutableFields = lifecycle->getImmutableFields();
-
+        if (!isInternalRequest){
             FieldRefSet noFields;
             // This will only validate the modified fields if not a replacement.
             uassertStatusOK(validate(original,
                                      noFields,
                                      _doc,
-                                     immutableFields,
+                                     immutablePaths,
                                      driver->modOptions()) );
         }
 
@@ -634,18 +634,15 @@ namespace mongo {
                 str::stream() << "Document to upsert is larger than " << BSONObjMaxUserSize,
                 newObj.objsize() <= BSONObjMaxUserSize);
 
-        WriteUnitOfWork wunit(request->getOpCtx());
-        // Only create the collection if the doc will be inserted.
-        if (!_collection) {
-            _collection = _db->getCollection(request->getOpCtx(),
-                                             request->getNamespaceString().ns());
-            if (!_collection) {
-                _collection = _db->createCollection(request->getOpCtx(),
-                                                    request->getNamespaceString().ns());
-            }
+        _specificStats.objInserted = newObj;
+
+        // If this is an explain, bail out now without doing the insert.
+        if (request->isExplain()) {
+            return;
         }
 
-
+        WriteUnitOfWork wunit(request->getOpCtx());
+        invariant(_collection);
         StatusWith<DiskLoc> newLoc = _collection->insertDocument(request->getOpCtx(),
                                                                  newObj,
                                                                  !request->isGod()/*enforceQuota*/);
@@ -661,8 +658,6 @@ namespace mongo {
         }
 
         wunit.commit();
-
-        _specificStats.objInserted = newObj;
     }
 
     bool UpdateStage::doneUpdating() {
@@ -747,8 +742,47 @@ namespace mongo {
 
             ++_specificStats.nMatched;
 
+            // Save state before making changes
+            saveState();
+
             // Do the update and return.
-            transformAndUpdate(oldObj, loc);
+            BSONObj reFetched;
+            while ( 1 ) {
+                try {
+                    transformAndUpdate(reFetched.isEmpty() ? oldObj : reFetched , loc);
+                    break;
+                }
+                catch ( const WriteConflictException& de ) {
+                    if ( !_params.request->isMulti() ) {
+                        // for single cases, we just restart.
+                        throw;
+                    }
+
+                    log() << "Had WriteConflict in the middle of a multi-update, redoing the doc";
+                    OperationContext* txn = _params.request->getOpCtx();
+                    txn->recoveryUnit()->commitAndRestart();
+                    if ( !_collection->findDoc( txn, loc, &reFetched ) ) {
+                        // document was deleted, we're done here
+                        break;
+                    }
+                    // we have to re-match the doc as it might not match anymore
+                    if ( _params.canonicalQuery &&
+                         _params.canonicalQuery->root() &&
+                         !_params.canonicalQuery->root()->matchesBSON( reFetched, NULL ) ) {
+                        // doesn't match!
+                        break;
+                    }
+                    // now we try again!
+                }
+            }
+
+            // Restore state after modification
+
+            // As restoreState may restore (recreate) cursors, make sure to restore the
+            // state outside of the WritUnitOfWork.
+
+            restoreState(_params.request->getOpCtx());
+
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
@@ -770,12 +804,15 @@ namespace mongo {
             }
             return status;
         }
-        else {
-            if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            return status;
+        else if (PlanStage::NEED_TIME == status) {
+            ++_commonStats.needTime;
         }
+        else if (PlanStage::NEED_FETCH == status) {
+            ++_commonStats.needFetch;
+            *out = id;
+        }
+
+        return status;
     }
 
     void UpdateStage::saveState() {
@@ -783,9 +820,40 @@ namespace mongo {
         _child->saveState();
     }
 
+    Status UpdateStage::restoreUpdateState(OperationContext* opCtx) {
+        const UpdateRequest& request = *_params.request;
+        const NamespaceString& nsString(request.getNamespaceString());
+
+        // We may have stepped down during the yield.
+        if (request.shouldCallLogOp() &&
+            !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(nsString.db())) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Demoted from primary while performing update on "
+                                        << nsString.ns());
+        }
+
+        if (request.getLifecycle()) {
+            UpdateLifecycle* lifecycle = request.getLifecycle();
+            lifecycle->setCollection(_collection);
+
+            if (!lifecycle->canContinue()) {
+                return Status(ErrorCodes::IllegalOperation,
+                              "Update aborted due to invalid state transitions after yield.",
+                              17270);
+            }
+
+            _params.driver->refreshIndexKeys(lifecycle->getIndexKeys(opCtx));
+        }
+
+        return Status::OK();
+    }
+
     void UpdateStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
+        // Restore our child.
         _child->restoreState(opCtx);
+        // Restore self.
+        uassertStatusOK(restoreUpdateState(opCtx));
     }
 
     void UpdateStage::invalidate(const DiskLoc& dl, InvalidationType type) {

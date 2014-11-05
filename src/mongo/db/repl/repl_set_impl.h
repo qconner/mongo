@@ -88,26 +88,24 @@ namespace repl {
         SyncSourceFeedback syncSourceFeedback;
 
         OpTime lastOpTimeWritten;
-        OpTime getEarliestOpTimeWritten() const;
 
-        // hash we use to make sure we are reading the right flow of ops and aren't on
-        // an out-of-date "fork"
-        long long lastH; 
         Status forceSyncFrom(const string& host, BSONObjBuilder* result);
         // Check if the current sync target is suboptimal. This must be called while holding a mutex
         // that prevents the sync source from changing.
-        bool shouldChangeSyncTarget(const OpTime& target) const;
+        bool shouldChangeSyncTarget(const HostAndPort& target);
 
         /**
          * Find the closest member (using ping time) with a higher latest optime.
          */
         const Member* getMemberToSyncTo();
-        void veto(const string& host, unsigned secs=10);
+        void veto(const string& host, Date_t until);
         bool gotForceSync();
         void goStale(OperationContext* txn, const Member* m, const BSONObj& o);
 
         OID getElectionId() const { return elect.getElectionId(); }
         OpTime getElectionTime() const { return elect.getElectionTime(); }
+
+        void loadLastOpTimeWritten(OperationContext* txn, bool quiet = false);
     private:
         set<ReplSetHealthPollTask*> healthTasks;
         void endOldHealthTasks();
@@ -121,13 +119,9 @@ namespace repl {
         bool _freeze(int secs);
     private:
         void _assumePrimary();
-        void loadLastOpTimeWritten(OperationContext* txn, bool quiet = false);
         void changeState(MemberState s);
 
         Member* _forceSyncTarget;
-
-        bool _blockSync;
-        void blockSync(bool block);
 
         // set of electable members' _ids
         set<unsigned> _electableSet;
@@ -198,7 +192,6 @@ namespace repl {
         string name() const { return _name; } /* @return replica set's logical name */
         int version() const { return _cfg->version; } /* @return replica set's config version */
         MemberState state() const { return box.getState(); }
-        void _fatal();
         void _getOplogDiagsAsHtml(unsigned server_id, stringstream& ss) const;
         void _summarizeAsHtml(OperationContext* txn, stringstream&) const;
         void _summarizeStatus(BSONObjBuilder&) const; // for replSetGetStatus command
@@ -249,13 +242,6 @@ namespace repl {
         // this is called from within a writelock in logOpRS
         unsigned selfId() const { return _id; }
         Manager *mgr;
-        /**
-         * This forces a secondary to go into recovering state and stay there
-         * until this is called again, passing in "false".  Multiple threads can
-         * call this and it will leave maintenance mode once all of the callers
-         * have called it again, passing in false.
-         */
-        bool setMaintenanceMode(OperationContext* txn, const bool inc);
 
     private:
         Member* head() const { return _members.head(); }
@@ -264,10 +250,9 @@ namespace repl {
         Member* getMutableMember(unsigned id);
         Member* findByName(const std::string& hostname) const;
 
-        /**
-         * Cause the node to resync from scratch.
-         */
-        bool resync(OperationContext* txn, std::string& errmsg);
+        // Clears the vetoes (blacklisted sync sources)
+        void clearVetoes();
+
     private:
         void _getTargets(list<Target>&, int &configVersion);
         void getTargets(list<Target>&, int &configVersion);
@@ -278,80 +263,30 @@ namespace repl {
         friend class Consensus;
 
     private:
-        bool _syncDoInitialSync_clone(OperationContext* txn, Cloner &cloner, const char *master,
-                                      const list<string>& dbs, bool dataPass);
-        bool _syncDoInitialSync_applyToHead( OperationContext* txn, SyncTail& syncer, OplogReader* r ,
-                                             const Member* source, const BSONObj& lastOp,
-                                             BSONObj& minValidOut);
-        void _syncDoInitialSync();
-        void syncDoInitialSync();
-        void _syncThread();
+        bool _initialSyncClone(OperationContext* txn,
+                               Cloner &cloner,
+                               const std::string& host,
+                               const list<string>& dbs,
+                               bool dataPass);
+        bool _initialSyncApplyOplog(OperationContext* txn,
+                                    repl::SyncTail& syncer,
+                                    OplogReader* r,
+                                    const Member* source);
+        void _initialSync();
         void syncTail();
-        unsigned _syncRollback(OperationContext* txn, OplogReader& r);
-        void syncFixUp(OperationContext* txn, FixUpInfo& h, OplogReader& r);
-
-        // keep a list of hosts that we've tried recently that didn't work
-        map<string,time_t> _veto;
-        // persistent pool of worker threads for writing ops to the databases
-        threadpool::ThreadPool _writerPool;
-        // persistent pool of worker threads for prefetching
-        threadpool::ThreadPool _prefetcherPool;
 
     public:
-        // Allow index prefetching to be turned on/off
-        enum IndexPrefetchConfig {
-            PREFETCH_NONE=0, PREFETCH_ID_ONLY=1, PREFETCH_ALL=2
-        };
-
-        void setIndexPrefetchConfig(const IndexPrefetchConfig cfg) {
-            _indexPrefetchConfig = cfg;
-        }
-        IndexPrefetchConfig getIndexPrefetchConfig() {
-            return _indexPrefetchConfig;
-        }
-            
-        static const int replWriterThreadCount;
-        static const int replPrefetcherThreadCount;
-        threadpool::ThreadPool& getPrefetchPool() { return _prefetcherPool; }
-        threadpool::ThreadPool& getWriterPool() { return _writerPool; }
+        // keep a list of hosts that we've tried recently that didn't work
+        map<string,time_t> _veto;
 
         const ReplSetConfig::MemberCfg& myConfig() const { return _config; }
-        bool tryToGoLiveAsASecondary(OperationContext* txn, OpTime&); // readlocks
-        void syncRollback(OperationContext* txn, OplogReader& r);
-        void syncThread();
         const OpTime lastOtherOpTime() const;
         /**
          * The most up to date electable replica
          */
         const OpTime lastOtherElectableOpTime() const;
 
-        /**
-         * When a member reaches its minValid optime it is in a consistent state.  Thus, minValid is
-         * set as the last step in initial sync.  At the beginning of initial sync, _initialSyncFlag
-         * is appended onto minValid to indicate that initial sync was started but has not yet 
-         * completed.
-         * minValid is also used during "normal" sync: the last op in each batch is used to set 
-         * minValid, to indicate that we are in a consistent state when the batch has been fully 
-         * applied.
-         */
-        static void setMinValid(OperationContext* txn, BSONObj obj);
-        static OpTime getMinValid(OperationContext* txn);
-        static void clearInitialSyncFlag(OperationContext* txn);
-        static bool getInitialSyncFlag();
-        static void setInitialSyncFlag(OperationContext* txn);
-
-        int oplogVersion;
-
-        // bool for indicating resync need on this node and the mutex that protects it
-        bool initialSyncRequested;
-        boost::mutex initialSyncMutex;
-
         BSONObj getLastErrorDefault;
-    private:
-        IndexPrefetchConfig _indexPrefetchConfig;
-
-        static const char* _initialSyncFlagString;
-        static const BSONObj _initialSyncFlag;
     };
 } // namespace repl
 } // namespace mongo

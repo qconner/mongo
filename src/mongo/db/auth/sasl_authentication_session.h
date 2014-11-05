@@ -1,5 +1,5 @@
 /*
- *    Copyright (C) 2012 10gen, Inc.  All Rights Reserved.
+ *    Copyright (C) 2012 10gen, Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -50,9 +50,10 @@ namespace mongo {
     class SaslAuthenticationSession : public AuthenticationSession {
         MONGO_DISALLOW_COPYING(SaslAuthenticationSession);
     public:
-        typedef stdx::function<SaslAuthenticationSession* (AuthorizationSession*)> 
-            SaslSessionFactoryFn;
-        static SaslSessionFactoryFn create; 
+        typedef stdx::function<SaslAuthenticationSession* (AuthorizationSession*,
+                                                           const std::string&)>
+            SaslAuthenticationSessionFactoryFn;
+        static SaslAuthenticationSessionFactoryFn create;
 
         // Mechanism name constants.
         static const char mechanismCRAMMD5[];
@@ -99,7 +100,7 @@ namespace mongo {
 
         /**
          * Returns the the operation context associated with the currently executing command.
-         * Authentication commands must set this on their associated 
+         * Authentication commands must set this on their associated
          * SaslAuthenticationSession.
          */
         OperationContext* getOpCtxt() const { return _txn; }

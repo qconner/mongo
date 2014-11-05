@@ -32,6 +32,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/eof.h"
 #include "mongo/db/exec/update.h"
@@ -55,13 +56,12 @@ namespace QueryStageUpdate {
               _nsString(StringData(ns())) {
             Client::WriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
-            ctx.commit();
+            _client.createCollection(ns());
         }
 
         virtual ~QueryStageUpdateBase() {
             Client::WriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
-            ctx.commit();
         }
 
         void insert(const BSONObj& doc) {
@@ -216,13 +216,12 @@ namespace QueryStageUpdate {
                     new UpdateStage(params, ws.get(), db, eofStage.release()));
 
                 runUpdate(updateStage.get());
-                ctx.commit();
             }
 
             // Verify the contents of the resulting collection.
             {
-                Client::ReadContext ctx(&_txn, ns());
-                Collection* collection = ctx.ctx().db()->getCollection(&_txn, ns());
+                AutoGetCollectionForRead ctx(&_txn, ns());
+                Collection* collection = ctx.getCollection();
 
                 vector<BSONObj> objs;
                 getCollContents(collection, &objs);
@@ -321,8 +320,6 @@ namespace QueryStageUpdate {
                     ASSERT(PlanStage::NEED_TIME == state || PlanStage::IS_EOF == state);
                 }
 
-                ctx.commit();
-
                 // 4 of the 5 matching documents should have been modified (one was deleted).
                 ASSERT_EQUALS(4U, stats->nModified);
                 ASSERT_EQUALS(4U, stats->nMatched);
@@ -330,8 +327,8 @@ namespace QueryStageUpdate {
 
             // Check the contents of the collection.
             {
-                Client::ReadContext ctx(&_txn, ns());
-                Collection* collection = ctx.ctx().db()->getCollection(&_txn, ns());
+                AutoGetCollectionForRead ctx(&_txn, ns());
+                Collection* collection = ctx.getCollection();
 
                 vector<BSONObj> objs;
                 getCollContents(collection, &objs);
@@ -359,6 +356,8 @@ namespace QueryStageUpdate {
             add<QueryStageUpdateUpsertEmptyColl>();
             add<QueryStageUpdateSkipInvalidatedDoc>();
         }
-    } all;
+    };
+
+    SuiteInstance<All> all;
 
 } // namespace QueryStageUpdate

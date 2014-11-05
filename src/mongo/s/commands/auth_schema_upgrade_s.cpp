@@ -26,6 +26,8 @@
  * then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+
 #include "mongo/platform/basic.h"
 
 #include <boost/scoped_ptr.hpp>
@@ -152,7 +154,7 @@ namespace {
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = checkClusterMongoVersions(configServer.getConnectionString(), "2.5.4");
+            status = checkClusterMongoVersions(configServer.getConnectionString(), "2.7.6");
             if (!status.isOK()) {
                 log() << "Auth schema upgrade failed: " << status << endl;
                 return appendCommandStatus(result, status);

@@ -73,10 +73,19 @@ namespace mongo {
 
             if (NULL == collection) {
                 EOFStage* eof = new EOFStage();
-                return new PlanExecutor(ws, eof, ns.toString());
+                PlanExecutor* exec;
+                // Takes ownership of 'ws' and 'eof'.
+                Status execStatus =  PlanExecutor::make(txn,
+                                                        ws,
+                                                        eof,
+                                                        ns.toString(),
+                                                        PlanExecutor::YIELD_MANUAL,
+                                                        &exec);
+                invariant(execStatus.isOK());
+                return exec;
             }
 
-            dassert( ns == collection->ns().ns() );
+            invariant( ns == collection->ns().ns() );
 
             CollectionScanParams params;
             params.collection = collection;
@@ -90,9 +99,15 @@ namespace mongo {
             }
 
             CollectionScan* cs = new CollectionScan(txn, params, ws, NULL);
-            PlanExecutor* exec = new PlanExecutor(ws, cs, collection);
-            // 'exec' will be registered until it is destroyed.
-            exec->registerExecInternalPlan();
+            PlanExecutor* exec;
+            // Takes ownership of 'ws' and 'cs'.
+            Status execStatus = PlanExecutor::make(txn,
+                                                   ws,
+                                                   cs,
+                                                   collection,
+                                                   PlanExecutor::YIELD_MANUAL,
+                                                   &exec);
+            invariant(execStatus.isOK());
             return exec;
         }
 
@@ -125,9 +140,15 @@ namespace mongo {
                 root = new FetchStage(txn, ws, root, NULL, collection);
             }
 
-            PlanExecutor* exec = new PlanExecutor(ws, root, collection);
-            // 'exec' will be registered until it is destroyed.
-            exec->registerExecInternalPlan();
+            PlanExecutor* exec;
+            // Takes ownership of 'ws' and 'root'.
+            Status execStatus = PlanExecutor::make(txn,
+                                                   ws,
+                                                   root,
+                                                   collection,
+                                                   PlanExecutor::YIELD_MANUAL,
+                                                   &exec);
+            invariant(execStatus.isOK());
             return exec;
         }
     };

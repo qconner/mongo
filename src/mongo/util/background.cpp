@@ -162,22 +162,12 @@ namespace mongo {
             run();
         }
         catch ( std::exception& e ) {
-            error() << "backgroundjob " << threadName << " exception: " << e.what() << endl;
-        }
-        catch(...) {
-            error() << "uncaught exception in BackgroundJob " << threadName << endl;
+            error() << "backgroundjob " << threadName << " exception: " << e.what();
+            throw e;
         }
 
         // We must cache this value so that we can use it after we leave the following scope.
         const bool selfDelete = _selfDelete;
-
-        {
-            // It is illegal to access any state owned by this BackgroundJob after leaving this
-            // scope, with the exception of the call to 'delete this' below.
-            scoped_lock l( _status->mutex );
-            _status->state = Done;
-            _status->done.notify_all();
-        }
 
 #ifdef MONGO_SSL
         // TODO(sverch): Allow people who use the BackgroundJob to also specify cleanup tasks.
@@ -187,6 +177,14 @@ namespace mongo {
         if (manager)
             manager->cleanupThreadLocals();
 #endif
+
+        {
+            // It is illegal to access any state owned by this BackgroundJob after leaving this
+            // scope, with the exception of the call to 'delete this' below.
+            scoped_lock l( _status->mutex );
+            _status->state = Done;
+            _status->done.notify_all();
+        }
 
         if( selfDelete )
             delete this;

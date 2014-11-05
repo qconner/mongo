@@ -99,6 +99,26 @@ namespace mongo {
                                                                const StringData& db ) = 0;
 
         /**
+         * Returns whether the storage engine supports its own locking locking below the collection
+         * level. If the engine returns true, MongoDB will acquire intent locks down to the
+         * collection level and will assume that the engine will ensure consistency at the level of
+         * documents. If false, MongoDB will lock the entire collection in Shared/Exclusive mode
+         * for read/write operations respectively.
+         */
+        virtual bool supportsDocLocking() const = 0;
+
+        /**
+         * Returns if the engine supports a journalling concept.
+         * This controls whether awaitCommit gets called or fsync to ensure data is on disk.
+         */
+        virtual bool isDurable() const = 0;
+
+        /**
+         * Only MMAPv1 should override this and return true to trigger MMAPv1-specific behavior.
+         */
+        virtual bool isMmapV1() const { return false; }
+
+        /**
          * Closes all file handles associated with a database.
          */
         virtual Status closeDatabase( OperationContext* txn, const StringData& db ) = 0;

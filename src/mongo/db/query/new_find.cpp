@@ -35,9 +35,11 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/oplogstart.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_constants.h"
@@ -48,6 +50,7 @@
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/storage/oplog_hack.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/s/chunk_version.h"
@@ -103,6 +106,11 @@ namespace {
         return mongoutils::str::equals(me->path().rawData(), "ts");
     }
 
+    mongo::BSONElement extractOplogTsOptime(const mongo::MatchExpression* me) {
+        invariant(isOplogTsPred(me));
+        return static_cast<const mongo::ComparisonMatchExpression*>(me)->getData();
+    }
+
 }  // namespace
 
 namespace mongo {
@@ -136,8 +144,30 @@ namespace mongo {
         return true;
     }
 
+    struct ScopedRecoveryUnitSwapper {
+        explicit ScopedRecoveryUnitSwapper(ClientCursor* cc, OperationContext* txn)
+            : _cc(cc), _txn(txn) {
+
+            // Save this for later.  We restore it upon destruction.
+            _txnPreviousRecoveryUnit = txn->releaseRecoveryUnit();
+
+            // Transfer ownership of the RecoveryUnit from the ClientCursor to the OpCtx.
+            RecoveryUnit* ccRecoveryUnit = cc->releaseOwnedRecoveryUnit();
+            txn->setRecoveryUnit(ccRecoveryUnit);
+        }
+
+        ~ScopedRecoveryUnitSwapper() {
+            _cc->setOwnedRecoveryUnit(_txn->releaseRecoveryUnit());
+            _txn->setRecoveryUnit(_txnPreviousRecoveryUnit);
+        }
+
+        ClientCursor* _cc;
+        OperationContext* _txn;
+        RecoveryUnit* _txnPreviousRecoveryUnit;
+    };
+
     /**
-     * Also called by db/ops/query.cpp.  This is the new getMore entry point.
+     * Called by db/instance.cpp.  This is the getMore entry point.
      *
      * pass - when QueryOption_AwaitData is in use, the caller will make repeated calls 
      *        when this method returns an empty result, incrementing pass on each call.  
@@ -150,7 +180,8 @@ namespace mongo {
                             CurOp& curop,
                             int pass,
                             bool& exhaust,
-                            bool* isCursorAuthorized) {
+                            bool* isCursorAuthorized,
+                            bool fromDBDirectClient) {
 
         // For testing, we may want to fail if we receive a getmore.
         if (MONGO_FAIL_POINT(failReceivedGetmore)) {
@@ -160,8 +191,9 @@ namespace mongo {
         exhaust = false;
 
         // This is a read lock.
-        scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(txn, ns));
-        Collection* collection = ctx->ctx().db()->getCollection(txn, ns);
+        const NamespaceString nss(ns);
+        scoped_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(txn, nss));
+        Collection* collection = ctx->getCollection();
         uassert( 17356, "collection dropped between getMore calls", collection );
 
         QLOG() << "Running getMore, cursorid: " << cursorid << endl;
@@ -170,9 +202,9 @@ namespace mongo {
         // passing in a query object (necessary to check SlaveOK query option), the only state where
         // reads are allowed is PRIMARY (or master in master/slave).  This function uasserts if
         // reads are not okay.
-        Status status = repl::getGlobalReplicationCoordinator()->canServeReadsFor(
+        Status status = repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(
                 txn,
-                NamespaceString(ns),
+                nss,
                 true);
         uassertStatusOK(status);
 
@@ -181,6 +213,15 @@ namespace mongo {
         // CC, so don't delete it.
         ClientCursorPin ccPin(collection, cursorid);
         ClientCursor* cc = ccPin.c();
+
+        // If we're not being called from DBDirectClient we want to associate the RecoveryUnit
+        // used to create the execution machinery inside the cursor with our OperationContext.
+        // If we throw or otherwise exit this method in a disorderly fashion, we must ensure
+        // that further calls to getMore won't fail, and that the provided OperationContext
+        // has a valid RecoveryUnit.  As such, we use RAII to accomplish this.
+        //
+        // This must be destroyed before the ClientCursor is destroyed.
+        std::auto_ptr<ScopedRecoveryUnitSwapper> ruSwapper;
 
         // These are set in the QueryResult msg we return.
         int resultFlags = ResultFlag_AwaitCapable;
@@ -203,6 +244,22 @@ namespace mongo {
             // there for the cursor
             uassert(17011, "auth error", str::equals(ns, cc->ns().c_str()));
             *isCursorAuthorized = true;
+
+            // Restore the RecoveryUnit if we need to.
+            if (fromDBDirectClient) {
+                if (cc->hasRecoveryUnit())
+                    invariant(txn->recoveryUnit() == cc->getUnownedRecoveryUnit());
+            }
+            else {
+                if (!cc->hasRecoveryUnit()) {
+                    // Start using a new RecoveryUnit
+                    cc->setOwnedRecoveryUnit(
+                        getGlobalEnvironment()->getGlobalStorageEngine()->newRecoveryUnit(txn));
+
+                }
+                // Swap RecoveryUnit(s) between the ClientCursor and OperationContext.
+                ruSwapper.reset(new ScopedRecoveryUnitSwapper(cc, txn));
+            }
 
             // Reset timeout timer on the cursor since the cursor is still in use.
             cc->setIdleTime(0);
@@ -261,14 +318,6 @@ namespace mongo {
                 }
             }
 
-            if (PlanExecutor::IS_EOF == state && 0 == numResults
-                && (queryOptions & QueryOption_CursorTailable)
-                && (queryOptions & QueryOption_AwaitData) && (pass < 1000)) {
-                // If the cursor is tailable we don't kill it if it's eof.  We let it try to get
-                // data some # of times first.
-                return 0;
-            }
-
             // We save the client cursor when there might be more results, and hence we may receive
             // another getmore. If we receive a EOF or an error, or 'exec' is dead, then we know
             // that we will not be producing more results. We indicate that the cursor is closed by
@@ -313,6 +362,7 @@ namespace mongo {
             }
 
             if (!saveClientCursor) {
+                ruSwapper.reset();
                 ccPin.deleteUnderlying();
                 // cc is now invalid, as is the executor
                 cursorid = 0;
@@ -328,6 +378,22 @@ namespace mongo {
                 QLOG() << "getMore saving client cursor ended with state "
                        << PlanExecutor::statestr(state)
                        << endl;
+
+                if (PlanExecutor::IS_EOF == state && (queryOptions & QueryOption_CursorTailable)) {
+                    if (!fromDBDirectClient) {
+                        // Don't stash the RU. Get a new one on the next getMore.
+                        ruSwapper.reset();
+                        delete cc->releaseOwnedRecoveryUnit();
+                    }
+
+                    if ((queryOptions & QueryOption_AwaitData)
+                            && (numResults == 0)
+                            && (pass < 1000)) {
+                        // Bubble up to the AwaitData handling code in receivedGetMore which will
+                        // try again.
+                        return NULL;
+                    }
+                }
 
                 // Possibly note slave's position in the oplog.
                 if ((queryOptions & QueryOption_OplogReplay) && !slaveReadTill.isNull()) {
@@ -391,27 +457,48 @@ namespace mongo {
                           "$gt or $gte over the 'ts' field.");
         }
 
-        // Make an oplog start finding stage.
-        WorkingSet* oplogws = new WorkingSet();
-        OplogStart* stage = new OplogStart(txn, collection, tsExpr, oplogws);
+        DiskLoc startLoc = DiskLoc().setInvalid();
 
-        // Takes ownership of ws and stage.
-        auto_ptr<PlanExecutor> exec(new PlanExecutor(oplogws, stage, collection));
-        exec->registerExecInternalPlan();
-
-        // The stage returns a DiskLoc of where to start.
-        DiskLoc startLoc;
-        PlanExecutor::ExecState state = exec->getNext(NULL, &startLoc);
-
-        // This is normal.  The start of the oplog is the beginning of the collection.
-        if (PlanExecutor::IS_EOF == state) {
-            return getExecutor(txn, collection, autoCq.release(), execOut);
+        // See if the RecordStore supports the oplogStartHack
+        const BSONElement tsElem = extractOplogTsOptime(tsExpr);
+        if (tsElem.type() == Timestamp) {
+            StatusWith<DiskLoc> goal = oploghack::keyForOptime(tsElem._opTime());
+            if (goal.isOK()) {
+                startLoc = collection->getRecordStore()->oplogStartHack(txn, goal.getValue());
+            }
         }
 
-        // This is not normal.  An error was encountered.
-        if (PlanExecutor::ADVANCED != state) {
-            return Status(ErrorCodes::InternalError,
-                          "quick oplog start location had error...?");
+        if (startLoc.isValid()) {
+            LOG(3) << "Using direct oplog seek";
+        }
+        else {
+            LOG(3) << "Using OplogStart stage";
+
+            // Fallback to trying the OplogStart stage.
+            WorkingSet* oplogws = new WorkingSet();
+            OplogStart* stage = new OplogStart(txn, collection, tsExpr, oplogws);
+            PlanExecutor* rawExec;
+
+            // Takes ownership of oplogws and stage.
+            Status execStatus = PlanExecutor::make(txn, oplogws, stage, collection,
+                                                   PlanExecutor::YIELD_AUTO, &rawExec);
+            invariant(execStatus.isOK());
+            scoped_ptr<PlanExecutor> exec(rawExec);
+
+            // The stage returns a DiskLoc of where to start.
+            PlanExecutor::ExecState state = exec->getNext(NULL, &startLoc);
+
+            // This is normal.  The start of the oplog is the beginning of the collection.
+            if (PlanExecutor::IS_EOF == state) {
+                return getExecutor(txn, collection, autoCq.release(), PlanExecutor::YIELD_AUTO,
+                                   execOut);
+            }
+
+            // This is not normal.  An error was encountered.
+            if (PlanExecutor::ADVANCED != state) {
+                return Status(ErrorCodes::InternalError,
+                              "quick oplog start location had error...?");
+            }
         }
 
         // cout << "diskloc is " << startLoc.toString() << endl;
@@ -421,20 +508,21 @@ namespace mongo {
         params.collection = collection;
         params.start = startLoc;
         params.direction = CollectionScanParams::FORWARD;
-        params.tailable = cq->getParsed().hasOption(QueryOption_CursorTailable);
+        params.tailable = cq->getParsed().getOptions().tailable;
 
         WorkingSet* ws = new WorkingSet();
         CollectionScan* cs = new CollectionScan(txn, params, ws, cq->root());
         // Takes ownership of 'ws', 'cs', and 'cq'.
-        *execOut = new PlanExecutor(ws, cs, autoCq.release(), collection);
-        return Status::OK();
+        return PlanExecutor::make(txn, ws, cs, autoCq.release(), collection,
+                                  PlanExecutor::YIELD_AUTO, execOut);
     }
 
     std::string newRunQuery(OperationContext* txn,
                             Message& m,
                             QueryMessage& q,
                             CurOp& curop,
-                            Message &result) {
+                            Message &result,
+                            bool fromDBDirectClient) {
         // Validate the namespace.
         const char *ns = q.ns;
         uassert(16332, "can't have an empty ns", ns[0]);
@@ -482,20 +570,15 @@ namespace mongo {
             return "";
         }
 
-        // This is a read lock.  We require this because if we're parsing a $where, the
-        // where-specific parsing code assumes we have a lock and creates execution machinery that
-        // requires it.
-        Client::ReadContext ctx(txn, q.ns);
-        Collection* collection = ctx.ctx().db()->getCollection( txn, ns );
+        const NamespaceString nss(q.ns);
 
         // Parse the qm into a CanonicalQuery.
         CanonicalQuery* cq;
         Status canonStatus = CanonicalQuery::canonicalize(
-                            q, &cq, WhereCallbackReal(txn, StringData(ctx.ctx().db()->name())));
+                                    q, &cq, WhereCallbackReal(txn, StringData(nss.db())));
         if (!canonStatus.isOK()) {
             uasserted(17287, str::stream() << "Can't canonicalize query: " << canonStatus.toString());
         }
-        verify(cq);
 
         QLOG() << "Running query:\n" << cq->toString();
         LOG(2) << "Running query: " << cq->toStringShort();
@@ -505,6 +588,13 @@ namespace mongo {
 
         // We use this a lot below.
         const LiteParsedQuery& pq = cq->getParsed();
+
+        AutoGetCollectionForRead ctx(txn, nss);
+
+        const int dbProfilingLevel = (ctx.getDb() != NULL) ? ctx.getDb()->getProfilingLevel() :
+                                                             serverGlobalParams.defaultProfile;
+
+        Collection* collection = ctx.getCollection();
 
         // We'll now try to get the query executor that will execute this query for us. There
         // are a few cases in which we know upfront which executor we should get and, therefore,
@@ -518,15 +608,7 @@ namespace mongo {
         // Otherwise we go through the selection of which executor is most suited to the
         // query + run-time context at hand.
         Status status = Status::OK();
-        if (collection == NULL) {
-            LOG(2) << "Collection " << ns << " does not exist."
-                   << " Using EOF stage: " << cq->toStringShort();
-            EOFStage* eofStage = new EOFStage();
-            WorkingSet* ws = new WorkingSet();
-            // Takes ownership of 'cq'.
-            rawExec = new PlanExecutor(ws, eofStage, cq, NULL);
-        }
-        else if (pq.hasOption(QueryOption_OplogReplay)) {
+        if (NULL != collection && pq.getOptions().oplogReplay) {
             // Takes ownership of 'cq'.
             status = getOplogStartHack(txn, collection, cq, &rawExec);
         }
@@ -536,7 +618,7 @@ namespace mongo {
                 options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
             }
             // Takes ownership of 'cq'.
-            status = getExecutor(txn, collection, cq, &rawExec, options);
+            status = getExecutor(txn, collection, cq, PlanExecutor::YIELD_AUTO, &rawExec, options);
         }
 
         if (!status.isOK()) {
@@ -554,11 +636,7 @@ namespace mongo {
             bb.skip(sizeof(QueryResult::Value));
 
             BSONObjBuilder explainBob;
-            Status explainStatus = Explain::explainStages(exec.get(), Explain::EXEC_ALL_PLANS,
-                                                          &explainBob);
-            if (!explainStatus.isOK()) {
-                uasserted(18521, "Explain error: " + explainStatus.reason());
-            }
+            Explain::explainStages(exec.get(), ExplainCommon::EXEC_ALL_PLANS, &explainBob);
 
             // Add the resulting object to the return buffer.
             BSONObj explainObj = explainBob.obj();
@@ -590,8 +668,8 @@ namespace mongo {
         txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
         // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-        bool slaveOK = pq.hasOption(QueryOption_SlaveOk) || pq.hasReadPref();
-        status = repl::getGlobalReplicationCoordinator()->canServeReadsFor(
+        bool slaveOK = pq.getOptions().slaveOk || pq.hasReadPref();
+        status = repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(
                 txn,
                 NamespaceString(cq->ns()),
                 slaveOK);
@@ -625,17 +703,12 @@ namespace mongo {
         // Do we save the PlanExecutor in a ClientCursor for getMore calls later?
         bool saveClientCursor = false;
 
-        // The executor registers itself with the active executors list in ClientCursor.
-        auto_ptr<ScopedExecutorRegistration> safety(new ScopedExecutorRegistration(exec.get()));
-
         BSONObj obj;
         PlanExecutor::ExecState state;
         // uint64_t numMisplacedDocs = 0;
 
         // Get summary info about which plan the executor is using.
-        PlanSummaryStats stats;
-        Explain::getSummaryStats(exec.get(), &stats);
-        curop.debug().planSummary = stats.summaryStr.c_str();
+        curop.debug().planSummary = Explain::getPlanSummary(exec.get());
 
         while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
             // Add result to output buffer.
@@ -645,7 +718,7 @@ namespace mongo {
             ++numResults;
 
             // Possibly note slave's position in the oplog.
-            if (pq.hasOption(QueryOption_OplogReplay)) {
+            if (pq.getOptions().oplogReplay) {
                 BSONElement e = obj["ts"];
                 if (Date == e.type() || Timestamp == e.type()) {
                     slaveReadTill = e._opTime();
@@ -679,7 +752,7 @@ namespace mongo {
         // If we don't cache the executor later, we are deleting it, so it must be deregistered.
         //
         // So, no matter what, deregister the executor.
-        safety.reset();
+        exec->deregisterExec();
 
         // Caller expects exceptions thrown in certain cases.
         if (PlanExecutor::EXEC_ERROR == state) {
@@ -693,11 +766,10 @@ namespace mongo {
         if (PlanExecutor::DEAD == state) {
             saveClientCursor = false;
         }
-        else if (pq.hasOption(QueryOption_CursorTailable)) {
+        else if (pq.getOptions().tailable) {
             // If we're tailing a capped collection, we don't bother saving the cursor if the
             // collection is empty. Otherwise, the semantics of the tailable cursor is that the
             // client will keep trying to read from it. So we'll keep it around.
-            Collection* collection = ctx.ctx().db()->getCollection(txn, cq->ns());
             if (collection && collection->numRecords(txn) != 0 && pq.getNumToReturn() != 1) {
                 saveClientCursor = true;
             }
@@ -712,19 +784,23 @@ namespace mongo {
                                            shardingState.getVersion(pq.ns()));
         }
 
+        const logger::LogComponent queryLogComponent = logger::LogComponent::kQuery;
+        const logger::LogSeverity logLevelOne = logger::LogSeverity::Debug(1);
+
+        PlanSummaryStats summaryStats;
+        Explain::getSummaryStats(exec.get(), &summaryStats);
+
+        curop.debug().ntoskip = pq.getSkip();
+        curop.debug().nreturned = numResults;
+        curop.debug().scanAndOrder = summaryStats.hasSortStage;
+        curop.debug().nscanned = summaryStats.totalKeysExamined;
+        curop.debug().nscannedObjects = summaryStats.totalDocsExamined;
+        curop.debug().idhack = summaryStats.isIdhack;
+
         // Set debug information for consumption by the profiler.
-        if (ctx.ctx().db()->getProfilingLevel() > 0 ||
-            curop.elapsedMillis() > serverGlobalParams.slowMS) {
-            PlanSummaryStats newStats;
-            Explain::getSummaryStats(exec.get(), &newStats);
-
-            curop.debug().ntoskip = pq.getSkip();
-            curop.debug().nreturned = numResults;
-            curop.debug().scanAndOrder = newStats.hasSortStage;
-            curop.debug().nscanned = newStats.totalKeysExamined;
-            curop.debug().nscannedObjects = newStats.totalDocsExamined;
-            curop.debug().idhack = newStats.isIdhack;
-
+        if (dbProfilingLevel > 0 ||
+            curop.elapsedMillis() > serverGlobalParams.slowMS ||
+            logger::globalLogDomain()->shouldLog(queryLogComponent, logLevelOne)) {
             // Get BSON stats.
             scoped_ptr<PlanStageStats> execStats(exec->getStats());
             BSONObjBuilder statsBob;
@@ -747,9 +823,24 @@ namespace mongo {
             // Allocate a new ClientCursor.  We don't have to worry about leaking it as it's
             // inserted into a global map by its ctor.
             ClientCursor* cc = new ClientCursor(collection, exec.get(),
-                                                cq->getParsed().getOptions(),
+                                                cq->getParsed().getOptions().toInt(),
                                                 cq->getParsed().getFilter());
             ccId = cc->cursorid();
+
+            if (fromDBDirectClient) {
+                cc->setUnownedRecoveryUnit(txn->recoveryUnit());
+            }
+            else if (state == PlanExecutor::IS_EOF && pq.getOptions().tailable) {
+                // Don't stash the RU for tailable cursors at EOF, let them get a new RU on their
+                // next getMore.
+            }
+            else {
+                // We stash away the RecoveryUnit in the ClientCursor.  It's used for subsequent
+                // getMore requests.  The calling OpCtx gets a fresh RecoveryUnit.
+                cc->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
+                StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+                txn->setRecoveryUnit(storageEngine->newRecoveryUnit(txn));
+            }
 
             QLOG() << "caching executor with cursorid " << ccId
                    << " after returning " << numResults << " results" << endl;
@@ -758,12 +849,12 @@ namespace mongo {
             exec.release();
 
             // TODO document
-            if (pq.hasOption(QueryOption_OplogReplay) && !slaveReadTill.isNull()) {
+            if (pq.getOptions().oplogReplay && !slaveReadTill.isNull()) {
                 cc->slaveReadTill(slaveReadTill);
             }
 
             // TODO document
-            if (pq.hasOption(QueryOption_Exhaust)) {
+            if (pq.getOptions().exhaust) {
                 curop.debug().exhaust = true;
             }
 

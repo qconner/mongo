@@ -43,6 +43,7 @@
 #include "mongo/db/storage/mmap_v1/dur_journalformat.h"
 #include "mongo/db/storage/mmap_v1/dur_journalimpl.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/server.h"
@@ -50,6 +51,7 @@
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
 #include "mongo/util/file.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/logfile.h"
 #include "mongo/util/mmap.h"
@@ -82,7 +84,7 @@ namespace mongo {
 #endif
 
         MONGO_INITIALIZER(InitializeJournalingParams)(InitializerContext* context) {
-            if (storageGlobalParams.smallfiles == true) {
+            if (mmapv1GlobalOptions.smallfiles == true) {
                 verify(dur::DataLimitPerJournalFile >= 128 * 1024 * 1024);
                 dur::DataLimitPerJournalFile = 128 * 1024 * 1024;
             }
@@ -417,12 +419,12 @@ namespace mongo {
         }
 
         void preallocateFiles() {
-            if (!(storageGlobalParams.durOptions & StorageGlobalParams::DurNoCheckSpace))
+            if (!(mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalNoCheckSpace))
                 checkFreeSpace();
 
             if( exists(preallocPath(0)) || // if enabled previously, keep using
                 exists(preallocPath(1)) ||
-                (storageGlobalParams.preallocj && preallocateIsFaster()) ) {
+                (mmapv1GlobalOptions.preallocj && preallocateIsFaster()) ) {
                     usingPreallocate = true;
                     try {
                         _preallocateFiles();
@@ -789,8 +791,3 @@ namespace mongo {
 
     }
 }
-
-/* todo
-   test (and handle) disk full on journal append.  best quick thing to do is to terminate.
-   if we roll back operations, there are nuances such as is ReplSetImpl::lastOpTimeWritten too new in ram then?
-*/

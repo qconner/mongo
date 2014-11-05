@@ -74,11 +74,9 @@ namespace mongo {
 
             NamespaceString ns( dbname, cmdObj[name].String() );
 
-            Client::ReadContext ctx(txn, ns.ns());
+            AutoGetCollectionForRead ctx(txn, ns.ns());
 
-            Database* db = ctx.ctx().db();
-            Collection* collection = db->getCollection( txn, ns );
-
+            Collection* collection = ctx.getCollection();
             if ( !collection )
                 return appendCommandStatus( result,
                                             Status( ErrorCodes::NamespaceNotFound,
@@ -104,8 +102,22 @@ namespace mongo {
             for ( size_t i = 0; i < numCursors; i++ ) {
                 WorkingSet* ws = new WorkingSet();
                 MultiIteratorStage* mis = new MultiIteratorStage(txn, ws, collection);
+
+                PlanExecutor* rawExec;
                 // Takes ownership of 'ws' and 'mis'.
-                execs.push_back(new PlanExecutor(ws, mis, collection));
+                Status execStatus = PlanExecutor::make(txn, ws, mis, collection,
+                                                       PlanExecutor::YIELD_AUTO, &rawExec);
+                invariant(execStatus.isOK());
+                auto_ptr<PlanExecutor> curExec(rawExec);
+
+                // The PlanExecutor was registered on construction due to the YIELD_AUTO policy.
+                // We have to deregister it, as it will be registered with ClientCursor.
+                curExec->deregisterExec();
+
+                // Need to save state while yielding locks between now and newGetMore.
+                curExec->saveState();
+
+                execs.push_back(curExec.release());
             }
 
             // transfer iterators to executors using a round-robin distribution.
@@ -113,6 +125,10 @@ namespace mongo {
             for (size_t i = 0; i < iterators.size(); i++) {
                 PlanExecutor* theExec = execs[i % execs.size()];
                 MultiIteratorStage* mis = static_cast<MultiIteratorStage*>(theExec->getRootStage());
+
+                // This wasn't called above as they weren't assigned yet
+                iterators[i]->saveState();
+
                 mis->addIterator(iterators.releaseAt(i));
             }
 

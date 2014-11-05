@@ -38,7 +38,6 @@
 #include "mongo/db/field_ref.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/path.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 

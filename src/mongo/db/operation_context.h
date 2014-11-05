@@ -34,11 +34,11 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/db/concurrency/lock_mgr.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/locker.h"
 
 
 namespace mongo {
+
     class Client;
     class CurOp;
     class ProgressMeter;
@@ -61,9 +61,25 @@ namespace mongo {
         virtual RecoveryUnit* recoveryUnit() const = 0;
 
         /**
+         * Returns the RecoveryUnit (same return value as recoveryUnit()) but the caller takes
+         * ownership of the returned RecoveryUnit, and the OperationContext instance relinquishes
+         * ownership.  Sets the RecoveryUnit to NULL.
+         *
+         * Used to transfer ownership of storage engine state from OperationContext
+         * to ClientCursor for getMore-able queries.
+         *
+         * Note that we don't allow the top-level locks to be stored across getMore.
+         * We rely on active cursors being killed when collections or databases are dropped,
+         * or when collection metadata changes.
+         */
+        virtual RecoveryUnit* releaseRecoveryUnit() = 0;
+
+        virtual void setRecoveryUnit(RecoveryUnit* unit) = 0;
+
+        /**
          * Interface for locking.  Caller DOES NOT own pointer.
          */
-        virtual LockState* lockState() const = 0;
+        virtual Locker* lockState() const = 0;
 
         // --- operation level info? ---
 
@@ -125,11 +141,6 @@ namespace mongo {
          */
         virtual bool isPrimaryFor( const StringData& ns ) = 0;
 
-        /**
-         * @return Transaction* for LockManager-ment.  Caller does not own pointer
-         */
-        virtual Transaction* getTransaction() = 0;
-
     protected:
         OperationContext() { }
     };
@@ -138,15 +149,39 @@ namespace mongo {
         MONGO_DISALLOW_COPYING(WriteUnitOfWork);
     public:
         WriteUnitOfWork(OperationContext* txn)
-                 : _txn(txn) {
+                 : _txn(txn),
+                   _ended(false) {
+
+            if ( _txn->lockState() ) {
+                _txn->lockState()->beginWriteUnitOfWork();
+            }
+
             _txn->recoveryUnit()->beginUnitOfWork();
         }
 
-        ~WriteUnitOfWork(){ _txn->recoveryUnit()->endUnitOfWork(); }
+        ~WriteUnitOfWork() {
+            _txn->recoveryUnit()->endUnitOfWork();
 
-        void commit() { _txn->recoveryUnit()->commitUnitOfWork(); }
+            if (_txn->lockState() && !_ended) {
+                _txn->lockState()->endWriteUnitOfWork();
+            }
+        }
 
+        void commit() {
+            invariant(!_ended);
+
+            _txn->recoveryUnit()->commitUnitOfWork();
+
+            if (_txn->lockState()) {
+                _txn->lockState()->endWriteUnitOfWork();
+                _ended = true;
+            }
+        }
+
+    private:
         OperationContext* const _txn;
+
+        bool _ended;
     };
 
 }  // namespace mongo

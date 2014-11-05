@@ -28,13 +28,19 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/currentop_command.h"
 #include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/dbwebserver.h"
 #include "mongo/util/mongoutils/html.h"
-
+#include "mongo/util/stringutils.h"
 
 namespace mongo {
 
@@ -54,7 +60,18 @@ namespace mongo {
 
             tablecell(_stringStream, co.opNum());
             tablecell(_stringStream, co.active());
-            tablecell(_stringStream, txn->lockState()->reportState());
+
+            // LockState
+            {
+                Locker::LockerInfo lockerInfo;
+                txn->lockState()->getLockerInfo(&lockerInfo);
+
+                BSONObjBuilder lockerInfoBuilder;
+                fillLockerInfo(lockerInfo, lockerInfoBuilder);
+
+                tablecell(_stringStream, lockerInfoBuilder.obj());
+            }
+
             if (co.active()) {
                 tablecell(_stringStream, co.elapsedSeconds());
             }
@@ -116,5 +133,101 @@ namespace {
         }
 
     } clientListPlugin;
+
+    class CommandHelper : public GlobalEnvironmentExperiment::ProcessOperationContext {
+    public:
+        CommandHelper( MatchExpression* me )
+            : matcher( me ) {
+        }
+
+        virtual void processOpContext(OperationContext* txn) {
+            BSONObjBuilder b;
+            if ( txn->getClient() )
+                txn->getClient()->reportState( b );
+            if ( txn->getCurOp() )
+                txn->getCurOp()->reportState( &b );
+            if ( txn->lockState() ) {
+                StringBuilder ss;
+                ss << txn->lockState();
+                b.append("lockStatePointer", ss.str());
+
+                // LockState
+                {
+                    Locker::LockerInfo lockerInfo;
+                    txn->lockState()->getLockerInfo(&lockerInfo);
+
+                    BSONObjBuilder lockerInfoBuilder;
+                    fillLockerInfo(lockerInfo, lockerInfoBuilder);
+
+                    b.append("lockState", lockerInfoBuilder.obj());
+                }
+            }
+            if ( txn->recoveryUnit() )
+                txn->recoveryUnit()->reportState( &b );
+
+            BSONObj obj = b.obj();
+
+            if ( matcher && !matcher->matchesBSON( obj ) ) {
+                return;
+            }
+
+            array.append( obj );
+        }
+
+        BSONArrayBuilder array;
+        MatchExpression* matcher;
+    };
+
+    class CurrentOpContexts : public Command {
+    public:
+        CurrentOpContexts()
+            : Command( "currentOpCtx" ) {
+        }
+
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+
+        virtual bool slaveOk() const { return true; }
+
+        virtual Status checkAuthForCommand(ClientBasic* client,
+                                           const std::string& dbname,
+                                           const BSONObj& cmdObj) {
+            if ( client->getAuthorizationSession()
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::inprog) ) {
+                return Status::OK();
+            }
+
+            return Status(ErrorCodes::Unauthorized, "unauthorized");
+
+        }
+
+        bool run( OperationContext* txn,
+                  const string& dbname,
+                  BSONObj& cmdObj,
+                  int,
+                  string& errmsg,
+                  BSONObjBuilder& result,
+                  bool fromRepl) {
+
+            scoped_ptr<MatchExpression> filter;
+            if ( cmdObj["filter"].isABSONObj() ) {
+                StatusWithMatchExpression res =
+                    MatchExpressionParser::parse( cmdObj["filter"].Obj() );
+                if ( !res.isOK() ) {
+                    return appendCommandStatus( result, res.getStatus() );
+                }
+                filter.reset( res.getValue() );
+            }
+
+            CommandHelper helper( filter.get() );
+            getGlobalEnvironment()->forEachOperationContext(&helper);
+
+            result.appendArray( "operations", helper.array.arr() );
+
+            return true;
+        }
+
+    } currentOpContexts;
+
 }  // namespace
 }  // namespace mongo

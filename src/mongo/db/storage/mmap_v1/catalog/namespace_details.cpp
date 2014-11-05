@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
 
@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/json.h"
@@ -65,7 +66,7 @@ namespace mongo {
         nIndexes = 0;
         isCapped = capped;
         maxDocsInCapped = 0x7fffffff; // no limit (value is for pre-v2.3.2 compatibility)
-        paddingFactor = 1.0;
+        paddingFactorOldDoNotUse = 1.0;
         systemFlagsOldDoNotUse = 0;
         userFlags = 0;
         capFirstNewRecord = DiskLoc();
@@ -74,7 +75,7 @@ namespace mongo {
         // For capped case, signal that we are doing initial extent allocation.
         if ( capped ) {
             // WAS: cappedLastDelRecLastExtent().setInvalid();
-            deletedList[1].setInvalid();
+            deletedListSmall[1].setInvalid();
         }
         verify( sizeof(_dataFileVersion) == 2 );
         _dataFileVersion = 0;

@@ -75,6 +75,10 @@ namespace mongo {
             IndexMetaData( BSONObj s, bool r, DiskLoc h, bool m )
                 : spec( s ), ready( r ), head( h ), multikey( m ) {}
 
+            void updateTTLSetting( long long newExpireSeconds );
+
+            std::string name() const { return spec["name"].String(); }
+
             BSONObj spec;
             bool ready;
             DiskLoc head;
@@ -93,7 +97,10 @@ namespace mongo {
              */
             bool eraseIndex( const StringData& name );
 
+            void rename( const StringData& toNS );
+
             std::string ns;
+            CollectionOptions options;
             std::vector<IndexMetaData> indexes;
         };
 

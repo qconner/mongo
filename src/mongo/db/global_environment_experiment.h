@@ -72,6 +72,11 @@ namespace mongo {
                                            const StorageEngine::Factory* factory) = 0;
 
         /**
+         * Returns true if "name" refers to a registered storage engine.
+         */
+        virtual bool isRegisteredStorageEngine(const std::string& name) = 0;
+
+        /**
          * Set the storage engine.  The engine must have been registered via registerStorageEngine.
          */
         virtual void setGlobalStorageEngine(const std::string& name) = 0;
@@ -188,5 +193,17 @@ namespace mongo {
      * Takes ownership of 'globalEnvironment'.
      */
     void setGlobalEnvironment(GlobalEnvironmentExperiment* globalEnvironment);
+
+    /**
+     * Shortcut for querying the storage engine about whether it supports document-level locking.
+     * If this call becomes too expensive, we could cache the value somewhere so we don't have to
+     * fetch the storage engine every time.
+     */
+    bool supportsDocLocking();
+
+    /**
+     * Returns true if the storage engine in use is MMAPV1.
+     */
+    bool isMMAPV1();
 
 }  // namespace mongo

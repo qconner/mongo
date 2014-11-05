@@ -35,14 +35,12 @@
 
 #include "mongo/client/constants.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
-
     class OperationContext;
 
 namespace repl {
-
-    class Member;
 
     class SyncSourceFeedback {
     public:
@@ -86,8 +84,10 @@ namespace repl {
 
         /* Inform the sync target of our current position in the oplog, as well as the positions
          * of all secondaries chained through us.
+         * ErrorCodes::NodeNotFound indicates that the caller should re-run replHandshake before
+         * calling this again.
          */
-        bool updateUpstream(OperationContext* txn);
+        Status updateUpstream(OperationContext* txn);
 
         bool hasConnection() {
             return _connection.get();
@@ -100,7 +100,7 @@ namespace repl {
         /// TODO(spencer): Remove this once the LegacyReplicationCoordinator is gone.
         BSONObj _me;
         // the member we are currently syncing from
-        const Member* _syncTarget;
+        HostAndPort _syncTarget;
         // our connection to our sync target
         boost::scoped_ptr<DBClientConnection> _connection;
         // protects cond, _shutdownSignaled, and the indicator bools.

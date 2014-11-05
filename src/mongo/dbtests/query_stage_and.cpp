@@ -35,12 +35,12 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
@@ -73,7 +73,7 @@ namespace QueryStageAnd {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(), false,
+            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(),
                                                    CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
@@ -157,10 +157,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -249,7 +251,6 @@ namespace QueryStageAnd {
                 ASSERT_GREATER_THAN_OR_EQUALS(elt.numberInt(), 10);
             }
 
-            ctx.commit();
             ASSERT_EQUALS(10, count);
         }
     };
@@ -259,10 +260,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -335,7 +338,6 @@ namespace QueryStageAnd {
                 ++count;
             }
 
-            ctx.commit();
             ASSERT_EQUALS(count, 20);
         }
     };
@@ -345,10 +347,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -378,7 +382,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // foo == bar == baz, and foo<=20, bar>=10, so our values are:
             // foo == 10, 11, 12, 13, 14, 15. 16, 17, 18, 19, 20
@@ -394,10 +397,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Generate large keys for {foo: 1, big: 1} index.
@@ -432,7 +437,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // Stage execution should fail.
             ASSERT_EQUALS(-1, countResults(ah.get()));
@@ -446,10 +450,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Generate large keys for {baz: 1, big: 1} index.
@@ -484,7 +490,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // foo == bar == baz, and foo<=20, bar>=10, so our values are:
             // foo == 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20.
@@ -497,10 +502,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -539,7 +546,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // foo == bar == baz, and foo<=20, bar>=10, 5<=baz<=15, so our values are:
             // foo == 10, 11, 12, 13, 14, 15.
@@ -558,10 +564,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Generate large keys for {bar: 1, big: 1} index.
@@ -605,7 +613,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // Stage execution should fail.
             ASSERT_EQUALS(-1, countResults(ah.get()));
@@ -617,10 +624,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -660,7 +669,6 @@ namespace QueryStageAnd {
                 if (PlanStage::ADVANCED != status) { continue; }
                 ++count;
             }
-            ctx.commit();
 
             ASSERT_EQUALS(0, count);
 
@@ -676,10 +684,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 10; ++i) {
@@ -713,7 +723,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = false;
             params.direction = -1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             ASSERT_EQUALS(0, countResults(ah.get()));
         }
@@ -724,10 +733,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -761,7 +772,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // Bar == 97
             ASSERT_EQUALS(1, countResults(ah.get()));
@@ -776,10 +786,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -814,7 +826,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // Check that the AndHash stage returns docs {foo: 10, bar: 10}
             // through {foo: 20, bar: 20}.
@@ -834,10 +845,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -872,7 +885,6 @@ namespace QueryStageAnd {
             // constructor means there is no filter.
             FetchStage* fetch = new FetchStage(&_txn, &ws, secondScan, NULL, coll);
             ah->addChild(fetch);
-            ctx.commit();
 
             // Check that the AndHash stage returns docs {foo: 10, bar: 10}
             // through {foo: 20, bar: 20}.
@@ -897,10 +909,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Insert a bunch of data
@@ -1000,7 +1014,6 @@ namespace QueryStageAnd {
                 ASSERT_TRUE(member->getFieldDotted("bar", &elt));
                 ASSERT_EQUALS(1, elt.numberInt());
             }
-            ctx.commit();
 
             ASSERT_EQUALS(count, 48);
 
@@ -1014,10 +1027,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Insert a bunch of data
@@ -1056,7 +1071,6 @@ namespace QueryStageAnd {
             // baz == 1
             params.descriptor = getIndex(BSON("baz" << 1), coll);
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             ASSERT_EQUALS(50, countResults(ah.get()));
         }
@@ -1067,12 +1081,13 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
-
 
             for (int i = 0; i < 50; ++i) {
                 insert(BSON("foo" << 8 << "bar" << 20));
@@ -1101,7 +1116,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             ASSERT_EQUALS(0, countResults(ah.get()));
         }
@@ -1112,10 +1126,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -1149,7 +1165,6 @@ namespace QueryStageAnd {
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             ASSERT_EQUALS(0, countResults(ah.get()));
         }
@@ -1160,10 +1175,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -1193,7 +1210,6 @@ namespace QueryStageAnd {
             // bar == 1
             params.descriptor = getIndex(BSON("bar" << 1), coll);
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             // Filter drops everything.
             ASSERT_EQUALS(0, countResults(ah.get()));
@@ -1205,10 +1221,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -1253,7 +1271,6 @@ namespace QueryStageAnd {
                 }
                 lastId = id;
             }
-            ctx.commit();
 
             ASSERT_EQUALS(count, 43);
         }
@@ -1267,10 +1284,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Insert a bunch of data
@@ -1302,7 +1321,6 @@ namespace QueryStageAnd {
             // bar == 1
             params.descriptor = getIndex(BSON("bar" << 1), coll);
             as->addChild(new IndexScan(&_txn, params, &ws, NULL));
-            ctx.commit();
 
             for (int i = 0; i < 50; i++) {
                 BSONObj obj = getNext(as.get(), &ws);
@@ -1320,10 +1338,12 @@ namespace QueryStageAnd {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Insert a bunch of data
@@ -1355,7 +1375,6 @@ namespace QueryStageAnd {
             // constructor means there is no filter.
             FetchStage* fetch = new FetchStage(&_txn, &ws, secondScan, NULL, coll);
             as->addChild(fetch);
-            ctx.commit();
 
             for (int i = 0; i < 50; i++) {
                 BSONObj obj = getNext(as.get(), &ws);
@@ -1392,6 +1411,8 @@ namespace QueryStageAnd {
             add<QueryStageAndSortedFirstChildFetched>();
             add<QueryStageAndSortedSecondChildFetched>();
         }
-    }  queryStageAndAll;
+    };
+
+    SuiteInstance<All> queryStageAndAll;
 
 }  // namespace QueryStageAnd

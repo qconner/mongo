@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include "mongo/db/storage/recovery_unit.h"
 
 namespace mongo {
@@ -37,9 +39,7 @@ namespace mongo {
         virtual void commitUnitOfWork() {}
         virtual void endUnitOfWork() {}
 
-        virtual bool commitIfNeeded(bool force = false) {
-            return false;
-        }
+        virtual void commitAndRestart() {}
 
         virtual bool awaitCommit() {
             return true;
@@ -53,8 +53,6 @@ namespace mongo {
         virtual void* writingPtr(void* data, size_t len) {
             return data;
         }
-
-        virtual void syncDataAndTruncateJournal() { }
     };
 
 }  // namespace mongo

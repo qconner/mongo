@@ -182,11 +182,12 @@ namespace mongo {
             delete (*it);
         }
 
-        for(NSMinMaxSet::iterator it = _blackList.begin();
-            it != _blackList.end();
+        for(std::deque<DeleteJobStats*>::iterator it = _statsHistory.begin();
+            it != _statsHistory.end();
             ++it) {
             delete (*it);
         }
+
     }
 
     void RangeDeleter::startWorkers() {
@@ -274,8 +275,8 @@ namespace {
                                                kWTimeoutMillis);
 
         repl::ReplicationCoordinator::StatusAndDuration replStatus =
-                repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOp(txn,
-                                                                                  writeConcern);
+                repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOpForClient(
+                        txn, writeConcern);
         repl::ReplicationCoordinator::Milliseconds elapsedTime = replStatus.duration;
         if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
             *errMsg = str::stream() << "rangeDeleter timed out after "
@@ -404,42 +405,6 @@ namespace {
 
         recordDelStats(new DeleteJobStats(taskDetails.stats));
         return result;
-    }
-
-    bool RangeDeleter::addToBlackList(const StringData& ns,
-                                      const BSONObj& min,
-                                      const BSONObj& max,
-                                      std::string* errMsg) {
-        string dummy;
-        if (errMsg == NULL) errMsg = &dummy;
-
-        scoped_lock sl(_queueMutex);
-
-        if (isBlacklisted_inlock(ns, min, max, errMsg)) {
-            return false;
-        }
-
-        for (NSMinMaxSet::const_iterator iter = _deleteSet.begin();
-                iter != _deleteSet.end(); ++iter) {
-            const NSMinMax* const entry = *iter;
-            if (entry->ns == ns && rangeOverlaps(entry->min, entry->max, min, max)) {
-                *errMsg = str::stream() << "Cannot black list ns: " << ns << ", min: " << min
-                                        << ", max: " << max
-                                        << " since it is already queued for deletion.";
-                return false;
-            }
-        }
-
-        _blackList.insert(new NSMinMax(ns.toString(), min, max));
-        return true;
-    }
-
-    bool RangeDeleter::removeFromBlackList(const StringData& ns,
-                                           const BSONObj& min,
-                                           const BSONObj& max) {
-        scoped_lock sl(_queueMutex);
-        NSMinMax entry(ns.toString(), min, max);
-        return deletePtrElement(&_blackList, &entry);
     }
 
     void RangeDeleter::getStatsHistory(std::vector<DeleteJobStats*>* stats) const {
@@ -593,33 +558,10 @@ namespace {
         }
     }
 
-    bool RangeDeleter::isBlacklisted_inlock(const StringData& ns,
-                                            const BSONObj& min,
-                                            const BSONObj& max,
-                                            std::string* errMsg) const {
-        for (NSMinMaxSet::const_iterator iter = _blackList.begin();
-                iter != _blackList.end(); ++iter) {
-            const NSMinMax* const entry = *iter;
-            if (ns != entry->ns) continue;
-
-            if (rangeOverlaps(min, max, entry->min, entry->max)) {
-                *errMsg = str::stream() << "ns: " << ns << ", min: " << min << ", max: " << max
-                                        << " intersects with black list" << " min: " << entry->min
-                                        << ", max: " << entry->max;
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     bool RangeDeleter::canEnqueue_inlock(const StringData& ns,
                                          const BSONObj& min,
                                          const BSONObj& max,
                                          string* errMsg) const {
-        if (isBlacklisted_inlock(ns, min, max, errMsg)) {
-            return false;
-        }
 
         NSMinMax toDelete(ns.toString(), min, max);
         if (_deleteSet.count(&toDelete) > 0) {
@@ -683,11 +625,11 @@ namespace {
         return builder.done().copy();
     }
 
-  RangeDeleterOptions::RangeDeleterOptions(const KeyRange& range):
-            range(range),
-            fromMigrate(false),
-            onlyRemoveOrphanedDocs(false),
-            waitForOpenCursors(false) {
-  }
+    RangeDeleterOptions::RangeDeleterOptions(const KeyRange& range)
+        : range(range),
+          fromMigrate(false),
+          onlyRemoveOrphanedDocs(false),
+          waitForOpenCursors(false) {
+    }
 
 }

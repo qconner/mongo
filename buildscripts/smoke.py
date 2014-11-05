@@ -8,9 +8,9 @@
 #   so the smoke.py process and all its children must be run with the
 #   mongo repo as current working directory.  That's kinda icky.
 
-# 1 The tests that are implemented as standalone executables ("test",
-#   "perftest"), don't take arguments for the dbpath, but
-#   unconditionally use "/tmp/unittest".
+# 1 The tests that are implemented as standalone executables ("test"),
+#   don't take arguments for the dbpath, but unconditionally use
+#   "/tmp/unittest".
 
 # 2 mongod output gets intermingled with mongo output, and it's often
 #   hard to find error messages in the slop.  Maybe have smoke.py do
@@ -54,6 +54,7 @@ from pymongo import Connection
 from pymongo.errors import OperationFailure
 
 import cleanbb
+import smoke
 import utils
 
 try:
@@ -218,7 +219,7 @@ class mongod(NullMongod):
         utils.ensureDir(dir_name)
 
         argv = [mongod_executable, "--port", str(self.port), "--dbpath", dir_name]
-        # These parameters are alwas set for tests
+        # These parameters are always set for tests
         # SERVER-9137 Added httpinterface parameter to keep previous behavior
         argv += ['--setParameter', 'enableTestCommands=1', '--httpinterface']
         if self.kwargs.get('small_oplog'):
@@ -238,8 +239,8 @@ class mongod(NullMongod):
             argv += ['--nopreallocj']
         if self.kwargs.get('auth'):
             argv += ['--auth', '--setParameter', 'enableLocalhostAuthBypass=false']
-            authMechanism = self.kwargs.get('authMechanism', 'MONGODB-CR')
-            if authMechanism != 'MONGODB-CR':
+            authMechanism = self.kwargs.get('authMechanism', 'SCRAM-SHA-1')
+            if authMechanism != 'SCRAM-SHA-1':
                 argv += ['--setParameter', 'authenticationMechanisms=' + authMechanism]
             self.auth = True
         if self.kwargs.get('keyFile'):
@@ -325,6 +326,14 @@ class mongod(NullMongod):
         self.proc.wait()
         sys.stderr.flush()
         sys.stdout.flush()
+
+        # Fail hard if mongod terminates with an error. That might indicate that an
+        # instrumented build (e.g. LSAN) has detected an error. For now we aren't doing this on
+        # windows because the exit code seems to be unpredictable. We don't have LSAN there
+        # anyway.
+        retcode = self.proc.returncode
+        if os.sys.platform != "win32" and retcode != 0:
+            raise(Exception('mongod process exited with non-zero code %d' % retcode))
 
     def wait_for_repl(self):
         Connection(port=self.port).testing.smokeWait.insert({}, w=2, wtimeout=5*60*1000)
@@ -514,12 +523,16 @@ def runTest(test, result):
         argv += [path]
     elif ext in ["", ".exe"]:
         # Blech.
-        if os.path.basename(path) in ["dbtest", "dbtest.exe", "perftest", "perftest.exe"]:
+        if os.path.basename(path) in ["dbtest", "dbtest.exe"]:
             argv = [path]
-            # default data directory for test and perftest is /tmp/unittest
+            # default data directory for dbtest is /tmp/unittest
             if smoke_db_prefix:
                 dir_name = smoke_db_prefix + '/unittests'
                 argv.extend(["--dbpath", dir_name] )
+
+            if storage_engine:
+                argv.extend(["--storageEngine", storage_engine])
+
         # more blech
         elif os.path.basename(path) in ['mongos', 'mongos.exe']:
             argv = [path, "--test"]
@@ -541,6 +554,7 @@ def runTest(test, result):
     # hangs... that's bad.
     if ( argv[0].endswith( 'mongo' ) or argv[0].endswith( 'mongo.exe' ) ) and not '--eval' in argv :
         evalString = 'TestData = new Object();' + \
+                     'TestData.storageEngine = "' + ternary( storage_engine, storage_engine, "" ) + '";' + \
                      'TestData.testPath = "' + path + '";' + \
                      'TestData.testFile = "' + os.path.basename( path ) + '";' + \
                      'TestData.testName = "' + re.sub( ".js$", "", os.path.basename( path ) ) + '";' + \
@@ -668,7 +682,9 @@ def run_tests(tests):
             master.start()
 
         if small_oplog:
-            slave = mongod(slave=True, set_parameters=set_parameters)
+            slave = mongod(slave=True,
+                           storage_engine=storage_engine,
+                           set_parameters=set_parameters)
             slave.start()
         elif small_oplog_rs:
             slave = mongod(slave=True,
@@ -933,7 +949,6 @@ def expand_suites(suites,expandUseDB=True):
     for suite in suites:
         if suite == 'all':
             return expand_suites(['dbtest',
-                                  'perf', 
                                   'jsCore', 
                                   'jsPerf', 
                                   'mmap_v1',
@@ -953,12 +968,6 @@ def expand_suites(suites,expandUseDB=True):
                 program = 'dbtest.exe'
             else:
                 program = 'dbtest'
-            (globstr, usedb) = (program, False)
-        elif suite == 'perf':
-            if os.sys.platform == "win32":
-                program = 'perftest.exe'
-            else:
-                program = 'perftest'
             (globstr, usedb) = (program, False)
         elif suite == 'mongosTest':
             if os.sys.platform == "win32":
@@ -1002,10 +1011,35 @@ def expand_suites(suites,expandUseDB=True):
 
     return tests
 
+
+def filter_tests_by_tag(tests, tag_query):
+    """Selects tests from a list based on a query over the tags in the tests."""
+
+    test_map = {}
+    roots = []
+    for test in tests:
+        root = os.path.abspath(test[0])
+        roots.append(root)
+        test_map[root] = test
+
+    new_style_tests = smoke.tests.build_tests(roots, extract_metadata=True)
+    new_style_tests = smoke.suites.build_suite(new_style_tests, tag_query)
+
+    print "\nTag query matches %s tests out of %s.\n" % (len(new_style_tests),
+                                                         len(tests))
+
+    tests = []
+    for new_style_test in new_style_tests:
+        tests.append(test_map[os.path.abspath(new_style_test.filename)])
+
+    return tests
+
+
 def add_exe(e):
     if os.sys.platform.startswith( "win" ) and not e.endswith( ".exe" ):
         e += ".exe"
     return e
+
 
 def set_globals(options, tests):
     global mongod_executable, mongod_port, shell_executable, continue_on_failure
@@ -1209,7 +1243,7 @@ def main():
     parser.add_option('--use-x509', dest='use_x509', default=False,
                       action="store_true",
                       help='Use x509 auth for internal cluster authentication')
-    parser.add_option('--authMechanism', dest='authMechanism', default='MONGODB-CR',
+    parser.add_option('--authMechanism', dest='authMechanism', default='SCRAM-SHA-1',
                       help='Use the given authentication mechanism, when --auth is used.')
     parser.add_option('--keyFile', dest='keyFile', default=None,
                       help='Path to keyFile to use to run replSet and sharding tests with authentication enabled')
@@ -1225,7 +1259,7 @@ def main():
                       default=False,
                       help='Clear database files before first test')
     parser.add_option('--clean-every', dest='clean_every_n_tests', type='int',
-                      default=20,
+                      default=(1 if 'detect_leaks=1' in os.getenv("ASAN_OPTIONS", "") else 20),
                       help='Clear database files every N tests [default %default]')
     parser.add_option('--dont-start-mongod', dest='start_mongod', default=True,
                       action='store_false',
@@ -1258,6 +1292,14 @@ def main():
                       help='Deprecated(use --shell-write-mode): Sets the shell to use write commands by default')
     parser.add_option('--shell-write-mode', dest='shell_write_mode', default="commands",
                       help='Sets the shell to use a specific write mode: commands/compatibility/legacy (default:legacy)')
+
+    parser.add_option('--include-tags', dest='include_tags', default="", action='store',
+                      help='Filters jstests run by tag regex(es) - a tag in the test must match the regexes.  ' +
+                           'Specify single regex string or JSON array.')
+
+    parser.add_option('--exclude-tags', dest='exclude_tags', default="", action='store',
+                      help='Filters jstests run by tag regex(es) - no tags in the test must match the regexes.  ' +
+                           'Specify single regex string or JSON array.')
 
     global tests
     (options, tests) = parser.parse_args()
@@ -1312,6 +1354,22 @@ def main():
                 return True
 
         tests = filter( ignore_test, tests )
+
+    if options.include_tags or options.exclude_tags:
+
+        def to_regex_array(tags_option):
+            if not tags_option:
+                return []
+
+            tags_list = smoke.json_options.json_coerce(tags_option)
+            if isinstance(tags_list, basestring):
+                tags_list = [tags_list]
+
+            return map(re.compile, tags_list)
+
+        tests = filter_tests_by_tag(tests,
+            smoke.suites.RegexQuery(include_res=to_regex_array(options.include_tags),
+                                    exclude_res=to_regex_array(options.exclude_tags)))
 
     if not tests:
         print "warning: no tests specified"

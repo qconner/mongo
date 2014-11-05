@@ -26,11 +26,14 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/exec/shard_filter.h"
 
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/keypattern.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -65,7 +68,7 @@ namespace mongo {
             // aborted migrations
             if (_metadata) {
 
-                KeyPattern shardKeyPattern(_metadata->getKeyPattern());
+                ShardKeyPattern shardKeyPattern(_metadata->getKeyPattern());
                 WorkingSetMember* member = _ws->get(*out);
                 WorkingSetMatchableDocument matchable(member);
                 BSONObj shardKey = shardKeyPattern.extractShardKeyFromMatchable(matchable);
@@ -108,12 +111,14 @@ namespace mongo {
             ++_commonStats.advanced;
             return status;
         }
-        else {
-            if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            return status;
+        else if (PlanStage::NEED_TIME == status) {
+            ++_commonStats.needTime;
         }
+        else if (PlanStage::NEED_FETCH == status) {
+            ++_commonStats.needFetch;
+        }
+
+        return status;
     }
 
     void ShardFilterStage::saveState() {

@@ -55,16 +55,17 @@ namespace mongo {
         };
 
         // parseFrom() must be called before getGeometry() to ensure initialization of geoContainer
-        bool parseFrom(const BSONObj &obj);
+        Status parseFrom(const BSONObj &obj);
 
         std::string getField() const { return field; }
         Predicate getPred() const { return predicate; }
         const GeometryContainer& getGeometry() const { return *geoContainer; }
 
     private:
-        // Try to parse the provided object into the right place.
-        bool parseLegacyQuery(const BSONObj &obj);
-        bool parseNewQuery(const BSONObj &obj);
+        // Parse geospatial query
+        // e.g.
+        // { "$intersect" : { "$geometry" : { "type" : "Point", "coordinates": [ 40, 5 ] } } }
+        Status parseQuery(const BSONObj &obj);
 
         // Name of the field in the query.
         std::string field;

@@ -29,6 +29,7 @@
 #include "mongo/pch.h"
 
 #include "mongo/client/gridfs.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/assert_util.h"
@@ -64,6 +65,8 @@ namespace {
         void setupTests() {
             add< SetChunkSizeTest >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 }
 

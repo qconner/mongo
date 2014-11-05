@@ -32,31 +32,34 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
+#include "mongo/db/cloner.h"
+
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/dbclientinterface.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/resource_pattern.h"
-#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_create.h"
-#include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
 #include "mongo/db/commands/rename_collection.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplogreader.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_EXPORT_SERVER_PARAMETER(skipCorruptDocumentsWhenCloning, bool, false);
 
     BSONElement getErrField(const BSONObj& o);
 
@@ -111,8 +114,7 @@ namespace mongo {
             Lock::GlobalWrite lk(txn->lockState());
 
             // Make sure database still exists after we resume from the temp release
-            bool unused;
-            Database* db = dbHolder().getOrCreate(txn, _dbName, unused);
+            Database* db = dbHolder().openDb(txn, _dbName);
 
             bool createdCollection = false;
             Collection* collection = NULL;
@@ -153,9 +155,14 @@ namespace mongo {
                 /* assure object is valid.  note this will slow us down a little. */
                 const Status status = validateBSON(tmp.objdata(), tmp.objsize());
                 if (!status.isOK()) {
-                    log() << "Cloner: skipping corrupt object from " << from_collection
+                    str::stream ss;
+                    ss << "Cloner: found corrupt document in " << from_collection.toString()
                           << ": " << status.reason();
-                    continue;
+                    if (skipCorruptDocumentsWhenCloning) {
+                        warning() << ss.ss.str() << "; skipping";
+                        continue;
+                    }
+                    msgasserted(28531, ss);
                 }
 
                 ++numSeen;
@@ -255,8 +262,7 @@ namespace mongo {
 
         // We are under lock here again, so reload the database in case it may have disappeared
         // during the temp release
-        bool unused;
-        Database* db = dbHolder().getOrCreate(txn, toDBName, unused);
+        Database* db = dbHolder().openDb(txn, toDBName);
 
         Collection* collection = db->getCollection( txn, to_collection );
         if ( !collection ) {
@@ -309,28 +315,31 @@ namespace mongo {
                                 bool logForRepl) {
 
         const NamespaceString nss(ns);
-        Lock::DBWrite dbWrite(txn->lockState(), nss.db());
+        const string dbname = nss.db().toString();
 
-        const string dbName = nss.db().toString();
+        Lock::DBLock dbWrite(txn->lockState(), dbname, MODE_X);
 
-        bool unused;
-        Database* db = dbHolder().getOrCreate(txn, dbName, unused);
+        Database* db = dbHolder().openDb(txn, dbname);
 
         // config
-        string temp = dbName + ".system.namespaces";
-        BSONObj config = _conn->findOne(temp , BSON("name" << ns));
-        if (config["options"].isABSONObj()) {
-            WriteUnitOfWork wunit(txn);
-            Status status = userCreateNS(txn, db, ns, config["options"].Obj(), logForRepl, 0);
-            if ( !status.isOK() ) {
-                errmsg = status.toString();
-                return false;
+        BSONObj filter = BSON("name" << nss.coll().toString());
+        list<BSONObj> collList = _conn->getCollectionInfos( dbname, filter);
+        if (!collList.empty()) {
+            invariant(collList.size() <= 1);
+            BSONObj col = collList.front();
+            if (col["options"].isABSONObj()) {
+                WriteUnitOfWork wunit(txn);
+                Status status = userCreateNS(txn, db, ns, col["options"].Obj(), logForRepl, 0);
+                if ( !status.isOK() ) {
+                    errmsg = status.toString();
+                    return false;
+                }
+                wunit.commit();
             }
-            wunit.commit();
         }
 
         // main data
-        copy(txn, dbName,
+        copy(txn, dbname,
              nss, nss,
              logForRepl, false, true, mayYield, mayBeInterrupted,
              Query(query).snapshot());
@@ -341,7 +350,7 @@ namespace mongo {
         }
 
         // indexes
-        copyIndexes(txn, dbName,
+        copyIndexes(txn, dbname,
                     NamespaceString(ns), NamespaceString(ns),
                     logForRepl, false, true, mayYield,
                     mayBeInterrupted);
@@ -374,16 +383,9 @@ namespace mongo {
         for (std::vector<HostAndPort>::const_iterator iter = csServers.begin();
              iter != csServers.end(); ++iter) {
 
-#if !defined(_WIN32) && !defined(__sunos__)
-            // isSelf() only does the necessary comparisons on os x and linux (SERVER-14165)
             if (!repl::isSelf(*iter))
                 continue;
-#else
-            if (iter->port() != serverGlobalParams.port)
-                continue;
-            if (iter->host() != "localhost" && iter->host() != "127.0.0.1")
-                continue;
-#endif
+
             masterSameProcess = true;
             break;
         }
@@ -406,8 +408,11 @@ namespace mongo {
                 auto_ptr<DBClientBase> con( cs.connect( errmsg ));
                 if ( !con.get() )
                     return false;
-                if (!repl::replAuthenticate(con.get()))
+                if (getGlobalAuthorizationManager()->isAuthEnabled() &&
+                    !authenticateInternalUser(con.get())) {
+
                     return false;
+                }
 
                 _conn = con;
             }
@@ -492,8 +497,7 @@ namespace mongo {
                     // Copy releases the lock, so we need to re-load the database. This should
                     // probably throw if the database has changed in between, but for now preserve
                     // the existing behaviour.
-                    bool unused;
-                    db = dbHolder().getOrCreate(txn, toDBName, unused);
+                    db = dbHolder().openDb(txn, toDBName);
 
                     // we defer building id index for performance - building it in batch is much
                     // faster

@@ -40,11 +40,11 @@ db.dropDatabase();
 assert.eq( 0, db.capped.count(), "capped not dropped");
 assert.eq( 0, db.system.indexes.count(), "indexes not dropped" );
 
-t.runTool( "restore" , "--dir" , t.ext , "--noOptionsRestore");
+t.runTool( "restore" , "--dir" , t.ext , "--noOptionsRestore", "--w=1");
 
 assert.eq( 1, db.capped.count() , "wrong number of docs restored to capped" );
 assert(true !== db.capped.stats().capped, "restore options were not ignored");
-assert.eq(undefined, db.capped.exists().options,
+assert.eq( {}, db.capped.exists().options,
        "restore options not ignored: " + tojson( db.capped.exists() ) );
 
 // Dump/restore single DB
@@ -67,13 +67,14 @@ db.dropDatabase();
 assert.eq( 0, db.capped.count(), "capped not dropped");
 assert.eq( 0, db.system.indexes.count(), "indexes not dropped" );
 
-t.runTool( "restore" , "-d", dbname2, "--dir" , dumppath + dbname, "--noOptionsRestore");
+t.runTool( "restore" , "-d", dbname2, "--dir" , dumppath + dbname, "--noOptionsRestore", "--w=1");
 
 db = db.getSiblingDB(dbname2);
 
 assert.eq( 1, db.capped.count() , "wrong number of docs restored to capped" );
 assert(true !== db.capped.stats().capped, "restore options were not ignored");
-assert(undefined === db.capped.exists().options, "restore options not ignored");
+assert.eq( {}, db.capped.exists().options, 
+          "restore options not ignored: " + tojson( db.capped.exists() ) );
 
 // Dump/restore single collection
 
@@ -98,12 +99,13 @@ db.dropDatabase();
 assert.eq( 0, db.capped.count(), "capped not dropped");
 assert.eq( 0, db.system.indexes.count(), "indexes not dropped" );
 
-t.runTool( "restore", "-d", dbname, "--drop", "--noOptionsRestore", dumppath + dbname );
+t.runTool( "restore", "-d", dbname, "--drop", "--noOptionsRestore", dumppath + dbname, "--w=1");
 
 db = db.getSiblingDB(dbname);
 
 assert.eq( 1, db.capped.count() , "wrong number of docs restored to capped" );
 assert( true !== db.capped.stats().capped, "restore options were not ignored" );
-assert( undefined === db.capped.exists().options );
+assert.eq( {}, db.capped.exists().options, 
+          "restore options not ignored: " + tojson( db.capped.exists() ) );
 
 t.stop();

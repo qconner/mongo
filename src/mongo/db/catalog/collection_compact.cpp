@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/db/catalog/collection.h"
 
 #include "mongo/base/counter.h"
@@ -110,7 +112,7 @@ namespace mongo {
 
 
         // same data, but might perform a little different after compact?
-        _infoCache.reset();
+        _infoCache.reset( txn );
 
         vector<BSONObj> indexSpecs;
         {

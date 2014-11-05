@@ -38,7 +38,6 @@
 #include "mongo/db/field_parser.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/util/log.h"
 
@@ -124,7 +123,7 @@ namespace mongo {
             LastError *le = lastError.disableForCommand();
 
             // Always append lastOp and connectionId
-            Client& c = cc();
+            Client& c = *txn->getClient();
             c.appendLastOp( result );
 
             // for sharding; also useful in general for debugging
@@ -142,7 +141,7 @@ namespace mongo {
             bool lastOpTimePresent = extracted != FieldParser::FIELD_NONE;
             if (!lastOpTimePresent) {
                 // Use the client opTime if no wOpTime is specified
-                lastOpTime = cc().getLastOp();
+                lastOpTime = c.getLastOp();
             }
             
             OID electionId;

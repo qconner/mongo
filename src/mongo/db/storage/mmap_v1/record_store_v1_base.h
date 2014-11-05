@@ -63,13 +63,17 @@ namespace mongo {
                                      long long numRecordsIncrement ) = 0;
 
         virtual void setStats( OperationContext* txn,
-                               long long dataSizeIncrement,
-                               long long numRecordsIncrement ) = 0;
+                               long long dataSize,
+                               long long numRecords ) = 0;
 
-        virtual const DiskLoc& deletedListEntry( int bucket ) const = 0;
+        virtual DiskLoc deletedListEntry( int bucket ) const = 0;
         virtual void setDeletedListEntry( OperationContext* txn,
                                           int bucket,
                                           const DiskLoc& loc ) = 0;
+
+        virtual DiskLoc deletedListLegacyGrabBag() const = 0;
+        virtual void setDeletedListLegacyGrabBag(OperationContext* txn, const DiskLoc& loc) = 0;
+
         virtual void orphanDeletedList(OperationContext* txn) = 0;
 
         virtual const DiskLoc& firstExtent( OperationContext* txn ) const = 0;
@@ -91,22 +95,19 @@ namespace mongo {
 
         virtual long long maxCappedDocs() const = 0;
 
-        virtual double paddingFactor() const = 0;
-
-        virtual void setPaddingFactor( OperationContext* txn, double paddingFactor ) = 0;
-
     };
 
     class RecordStoreV1Base : public RecordStore {
     public:
 
-        static const int Buckets;
-        static const int MaxBucket;
+        static const int Buckets = 26;
+        static const int MaxAllowedAllocation = 16*1024*1024 + 512*1024;
 
         static const int bucketSizes[];
 
         enum UserFlags {
-            Flag_UsePowerOf2Sizes = 1 << 0
+            Flag_UsePowerOf2Sizes = 1 << 0,
+            Flag_NoPadding = 1 << 1,
         };
 
         // ------------
@@ -133,8 +134,13 @@ namespace mongo {
 
         virtual RecordData dataFor( OperationContext* txn, const DiskLoc& loc ) const;
 
+        virtual bool findRecord( OperationContext* txn, const DiskLoc& loc, RecordData* rd ) const;
+
         void deleteRecord( OperationContext* txn,
                            const DiskLoc& dl );
+
+        virtual RecordFetcher* recordNeedsFetch( OperationContext* txn,
+                                                 const DiskLoc& loc ) const;
 
         StatusWith<DiskLoc> insertRecord( OperationContext* txn,
                                           const char* data,
@@ -154,7 +160,8 @@ namespace mongo {
 
         virtual Status updateWithDamages( OperationContext* txn,
                                           const DiskLoc& loc,
-                                          const char* damangeSource,
+                                          const RecordData& oldRec,
+                                          const char* damageSource,
                                           const mutablebson::DamageVector& damages );
 
         virtual RecordIterator* getIteratorForRepair( OperationContext* txn ) const;
@@ -174,13 +181,6 @@ namespace mongo {
 
         const RecordStoreV1MetaData* details() const { return _details.get(); }
 
-        /**
-         * @return the actual size to create
-         *         will be >= oldRecordSize
-         *         based on padding and any other flags
-         */
-        int getRecordAllocationSize( int minRecordSize ) const;
-
         DiskLoc getExtentLocForRecord( OperationContext* txn, const DiskLoc& loc ) const;
 
         DiskLoc getNextRecord( OperationContext* txn, const DiskLoc& loc ) const;
@@ -189,16 +189,12 @@ namespace mongo {
         DiskLoc getNextRecordInExtent( OperationContext* txn, const DiskLoc& loc ) const;
         DiskLoc getPrevRecordInExtent( OperationContext* txn, const DiskLoc& loc ) const;
 
-        /* @return the size for an allocated record quantized to 1/16th of the BucketSize.
-           @param allocSize    requested size to allocate
-           The returned size will be greater than or equal to 'allocSize'.
-        */
-        static int quantizeAllocationSpace(int allocSize);
-
         /**
-         * Quantize 'allocSize' to the nearest bucketSize (or nearest 1mb boundary for large sizes).
+         * Quantize 'minSize' to the nearest allocation size.
          */
-        static int quantizePowerOf2AllocationSpace(int allocSize);
+        static int quantizeAllocationSpace(int minSize);
+
+        static bool isQuantized(int recordSize);
 
         /* return which "deleted bucket" for this size object */
         static int bucket(int size);
@@ -213,6 +209,8 @@ namespace mongo {
         const DeletedRecord* deletedRecordFor( const DiskLoc& loc ) const;
 
         virtual bool isCapped() const = 0;
+
+        virtual bool shouldPadInserts() const = 0;
 
         virtual StatusWith<DiskLoc> allocRecord( OperationContext* txn,
                                                  int lengthWithHeaders,
@@ -245,9 +243,6 @@ namespace mongo {
             require: you must have already declared write intent for the record header.
         */
         void _addRecordToRecListInExtent(OperationContext* txn, Record* r, DiskLoc loc);
-
-        void _paddingTooSmall( OperationContext* txn );
-        void _paddingFits( OperationContext* txn );
 
         /**
          * internal
@@ -288,7 +283,7 @@ namespace mongo {
 
         virtual void saveState() {}
 
-        virtual bool restoreState() { return true; }
+        virtual bool restoreState(OperationContext* txn) { return true; }
 
         virtual RecordData dataFor( const DiskLoc& loc ) const { return _rs->dataFor(_txn, loc); }
 

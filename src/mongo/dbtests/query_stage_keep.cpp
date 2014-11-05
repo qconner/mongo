@@ -34,11 +34,12 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
+#include "mongo/db/exec/eof.h"
 #include "mongo/db/exec/keep_mutations.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
@@ -61,8 +62,7 @@ namespace QueryStageKeep {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(), false,
-                                                   CollectionScanParams::FORWARD);
+            RecordIterator* it = coll->getIterator(&_txn);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
                 out->insert(nextLoc);
@@ -106,12 +106,14 @@ namespace QueryStageKeep {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
+
             WorkingSet ws;
 
             // Add 10 objects to the collection.
@@ -127,7 +129,6 @@ namespace QueryStageKeep {
                 member->obj = BSON("x" << 2);
                 ws.flagForReview(id);
             }
-            ctx.commit();
 
             // Create a collscan to provide the 10 objects in the collection.
             CollectionScanParams params;
@@ -139,10 +140,11 @@ namespace QueryStageKeep {
 
             // Create a KeepMutations stage to merge in the 10 flagged objects.
             // Takes ownership of 'cs'
-            KeepMutationsStage* keep = new KeepMutationsStage(NULL, &ws, cs);
+            MatchExpression* nullFilter = NULL;
+            std::auto_ptr<KeepMutationsStage> keep(new KeepMutationsStage(nullFilter, &ws, cs));
 
             for (size_t i = 0; i < 10; ++i) {
-                WorkingSetID id = getNextResult(keep);
+                WorkingSetID id = getNextResult(keep.get());
                 WorkingSetMember* member = ws.get(id);
                 ASSERT_FALSE(ws.isFlagged(id));
                 ASSERT_EQUALS(member->obj["x"].numberInt(), 1);
@@ -152,11 +154,78 @@ namespace QueryStageKeep {
 
             // Flagged results *must* be at the end.
             for (size_t i = 0; i < 10; ++i) {
-                WorkingSetID id = getNextResult(keep);
+                WorkingSetID id = getNextResult(keep.get());
                 WorkingSetMember* member = ws.get(id);
                 ASSERT(ws.isFlagged(id));
                 ASSERT_EQUALS(member->obj["x"].numberInt(), 2);
             }
+        }
+    };
+
+    /**
+     * SERVER-15580: test that the KeepMutationsStage behaves correctly if additional results are
+     * flagged after some flagged results have already been returned.
+     */
+    class KeepStageFlagAdditionalAfterStreamingStarts : public QueryStageKeepBase {
+    public:
+        void run() {
+            Client::WriteContext ctx(&_txn, ns());
+
+            Database* db = ctx.ctx().db();
+            Collection* coll = db->getCollection(&_txn, ns());
+            if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
+            }
+            WorkingSet ws;
+
+            std::set<WorkingSetID> expectedResultIds;
+            std::set<WorkingSetID> resultIds;
+
+            // Create a KeepMutationsStage with an EOF child, and flag 50 objects.  We expect these
+            // objects to be returned by the KeepMutationsStage.
+            MatchExpression* nullFilter = NULL;
+            std::auto_ptr<KeepMutationsStage> keep(new KeepMutationsStage(nullFilter, &ws,
+                                                                          new EOFStage()));
+            for (size_t i = 0; i < 50; ++i) {
+                WorkingSetID id = ws.allocate();
+                WorkingSetMember* member = ws.get(id);
+                member->state = WorkingSetMember::OWNED_OBJ;
+                member->obj = BSON("x" << 1);
+                ws.flagForReview(id);
+                expectedResultIds.insert(id);
+            }
+
+            // Call work() on the KeepMutationsStage.  The stage should start streaming the
+            // already-flagged objects.
+            WorkingSetID id = getNextResult(keep.get());
+            resultIds.insert(id);
+
+            // Flag more objects, then call work() again on the KeepMutationsStage, and expect none
+            // of the newly-flagged objects to be returned (the KeepMutationsStage does not
+            // incorporate objects flagged since the streaming phase started).
+            //
+            // This condition triggers SERVER-15580 (the new flagging causes a rehash of the
+            // unordered_set "WorkingSet::_flagged", which invalidates all iterators, which were
+            // previously being dereferenced in KeepMutationsStage::work()).
+            // Note that std::unordered_set<>::insert() triggers a rehash if the new number of
+            // elements is greater than or equal to max_load_factor()*bucket_count().
+            size_t rehashSize = static_cast<size_t>(ws.getFlagged().max_load_factor() *
+                                                    ws.getFlagged().bucket_count());
+            while (ws.getFlagged().size() <= rehashSize) {
+                WorkingSetID id = ws.allocate();
+                WorkingSetMember* member = ws.get(id);
+                member->state = WorkingSetMember::OWNED_OBJ;
+                member->obj = BSON("x" << 1);
+                ws.flagForReview(id);
+            }
+            while ((id = getNextResult(keep.get())) != WorkingSet::INVALID_ID) {
+                resultIds.insert(id);
+            }
+
+            // Assert that only the first 50 objects were returned.
+            ASSERT(expectedResultIds == resultIds);
         }
     };
 
@@ -166,7 +235,10 @@ namespace QueryStageKeep {
 
         void setupTests() {
             add<KeepStageBasic>();
+            add<KeepStageFlagAdditionalAfterStreamingStarts>();
         }
-    }  queryStageKeepAll;
+    };
+
+    SuiteInstance<All> queryStageKeepAll;
 
 }  // namespace QueryStageKeep

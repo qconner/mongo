@@ -26,11 +26,14 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrites
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/delete.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
@@ -91,32 +94,43 @@ namespace mongo {
 
             BSONObj deletedDoc;
 
-            WriteUnitOfWork wunit(_txn);
-
             // TODO: Do we want to buffer docs and delete them in a group rather than
             // saving/restoring state repeatedly?
             saveState();
-            const bool deleteCappedOK = false;
-            const bool deleteNoWarn = false;
-            _collection->deleteDocument(_txn, rloc, deleteCappedOK, deleteNoWarn,
-                                        _params.shouldCallLogOp ? &deletedDoc : NULL);
+
+            {
+                WriteUnitOfWork wunit(_txn);
+
+                const bool deleteCappedOK = false;
+                const bool deleteNoWarn = false;
+
+                // Do the write, unless this is an explain.
+                if (!_params.isExplain) {
+                    _collection->deleteDocument(_txn, rloc, deleteCappedOK, deleteNoWarn,
+                                                _params.shouldCallLogOp ? &deletedDoc : NULL);
+
+                    if (_params.shouldCallLogOp) {
+                        if (deletedDoc.isEmpty()) {
+                            log() << "Deleted object without id in collection " << _collection->ns()
+                            << ", not logging.";
+                        }
+                        else {
+                            bool replJustOne = true;
+                            repl::logOp(_txn, "d", _collection->ns().ns().c_str(), deletedDoc, 0,
+                                        &replJustOne, _params.fromMigrate);
+                        }
+                    }
+                }
+
+                wunit.commit();
+            }
+
+            //  As restoreState may restore (recreate) cursors, cursors are tied to the
+            //  transaction in which they are created, and a WriteUnitOfWork is a
+            //  transaction, make sure to restore the state outside of the WritUnitOfWork.
             restoreState(_txn);
 
             ++_specificStats.docsDeleted;
-
-            if (_params.shouldCallLogOp) {
-                if (deletedDoc.isEmpty()) {
-                    log() << "Deleted object without id in collection " << _collection->ns()
-                          << ", not logging.";
-                }
-                else {
-                    bool replJustOne = true;
-                    repl::logOp(_txn, "d", _collection->ns().ns().c_str(), deletedDoc, 0,
-                                &replJustOne, _params.fromMigrate);
-                }
-            }
-
-            wunit.commit();
 
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
@@ -133,12 +147,15 @@ namespace mongo {
             }
             return status;
         }
-        else {
-            if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            return status;
+        else if (PlanStage::NEED_TIME == status) {
+            ++_commonStats.needTime;
         }
+        else if (PlanStage::NEED_FETCH == status) {
+            *out = id;
+            ++_commonStats.needFetch;
+        }
+
+        return status;
     }
 
     void DeleteStage::saveState() {
@@ -147,8 +164,15 @@ namespace mongo {
     }
 
     void DeleteStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
         _child->restoreState(opCtx);
+
+        const NamespaceString& ns(_collection->ns());
+        massert(28537,
+                str::stream() << "Demoted from primary while removing from " << ns.ns(),
+                !_params.shouldCallLogOp ||
+                repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(ns.db()));
     }
 
     void DeleteStage::invalidate(const DiskLoc& dl, InvalidationType type) {

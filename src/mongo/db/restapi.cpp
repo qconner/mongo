@@ -29,6 +29,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetworking
+
 #include "mongo/pch.h"
 
 #include "mongo/db/restapi.h"
@@ -38,9 +40,9 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/background.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbwebserver.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/util/log.h"
@@ -265,7 +267,7 @@ namespace mongo {
     } restHandler;
 
     bool RestAdminAccess::haveAdminUsers(OperationContext* txn) const {
-        AuthorizationSession* authzSession = cc().getAuthorizationSession();
+        AuthorizationSession* authzSession = txn->getClient()->getAuthorizationSession();
         return authzSession->getAuthorizationManager().hasAnyPrivilegeDocuments(txn);
     }
 

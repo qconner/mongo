@@ -23,8 +23,10 @@
 #include "mongo/dbtests/dbtests.h"
 
 #include "mongo/db/db.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/oplogstart.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -50,6 +52,9 @@ namespace OplogStartTests {
         ~Base() {
             client()->dropCollection(ns());
             _wunit.commit();
+
+            // The OplogStart stage is not allowed to outlive it's RecoveryUnit.
+            _stage.reset();
         }
 
     protected:
@@ -350,15 +355,22 @@ namespace OplogStartTests {
         void setupTests() {
             add< OplogStartIsOldest >();
             add< OplogStartIsNewest >();
-            add< OplogStartIsNewestExtentHop >();
-            add< OplogStartOneEmptyExtent >();
-            add< OplogStartTwoEmptyExtents >();
-            add< OplogStartTwoFullExtents >();
-            add< OplogStartThreeFullOneEmpty >();
-            add< OplogStartOneFullExtent >();
-            add< OplogStartFirstExtentEmpty >();
-            add< OplogStartEOF >();
+
+            // These tests rely on extent allocation details specific to mmapv1.
+            // TODO figure out a way to generically test this.
+            if (getGlobalEnvironment()->getGlobalStorageEngine()->isMmapV1()) {
+                add< OplogStartIsNewestExtentHop >();
+                add< OplogStartOneEmptyExtent >();
+                add< OplogStartTwoEmptyExtents >();
+                add< OplogStartTwoFullExtents >();
+                add< OplogStartThreeFullOneEmpty >();
+                add< OplogStartOneFullExtent >();
+                add< OplogStartFirstExtentEmpty >();
+                add< OplogStartEOF >();
+            }
         }
-    } oplogStart;
+    };
+
+    SuiteInstance<All> oplogStart;
 
 } // namespace OplogStartTests

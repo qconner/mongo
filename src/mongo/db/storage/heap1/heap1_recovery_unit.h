@@ -30,39 +30,44 @@
 
 #pragma once
 
+#include <vector>
+
+#include "mongo/db/diskloc.h"
 #include "mongo/db/storage/recovery_unit.h"
 
 namespace mongo {
 
+    class SortedDataInterface;
+
     class Heap1RecoveryUnit : public RecoveryUnit {
     public:
-        Heap1RecoveryUnit() {
-            rollbackPossible = true;
-        }
+        Heap1RecoveryUnit() : _depth(0) {}
+        virtual ~Heap1RecoveryUnit();
 
-        virtual void beginUnitOfWork() {}
-        virtual void commitUnitOfWork() {}
-
-        virtual void endUnitOfWork() {}
-
-        virtual bool commitIfNeeded(bool force = false) {
-            return false;
-        }
+        virtual void beginUnitOfWork();
+        virtual void commitUnitOfWork();
+        virtual void endUnitOfWork();
 
         virtual bool awaitCommit() {
             return true;
         }
 
+        virtual void commitAndRestart() {}
+
         virtual void registerChange(Change* change) {
+            _changes.push_back(ChangePtr(change));
         }
 
         virtual void* writingPtr(void* data, size_t len) {
-            return data;
+            invariant(!"don't call writingPtr");
         }
 
-        virtual void syncDataAndTruncateJournal() {}
+    private:
+        typedef boost::shared_ptr<Change> ChangePtr;
+        typedef std::vector<ChangePtr> Changes;
 
-        bool rollbackPossible;
+        int _depth;
+        Changes _changes;
     };
 
 }

@@ -35,13 +35,14 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/dbhash.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/repl/oplog.h"
 
 namespace mongo {
     class ApplyOpsCmd : public Command {
@@ -73,11 +74,9 @@ namespace mongo {
                 BSONObjIterator i( ops );
                 while ( i.more() ) {
                     BSONElement e = i.next();
-                    if ( e.type() == Object )
-                        continue;
-                    errmsg = "op not an object: ";
-                    errmsg += e.fieldName();
-                    return false;
+                    if (!_checkOperation(e, errmsg)) {
+                        return false;
+                    }
                 }
             }
 
@@ -121,28 +120,32 @@ namespace mongo {
                 BSONElement e = i.next();
                 const BSONObj& temp = e.Obj();
 
+                // Ignore 'n' operations.
+                const char *opType = temp["op"].valuestrsafe();
+                if (*opType == 'n') continue;
+
                 string ns = temp["ns"].String();
 
-                // Run operations under a nested lock as a hack to prevent them from yielding.
+                // Run operations under a nested lock as a hack to prevent yielding.
                 //
-                // The list of operations is supposed to be applied atomically; yielding would break
-                // atomicity by allowing an interruption or a shutdown to occur after only some
-                // operations are applied.  We are already locked globally at this point, so taking
-                // a DBWrite on the namespace creates a nested lock, and yields are disallowed for
-                // operations that hold a nested lock.
+                // The list of operations is supposed to be applied atomically; yielding
+                // would break atomicity by allowing an interruption or a shutdown to occur
+                // after only some operations are applied.  We are already locked globally
+                // at this point, so taking a DBLock on the namespace creates a nested lock,
+                // and yields are disallowed for operations that hold a nested lock.
                 //
-                // We do not have a wrapping WriteUnitOfWork so it is possible for a journal commit
-                // to happen with a subset of ops applied.
+                // We do not have a wrapping WriteUnitOfWork so it is possible for a journal
+                // commit to happen with a subset of ops applied.
                 // TODO figure out what to do about this.
-                Lock::DBWrite lk(txn->lockState(), ns);
+                Lock::DBLock lk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_X);
                 invariant(txn->lockState()->isRecursive());
 
                 Client::Context ctx(txn, ns);
                 bool failed = repl::applyOperation_inlock(txn,
-                                                             ctx.db(),
-                                                             temp,
-                                                             false,
-                                                             alwaysUpsert);
+                                                          ctx.db(),
+                                                          temp,
+                                                          false,
+                                                          alwaysUpsert);
                 ab.append(!failed);
                 if ( failed )
                     errors++;
@@ -173,13 +176,68 @@ namespace mongo {
                     }
                 }
 
+                // We currently always logOp the command regardless of whether the individial ops
+                // succeeded and rely on any failures to also happen on secondaries. This isn't
+                // perfect, but it's what the command has always done and is part of its "correct"
+                // behavior.
+                WriteUnitOfWork wunit(txn);
                 repl::logOp(txn, "c", tempNS.c_str(), cmdBuilder.done());
+                wunit.commit();
             }
 
             if (errors != 0) {
                 return false;
             }
 
+            return true;
+        }
+
+    private:
+        /**
+         * Returns true if 'e' contains a valid operation.
+         */
+        bool _checkOperation(const BSONElement& e, string& errmsg) {
+            if (e.type() != Object) {
+                errmsg = str::stream() << "op not an object: " << e.fieldName();
+                return false;
+            }
+            BSONObj obj = e.Obj();
+            // op - operation type
+            BSONElement opElement = obj.getField("op");
+            if (opElement.eoo()) {
+                errmsg = str::stream() << "op does not contain required \"op\" field: "
+                                       << e.fieldName();
+                return false;
+            }
+            if (opElement.type() != mongo::String) {
+                errmsg = str::stream() << "\"op\" field is not a string: " << e.fieldName();
+                return false;
+            }
+            // operation type -- see logOp() comments for types
+            const char *opType = opElement.valuestrsafe();
+            if (*opType == '\0') {
+                errmsg = str::stream() << "\"op\" field value cannot be empty: " << e.fieldName();
+                return false;
+            }
+
+            // ns - namespace
+            // Only operations of type 'n' are allowed to have an empty namespace.
+            BSONElement nsElement = obj.getField("ns");
+            if (nsElement.eoo()) {
+                errmsg = str::stream() << "op does not contain required \"ns\" field: "
+                                       << e.fieldName();
+                return false;
+            }
+            if (nsElement.type() != mongo::String) {
+                errmsg = str::stream() << "\"ns\" field is not a string: " << e.fieldName();
+                return false;
+            }
+            if (*opType != 'n' && nsElement.String().empty()) {
+                errmsg = str::stream()
+                    << "\"ns\" field value cannot be empty when op type is not 'n': "
+                    << e.fieldName();
+                return false;
+            }
             return true;
         }
     } applyOpsCmd;

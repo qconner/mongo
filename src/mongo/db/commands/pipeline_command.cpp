@@ -26,7 +26,7 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <boost/smart_ptr.hpp>
 #include <vector>
@@ -39,6 +39,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/exec/pipeline_proxy.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -142,6 +143,16 @@ namespace mongo {
             // If a time limit was set on the pipeline, remaining time is "rolled over" to the
             // cursor (for use by future getmore ops).
             cursor->setLeftoverMaxTimeMicros( txn->getCurOp()->getRemainingMaxTimeMicros() );
+
+            // We stash away the RecoveryUnit in the ClientCursor.  It's used for subsequent
+            // getMore requests.  The calling OpCtx gets a fresh RecoveryUnit.
+            cursor->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
+            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+            txn->setRecoveryUnit(storageEngine->newRecoveryUnit(txn));
+
+            // Cursor needs to be in a saved state while we yield locks for getmore. State
+            // will be restored in newGetMore().
+            exec->saveState();
         }
 
         BSONObjBuilder cursorObj(result.subobjStart("cursor"));
@@ -178,12 +189,15 @@ namespace mongo {
             Pipeline::addRequiredPrivileges(this, dbname, cmdObj, out);
         }
 
-        virtual bool run(OperationContext* txn, const string &db, BSONObj &cmdObj, int options, string &errmsg,
-                         BSONObjBuilder &result, bool fromRepl) {
+        virtual bool run(OperationContext* txn, const string &db, BSONObj &cmdObj, int options,
+                         string &errmsg, BSONObjBuilder &result, bool fromRepl) {
+            NamespaceString nss(parseNs(db, cmdObj));
+            if (nss.coll().empty()) {
+                errmsg = "missing collection name";
+                return false;
+            }
 
-            string ns = parseNs(db, cmdObj);
-
-            intrusive_ptr<ExpressionContext> pCtx = new ExpressionContext(txn, NamespaceString(ns));
+            intrusive_ptr<ExpressionContext> pCtx = new ExpressionContext(txn, nss);
             pCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
 
             /* try to parse the command; if this fails, then we didn't run */
@@ -216,9 +230,9 @@ namespace mongo {
                 // sharding version that we synchronize on here. This is also why we always need to
                 // create a ClientCursor even when we aren't outputting to a cursor. See the comment
                 // on ShardFilterStage for more details.
-                Client::ReadContext ctx(txn, ns);
+                AutoGetCollectionForRead ctx(txn, nss.ns());
 
-                Collection* collection = ctx.ctx().db()->getCollection(txn, ns);
+                Collection* collection = ctx.getCollection();
 
                 // This does mongod-specific stuff like creating the input PlanExecutor and adding
                 // it to the front of the pipeline if needed.
@@ -234,13 +248,25 @@ namespace mongo {
                 auto_ptr<WorkingSet> ws(new WorkingSet());
                 auto_ptr<PipelineProxyStage> proxy(
                     new PipelineProxyStage(pPipeline, input, ws.get()));
+                Status execStatus = Status::OK();
                 if (NULL == collection) {
-                    execHolder.reset(new PlanExecutor(ws.release(), proxy.release(), ns));
+                    execStatus = PlanExecutor::make(txn,
+                                                    ws.release(),
+                                                    proxy.release(),
+                                                    nss.ns(),
+                                                    PlanExecutor::YIELD_MANUAL,
+                                                    &exec);
                 }
                 else {
-                    execHolder.reset(new PlanExecutor(ws.release(), proxy.release(), collection));
+                    execStatus = PlanExecutor::make(txn,
+                                                    ws.release(),
+                                                    proxy.release(),
+                                                    collection,
+                                                    PlanExecutor::YIELD_MANUAL,
+                                                    &exec);
                 }
-                exec = execHolder.get();
+                invariant(execStatus.isOK());
+                execHolder.reset(exec);
 
                 if (!collection && input) {
                     // If we don't have a collection, we won't be able to register any executors, so
@@ -250,6 +276,7 @@ namespace mongo {
                 }
 
                 if (collection) {
+                    // XXX
                     ClientCursor* cursor = new ClientCursor(collection, execHolder.release());
                     cursor->isAggCursor = true; // enable special locking behavior
                     pin.reset(new ClientCursorPin(collection, cursor->cursorid()));
@@ -266,7 +293,7 @@ namespace mongo {
                     result << "stages" << Value(pPipeline->writeExplainOps());
                 }
                 else if (isCursorCommand(cmdObj)) {
-                    handleCursorCommand(txn, ns, pin.get(), exec, cmdObj, result);
+                    handleCursorCommand(txn, nss.ns(), pin.get(), exec, cmdObj, result);
                     keepCursor = true;
                 }
                 else {

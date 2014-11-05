@@ -44,8 +44,22 @@ namespace mongo {
     public:
         /**
          * Caller owns the pointer in 'out' if any call to canonicalize returns Status::OK().
+         *
+         * Used for legacy find through the OP_QUERY message.
          */
         static Status canonicalize(const QueryMessage& qm,
+                                   CanonicalQuery** out,
+                                   const MatchExpressionParser::WhereCallback& whereCallback =
+                                            MatchExpressionParser::WhereCallback());
+
+        /**
+         * Takes ownership of 'lpq'.
+         *
+         * Caller owns the pointer in 'out' if any call to canonicalize returns Status::OK().
+         *
+         * Used for finds using the find command path.
+         */
+        static Status canonicalize(LiteParsedQuery* lpq,
                                    CanonicalQuery** out,
                                    const MatchExpressionParser::WhereCallback& whereCallback =
                                             MatchExpressionParser::WhereCallback());
@@ -69,6 +83,13 @@ namespace mongo {
 
         static Status canonicalize(const std::string& ns,
                                    const BSONObj& query,
+                                   CanonicalQuery** out,
+                                   const MatchExpressionParser::WhereCallback& whereCallback =
+                                            MatchExpressionParser::WhereCallback());
+
+        static Status canonicalize(const std::string& ns,
+                                   const BSONObj& query,
+                                   bool explain,
                                    CanonicalQuery** out,
                                    const MatchExpressionParser::WhereCallback& whereCallback =
                                             MatchExpressionParser::WhereCallback());
@@ -151,6 +172,9 @@ namespace mongo {
         std::string toString() const;
         std::string toStringShort() const;
 
+        bool isForWrite() const { return _isForWrite; }
+        void setIsForWrite( bool w ) { _isForWrite = w; }
+
         /**
          * Validates match expression, checking for certain
          * combinations of operators in match expression and
@@ -189,7 +213,6 @@ namespace mongo {
          * while exploring the enumeration space we do it here.
          */
         static MatchExpression* logicalRewrite(MatchExpression* tree);
-
     private:
         // You must go through canonicalize to create a CanonicalQuery.
         CanonicalQuery() { }
@@ -219,6 +242,8 @@ namespace mongo {
          * for minimal user comprehension.
          */
         PlanCacheKey _cacheKey;
+
+        bool _isForWrite;
     };
 
 }  // namespace mongo

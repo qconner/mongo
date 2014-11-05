@@ -32,6 +32,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/index_names.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_key_generator.h"
@@ -394,12 +395,15 @@ namespace mongo {
                 }
                 return code;
             }
-            else {
-                if (PlanStage::NEED_TIME == code) {
-                    ++_commonStats.needTime;
-                }
-                return code;
+            else if (PlanStage::NEED_TIME == code) {
+                ++_commonStats.needTime;
             }
+            else if (PlanStage::NEED_FETCH == code) {
+                ++_commonStats.needFetch;
+                *out = id;
+            }
+
+            return code;
         }
 
         // Returning results.
@@ -425,6 +429,7 @@ namespace mongo {
     }
 
     void SortStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
         _child->restoreState(opCtx);
     }

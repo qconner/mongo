@@ -1,59 +1,36 @@
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2014 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
+#include "mongo/db/concurrency/lock_mgr_test_help.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/db/concurrency/lock_mgr_new.h"
-#include "mongo/db/concurrency/lock_state.h"
 
 
 namespace mongo {
-namespace newlm {
-
-    class TrackingLockGrantNotification : public LockGrantNotification {
-    public:
-        TrackingLockGrantNotification() : numNotifies(0), lastResult(LOCK_INVALID) {
-
-        }
-
-        virtual void notify(const ResourceId& resId, LockResult result) {
-            numNotifies++;
-            lastResId = resId;
-            lastResult = result;
-        }
-
-    public:
-        int numNotifies;
-
-        ResourceId lastResId;
-        LockResult lastResult;
-    };
-
-
 
     TEST(ResourceId, Semantics) {
         ResourceId resIdDb(RESOURCE_DATABASE, 324334234);
@@ -92,11 +69,11 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request;
-        request.initNew(resId, &locker, &notify);
+        request.initNew(&locker, &notify);
 
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_S));
         ASSERT(request.mode == MODE_S);
@@ -111,12 +88,12 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request[6];
         for (int i = 0; i < 6; i++) {
-            request[i].initNew(resId, &locker, &notify);
+            request[i].initNew(&locker, &notify);
             ASSERT(LOCK_OK == lockMgr.lock(resId, &request[i], MODE_S));
 
             ASSERT(request[i].mode == MODE_S);
@@ -144,12 +121,16 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker[6];
+        boost::scoped_ptr<MMAPV1LockerImpl> locker[6];
+        for (int i = 0; i < 6; i++) {
+            locker[i].reset(new MMAPV1LockerImpl(i));
+        }
+
         TrackingLockGrantNotification notify[6];
 
         LockRequest request[6];
         for (int i = 0; i < 6; i++) {
-            request[i].initNew(resId, &locker[i], &notify[i]);
+            request[i].initNew(locker[i].get(), &notify[i]);
             lockMgr.lock(resId, &request[i], MODE_X);
 
             ASSERT(request[i].mode == MODE_X);
@@ -173,11 +154,11 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request;
-        request.initNew(resId, &locker, &notify);
+        request.initNew(&locker, &notify);
 
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_S));
         ASSERT(request.mode == MODE_S);
@@ -204,11 +185,11 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request;
-        request.initNew(resId, &locker, &notify);
+        request.initNew(&locker, &notify);
 
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_IS));
         ASSERT(request.mode == MODE_IS);
@@ -235,11 +216,11 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request;
-        request.initNew(resId, &locker, &notify);
+        request.initNew(&locker, &notify);
 
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_S));
         ASSERT(request.mode == MODE_S);
@@ -266,18 +247,18 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request;
-        request.initNew(resId, &locker, &notify);
+        request.initNew(&locker, &notify);
 
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_X));
         ASSERT(request.mode == MODE_X);
         ASSERT(request.recursiveCount == 1);
         ASSERT(notify.numNotifies == 0);
 
-        // Acquire again, in *non-compatible*, but stricter mode
+        // Acquire again, in *non-compatible*, but less strict mode
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request, MODE_S));
         ASSERT(request.mode == MODE_X);
         ASSERT(request.recursiveCount == 2);
@@ -297,17 +278,17 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker1;
+        MMAPV1LockerImpl locker1(1);
         TrackingLockGrantNotification notify1;
 
-        LockState locker2;
+        MMAPV1LockerImpl locker2(2);
         TrackingLockGrantNotification notify2;        
 
         LockRequest request1;
-        request1.initNew(resId, &locker1, &notify1);
+        request1.initNew(&locker1, &notify1);
 
         LockRequest request2;
-        request2.initNew(resId, &locker2, &notify2);
+        request2.initNew(&locker2, &notify2);
 
         // First request granted right away
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_S));
@@ -342,12 +323,12 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request[6];
         for (int i = 0; i < 6; i++) {
-            request[i].initNew(resId, &locker, &notify);
+            request[i].initNew(&locker, &notify);
 
             if (i == 0) {
                 ASSERT(LOCK_OK == lockMgr.lock(resId, &request[i], MODE_X));
@@ -376,17 +357,17 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker1;
+        MMAPV1LockerImpl locker1(1);
         TrackingLockGrantNotification notify1;
 
-        LockState locker2;
+        MMAPV1LockerImpl locker2(2);
         TrackingLockGrantNotification notify2;
 
         LockRequest request1;
-        request1.initNew(resId, &locker1, &notify1);
+        request1.initNew(&locker1, &notify1);
 
         LockRequest request2;
-        request2.initNew(resId, &locker2, &notify2);
+        request2.initNew(&locker2, &notify2);
 
         // First request granted right away
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_S));
@@ -409,12 +390,12 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request[6];
         for (int i = 0; i < 6; i++) {
-            request[i].initNew(resId, &locker, &notify);
+            request[i].initNew(&locker, &notify);
             lockMgr.lock(resId, &request[i], MODE_X);
 
             ASSERT(request[i].mode == MODE_X);
@@ -442,17 +423,17 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker1;
+        MMAPV1LockerImpl locker1(1);
         TrackingLockGrantNotification notify1;
 
-        LockState locker2;
+        MMAPV1LockerImpl locker2(2);
         TrackingLockGrantNotification notify2;
 
         LockRequest request1;
-        request1.initNew(resId, &locker1, &notify1);
+        request1.initNew(&locker1, &notify1);
 
         LockRequest request2;
-        request2.initNew(resId, &locker2, &notify2);
+        request2.initNew(&locker2, &notify2);
 
         // First request granted right away
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_S));
@@ -483,17 +464,17 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker1;
+        MMAPV1LockerImpl locker1(1);
         TrackingLockGrantNotification notify1;
 
-        LockState locker2;
+        MMAPV1LockerImpl locker2(2);
         TrackingLockGrantNotification notify2;
 
         LockRequest request1;
-        request1.initNew(resId, &locker1, &notify1);
+        request1.initNew(&locker1, &notify1);
 
         LockRequest request2;
-        request2.initNew(resId, &locker2, &notify2);
+        request2.initNew(&locker2, &notify2);
 
         // First request granted right away
         ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_S));
@@ -524,12 +505,12 @@ namespace newlm {
         LockManager lockMgr;
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockState locker;
+        MMAPV1LockerImpl locker(1);
         TrackingLockGrantNotification notify;
 
         LockRequest request[3];
         for (int i = 0; i < 3; i++) {
-            request[i].initNew(resId, &locker, &notify);
+            request[i].initNew(&locker, &notify);
             lockMgr.lock(resId, &request[i], MODE_S);
         }
 
@@ -552,5 +533,111 @@ namespace newlm {
         lockMgr.unlock(&request[1]);
     }
 
-} // namespace newlm
+    TEST(LockManager, Upgrade) {
+        LockManager lockMgr;
+        const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+
+        MMAPV1LockerImpl locker1(1);
+        TrackingLockGrantNotification notify1;
+        LockRequest request1;
+        request1.initNew(&locker1, &notify1);
+        ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_IS));
+
+        MMAPV1LockerImpl locker2(2);
+        TrackingLockGrantNotification notify2;
+        LockRequest request2;
+        request2.initNew(&locker2, &notify2);
+        ASSERT(LOCK_OK == lockMgr.lock(resId, &request2, MODE_S));
+        ASSERT(request2.recursiveCount == 1);
+
+        // Upgrade the IS lock to X
+        ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request1, MODE_IX));
+
+        ASSERT(!lockMgr.unlock(&request1));
+        ASSERT(lockMgr.unlock(&request1));
+
+        ASSERT(lockMgr.unlock(&request2));
+    }
+
+    TEST(LockManager, Downgrade) {
+        LockManager lockMgr;
+        const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+
+        MMAPV1LockerImpl locker1(1);
+        TrackingLockGrantNotification notify1;
+        LockRequest request1;
+        request1.initNew(&locker1, &notify1);
+        ASSERT(LOCK_OK == lockMgr.lock(resId, &request1, MODE_X));
+
+        MMAPV1LockerImpl locker2(2);
+        TrackingLockGrantNotification notify2;
+        LockRequest request2;
+        request2.initNew(&locker2, &notify2);
+        ASSERT(LOCK_WAITING == lockMgr.lock(resId, &request2, MODE_S));
+        ASSERT(request2.recursiveCount == 1);
+
+        lockMgr.downgrade(&request1, MODE_S);
+        ASSERT(notify2.numNotifies == 1);
+        ASSERT(request2.recursiveCount == 1);
+
+        lockMgr.unlock(&request1);
+        ASSERT(request1.recursiveCount == 0);
+
+        lockMgr.unlock(&request2);
+        ASSERT(request2.recursiveCount == 0);
+    }
+
+
+
+    static void checkConflict(LockMode existingMode, LockMode newMode, bool hasConflict) {
+        LockManager lockMgr;
+
+        const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+
+        MMAPV1LockerImpl lockerExisting(1);
+        TrackingLockGrantNotification notifyExisting;
+        LockRequest requestExisting;
+        requestExisting.initNew(&lockerExisting, &notifyExisting);
+
+        ASSERT(LOCK_OK == lockMgr.lock(resId, &requestExisting, existingMode));
+
+        MMAPV1LockerImpl lockerNew(1);
+        TrackingLockGrantNotification notifyNew;
+        LockRequest requestNew;
+        requestNew.initNew(&lockerNew, &notifyNew);
+
+        LockResult result = lockMgr.lock(resId, &requestNew, newMode);
+        if (hasConflict) {
+            ASSERT_EQUALS(LOCK_WAITING, result);
+        }
+        else {
+            ASSERT_EQUALS(LOCK_OK, result);
+        }
+
+        lockMgr.unlock(&requestNew);
+        lockMgr.unlock(&requestExisting);
+    }
+
+    TEST(LockManager, ValidateConflictMatrix) {
+        checkConflict(MODE_IS, MODE_IS, false);
+        checkConflict(MODE_IS, MODE_IX, false);
+        checkConflict(MODE_IS, MODE_S, false);
+        checkConflict(MODE_IS, MODE_X, true);
+
+        checkConflict(MODE_IX, MODE_IS, false);
+        checkConflict(MODE_IX, MODE_IX, false);
+        checkConflict(MODE_IX, MODE_S, true);
+        checkConflict(MODE_IX, MODE_X, true);
+
+        checkConflict(MODE_S, MODE_IS, false);
+        checkConflict(MODE_S, MODE_IX, true);
+        checkConflict(MODE_S, MODE_S, false);
+        checkConflict(MODE_S, MODE_X, true);
+
+        checkConflict(MODE_X, MODE_IS, true);
+        checkConflict(MODE_X, MODE_IX, true);
+        checkConflict(MODE_X, MODE_S, true);
+        checkConflict(MODE_X, MODE_X, true);
+    }
+
 } // namespace mongo

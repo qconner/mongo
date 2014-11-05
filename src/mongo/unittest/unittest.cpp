@@ -26,6 +26,8 @@
 *    then also delete it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/pch.h"
 
 #include "mongo/unittest/unittest.h"
@@ -50,7 +52,8 @@ namespace mongo {
         namespace {
             logger::MessageLogDomain* unittestOutput =
                 logger::globalLogManager()->getNamedDomain("unittest");
-            typedef std::map<std::string, Suite*> SuiteMap;
+
+            typedef std::map<std::string, boost::shared_ptr<Suite> > SuiteMap;
 
             inline SuiteMap& _allSuites() {
                 static SuiteMap allSuites;
@@ -186,7 +189,7 @@ namespace {
         Suite::~Suite() {}
 
         void Suite::add(const std::string& name, const TestFunction& testFn) {
-            _tests.push_back(new TestHolder(name, testFn));
+            _tests.push_back(boost::shared_ptr<TestHolder>(new TestHolder(name, testFn)));
         }
 
         Result * Suite::run( const std::string& filter, int runsPerTest ) {
@@ -199,8 +202,9 @@ namespace {
             Result * r = new Result( _name );
             Result::cur = r;
 
-            for ( std::vector<TestHolder*>::iterator i=_tests.begin(); i!=_tests.end(); i++ ) {
-                TestHolder* tc = *i;
+            for ( std::vector< boost::shared_ptr<TestHolder> >::iterator i=_tests.begin();
+                  i!=_tests.end(); i++ ) {
+                boost::shared_ptr<TestHolder>& tc = *i;
                 if ( filter.size() && tc->getName().find( filter ) == std::string::npos ) {
                     LOG(1) << "\t skipping test: " << tc->getName() << " because doesn't match filter" << std::endl;
                     continue;
@@ -280,7 +284,7 @@ namespace {
 
             for ( std::vector<std::string>::iterator i=torun.begin(); i!=torun.end(); i++ ) {
                 std::string name = *i;
-                Suite* s = _allSuites()[name];
+                boost::shared_ptr<Suite>& s = _allSuites()[name];
                 fassert( 16145,  s );
 
                 log() << "going to run suite: " << name << std::endl;
@@ -298,6 +302,7 @@ namespace {
             Result totals ("TOTALS");
             std::vector<std::string> failedSuites;
 
+            Result::cur = NULL;
             for ( std::vector<Result*>::iterator i=results.begin(); i!=results.end(); i++ ) {
                 Result* r = *i;
                 log() << r->toString();
@@ -315,6 +320,8 @@ namespace {
                 }
                 asserts += r->_asserts;
                 millis += r->_millis;
+
+                delete r;
             }
 
             totals._tests = tests;
@@ -342,16 +349,19 @@ namespace {
         }
 
         void Suite::registerSuite( const std::string& name , Suite* s ) {
-            Suite*& m = _allSuites()[name];
-            fassert( 10162, ! m );
-            m = s;
+            boost::shared_ptr<Suite>& m = _allSuites()[name];
+            fassert( 10162, !m );
+            m.reset(s);
         }
 
         Suite* Suite::getSuite(const std::string& name) {
-            Suite* result = _allSuites()[name];
-            if (!result)
-                result = new Suite(name);  // Suites are self-registering.
-            return result;
+            boost::shared_ptr<Suite>& result = _allSuites()[name];
+            if (!result) {
+                // Suites are self-registering.
+                new Suite(name);
+            }
+            invariant(result);
+            return result.get();
         }
 
         void Suite::setupTests() {}
@@ -371,37 +381,41 @@ namespace {
         TestAssertionFailure::TestAssertionFailure(const std::string& file,
                                                    unsigned line,
                                                    const std::string& message)
-            : _exception(file, line, message) {}
+            : _exception(file, line, message), _enabled(false) {}
+
+        TestAssertionFailure::TestAssertionFailure(const TestAssertionFailure& other) :
+            _exception(other._exception), _enabled(false) {
+
+            invariant(!other._enabled);
+        }
+
+        TestAssertionFailure& TestAssertionFailure::operator=(const TestAssertionFailure& other) {
+            invariant(!_enabled);
+            invariant(!other._enabled);
+            _exception = other._exception;
+            return *this;
+        }
 
         TestAssertionFailure::~TestAssertionFailure()
 #if __cplusplus >= 201103
         noexcept(false)
 #endif
         {
-            if (!_stream.str().empty())
+            if (!_enabled) {
+                invariant(_stream.str().empty());
+                return;
+            }
+            if (!_stream.str().empty()) {
                 _exception.setMessage(_exception.getMessage() + " " + _stream.str());
+            }
             throw _exception;
         }
 
         std::ostream& TestAssertionFailure::stream() {
+            invariant(!_enabled);
+            _enabled = true;
             return _stream;
         }
-
-        TestAssertion::TestAssertion( const char* file, unsigned line )
-            : _file( file ), _line( line ) {
-
-            ++Result::cur->_asserts;
-        }
-
-        TestAssertion::~TestAssertion() {}
-
-        void TestAssertion::fail( const std::string& message ) const {
-            throw TestAssertionFailureException( _file, _line, message );
-        }
-
-        ComparisonAssertion::ComparisonAssertion( const char* aexp, const char* bexp,
-                                                  const char* file, unsigned line )
-            : TestAssertion( file, line ), _aexp( aexp ), _bexp( bexp ) {}
 
         std::vector<std::string> getAllSuiteNames() {
             std::vector<std::string> result;

@@ -134,13 +134,25 @@ namespace mongo {
          */
         virtual StatusWith<double> computeDistance(WorkingSetMember* member) = 0;
 
+        /*
+         * Initialize near stage before buffering the data.
+         * Return IS_EOF if subclass finishes the initialization.
+         * Return NEED_TIME if we need more time.
+         * Return errors if an error occurs.
+         * Can't return ADVANCED.
+         */
+        virtual StageState initialize(OperationContext* txn,
+                                      WorkingSet* workingSet,
+                                      Collection* collection);
+
     private:
 
         //
         // Generic methods for progressive search functionality
         //
 
-        StageState bufferNext(Status* error);
+        StageState initNext();
+        StageState bufferNext(WorkingSetID* toReturn, Status* error);
         StageState advanceNext(WorkingSetID* toReturn);
 
         //
@@ -156,13 +168,11 @@ namespace mongo {
 
         // A progressive search works in stages of buffering and then advancing
         enum SearchState {
+            SearchState_Initializing,
             SearchState_Buffering,
             SearchState_Advancing,
             SearchState_Finished
         } _searchState;
-
-        // The current stage from which this stage should buffer results
-        scoped_ptr<CoveredInterval> _nextInterval;
 
         // May need to track disklocs from the child stage to do our own deduping, also to do
         // invalidation of buffered results.
@@ -177,6 +187,16 @@ namespace mongo {
 
         // Stats
         scoped_ptr<PlanStageStats> _stats;
+
+        // The current stage from which this stage should buffer results
+        // Pointer to the last interval in _childrenIntervals. Owned by _childrenIntervals.
+        CoveredInterval* _nextInterval;
+
+        // All children CoveredIntervals and the sub-stages owned by them.
+        //
+        // All children intervals except the last active one are only used by getStats(),
+        // because they are all EOF.
+        OwnedPointerVector<CoveredInterval> _childrenIntervals;
     };
 
     /**
@@ -190,7 +210,8 @@ namespace mongo {
                         double maxDistance,
                         bool inclusiveMax);
 
-        const scoped_ptr<PlanStage> covering;
+        // Owned by NearStage
+        scoped_ptr<PlanStage> const covering;
         const bool dedupCovering;
 
         const double minDistance;

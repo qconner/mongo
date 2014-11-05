@@ -78,8 +78,7 @@ namespace mongo {
                                   .setDefault(moe::Value(std::string("")));
 
         authenticationOptions.addOptionChaining("authenticationMechanism",
-                "authenticationMechanism", moe::String, "authentication mechanism")
-                                  .setDefault(moe::Value(std::string("MONGODB-CR")));
+                "authenticationMechanism", moe::String, "authentication mechanism");
 
         authenticationOptions.addOptionChaining("gssapiServiceName", "gssapiServiceName",
                  moe::String,
@@ -290,4 +289,13 @@ namespace mongo {
         return Status::OK();
     }
 
+    Status validateMongoShellOptions(const moe::Environment& params) {
+#ifdef MONGO_SSL
+        Status ret = validateSSLMongoShellOptions(params);
+        if (!ret.isOK()) {
+            return ret;
+        }
+#endif
+        return Status::OK();
+    }
 }

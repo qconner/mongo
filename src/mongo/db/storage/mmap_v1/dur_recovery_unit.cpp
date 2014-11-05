@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
@@ -38,11 +40,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
-// Remove once we are ready to enable
-#define ROLLBACK_ENABLED 0
-
 namespace mongo {
-
 
     /**
      *  A MemoryWrite provides rollback by keeping a pre-image.
@@ -64,13 +62,10 @@ namespace mongo {
     {}
 
     void DurRecoveryUnit::beginUnitOfWork() {
-#if ROLLBACK_ENABLED
         _startOfUncommittedChangesForLevel.push_back(_changes.size());
-#endif
     }
 
     void DurRecoveryUnit::commitUnitOfWork() {
-#if ROLLBACK_ENABLED
         invariant(inAUnitOfWork());
         invariant(!_mustRollback);
 
@@ -85,14 +80,12 @@ namespace mongo {
         }
 
         publishChanges();
-#endif
 
         // global journal flush opportunity
         getDur().commitIfNeeded(_txn);
     }
 
     void DurRecoveryUnit::endUnitOfWork() {
-#if ROLLBACK_ENABLED
         invariant(inAUnitOfWork());
 
         if (haveUncommitedChangesAtCurrentLevel()) {
@@ -100,7 +93,11 @@ namespace mongo {
         }
 
         _startOfUncommittedChangesForLevel.pop_back();
-#endif
+    }
+
+    void DurRecoveryUnit::commitAndRestart() {
+        invariant( !inAUnitOfWork() );
+        // no-op since we have no transaction
     }
 
     void DurRecoveryUnit::publishChanges() {
@@ -153,53 +150,25 @@ namespace mongo {
     }
 
     bool DurRecoveryUnit::awaitCommit() {
-#if ROLLBACK_ENABLED
         invariant(!inAUnitOfWork());
-#endif
         return getDur().awaitCommit();
     }
 
-    bool DurRecoveryUnit::commitIfNeeded(bool force) {
-        // TODO this method will be going away completely soon. There is only one remaining caller.
-        invariant(force);
-#if ROLLBACK_ENABLED
-        publishChanges();
-#endif
-        return getDur().commitIfNeeded(_txn, force);
-    }
-
     void* DurRecoveryUnit::writingPtr(void* data, size_t len) {
-        invariant(len > 0);
-#if ROLLBACK_ENABLED
         invariant(inAUnitOfWork());
+
+        if (len == 0) return data; // Don't need to do anything for empty ranges.
 
         // Windows requires us to adjust the address space *before* we write to anything.
         MemoryMappedFile::makeWritable(data, len);
 
         registerChange(new MemoryWrite(static_cast<char*>(data), len));
         return data;
-#else
-        invariant(_txn->lockState()->isWriteLocked());
-
-        return getDur().writingPtr(data, len);
-#endif
     }
 
     void DurRecoveryUnit::registerChange(Change* change) {
-#if ROLLBACK_ENABLED
         invariant(inAUnitOfWork());
         _changes.push_back(ChangePtr(change));
-#else
-        change->commit();
-        delete change;
-#endif
-    }
-
-    void DurRecoveryUnit::syncDataAndTruncateJournal() {
-#if ROLLBACK_ENABLED
-        publishChanges();
-#endif
-        return getDur().syncDataAndTruncateJournal(_txn);
     }
 
     void MemoryWrite::commit() {

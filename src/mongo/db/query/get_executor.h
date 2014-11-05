@@ -38,6 +38,9 @@ namespace mongo {
 
     class Collection;
     class Database;
+    struct CountRequest;
+
+    struct GroupRequest;
 
     /**
      * Filter indexes retrieved from index catalog by
@@ -68,6 +71,7 @@ namespace mongo {
     Status getExecutor(OperationContext* txn,
                        Collection* collection,
                        CanonicalQuery* rawCanonicalQuery,
+                       PlanExecutor::YieldPolicy yieldPolicy,
                        PlanExecutor** out,
                        size_t plannerOptions = 0);
 
@@ -87,6 +91,7 @@ namespace mongo {
                        Collection* collection,
                        const std::string& ns,
                        const BSONObj& unparsedQuery,
+                       PlanExecutor::YieldPolicy yieldPolicy,
                        PlanExecutor** out,
                        size_t plannerOptions = 0);
 
@@ -110,6 +115,7 @@ namespace mongo {
                                Collection* collection,
                                const BSONObj& query,
                                const std::string& field,
+                               PlanExecutor::YieldPolicy yieldPolicy,
                                PlanExecutor** out);
 
     /*
@@ -121,8 +127,8 @@ namespace mongo {
      */
     Status getExecutorCount(OperationContext* txn,
                             Collection* collection,
-                            const BSONObj& query,
-                            const BSONObj& hintObj,
+                            const CountRequest& request,
+                            PlanExecutor::YieldPolicy yieldPolicy,
                             PlanExecutor** execOut);
 
     //
@@ -146,6 +152,8 @@ namespace mongo {
                              bool isMulti,
                              bool shouldCallLogOp,
                              bool fromMigrate,
+                             bool isExplain,
+                             PlanExecutor::YieldPolicy yieldPolicy,
                              PlanExecutor** execOut);
 
     /**
@@ -164,6 +172,8 @@ namespace mongo {
                              bool isMulti,
                              bool shouldCallLogOp,
                              bool fromMigrate,
+                             bool isExplain,
+                             PlanExecutor::YieldPolicy yieldPolicy,
                              PlanExecutor** execOut);
 
     //
@@ -187,6 +197,7 @@ namespace mongo {
                              const UpdateRequest* request,
                              UpdateDriver* driver,
                              OpDebug* opDebug,
+                             PlanExecutor::YieldPolicy yieldPolicy,
                              PlanExecutor** execOut);
 
     /**
@@ -206,6 +217,28 @@ namespace mongo {
                              const UpdateRequest* request,
                              UpdateDriver* driver,
                              OpDebug* opDebug,
+                             PlanExecutor::YieldPolicy yieldPolicy,
                              PlanExecutor** execOut);
+
+    //
+    // Group
+    //
+
+    /**
+     * Get a PlanExecutor for a group operation.  'rawCanonicalQuery' describes the predicate for
+     * the documents to be grouped.
+     *
+     * Takes ownership of 'rawCanonicalQuery'. Does not take ownership of other args.
+     *
+     * If the query is valid and an executor could be created, returns Status::OK() and populates
+     * *out with the PlanExecutor.
+     *
+     * If an executor could not be created, returns a Status indicating why.
+     */
+    Status getExecutorGroup(OperationContext* txn,
+                            Collection* collection,
+                            const GroupRequest& request,
+                            PlanExecutor::YieldPolicy yieldPolicy,
+                            PlanExecutor** execOut);
 
 }  // namespace mongo

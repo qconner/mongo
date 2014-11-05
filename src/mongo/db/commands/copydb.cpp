@@ -30,8 +30,10 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -39,7 +41,7 @@
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
-#include "mongo/db/commands/copydb_getnonce.h"
+#include "mongo/db/commands/copydb_start_commands.h"
 #include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
@@ -48,7 +50,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
@@ -151,10 +152,18 @@ namespace mongo {
                 return false;
             }
 
+            if ( !NamespaceString::validDBName( todb ) ) {
+                errmsg = "invalid todb name: " + todb;
+                return false;
+            }
+
             Cloner cloner;
+
+            // Get MONGODB-CR parameters
             string username = cmdObj.getStringField( "username" );
             string nonce = cmdObj.getStringField( "nonce" );
             string key = cmdObj.getStringField( "key" );
+
             if ( !username.empty() && !nonce.empty() && !key.empty() ) {
                 uassert( 13008, "must call copydbgetnonce first", authConn_.get() );
                 BSONObj ret;
@@ -166,6 +175,27 @@ namespace mongo {
                         return false;
                     }
                 }
+                cloner.setConnection( authConn_.release() );
+            }
+            else if (cmdObj.hasField(saslCommandConversationIdFieldName) &&
+                     cmdObj.hasField(saslCommandPayloadFieldName)) {
+                uassert( 25487, "must call copydbsaslstart first", authConn_.get() );
+                BSONObj ret;
+                if ( !authConn_->runCommand( cloneOptions.fromDB,
+                                             BSON( "saslContinue" << 1 <<
+                                                   cmdObj[saslCommandConversationIdFieldName] <<
+                                                   cmdObj[saslCommandPayloadFieldName] ),
+                                             ret ) ) {
+                    errmsg = "unable to login " + ret.toString();
+                    return false;
+                }
+
+                if (!ret["done"].Bool()) {
+                    result.appendElements( ret );
+                    return true;
+                }
+
+                result.append("done", true);
                 cloner.setConnection( authConn_.release() );
             }
             else if (!fromSelf) {
@@ -183,15 +213,14 @@ namespace mongo {
                 cloner.setConnection(conn);
             }
 
-
-            // SERVER-4328 todo lock just the two db's not everything for the fromself case
-            scoped_ptr<Lock::ScopedLock> lk( fromSelf ?
-                                             static_cast<Lock::ScopedLock*>(new Lock::GlobalWrite(txn->lockState())) :
-                                             static_cast<Lock::ScopedLock*>(new Lock::DBWrite(txn->lockState(), todb)));
-            if (!cloner.go(txn, todb, fromhost, cloneOptions, NULL, errmsg )) {
-                return false;
+            if (fromSelf) {
+                // SERVER-4328 todo lock just the two db's not everything for the fromself case
+                Lock::GlobalWrite lk(txn->lockState());
+                return cloner.go(txn, todb, fromhost, cloneOptions, NULL, errmsg);
             }
-            return true;
+
+            Lock::DBLock lk (txn->lockState(), todb, MODE_X);
+            return cloner.go(txn, todb, fromhost, cloneOptions, NULL, errmsg);
         }
 
     } cmdCopyDB;

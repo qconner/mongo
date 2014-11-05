@@ -10,6 +10,7 @@ env.Library(
                "catalog/namespace_details_rsv1_metadata.cpp",
                "catalog/namespace_index.cpp",
                "data_file.cpp",
+               "data_file_sync.cpp",
                "durable_mapped_file.cpp",
                "dur.cpp",
                "durop.cpp",
@@ -23,10 +24,12 @@ env.Library(
                "mmap_v1_engine.cpp",
                "mmap_v1_extent_manager.cpp",
                "mmap_v1_init.cpp",
+               "mmap_v1_options.cpp",
                "repair_database.cpp",
              ],
     LIBDEPS = [
         'record_store_v1',
+        'record_access_tracker',
         'btree']
     )
 
@@ -68,6 +71,20 @@ env.Library(
         ]
     )
 
+env.Library(
+    target='record_access_tracker',
+    source=['record_access_tracker.cpp',
+            ],
+    LIBDEPS=[
+        ]
+    )
+
+env.CppUnitTest(target = 'record_access_tracker_test',
+                source = ['record_access_tracker_test.cpp'],
+                LIBDEPS = ['record_access_tracker',
+                           '$BUILD_DIR/mongo/processinfo',
+                           '$BUILD_DIR/mongo/network'])
+
 env.CppUnitTest(target = 'namespace_test',
                 source = ['catalog/namespace_test.cpp'],
                 LIBDEPS = ['$BUILD_DIR/mongo/foundation'])
@@ -89,6 +106,18 @@ env.CppUnitTest(
         'record_store_v1_test_help'
         ]
     )
+
+
+env.CppUnitTest(
+    target='record_store_v1_test',
+    source=['mmap_v1_record_store_test.cpp',
+            ],
+    LIBDEPS=[
+        'record_store_v1_test_help',
+        '$BUILD_DIR/mongo/db/storage/record_store_test_harness'
+        ]
+    )
+
 
 env.Library(
     target= 'btree',
@@ -122,6 +151,16 @@ env.CppUnitTest(
             ],
     LIBDEPS=[
         'btree_test_help'
+        ]
+    )
+
+env.CppUnitTest(
+    target='btree_interface_test',
+    source=['btree/btree_interface_test.cpp'
+            ],
+    LIBDEPS=[
+        'btree_test_help',
+        '$BUILD_DIR/mongo/db/storage/sorted_data_interface_test_harness'
         ]
     )
 

@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/db/jsobj.h"
 
 #include "mongo/bson/bson_validate.h"
 #include "mongo/db/json.h"
 #include "mongo/util/allocator.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/mongoutils/str.h"

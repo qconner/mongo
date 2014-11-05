@@ -28,7 +28,11 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+#include <boost/thread.hpp>
+
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/repl_coordinator_external_state.h"
 #include "mongo/db/repl/sync_source_feedback.h"
 
@@ -38,9 +42,11 @@ namespace repl {
     class ReplicationCoordinatorExternalStateImpl : public ReplicationCoordinatorExternalState {
         MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalStateImpl);
     public:
+
         ReplicationCoordinatorExternalStateImpl();
         virtual ~ReplicationCoordinatorExternalStateImpl();
-        virtual void runSyncSourceFeedback();
+        virtual void startThreads();
+        virtual void startMasterSlave();
         virtual void shutdown();
         virtual void forwardSlaveHandshake();
         virtual void forwardSlaveProgress();
@@ -48,8 +54,17 @@ namespace repl {
         virtual bool isSelf(const HostAndPort& host);
         virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* txn);
         virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config);
+        virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
         virtual HostAndPort getClientHostAndPort(const OperationContext* txn);
-        virtual void closeClientConnections();
+        virtual void closeConnections();
+        virtual void clearShardingState();
+        virtual void signalApplierToChooseNewSyncSource();
+        virtual ReplicationCoordinatorExternalState::GlobalSharedLockAcquirer*
+                getGlobalSharedLockAcquirer();
+        virtual OperationContext* createOperationContext(const std::string& threadName);
+        virtual void dropAllTempCollections(OperationContext* txn);
+
+        std::string getNextOpContextThreadName();
 
     private:
 
@@ -57,6 +72,20 @@ namespace repl {
         // for forwarding replication progress information upstream when there is chained
         // replication.
         SyncSourceFeedback _syncSourceFeedback;
+
+        // Thread running SyncSourceFeedback::run().
+        boost::scoped_ptr<boost::thread> _syncSourceFeedbackThread;
+
+        // Thread running runSyncThread().
+        boost::scoped_ptr<boost::thread> _applierThread;
+
+        // Thread running BackgroundSync::producerThread().
+        boost::scoped_ptr<boost::thread> _producerThread;
+
+        // Mutex guarding the _nextThreadId value to prevent concurrent incrementing.
+        boost::mutex _nextThreadIdMutex;
+        // Number used to uniquely name threads.
+        long long _nextThreadId;
     };
 
 } // namespace repl

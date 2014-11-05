@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/db/jsobj.h"
 
 #include <boost/lexical_cast.hpp>
@@ -63,7 +65,6 @@ namespace mongo {
             appendMaxKey( fieldName ); return;
         case jstOID: {
             OID o;
-            memset(&o, 0, sizeof(o));
             appendOID( fieldName , &o);
             return;
         }
@@ -81,7 +82,6 @@ namespace mongo {
             appendRegex( fieldName , "" ); return;
         case DBRef: {
             OID o;
-            memset(&o, 0, sizeof(o));
             appendDBRef( fieldName , "" , o );
             return;
         }
@@ -118,8 +118,7 @@ namespace mongo {
         case MaxKey:
             appendMaxKey( fieldName ); return;
         case jstOID: {
-            OID o;
-            memset(&o, 0xFF, sizeof(o));
+            OID o = OID::max();
             appendOID( fieldName , &o);
             return;
         }

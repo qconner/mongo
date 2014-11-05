@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrites
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/delete_executor.h"
@@ -36,6 +38,7 @@
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -68,6 +71,7 @@ namespace mongo {
 
         Status status = CanonicalQuery::canonicalize(_request->getNamespaceString().ns(),
                                                      _request->getQuery(),
+                                                     _request->isExplain(),
                                                      &cqRaw,
                                                      whereCallback);
         if (status.isOK()) {
@@ -78,8 +82,16 @@ namespace mongo {
         return status;
     }
 
-    long long DeleteExecutor::execute(Database* db) {
-        uassertStatusOK(prepare());
+    PlanExecutor* DeleteExecutor::getPlanExecutor() {
+        return _exec.get();
+    }
+
+    Status DeleteExecutor::prepareInLock(Database* db) {
+        // If we have a non-NULL PlanExecutor, then we've already done the in-lock preparation.
+        if (_exec.get()) {
+            return Status::OK();
+        }
+
         uassert(17417,
                 mongoutils::str::stream() <<
                 "DeleteExecutor::prepare() failed to parse query " << _request->getQuery(),
@@ -98,52 +110,83 @@ namespace mongo {
             }
         }
 
+        // Note that 'collection' may by NULL in the case that the collection we are trying to
+        // delete from does not exist. NULL 'collection' is handled by getExecutorDelete(); we
+        // expect to get back a plan executor whose plan is a DeleteStage on top of an EOFStage.
         Collection* collection = db->getCollection(_request->getOpCtx(), ns.ns());
-        if (NULL == collection) {
-            return 0;
+
+        if (collection && collection->isCapped()) {
+            return Status(ErrorCodes::IllegalOperation,
+                          str::stream() << "cannot remove from a capped collection: " <<  ns.ns());
         }
 
-        uassert(10101,
-                str::stream() << "cannot remove from a capped collection: " << ns.ns(),
-                !collection->isCapped());
+        if (_request->shouldCallLogOp() &&
+            !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(ns.db())) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while removing from " << ns.ns());
+        }
 
-        uassert(ErrorCodes::NotMaster,
-                str::stream() << "Not primary while removing from " << ns.ns(),
-                !_request->shouldCallLogOp() ||
-                repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(ns.db()));
+        // If yielding is allowed for this plan, then set an auto yield policy. Otherwise set
+        // a manual yield policy.
+        const bool canYield = !_request->isGod() &&
+            PlanExecutor::YIELD_AUTO == _request->getYieldPolicy() && (
+            _canonicalQuery.get() ?
+            !QueryPlannerCommon::hasNode(_canonicalQuery->root(), MatchExpression::ATOMIC) :
+            !LiteParsedQuery::isQueryIsolated(_request->getQuery()));
+
+        PlanExecutor::YieldPolicy policy = canYield ? PlanExecutor::YIELD_AUTO :
+                                                      PlanExecutor::YIELD_MANUAL;
 
         PlanExecutor* rawExec;
+        Status getExecStatus = Status::OK();
         if (_canonicalQuery.get()) {
             // This is the non-idhack branch.
-            uassertStatusOK(getExecutorDelete(_request->getOpCtx(),
+            getExecStatus = getExecutorDelete(_request->getOpCtx(),
                                               collection,
                                               _canonicalQuery.release(),
                                               _request->isMulti(),
                                               _request->shouldCallLogOp(),
                                               _request->isFromMigrate(),
-                                              &rawExec));
+                                              _request->isExplain(),
+                                              policy,
+                                              &rawExec);
         }
         else {
             // This is the idhack branch.
-            uassertStatusOK(getExecutorDelete(_request->getOpCtx(),
+            getExecStatus = getExecutorDelete(_request->getOpCtx(),
                                               collection,
                                               ns.ns(),
                                               _request->getQuery(),
                                               _request->isMulti(),
                                               _request->shouldCallLogOp(),
                                               _request->isFromMigrate(),
-                                              &rawExec));
+                                              _request->isExplain(),
+                                              policy,
+                                              &rawExec);
         }
-        scoped_ptr<PlanExecutor> exec(rawExec);
 
-        // Concurrently mutating state (by us) so we need to register 'exec'.
-        const ScopedExecutorRegistration safety(exec.get());
+        if (!getExecStatus.isOK()) {
+            return getExecStatus;
+        }
 
-        uassertStatusOK(exec->executePlan());
+        invariant(rawExec);
+        _exec.reset(rawExec);
+
+        return Status::OK();
+    }
+
+    long long DeleteExecutor::execute(Database* db) {
+        uassertStatusOK(prepare());
+
+        // If we've already done the in-lock preparation, this is a no-op.
+        uassertStatusOK(prepareInLock(db));
+        invariant(_exec.get());
+
+        uassertStatusOK(_exec->executePlan());
 
         // Extract the number of documents deleted from the DeleteStage stats.
-        invariant(exec->getRootStage()->stageType() == STAGE_DELETE);
-        DeleteStage* deleteStage = static_cast<DeleteStage*>(exec->getRootStage());
+        invariant(_exec->getRootStage()->stageType() == STAGE_DELETE);
+        DeleteStage* deleteStage = static_cast<DeleteStage*>(_exec->getRootStage());
         const DeleteStats* deleteStats =
             static_cast<const DeleteStats*>(deleteStage->getSpecificStats());
         return deleteStats->docsDeleted;

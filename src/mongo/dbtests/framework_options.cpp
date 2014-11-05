@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/dbtests/framework_options.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -33,6 +35,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/query/new_find.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
@@ -77,6 +80,9 @@ namespace mongo {
         options->addOptionChaining("perfHist", "perfHist", moe::Unsigned,
                 "number of back runs of perf stats to display");
 
+        options->addOptionChaining("storage.engine", "storageEngine", moe::String,
+                                   "what storage engine to use")
+               .setDefault(moe::Value(std::string("mmapv1")));
 
         options->addOptionChaining("suites", "suites", moe::StringVector, "test suites to run")
                                   .hidden()
@@ -146,7 +152,7 @@ namespace mongo {
         }
 
         if( params.count("nopreallocj") ) {
-            storageGlobalParams.preallocj = false;
+            mmapv1GlobalOptions.preallocj = false;
         }
 
         if (params.count("debug") || params.count("verbose") ) {
@@ -183,10 +189,10 @@ namespace mongo {
         string dbpathString = p.string();
         storageGlobalParams.dbpath = dbpathString.c_str();
 
-        storageGlobalParams.prealloc = false;
+        mmapv1GlobalOptions.prealloc = false;
 
         // dbtest defaults to smallfiles
-        storageGlobalParams.smallfiles = true;
+        mmapv1GlobalOptions.smallfiles = true;
         if( params.count("bigfiles") ) {
             storageGlobalParams.dur = true;
         }
@@ -206,6 +212,8 @@ namespace mongo {
             }
         }
 
+        storageGlobalParams.engine = params["storage.engine"].as<string>();
+
         if (params.count("suites")) {
             frameworkGlobalParams.suites = params["suites"].as< vector<string> >();
         }
@@ -216,10 +224,10 @@ namespace mongo {
         }
 
         if (debug && storageGlobalParams.dur) {
-            log() << "_DEBUG: automatically enabling storageGlobalParams.durOptions=8 "
-                  << "(DurParanoid)" << endl;
+            log() << "_DEBUG: automatically enabling mmapv1GlobalOptions.journalOptions=8 "
+                  << "(JournalParanoid)" << endl;
             // this was commented out.  why too slow or something?
-            storageGlobalParams.durOptions |= 8;
+            mmapv1GlobalOptions.journalOptions |= MMAPV1Options::JournalParanoid;
         }
 
         return Status::OK();

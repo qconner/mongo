@@ -57,7 +57,6 @@
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rs.h" // this is ugly
 #include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -274,16 +273,28 @@ namespace mongo {
         return StatusWith<BSONObj>( fixed );
     }
 
+    void IndexCatalog::registerIndexBuild(IndexDescriptor* descriptor, unsigned int opNum) {
+        _inProgressIndexes[descriptor] = opNum;
+    }
+
+    void IndexCatalog::unregisterIndexBuild(IndexDescriptor* descriptor) {
+        InProgressIndexesMap::iterator it = _inProgressIndexes.find(descriptor);
+        invariant(it != _inProgressIndexes.end());
+        _inProgressIndexes.erase(it);
+    }
+
 namespace {
     class IndexCleanupOnRollback : public RecoveryUnit::Change {
     public:
         /**
          * None of these pointers are owned by this class.
          */
-        IndexCleanupOnRollback(Collection* collection,
+        IndexCleanupOnRollback(OperationContext* txn,
+                               Collection* collection,
                                IndexCatalogEntryContainer* entries,
                                const IndexDescriptor* desc)
-            : _collection(collection),
+            : _txn(txn),
+              _collection(collection),
               _entries(entries),
               _desc(desc) {
         }
@@ -292,13 +303,42 @@ namespace {
 
         virtual void rollback() {
             _entries->remove(_desc);
-            _collection->infoCache()->reset();
+            _collection->infoCache()->reset(_txn);
         }
 
     private:
+        OperationContext* _txn;
         Collection* _collection;
         IndexCatalogEntryContainer* _entries;
         const IndexDescriptor* _desc;
+    };
+
+    class IndexRemoveChange : public RecoveryUnit::Change {
+    public:
+        IndexRemoveChange(OperationContext* txn,
+                          Collection* collection,
+                          IndexCatalogEntryContainer* entries,
+                          IndexCatalogEntry* entry)
+            : _txn(txn),
+              _collection(collection),
+              _entries(entries),
+              _entry(entry) {
+        }
+
+        virtual void commit() {
+            delete _entry;
+        }
+
+        virtual void rollback() {
+            _entries->add(_entry);
+            _collection->infoCache()->reset(_txn);
+        }
+
+    private:
+        OperationContext* _txn;
+        Collection* _collection;
+        IndexCatalogEntryContainer* _entries;
+        IndexCatalogEntry* _entry;
     };
 } // namespace
 
@@ -341,7 +381,8 @@ namespace {
         if (!status.isOK())
             return status;
 
-        txn->recoveryUnit()->registerChange(new IndexCleanupOnRollback(_collection,
+        txn->recoveryUnit()->registerChange(new IndexCleanupOnRollback(txn,
+                                                                       _collection,
                                                                        &_entries,
                                                                        entry->descriptor()));
         indexBuildBlock.success();
@@ -449,12 +490,16 @@ namespace {
 
         _catalog->_collection->getCatalogEntry()->indexBuildSuccess( _txn, _indexName );
 
-        _catalog->_collection->infoCache()->addedIndex();
+        _catalog->_collection->infoCache()->addedIndex( _txn );
 
         IndexDescriptor* desc = _catalog->findIndexByName( _txn, _indexName, true );
         fassert( 17330, desc );
         IndexCatalogEntry* entry = _catalog->_entries.find( desc );
         fassert( 17331, entry && entry == _entry );
+
+        if ( entry->wantToSetIsMultikey() ) {
+            _catalog->_collection->getCatalogEntry()->setIndexIsMultikey( _txn, _indexName, true );
+        }
 
         entry->setIsReady( true );
     }
@@ -571,7 +616,8 @@ namespace {
 
                 // Index already exists with the same options, so no need to build a new
                 // one (not an error). Most likely requested by a client using ensureIndex.
-                return Status( ErrorCodes::IndexAlreadyExists, name );
+                return Status( ErrorCodes::IndexAlreadyExists, str::stream() << 
+                               "index already exists: " << name );
             }
         }
 
@@ -590,7 +636,8 @@ namespace {
                                    str::stream() << "Index with pattern: " << key
                                    << " already exists with different options" );
 
-                return Status( ErrorCodes::IndexAlreadyExists, name );
+                return Status( ErrorCodes::IndexAlreadyExists, str::stream() << 
+                               "index already exists: " << name );
             }
         }
 
@@ -741,7 +788,7 @@ namespace {
         _collection->cursorCache()->invalidateAll( false );
 
         // wipe out stats
-        _collection->infoCache()->reset();
+        _collection->infoCache()->reset(txn);
 
         string indexNamespace = entry->descriptor()->indexNamespace();
         string indexName = entry->descriptor()->indexName();
@@ -750,7 +797,9 @@ namespace {
 
         audit::logDropIndex( currentClient.get(), indexName, _collection->ns().ns() );
 
-        _entries.remove( entry->descriptor() );
+        invariant(_entries.release(entry->descriptor()) == entry);
+        txn->recoveryUnit()->registerChange(new IndexRemoveChange(txn, _collection,
+                                                                  &_entries, entry));
         entry = NULL;
 
         try {
@@ -768,12 +817,12 @@ namespace {
                   << " going to leak some memory to be safe";
 
 
-            _collection->_database->_clearCollectionCache( indexNamespace );
+            _collection->_database->_clearCollectionCache( txn, indexNamespace );
 
             throw;
         }
 
-        _collection->_database->_clearCollectionCache( indexNamespace );
+        _collection->_database->_clearCollectionCache( txn, indexNamespace );
 
         _checkMagic();
 
@@ -818,6 +867,10 @@ namespace {
 
 
     // ---------------------------
+
+    bool IndexCatalog::haveAnyIndexes() const {
+        return _entries.size() != 0;
+    }
 
     int IndexCatalog::numIndexesTotal( OperationContext* txn ) const {
         return _collection->getCatalogEntry()->getTotalIndexCount( txn );
@@ -967,20 +1020,24 @@ namespace {
 
     // ---------------------------
 
+    namespace {
+        bool isDupsAllowed( IndexDescriptor* desc ) {
+            bool isUnique = desc->unique() || KeyPattern::isIdKeyPattern(desc->keyPattern());
+            if ( !isUnique )
+                return true;
+
+            return repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(desc);
+        }
+
+    }
+
     Status IndexCatalog::_indexRecord(OperationContext* txn,
                                       IndexCatalogEntry* index,
                                       const BSONObj& obj,
                                       const DiskLoc &loc ) {
         InsertDeleteOptions options;
         options.logIfError = false;
-
-        bool isUnique =
-            KeyPattern::isIdKeyPattern(index->descriptor()->keyPattern()) ||
-            index->descriptor()->unique();
-
-        options.dupsAllowed =
-            repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(index->descriptor())
-            || !isUnique;
+        options.dupsAllowed = isDupsAllowed( index->descriptor() );
 
         int64_t inserted;
         return index->accessMethod()->insert(txn, obj, loc, options, &inserted);
@@ -993,6 +1050,7 @@ namespace {
                                         bool logIfError) {
         InsertDeleteOptions options;
         options.logIfError = logIfError;
+        options.dupsAllowed = isDupsAllowed( index->descriptor() );
 
         int64_t removed;
         Status status = index->accessMethod()->remove(txn, obj, loc, options, &removed);
@@ -1007,44 +1065,19 @@ namespace {
     }
 
 
-    void IndexCatalog::indexRecord(OperationContext* txn,
+    Status IndexCatalog::indexRecord(OperationContext* txn,
                                    const BSONObj& obj,
                                    const DiskLoc &loc ) {
 
         for ( IndexCatalogEntryContainer::const_iterator i = _entries.begin();
               i != _entries.end();
               ++i ) {
-
-            IndexCatalogEntry* entry = *i;
-
-            try {
-                Status s = _indexRecord( txn, entry, obj, loc );
-                uassertStatusOK( s );
-            }
-            catch ( AssertionException& ae ) {
-                LOG(2) << "IndexCatalog::indexRecord failed: " << ae;
-
-                for ( IndexCatalogEntryContainer::const_iterator j = _entries.begin();
-                      j != _entries.end();
-                      ++j ) {
-
-                    IndexCatalogEntry* toDelete = *j;
-
-                    try {
-                        _unindexRecord(txn, toDelete, obj, loc, false);
-                    }
-                    catch ( DBException& e ) {
-                        LOG(1) << "IndexCatalog::indexRecord rollback failed: " << e;
-                    }
-
-                    if ( toDelete == entry )
-                        break;
-                }
-
-                throw;
-            }
+            Status s = _indexRecord(txn, *i, obj, loc);
+            if (!s.isOK())
+                return s;
         }
 
+        return Status::OK();
     }
 
     void IndexCatalog::unindexRecord(OperationContext* txn,
@@ -1062,32 +1095,6 @@ namespace {
             bool logIfError = entry->isReady(txn) ? !noWarn : false;
             _unindexRecord(txn, entry, obj, loc, logIfError);
         }
-    }
-
-    Status IndexCatalog::checkNoIndexConflicts( OperationContext* txn, const BSONObj &obj ) {
-        IndexIterator ii = getIndexIterator( txn, true );
-        while ( ii.more() ) {
-            IndexDescriptor* descriptor = ii.next();
-
-            if ( !descriptor->unique() )
-                continue;
-
-            if (repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor))
-                continue;
-
-            IndexAccessMethod* iam = getIndex( descriptor );
-
-            InsertDeleteOptions options;
-            options.logIfError = false;
-            options.dupsAllowed = false;
-
-            UpdateTicket ticket;
-            Status ret = iam->validateUpdate(txn, BSONObj(), obj, DiskLoc(), options, &ticket);
-            if ( !ret.isOK() )
-                return ret;
-        }
-
-        return Status::OK();
     }
 
     BSONObj IndexCatalog::fixIndexKey( const BSONObj& key ) {
@@ -1150,10 +1157,38 @@ namespace {
         return b.obj();
     }
 
-    std::vector<BSONObj> IndexCatalog::killMatchingIndexBuilds(
-            const IndexCatalog::IndexKillCriteria& criteria) {
-        // This is just a no-op stub. When SERVER-14860 is resolved, this will either be filled out
-        // or removed entirely.
-        return std::vector<BSONObj>();
+    std::vector<BSONObj>
+    IndexCatalog::killMatchingIndexBuilds(const IndexCatalog::IndexKillCriteria& criteria) {
+        std::vector<BSONObj> indexes;
+        for (InProgressIndexesMap::iterator it = _inProgressIndexes.begin();
+             it != _inProgressIndexes.end();
+             it++) {
+            // check criteria
+            IndexDescriptor* desc = it->first;
+            unsigned int opNum = it->second;
+            if (!criteria.ns.empty() && (desc->parentNS() != criteria.ns)) {
+                continue;
+            }
+            if (!criteria.name.empty() && (desc->indexName() != criteria.name)) {
+                continue;
+            }
+            if (!criteria.key.isEmpty() && (desc->keyPattern() != criteria.key)) {
+                continue;
+            }
+            indexes.push_back(desc->keyPattern().getOwned());
+            log() << "halting index build: " << desc->keyPattern();
+            // Note that we can only be here if the background index build in question is
+            // yielding. The bg index code is set up specially to check for interrupt
+            // immediately after it recovers from yield, such that no further work is done
+            // on the index build. Thus this thread does not have to synchronize with the
+            // bg index operation; we can just assume that it is safe to proceed.
+            getGlobalEnvironment()->killOperation(opNum);
+        }
+
+        if (indexes.size() > 0) {
+            log() << "halted " << indexes.size() << " index build(s)" << endl;
+        }
+
+        return indexes;
     }
 }

@@ -87,6 +87,8 @@ namespace mongo {
         // if this ready is ready for queries
         bool isReady( OperationContext* txn ) const;
 
+        bool wantToSetIsMultikey() const { return _wantToSetIsMultikey; }
+
     private:
 
         bool _catalogIsReady( OperationContext* txn ) const;
@@ -114,6 +116,8 @@ namespace mongo {
         bool _isReady; // cache of NamespaceDetails info
         DiskLoc _head; // cache of IndexDetails
         bool _isMultikey; // cache of NamespaceDetails info
+
+        bool _wantToSetIsMultikey; // see ::setMultikey
     };
 
     class IndexCatalogEntryContainer {
@@ -139,7 +143,16 @@ namespace mongo {
         unsigned size() const { return _entries.size(); }
         // -----------------
 
-        bool remove( const IndexDescriptor* desc );
+        /**
+         * Removes from _entries and returns the matching entry or NULL if none matches.
+         */
+        IndexCatalogEntry* release( const IndexDescriptor* desc );
+
+        bool remove( const IndexDescriptor* desc ) {
+            IndexCatalogEntry* entry = release(desc);
+            delete entry;
+            return entry;
+        }
 
         // pass ownership to EntryContainer
         void add( IndexCatalogEntry* entry ) { _entries.mutableVector().push_back( entry ); }

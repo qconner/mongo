@@ -30,6 +30,7 @@
 
 #include "mongo/db/exec/and_common-inl.h"
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/util/mongoutils/str.h"
@@ -167,7 +168,7 @@ namespace mongo {
                         _dataMap.clear();
                         return PlanStage::FAILURE;
                     }
-                    // We ignore NEED_TIME.
+                    // We ignore NEED_TIME. TODO: what do we want to do if we get NEED_FETCH here?
                 }
             }
 
@@ -332,6 +333,10 @@ namespace mongo {
             if (PlanStage::NEED_TIME == childStatus) {
                 ++_commonStats.needTime;
             }
+            else if (PlanStage::NEED_FETCH == childStatus) {
+                ++_commonStats.needFetch;
+                *out = id;
+            }
 
             return childStatus;
         }
@@ -431,6 +436,10 @@ namespace mongo {
             if (PlanStage::NEED_TIME == childStatus) {
                 ++_commonStats.needTime;
             }
+            else if (PlanStage::NEED_FETCH == childStatus) {
+                ++_commonStats.needFetch;
+                *out = id;
+            }
 
             return childStatus;
         }
@@ -445,6 +454,7 @@ namespace mongo {
     }
 
     void AndHashStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
 
         for (size_t i = 0; i < _children.size(); ++i) {

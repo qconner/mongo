@@ -36,11 +36,12 @@
 
 #include <boost/filesystem/operations.hpp>
 
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
+
 
 namespace mongo {
 
@@ -57,7 +58,7 @@ namespace mongo {
         if ( sizeof( int* ) == 4 ) {
             return 512 * 1024 * 1024;
         }
-        else if (storageGlobalParams.smallfiles) {
+        else if (mmapv1GlobalOptions.smallfiles) {
             return 0x7ff00000 >> 2;
         }
         else {
@@ -65,16 +66,10 @@ namespace mongo {
         }
     }
 
-    NOINLINE_DECL void DataFile::badOfs2(int ofs) const {
-        uasserted(13441, str::stream() << "bad offset:" << ofs
-                  << " accessing file: " << mmf.filename()
-                  << ". See http://dochub.mongodb.org/core/data-recovery");
-    }
-
     NOINLINE_DECL void DataFile::badOfs(int ofs) const {
-        uasserted(13440, str::stream()  << "bad offset:" << ofs
-                  << " accessing file: " << mmf.filename()
-                  << ". See http://dochub.mongodb.org/core/data-recovery");
+        msgasserted(13440, str::stream()  << "bad offset:" << ofs
+                    << " accessing file: " << mmf.filename()
+                    << ". See http://dochub.mongodb.org/core/data-recovery");
     }
 
     int DataFile::defaultSize( const char *filename ) const {
@@ -83,14 +78,14 @@ namespace mongo {
             size = (64*1024*1024) << fileNo;
         else
             size = 0x7ff00000;
-        if (storageGlobalParams.smallfiles) {
+        if (mmapv1GlobalOptions.smallfiles) {
             size = size >> 2;
         }
         return size;
     }
 
     /** @return true if found and opened. if uninitialized (prealloc only) does not open. */
-    Status DataFile::openExisting( OperationContext* txn, const char *filename ) {
+    Status DataFile::openExisting(const char *filename) {
         verify( _mb == 0 );
         if( !boost::filesystem::exists(filename) )
             return Status( ErrorCodes::InvalidPath, "DataFile::openExisting - file does not exist" );
@@ -102,10 +97,10 @@ namespace mongo {
         unsigned long long sz = mmf.length();
         verify( sz <= 0x7fffffff );
         verify( sz % 4096 == 0 );
-        if (sz < 64*1024*1024 && !storageGlobalParams.smallfiles) {
+        if (sz < 64*1024*1024 && !mmapv1GlobalOptions.smallfiles) {
             if( sz >= 16*1024*1024 && sz % (1024*1024) == 0 ) {
                 log() << "info openExisting file size " << sz
-                      << " but storageGlobalParams.smallfiles=false: "
+                      << " but mmapv1GlobalOptions.smallfiles=false: "
                       << filename << endl;
             }
             else {
@@ -134,11 +129,11 @@ namespace mongo {
         if ( size > maxSize() )
             size = maxSize();
 
-        verify(size >= 64*1024*1024 || storageGlobalParams.smallfiles);
+        verify(size >= 64*1024*1024 || mmapv1GlobalOptions.smallfiles);
         verify( size % 4096 == 0 );
 
         if ( preallocateOnly ) {
-            if (storageGlobalParams.prealloc) {
+            if (mmapv1GlobalOptions.prealloc) {
                 FileAllocator::get()->requestAllocation( filename, size );
             }
             return;
@@ -208,8 +203,7 @@ namespace mongo {
             verify( HeaderSize == 8192 );
             DataFileHeader *h = getDur().writing(this);
             h->fileLength = filelength;
-            h->version = PDFILE_VERSION;
-            h->versionMinor = PDFILE_VERSION_MINOR_22_AND_OLDER; // All dbs start like this
+            h->version = DataFileVersion::defaultForNewFiles();
             h->unused.set( fileno, HeaderSize );
             verify( (data-(char*)this) == HeaderSize );
             h->unusedLength = fileLength - HeaderSize - 16;

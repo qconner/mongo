@@ -37,7 +37,6 @@
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
-#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 

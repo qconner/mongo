@@ -28,9 +28,9 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
@@ -59,35 +59,39 @@ namespace QueryStageTests {
 
             addIndex(BSON("foo" << 1));
             addIndex(BSON("foo" << 1 << "baz" << 1));
-            ctx.commit();
         }
 
         virtual ~IndexScanBase() {
             Client::WriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
-            ctx.commit();
         }
 
         void addIndex(const BSONObj& obj) {
             Client::WriteContext ctx(&_txn, ns());
             _client.ensureIndex(ns(), obj);
-            ctx.commit();
         }
 
         int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
-            Client::ReadContext ctx(&_txn, ns());
+            AutoGetCollectionForRead ctx(&_txn, ns());
 
             StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
             verify(swme.isOK());
             auto_ptr<MatchExpression> filterExpr(swme.getValue());
 
             WorkingSet* ws = new WorkingSet();
-            PlanExecutor runner(ws, 
-                                new IndexScan(&_txn, params, ws, filterExpr.get()), 
-                                ctx.ctx().db()->getCollection(&_txn, ns()));
+
+            PlanExecutor* rawExec;
+            Status status = PlanExecutor::make(&_txn,
+                                               ws,
+                                               new IndexScan(&_txn, params, ws, filterExpr.get()),
+                                               ctx.getCollection(),
+                                               PlanExecutor::YIELD_MANUAL,
+                                               &rawExec);
+            ASSERT_OK(status);
+            boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             int count = 0;
-            for (DiskLoc dl; PlanExecutor::ADVANCED == runner.getNext(NULL, &dl); ) {
+            for (DiskLoc dl; PlanExecutor::ADVANCED == exec->getNext(NULL, &dl); ) {
                 ++count;
             }
 
@@ -102,12 +106,11 @@ namespace QueryStageTests {
                 double lng = double(rand()) / RAND_MAX;
                 _client.insert(ns(), BSON("geo" << BSON_ARRAY(lng << lat)));
             }
-            ctx.commit();
         }
 
         IndexDescriptor* getIndex(const BSONObj& obj) {
-            Client::ReadContext ctx(&_txn, ns());
-            Collection* collection = ctx.ctx().db()->getCollection( &_txn, ns() );
+            AutoGetCollectionForRead ctx(&_txn, ns());
+            Collection* collection = ctx.getCollection();
             return collection->getIndexCatalog()->findIndexByKeyPattern( &_txn, obj );
         }
 
@@ -224,6 +227,8 @@ namespace QueryStageTests {
             add<QueryStageIXScanLowerUpperInclFilter>();
             add<QueryStageIXScanCantMatch>();
         }
-    }  queryStageTestsAll;
+    };
+
+    SuiteInstance<All> queryStageTestsAll;
 
 }  // namespace

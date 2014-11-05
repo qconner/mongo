@@ -43,7 +43,11 @@ namespace mongo {
 
         virtual RecoveryUnit* recoveryUnit() const;
 
-        virtual LockState* lockState() const;
+        virtual RecoveryUnit* releaseRecoveryUnit();
+
+        virtual void setRecoveryUnit(RecoveryUnit* unit);
+
+        virtual Locker* lockState() const;
 
         virtual ProgressMeter* setMessage(const char* msg,
                                           const std::string& name,
@@ -66,12 +70,10 @@ namespace mongo {
 
         virtual bool isPrimaryFor( const StringData& ns );
 
-        virtual Transaction* getTransaction();
-
     private:
-        boost::scoped_ptr<RecoveryUnit> _recovery;
-        Transaction _tx;
-        LockState _lockState;
+        std::auto_ptr<RecoveryUnit> _recovery;
+        std::auto_ptr<Locker> _locker;
+        Client* const _client; // cached, not owned
     };
 
 }  // namespace mongo

@@ -54,6 +54,7 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/shutdown.h"
 #include "mongo/db/db.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_environment_d.h"
 #include "mongo/db/index_builder.h"
@@ -67,7 +68,6 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/oplog.h"
@@ -107,13 +107,25 @@ namespace mongo {
                 timeoutSecs = cmdObj["timeoutSecs"].numberLong();
             }
 
-            Status status = repl::getGlobalReplicationCoordinator()->stepDownAndWaitForSecondary(
+            Status status = repl::getGlobalReplicationCoordinator()->stepDown(
                     txn,
+                    false,
                     repl::ReplicationCoordinator::Milliseconds(timeoutSecs * 1000),
-                    repl::ReplicationCoordinator::Milliseconds(120 * 1000),
-                    repl::ReplicationCoordinator::Milliseconds(60 * 1000));
+                    repl::ReplicationCoordinator::Milliseconds(120 * 1000));
             if (!status.isOK() && status.code() != ErrorCodes::NotMaster) { // ignore not master
                 return appendCommandStatus(result, status);
+            }
+
+            // TODO(spencer): This block can be removed once stepDown() guarantees that a secondary
+            // is fully caught up instead of just within 10 seconds of the primary.
+            if (status.code() != ErrorCodes::NotMaster) {
+                WriteConcernOptions writeConcern;
+                writeConcern.wNumNodes = 2;
+                writeConcern.wTimeout = 60 * 1000; // 1 minute
+                // Note that return value is ignored - we shut down after 1 minute even if we're not
+                // done replicating.
+                repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOpApplied(
+                        txn, writeConcern);
             }
         }
 
@@ -181,12 +193,12 @@ namespace mongo {
             }
 
             {
-
-                // this is suboptimal but syncDataAndTruncateJournal is called from dropDatabase,
-                // and that may need a global lock.
+                // TODO: SERVER-4328 Don't lock globally
                 Lock::GlobalWrite lk(txn->lockState());
+                if (dbHolder().get(txn, dbname) == NULL) {
+                    return true; // didn't exist, was no-op
+                }
                 Client::Context context(txn, dbname);
-                WriteUnitOfWork wunit(txn);
 
                 log() << "dropDatabase " << dbname << " starting" << endl;
 
@@ -195,8 +207,11 @@ namespace mongo {
 
                 log() << "dropDatabase " << dbname << " finished";
 
-                if (!fromRepl)
-                    repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
+                WriteUnitOfWork wunit(txn);
+
+                if (!fromRepl) {
+                    repl::logOp(txn, "c", (dbname + ".$cmd").c_str(), cmdObj);
+                }
 
                 wunit.commit();
             }
@@ -262,8 +277,7 @@ namespace mongo {
                 return false;
             }
 
-            // SERVER-4328 todo don't lock globally. currently syncDataAndTruncateJournal is being
-            // called within, and that requires a global lock i believe.
+            // TODO: SERVER-4328 Don't lock globally
             Lock::GlobalWrite lk(txn->lockState());
             Client::Context context(txn,  dbname );
 
@@ -336,8 +350,7 @@ namespace mongo {
             // Needs to be locked exclusively, because creates the system.profile collection
             // in the local database.
             //
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            WriteUnitOfWork wunit(txn);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             Client::Context ctx(txn, dbname);
 
             BSONElement e = cmdObj.firstElement();
@@ -354,10 +367,10 @@ namespace mongo {
             }
 
             BSONElement slow = cmdObj["slowms"];
-            if ( slow.isNumber() )
+            if (slow.isNumber()) {
                 serverGlobalParams.slowMS = slow.numberInt();
+            }
 
-            wunit.commit();
             return ok;
         }
     } cmdProfile;
@@ -392,7 +405,7 @@ namespace mongo {
             // This doesn't look like it requires exclusive DB lock, because it uses its own diag
             // locking, but originally the lock was set to be WRITE, so preserving the behaviour.
             //
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             Client::Context ctx(txn, dbname);
 
             int was = _diaglog.setLevel( cmdObj.firstElement().numberInt() );
@@ -448,8 +461,7 @@ namespace mongo {
                 return false;
             }
 
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            WriteUnitOfWork wunit(txn);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             Client::Context ctx(txn, nsToDrop);
             Database* db = ctx.db();
 
@@ -467,6 +479,7 @@ namespace mongo {
             result.append( "ns", nsToDrop );
             result.append( "nIndexesWas", numIndexes );
 
+            WriteUnitOfWork wunit(txn);
             Status s = db->dropCollection( txn, nsToDrop );
 
             if ( !s.isOK() ) {
@@ -548,7 +561,7 @@ namespace mongo {
                     !options["capped"].trueValue() || options["size"].isNumber() ||
                         options.hasField("$nExtents"));
 
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             WriteUnitOfWork wunit(txn);
             Client::Context ctx(txn, ns);
 
@@ -563,51 +576,6 @@ namespace mongo {
         }
     } cmdCreate;
 
-
-    /* note an access to a database right after this will open it back up - so this is mainly
-       for diagnostic purposes.
-       */
-    class CmdCloseAllDatabases : public Command {
-    public:
-        virtual void help( stringstream& help ) const { 
-            help << "Close all database files." << endl 
-                << "A new request will cause an immediate reopening; thus, this is mostly for testing purposes.";
-        }
-
-        virtual bool adminOnly() const { return true; }
-        virtual bool slaveOk() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return true; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::closeAllDatabases);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-
-        CmdCloseAllDatabases() : Command( "closeAllDatabases" ) {
-
-        }
-
-        bool run(OperationContext* txn, const string& dbname , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
-            Lock::GlobalWrite globalWriteLock(txn->lockState());
-            // No WriteUnitOfWork necessary, as no actual writes happen.
-            Client::Context ctx(txn, dbname);
-
-            try {
-                return dbHolder().closeAll(txn, result, false);
-            }
-            catch(DBException&) { 
-                throw;
-            }
-            catch(...) { 
-                log() << "ERROR uncaught exception in command closeAllDatabases" << endl;
-                errmsg = "unexpected uncaught exception";
-                return false;
-            }
-        }
-
-    } cmdCloseAllDatabases;
 
     class CmdFileMD5 : public Command {
     public:
@@ -669,8 +637,8 @@ namespace mongo {
 
             // Check shard version at startup.
             // This will throw before we've done any work if shard version is outdated
-            Client::ReadContext ctx(txn, ns);
-            Collection* coll = ctx.ctx().db()->getCollection(txn, ns);
+            AutoGetCollectionForRead ctx(txn, ns);
+            Collection* coll = ctx.getCollection();
 
             CanonicalQuery* cq;
             if (!CanonicalQuery::canonicalize(ns, query, sort, BSONObj(), &cq).isOK()) {
@@ -679,16 +647,13 @@ namespace mongo {
             }
 
             PlanExecutor* rawExec;
-            if (!getExecutor(txn, coll, cq, &rawExec, QueryPlannerParams::NO_TABLE_SCAN).isOK()) {
+            if (!getExecutor(txn, coll, cq, PlanExecutor::YIELD_MANUAL, &rawExec,
+                             QueryPlannerParams::NO_TABLE_SCAN).isOK()) {
                 uasserted(17241, "Can't get executor for query " + query.toString());
                 return 0;
             }
 
             auto_ptr<PlanExecutor> exec(rawExec);
-
-            // The executor must be registered to be informed of DiskLoc deletions and NS dropping
-            // when we yield the lock below.
-            const ScopedExecutorRegistration safety(exec.get());
 
             const ChunkVersion shardVersionAtStart = shardingState.getVersion(ns);
 
@@ -780,9 +745,9 @@ namespace mongo {
             BSONObj keyPattern = jsobj.getObjectField( "keyPattern" );
             bool estimate = jsobj["estimate"].trueValue();
 
-            Client::ReadContext ctx(txn, ns);
+            AutoGetCollectionForRead ctx(txn, ns);
 
-            Collection* collection = ctx.ctx().db()->getCollection( txn, ns );
+            Collection* collection = ctx.getCollection();
 
             if ( !collection || collection->numRecords(txn) == 0 ) {
                 result.appendNumber( "size" , 0 );
@@ -896,17 +861,6 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            const string ns = dbname + "." + jsobj.firstElement().valuestr();
-            Client::ReadContext cx(txn, ns);
-            Database* db = cx.ctx().db();
-            Collection* collection = db->getCollection( txn, ns );
-            if ( !collection ) {
-                errmsg = "Collection [" + ns + "] not found.";
-                return false;
-            }
-
-            result.append( "ns" , ns.c_str() );
-
             int scale = 1;
             if ( jsobj["scale"].isNumber() ) {
                 scale = jsobj["scale"].numberInt();
@@ -921,6 +875,27 @@ namespace mongo {
             }
 
             bool verbose = jsobj["verbose"].trueValue();
+
+            const NamespaceString nss(parseNs(dbname, jsobj));
+
+            if (nss.coll().empty()) {
+                errmsg = "No collection name specified";
+                return false;
+            }
+
+            AutoGetCollectionForRead ctx(txn, nss);
+            if (!ctx.getDb()) {
+                errmsg = "Database [" + nss.db().toString() + "] not found.";
+                return false;
+            }
+
+            Collection* collection = ctx.getCollection();
+            if (!collection) {
+                errmsg = "Collection [" + nss.toString() + "] not found.";
+                return false;
+            }
+
+            result.append( "ns" , nss );
 
             long long size = collection->dataSize(txn) / scale;
             long long numRecords = collection->numRecords(txn);
@@ -938,10 +913,9 @@ namespace mongo {
             collection->getRecordStore()->appendCustomStats( txn, &result, scale );
 
             BSONObjBuilder indexSizes;
-            result.appendNumber( "totalIndexSize" , db->getIndexSizeForCollection(txn,
-                                                                                  collection,
-                                                                                  &indexSizes,
-                                                                                  scale) / scale );
+            long long indexSize = collection->getIndexSize(txn, &indexSizes, scale);
+
+            result.appendNumber("totalIndexSize", indexSize / scale);
             result.append("indexSizes", indexSizes.obj());
 
             return true;
@@ -975,7 +949,7 @@ namespace mongo {
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             const string ns = dbname + "." + jsobj.firstElement().valuestr();
 
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             WriteUnitOfWork wunit(txn);
             Client::Context ctx(txn,  ns );
 
@@ -1112,10 +1086,40 @@ namespace mongo {
 
             const string ns = parseNs(dbname, jsobj);
 
-            Client::ReadContext ctx(txn, ns);
-            Database* d = ctx.ctx().db();
+            // TODO: Client::Context legacy, needs to be removed
+            txn->getCurOp()->ensureStarted();
+            txn->getCurOp()->setNS(dbname);
 
-            d->getStats( txn, &result, scale );
+            // We lock the entire database in S-mode in order to ensure that the contents will not
+            // change for the stats snapshot. This might be unnecessary and if it becomes a
+            // performance issue, we can take IS lock and then lock collection-by-collection.
+            AutoGetDb autoDb(txn, ns, MODE_S);
+
+            result.append("db", ns);
+
+            Database* db = autoDb.getDb();
+            if (!db) {
+                // TODO: This preserves old behaviour where we used to create an empty database
+                // metadata even when the database is accessed for read. Without this several
+                // unit-tests will fail, which are fairly easy to fix. If backwards compatibility
+                // is not needed for the missing DB case, we can just do the same that's done in
+                // CollectionStats.
+                result.appendNumber("collections", 0);
+                result.appendNumber("objects", 0);
+                result.append("avgObjSize", 0);
+                result.appendNumber("dataSize", 0);
+                result.appendNumber("storageSize", 0);
+                result.appendNumber("numExtents", 0);
+                result.appendNumber("indexes", 0);
+                result.appendNumber("indexSize", 0);
+                result.appendNumber("fileSize", 0);
+            }
+            else {
+                // TODO: Client::Context legacy, needs to be removed
+                txn->getCurOp()->enter(dbname.c_str(), db->getProfilingLevel());
+
+                db->getStats(txn, &result, scale);
+            }
 
             return true;
         }
@@ -1172,15 +1176,15 @@ namespace mongo {
     }
 
     /* Sometimes we cannot set maintenance mode, in which case the call to setMaintenanceMode will
-       return false.  This class does not treat that case as an error which means that anybody 
-       using it is assuming it is ok to continue execution without maintenance mode.  This 
+       return a non-OK status.  This class does not treat that case as an error which means that
+       anybody using it is assuming it is ok to continue execution without maintenance mode.  This
        assumption needs to be audited and documented. */
     class MaintenanceModeSetter {
     public:
         MaintenanceModeSetter(OperationContext* txn) :
             _txn(txn),
             maintenanceModeSet(
-                    repl::getGlobalReplicationCoordinator()->setMaintenanceMode(txn, true))
+                    repl::getGlobalReplicationCoordinator()->setMaintenanceMode(txn, true).isOK())
             {}
         ~MaintenanceModeSetter() {
             if (maintenanceModeSet)
@@ -1242,7 +1246,6 @@ namespace mongo {
     */
     void Command::execCommand(OperationContext* txn,
                               Command * c ,
-                              Client& client,
                               int queryOptions,
                               const char *cmdns,
                               BSONObj& cmdObj,
@@ -1252,7 +1255,7 @@ namespace mongo {
         scoped_ptr<MaintenanceModeSetter> mmSetter;
 
         if ( cmdObj["help"].trueValue() ) {
-            client.curop()->ensureStarted();
+            txn->getCurOp()->ensureStarted();
             stringstream ss;
             ss << "help for: " << c->name << " ";
             c->help( ss );
@@ -1267,7 +1270,7 @@ namespace mongo {
         // in that code path that must not see the impersonated user and roles array elements.
         std::vector<UserName> parsedUserNames;
         std::vector<RoleName> parsedRoleNames;
-        AuthorizationSession* authSession = client.getAuthorizationSession();
+        AuthorizationSession* authSession = txn->getClient()->getAuthorizationSession();
         bool rolesFieldIsPresent = false;
         bool usersFieldIsPresent = false;
         audit::parseAndRemoveImpersonatedRolesField(cmdObj,
@@ -1291,7 +1294,7 @@ namespace mongo {
                                                        parsedUserNames,
                                                        parsedRoleNames);
 
-        Status status = _checkAuthorization(c, &client, dbname, cmdObj, fromRepl);
+        Status status = _checkAuthorization(c, txn->getClient(), dbname, cmdObj, fromRepl);
         if (!status.isOK()) {
             appendCommandStatus(result, status);
             return;
@@ -1323,7 +1326,7 @@ namespace mongo {
             LOG( 2 ) << "command: " << cmdObj << endl;
         }
 
-        client.curop()->setCommand(c);
+        txn->getCurOp()->setCommand(c);
 
         if (c->maintenanceMode() &&
                 repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
@@ -1351,8 +1354,8 @@ namespace mongo {
             return;
         }
 
-        client.curop()->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS.getValue())
-                                         * 1000);
+        txn->getCurOp()->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS.getValue())
+                                          * 1000);
         try {
             txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
         }
@@ -1364,9 +1367,15 @@ namespace mongo {
         std::string errmsg;
         bool retval = false;
 
-        client.curop()->ensureStarted();
+        txn->getCurOp()->ensureStarted();
+
+        c->_commandsExecuted.increment();
 
         retval = _execCommand(txn, c, dbname, cmdObj, queryOptions, errmsg, result, fromRepl);
+
+        if ( !retval ){
+            c->_commandsFailed.increment();
+        }
 
         appendCommandStatus(result, retval, errmsg);
         
@@ -1375,7 +1384,7 @@ namespace mongo {
             // Detect mongos connections by looking for setShardVersion to have been run previously
             // on this connection.
             if (shardingState.needCollectionMetadata(dbname)) {
-                appendGLEHelperData(result, client.getLastOp(), replCoord->getElectionId());
+                appendGLEHelperData(result, txn->getClient()->getLastOp(), replCoord->getElectionId());
             }
         }
         return;
@@ -1433,14 +1442,12 @@ namespace mongo {
             queryOptions |= QueryOption_SlaveOk;
         }
 
-        Client& client = cc();
-
         BSONElement e = jsobj.firstElement();
 
         Command * c = e.type() ? Command::findCommand( e.fieldName() ) : 0;
 
         if ( c ) {
-            Command::execCommand(txn, c, client, queryOptions, ns, jsobj, anObjBuilder, fromRepl);
+            Command::execCommand(txn, c, queryOptions, ns, jsobj, anObjBuilder, fromRepl);
         }
         else {
             Command::appendCommandStatus(anObjBuilder,
@@ -1448,6 +1455,7 @@ namespace mongo {
                                          str::stream() << "no such cmd: " << e.fieldName());
             anObjBuilder.append("code", ErrorCodes::CommandNotFound);
             anObjBuilder.append("bad cmd" , _cmdobj );
+            Command::unknownCommands.increment();
         }
 
         BSONObj x = anObjBuilder.done();

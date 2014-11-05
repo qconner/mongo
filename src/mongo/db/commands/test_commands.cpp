@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
@@ -64,7 +66,7 @@ namespace mongo {
             string ns = dbname + "." + coll;
             BSONObj obj = cmdObj[ "obj" ].embeddedObjectUserCheck();
 
-            Lock::DBWrite lk(txn->lockState(), ns);
+            Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
             WriteUnitOfWork wunit(txn);
             Client::Context ctx(txn,  ns );
             Database* db = ctx.db();
@@ -148,21 +150,24 @@ namespace mongo {
             bool inc = cmdObj.getBoolField( "inc" ); // inclusive range?
 
             Client::WriteContext ctx(txn,  nss.ns() );
-            Collection* collection = ctx.ctx().db()->getCollection( txn, nss.ns() );
+            Collection* collection = ctx.getCollection();
             massert( 13417, "captrunc collection not found or empty", collection);
 
-            boost::scoped_ptr<PlanExecutor> exec(
-                InternalPlanner::collectionScan(txn, nss.ns(), collection,
-                                                InternalPlanner::BACKWARD));
-
             DiskLoc end;
-            // We remove 'n' elements so the start is one past that
-            for( int i = 0; i < n + 1; ++i ) {
-                PlanExecutor::ExecState state = exec->getNext(NULL, &end);
-                massert( 13418, "captrunc invalid n", PlanExecutor::ADVANCED == state);
+            {
+                boost::scoped_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn,
+                                                                                     nss.ns(),
+                                                                                     collection,
+                                                                                     InternalPlanner::BACKWARD));
+                // We remove 'n' elements so the start is one past that
+                for( int i = 0; i < n + 1; ++i ) {
+                    PlanExecutor::ExecState state = exec->getNext(NULL, &end);
+                    massert( 13418, "captrunc invalid n", PlanExecutor::ADVANCED == state);
+                }
             }
+            WriteUnitOfWork wuow(txn);
             collection->temp_cappedTruncateAfter( txn, end, inc );
-            ctx.commit();
+            wuow.commit();
             return true;
         }
     };
@@ -196,8 +201,9 @@ namespace mongo {
             NamespaceString nss( dbname, coll );
 
             Client::WriteContext ctx(txn,  nss.ns() );
-            Database* db = ctx.ctx().db();
-            Collection* collection = db->getCollection( txn, nss.ns() );
+            WriteUnitOfWork wuow(txn);
+            Database* db = ctx.db();
+            Collection* collection = ctx.getCollection();
             massert( 13429, "emptycapped no such collection", collection );
 
             std::vector<BSONObj> indexes = stopIndexBuilds(txn, db, cmdObj);
@@ -210,7 +216,7 @@ namespace mongo {
 
             if (!fromRepl)
                 repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
-            ctx.commit();
+            wuow.commit();
             return true;
         }
     };

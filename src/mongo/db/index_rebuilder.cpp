@@ -64,7 +64,7 @@ namespace {
 
             // This write lock is held throughout the index building process
             // for this namespace.
-            Lock::DBWrite lk(txn->lockState(), ns);
+            Lock::DBLock lk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_X);
             Client::Context ctx(txn, ns);
 
             Collection* collection = ctx.db()->getCollection(txn, ns);
@@ -124,6 +124,14 @@ namespace {
                 indexer.commit();
                 wunit.commit();
             }
+            catch (const DBException& e) {
+                error() << "Index rebuilding did not complete: " << e.toString();
+                log() << "note: restart the server with --noIndexBuildRetry to skip index rebuilds";
+                // If anything went wrong, leave the indexes partially built so that we pick them up
+                // again on restart.
+                indexer.abortWithoutCleanup();
+                fassertFailedNoTrace(26100);
+            }
             catch (...) {
                 // If anything went wrong, leave the indexes partially built so that we pick them up
                 // again on restart.
@@ -134,10 +142,8 @@ namespace {
     }
 } // namespace
 
-    void restartInProgressIndexesFromLastShutdown() {
-        OperationContextImpl txn;
-
-        cc().getAuthorizationSession()->grantInternalAuthorization();
+    void restartInProgressIndexesFromLastShutdown(OperationContext* txn) {
+        txn->getClient()->getAuthorizationSession()->grantInternalAuthorization();
 
         std::vector<std::string> dbNames;
 
@@ -149,16 +155,15 @@ namespace {
             for (std::vector<std::string>::const_iterator dbName = dbNames.begin();
                  dbName < dbNames.end();
                  ++dbName) {
-                Client::ReadContext ctx(&txn, *dbName);
+                AutoGetDb autoDb(txn, *dbName, MODE_S);
 
-                Database* db = ctx.ctx().db();
+                Database* db = autoDb.getDb();
                 db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collNames);
             }
-            checkNS(&txn, collNames);
+            checkNS(txn, collNames);
         }
         catch (const DBException& e) {
-            error() << "Index rebuilding did not complete: " << e.toString();
-            log() << "note: restart the server with --noIndexBuildRetry to skip index rebuilds";
+            error() << "Index verification did not complete: " << e.toString();
             fassertFailedNoTrace(18643);
         }
         LOG(1) << "checking complete" << endl;

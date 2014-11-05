@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+
 #include "mongo/pch.h"
 
 #include <time.h>
@@ -48,8 +50,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/repl/multicmd.h"
-#include "mongo/db/repl/write_concern.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/scripting/engine.h"

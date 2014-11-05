@@ -2,6 +2,7 @@
 
 Import("env")
 
+# WorkingSet target and associated test
 env.Library(
     target = "working_set",
     source = [
@@ -33,6 +34,15 @@ env.Library(
 )
 
 env.Library(
+    target = "scoped_timer",
+    source = [
+        "scoped_timer.cpp",
+    ],
+    LIBDEPS = [
+    ],
+)
+
+env.Library(
     target = 'exec',
     source = [
         "and_hash.cpp",
@@ -40,11 +50,13 @@ env.Library(
         "cached_plan.cpp",
         "collection_scan.cpp",
         "count.cpp",
+        "count_scan.cpp",
         "delete.cpp",
         "distinct_scan.cpp",
         "eof.cpp",
         "fetch.cpp",
         "geo_near.cpp",
+        "group.cpp",
         "idhack.cpp",
         "index_scan.cpp",
         "keep_mutations.cpp",
@@ -68,8 +80,25 @@ env.Library(
         "working_set_common.cpp",
     ],
     LIBDEPS = [
+        "scoped_timer",
         "$BUILD_DIR/mongo/bson",
     ],
+)
+
+env.CppUnitTest(
+    target = "mock_stage_test",
+    source = [
+        "mock_stage_test.cpp",
+    ],
+    LIBDEPS = [
+        "exec",
+        "mock_stage",
+        "$BUILD_DIR/mongo/serveronly",
+        "$BUILD_DIR/mongo/coreserver",
+        "$BUILD_DIR/mongo/coredb",
+        "$BUILD_DIR/mongo/mocklib",
+    ],
+    NO_CRUTCH = True,
 )
 
 env.CppUnitTest(

@@ -33,7 +33,6 @@
 #include "mongo/base/init.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_geo.h"
-#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -43,9 +42,9 @@ namespace mongo {
                                                                const BSONObj& section ) {
         if (BSONObj::opWITHIN == type || BSONObj::opGEO_INTERSECTS == type) {
             auto_ptr<GeoExpression> gq(new GeoExpression(name));
-            if ( !gq->parseFrom( section ) )
-                return StatusWithMatchExpression( ErrorCodes::BadValue,
-                                                  string("bad geo query: ") + section.toString() );
+            Status parseStatus = gq->parseFrom(section);
+
+            if (!parseStatus.isOK()) return StatusWithMatchExpression(parseStatus);
 
             auto_ptr<GeoMatchExpression> e( new GeoMatchExpression() );
 

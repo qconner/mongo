@@ -39,15 +39,15 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/db.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rs.h"
-#include "mongo/db/repl/write_concern.h"
 
 namespace mongo {
 
@@ -72,7 +72,9 @@ namespace mongo {
     ClientCursor::ClientCursor(const Collection* collection, PlanExecutor* exec,
                                int qopts, const BSONObj query)
         : _collection( collection ),
-          _countedYet( false ) {
+          _countedYet( false ),
+          _unownedRU(NULL) {
+
         _exec.reset(exec);
         _ns = exec->ns();
         _query = query;
@@ -87,7 +89,8 @@ namespace mongo {
         : _ns(collection->ns().ns()),
           _collection(collection),
           _countedYet( false ),
-          _queryOptions(QueryOption_NoCursorTimeout) {
+          _queryOptions(QueryOption_NoCursorTimeout),
+          _unownedRU(NULL) {
         init();
     }
 
@@ -172,7 +175,31 @@ namespace mongo {
         if (!rid.isSet())
             return;
 
-        repl::getGlobalReplicationCoordinator()->setLastOptime(txn, rid, _slaveReadTill);
+        repl::getGlobalReplicationCoordinator()->setLastOptimeForSlave(txn, rid, _slaveReadTill);
+    }
+
+    //
+    // Storage engine state for getMore.
+    //
+
+    void ClientCursor::setUnownedRecoveryUnit(RecoveryUnit* ru) {
+        invariant(!_unownedRU);
+        invariant(!_ownedRU.get());
+        _unownedRU = ru;
+    }
+
+    RecoveryUnit* ClientCursor::getUnownedRecoveryUnit() const {
+        return _unownedRU;
+    }
+
+    void ClientCursor::setOwnedRecoveryUnit(RecoveryUnit* ru) {
+        invariant(!_unownedRU);
+        invariant(!_ownedRU.get());
+        _ownedRU.reset(ru);
+    }
+
+    RecoveryUnit* ClientCursor::releaseOwnedRecoveryUnit() {
+        return _ownedRU.release();
     }
 
     //

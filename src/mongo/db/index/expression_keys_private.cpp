@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+
 #include "mongo/db/index/expression_keys_private.h"
 
 #include <utility>
@@ -83,35 +85,41 @@ namespace {
     }
 
 
-    bool S2GetKeysForObject(const BSONObj& obj,
+    Status S2GetKeysForElement(const BSONElement& element,
                             const S2IndexingParams& params,
                             vector<string>* out) {
+        GeometryContainer geoContainer;
+        Status status = geoContainer.parseFromStorage(element);
+        if (!status.isOK()) return status;
+
         S2RegionCoverer coverer;
         params.configureCoverer(&coverer);
 
-        GeometryContainer geoContainer;
-        if (!geoContainer.parseFrom(obj)) { return false; }
-
         // Don't index big polygon
         if (geoContainer.getNativeCRS() == STRICT_SPHERE) {
-            return false;
+            return Status(ErrorCodes::BadValue, "can't index geometry with strict winding order");
         }
 
         // Only certain geometries can be indexed in the old index format S2_INDEX_VERSION_1.  See
         // definition of S2IndexVersion for details.
         if (params.indexVersion == S2_INDEX_VERSION_1 && !geoContainer.isSimpleContainer()) {
-            return false;
+            return Status(ErrorCodes::BadValue,
+                          str::stream()
+                                  << "given geometry can't be indexed in the old index format");
         }
 
         // Project the geometry into spherical space
-        if (!geoContainer.supportsProject(SPHERE))
-            return false;
+        if (!geoContainer.supportsProject(SPHERE)) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "can't project geometry into spherical CRS: "
+                                        << element.toString(false));
+        }
         geoContainer.projectInto(SPHERE);
 
         invariant(geoContainer.hasS2Region());
 
         S2KeysFromRegion(&coverer, geoContainer.getS2Region(), out);
-        return true;
+        return Status::OK();
     }
 
 
@@ -123,14 +131,10 @@ namespace {
                                     const S2IndexingParams& params,
                                     BSONObjSet* out) {
         for (BSONElementSet::iterator i = elements.begin(); i != elements.end(); ++i) {
-            uassert(16754, "Can't parse geometry from element: " + i->toString(),
-                    i->isABSONObj());
-            const BSONObj &geoObj = i->Obj();
-
             vector<string> cells;
-            bool succeeded = S2GetKeysForObject(geoObj, params, &cells);
-            uassert(16755, "Can't extract geo keys from object, malformed geometry?: "
-                           + document.toString(), succeeded);
+            Status status = S2GetKeysForElement(*i, params, &cells);
+            uassert(16755, str::stream() << "Can't extract geo keys: " << document << "  "
+                    << status.reason(), status.isOK());
 
             uassert(16756, "Unable to generate keys for (likely malformed) geometry: "
                     + document.toString(),
@@ -359,7 +363,11 @@ namespace mongo {
 
         if (loc.eoo()) { return; }
 
-        uassert(16775, "latlng not an array", loc.isABSONObj());
+        // NOTE: We explicitly test nFields >= 2 to support legacy users who may have indexed
+        // (intentionally or unintentionally) objects/arrays with more than two fields.
+        uassert(16775, str::stream() << "cannot extract [lng, lat] array or object from " << obj,
+            loc.isABSONObj() && loc.Obj().nFields() >= 2);
+
         string root;
         {
             BSONObjIterator i(loc.Obj());

@@ -33,6 +33,7 @@
 #include <set>
 
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/storage/heap1/heap1_recovery_unit.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -85,12 +86,13 @@ namespace {
         Heap1BtreeBuilderImpl(IndexSet* data, long long* currentKeySize, bool dupsAllowed)
                 : _data(data),
                   _currentKeySize( currentKeySize ),
-                  _dupsAllowed(dupsAllowed) {
+                  _dupsAllowed(dupsAllowed),
+                  _comparator(_data->key_comp()) {
             invariant(_data->empty());
         }
 
         Status addKey(const BSONObj& key, const DiskLoc& loc) {
-            // inserts should be in ascending order.
+            // inserts should be in ascending (key, DiskLoc) order.
 
             if ( key.objsize() >= TempKeyMaxSize ) {
                 return Status(ErrorCodes::KeyTooLong, "key too big");
@@ -101,12 +103,20 @@ namespace {
             invariant(loc.isValid());
             invariant(!hasFieldNames(key));
 
-            // TODO optimization: dup check can assume dup is only possible with last inserted key
-            // and avoid the log(n) lookup.
-            if (!_dupsAllowed && isDup(*_data, key, loc))
-                return dupKeyError(key);
+            if (!_data->empty()) {
+                // Compare specified key with last inserted key, ignoring its DiskLoc
+                int cmp = _comparator.compare(IndexKeyEntry(key, DiskLoc()), *_last);
+                if (cmp < 0 || (_dupsAllowed && cmp == 0 && loc < _last->loc)) {
+                    return Status(ErrorCodes::InternalError,
+                                  "expected ascending (key, DiskLoc) order in bulk builder");
+                }
+                else if (!_dupsAllowed && cmp == 0 && loc != _last->loc) {
+                    return dupKeyError(key);
+                }
+            }
 
-            _data->insert(_data->end(), IndexKeyEntry(key.getOwned(), loc));
+            BSONObj owned = key.getOwned();
+            _last = _data->insert(_data->end(), IndexKeyEntry(owned, loc));
             *_currentKeySize += key.objsize();
 
             return Status::OK();
@@ -116,13 +126,15 @@ namespace {
         IndexSet* const _data;
         long long* _currentKeySize;
         const bool _dupsAllowed;
+
+        IndexEntryComparison _comparator;  // used by the bulk builder to detect duplicate keys
+        IndexSet::const_iterator _last;    // or (key, DiskLoc) ordering violations
     };
 
     class Heap1BtreeImpl : public SortedDataInterface {
     public:
-        Heap1BtreeImpl(const IndexCatalogEntry& info, IndexSet* data)
-            : _info(info),
-              _data(data) {
+        Heap1BtreeImpl(IndexSet* data)
+            : _data(data) {
             _currentKeySize = 0;
         }
 
@@ -150,25 +162,33 @@ namespace {
             if (!dupsAllowed && isDup(*_data, key, loc))
                 return dupKeyError(key);
 
-            if ( _data->insert(IndexKeyEntry(key.getOwned(), loc)).second )
+            IndexKeyEntry entry(key.getOwned(), loc);
+            if ( _data->insert(entry).second ) {
                 _currentKeySize += key.objsize();
+                txn->recoveryUnit()->registerChange(new IndexChange(_data, entry, true));
+            }
             return Status::OK();
         }
 
-        virtual bool unindex(OperationContext* txn, const BSONObj& key, const DiskLoc& loc) {
+        virtual void unindex(OperationContext* txn,
+                             const BSONObj& key,
+                             const DiskLoc& loc,
+                             bool dupsAllowed) {
             invariant(!loc.isNull());
             invariant(loc.isValid());
             invariant(!hasFieldNames(key));
 
-            const size_t numDeleted = _data->erase(IndexKeyEntry(key, loc));
+            IndexKeyEntry entry(key.getOwned(), loc);
+            const size_t numDeleted = _data->erase(entry);
             invariant(numDeleted <= 1);
-            if ( numDeleted == 1 )
+            if ( numDeleted == 1 ) {
                 _currentKeySize -= key.objsize();
-
-            return numDeleted == 1;
+                txn->recoveryUnit()->registerChange(new IndexChange(_data, entry, false));
+            }
         }
 
-        virtual void fullValidate(OperationContext* txn, long long *numKeysOut) {
+        virtual void fullValidate(OperationContext* txn, bool full, long long *numKeysOut,
+                                  BSONObjBuilder* output) const {
             // TODO check invariants?
             *numKeysOut = _data->size();
         }
@@ -218,15 +238,17 @@ namespace {
             }
 
             virtual bool locate(const BSONObj& keyRaw, const DiskLoc& loc) {
-                // An empty key means we should seek to the front
-                if (keyRaw.isEmpty()) {
-                    _it = _data.begin();
+                const BSONObj key = stripFieldNames(keyRaw);
+                _it = _data.lower_bound(IndexKeyEntry(key, loc)); // lower_bound is >= key
+                if ( _it == _data.end() ) {
                     return false;
                 }
 
-                const BSONObj key = stripFieldNames(keyRaw);
-                _it = _data.lower_bound(IndexKeyEntry(key, loc)); // lower_bound is >= key
-                return _it != _data.end() && (_it->key == key); // intentionally not comparing loc
+                if ( _it->key != key ) {
+                    return false;
+                }
+
+                return _it->loc == loc;
             }
 
             virtual void customLocate(const BSONObj& keyBegin,
@@ -278,7 +300,7 @@ namespace {
                 _savedLoc = _it->loc;
             }
 
-            virtual void restorePosition() {
+            virtual void restorePosition(OperationContext* txn) {
                 if (_savedAtEnd) {
                     _it = _data.end();
                 }
@@ -288,6 +310,7 @@ namespace {
             }
 
         private:
+
             OperationContext* _txn; // not owned
             const IndexSet& _data;
             IndexSet::const_iterator _it;
@@ -325,16 +348,19 @@ namespace {
             }
 
             virtual bool locate(const BSONObj& keyRaw, const DiskLoc& loc) {
-                // An empty key means we should seek to the seek to the end, 
-                // i.e. one past the lowest key in the iterator
-                if (keyRaw.isEmpty()) {
-                    _it = _data.rend();
+                const BSONObj key = stripFieldNames(keyRaw);
+                _it = lower_bound(IndexKeyEntry(key, loc)); // lower_bound is <= query
+
+                if ( _it == _data.rend() ) {
                     return false;
                 }
 
-                const BSONObj key = stripFieldNames(keyRaw);
-                _it = lower_bound(IndexKeyEntry(key, loc)); // lower_bound is <= query
-                return _it != _data.rend() && (_it->key == key); // intentionally not comparing loc
+
+                if ( _it->key != key ) {
+                    return false;
+                }
+
+                return _it->loc == loc;
             }
 
             virtual void customLocate(const BSONObj& keyBegin,
@@ -386,7 +412,7 @@ namespace {
                 _savedLoc = _it->loc;
             }
 
-            virtual void restorePosition() {
+            virtual void restorePosition(OperationContext* txn) {
                 if (_savedAtEnd) {
                     _it = _data.rend();
                 }
@@ -435,7 +461,26 @@ namespace {
         }
 
     private:
-        const IndexCatalogEntry& _info;
+        class IndexChange : public RecoveryUnit::Change {
+        public:
+            IndexChange(IndexSet* data, const IndexKeyEntry& entry, bool insert)
+                : _data(data), _entry(entry), _insert(insert)
+            {}
+
+            virtual void commit() {}
+            virtual void rollback() {
+                if (_insert)
+                    _data->erase(_entry);
+                else
+                    _data->insert(_entry);
+            }
+
+        private:
+            IndexSet* _data;
+            const IndexKeyEntry _entry;
+            const bool _insert;
+        };
+
         IndexSet* _data;
         long long _currentKeySize;
     };
@@ -443,13 +488,13 @@ namespace {
 
     // IndexCatalogEntry argument taken by non-const pointer for consistency with other Btree
     // factories. We don't actually modify it.
-    SortedDataInterface* getHeap1BtreeImpl(IndexCatalogEntry* info, boost::shared_ptr<void>* dataInOut) {
-        invariant(info);
+    SortedDataInterface* getHeap1BtreeImpl(const Ordering& ordering,
+                                           boost::shared_ptr<void>* dataInOut) {
         invariant(dataInOut);
         if (!*dataInOut) {
-            *dataInOut = boost::make_shared<IndexSet>(IndexEntryComparison(info->ordering()));
+            *dataInOut = boost::make_shared<IndexSet>(IndexEntryComparison(ordering));
         }
-        return new Heap1BtreeImpl(*info, static_cast<IndexSet*>(dataInOut->get()));
+        return new Heap1BtreeImpl(static_cast<IndexSet*>(dataInOut->get()));
     }
 
 }  // namespace mongo

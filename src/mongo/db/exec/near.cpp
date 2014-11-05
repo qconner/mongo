@@ -42,8 +42,9 @@ namespace mongo {
         : _txn(txn),
           _workingSet(workingSet),
           _collection(collection),
-          _searchState(SearchState_Buffering),
-          _stats(stats) {
+          _searchState(SearchState_Initializing),
+          _stats(stats),
+          _nextInterval(NULL) {
 
         // Ensure we have specific distance search stats unless a child class specified their
         // own distance stats subclass
@@ -67,6 +68,27 @@ namespace mongo {
         inclusiveMax(inclusiveMax) {
     }
 
+
+    PlanStage::StageState NearStage::initNext() {
+        PlanStage::StageState state = initialize(_txn, _workingSet, _collection);
+        if (state == PlanStage::IS_EOF) {
+            _searchState = SearchState_Buffering;
+            return PlanStage::NEED_TIME;
+        }
+
+        invariant(state != PlanStage::ADVANCED && state != PlanStage::NEED_FETCH);
+
+        // Propagate NEED_TIME or errors upward.
+        return state;
+    }
+
+    PlanStage::StageState NearStage::initialize(OperationContext* txn,
+                                                WorkingSet* workingSet,
+                                                Collection* collection)
+    {
+        return PlanStage::IS_EOF;
+    }
+
     PlanStage::StageState NearStage::work(WorkingSetID* out) {
 
         ++_stats->common.works;
@@ -79,8 +101,11 @@ namespace mongo {
         // Work the search
         //
 
-        if (SearchState_Buffering == _searchState) {
-            nextState = bufferNext(&error);
+        if (SearchState_Initializing == _searchState) {
+            nextState = initNext();
+        }
+        else if (SearchState_Buffering == _searchState) {
+            nextState = bufferNext(&toReturn, &error);
         }
         else if (SearchState_Advancing == _searchState) {
             nextState = advanceNext(&toReturn);
@@ -100,6 +125,10 @@ namespace mongo {
         else if (PlanStage::ADVANCED == nextState) {
             *out = toReturn;
             ++_stats->common.advanced;
+        }
+        else if (PlanStage::NEED_FETCH == nextState) {
+            *out = toReturn;
+            ++_stats->common.needFetch;
         }
         else if (PlanStage::NEED_TIME == nextState) {
             ++_stats->common.needTime;
@@ -129,7 +158,8 @@ namespace mongo {
         double distance;
     };
 
-    PlanStage::StageState NearStage::bufferNext(Status* error) {
+    // Set "toReturn" when NEED_FETCH.
+    PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn, Status* error) {
 
         //
         // Try to retrieve the next covered member
@@ -151,17 +181,20 @@ namespace mongo {
                 return PlanStage::IS_EOF;
             }
 
-            _nextInterval.reset(intervalStatus.getValue());
+            // CoveredInterval and its child stage are owned by _childrenIntervals
+            _childrenIntervals.push_back(intervalStatus.getValue());
+            _nextInterval = _childrenIntervals.back();
             _nextIntervalStats.reset(new IntervalStats());
+            _nextIntervalStats->minDistanceAllowed = _nextInterval->minDistance;
+            _nextIntervalStats->maxDistanceAllowed = _nextInterval->maxDistance;
+            _nextIntervalStats->inclusiveMaxDistanceAllowed = _nextInterval->inclusiveMax;
         }
 
         WorkingSetID nextMemberID;
         PlanStage::StageState intervalState = _nextInterval->covering->work(&nextMemberID);
 
         if (PlanStage::IS_EOF == intervalState) {
-
-            _stats->children.push_back(_nextInterval->covering->getStats());
-            _nextInterval.reset();
+            _nextInterval = NULL;
             _nextIntervalSeen.clear();
 
             _searchState = SearchState_Advancing;
@@ -169,6 +202,10 @@ namespace mongo {
         }
         else if (PlanStage::FAILURE == intervalState) {
             *error = WorkingSetCommon::getMemberStatus(*_workingSet->get(nextMemberID));
+            return intervalState;
+        }
+        else if (PlanStage::NEED_FETCH == intervalState) {
+            *toReturn = nextMemberID;
             return intervalState;
         }
         else if (PlanStage::ADVANCED != intervalState) {
@@ -267,22 +304,23 @@ namespace mongo {
 
     void NearStage::saveState() {
         ++_stats->common.yields;
-        if (_nextInterval) {
-            _nextInterval->covering->saveState();
+        for (size_t i = 0; i < _childrenIntervals.size(); i++) {
+            _childrenIntervals[i]->covering->saveState();
         }
     }
 
     void NearStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_stats->common.unyields;
-        if (_nextInterval) {
-            _nextInterval->covering->restoreState(opCtx);
+        for (size_t i = 0; i < _childrenIntervals.size(); i++) {
+            _childrenIntervals[i]->covering->restoreState(opCtx);
         }
     }
 
     void NearStage::invalidate(const DiskLoc& dl, InvalidationType type) {
         ++_stats->common.invalidates;
-        if (_nextInterval) {
-            _nextInterval->covering->invalidate(dl, type);
+        for (size_t i = 0; i < _childrenIntervals.size(); i++) {
+            _childrenIntervals[i]->covering->invalidate(dl, type);
         }
 
         // If a result is in _resultBuffer and has a DiskLoc it will be in _nextIntervalSeen as
@@ -303,17 +341,18 @@ namespace mongo {
     }
 
     vector<PlanStage*> NearStage::getChildren() const {
-        // TODO: Keep around all our interval stages and report as children
-        return vector<PlanStage*>();
+        vector<PlanStage*> children;
+        for (size_t i = 0; i < _childrenIntervals.size(); i++) {
+            children.push_back(_childrenIntervals[i]->covering.get());
+        }
+        return children;
     }
 
     PlanStageStats* NearStage::getStats() {
         PlanStageStats* statsClone = _stats->clone();
-
-        // If we have an active interval, add those child stats as well
-        if (_nextInterval)
-            statsClone->children.push_back(_nextInterval->covering->getStats());
-
+        for (size_t i = 0; i < _childrenIntervals.size(); ++i) {
+            statsClone->children.push_back(_childrenIntervals[i]->covering->getStats());
+        }
         return statsClone;
     }
 
