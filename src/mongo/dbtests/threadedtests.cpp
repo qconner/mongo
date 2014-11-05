@@ -36,7 +36,7 @@
 #include <boost/thread.hpp>
 
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/bits.h"
@@ -46,14 +46,10 @@
 #include "mongo/util/concurrency/list.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/concurrency/synchronization.h"
-#include "mongo/util/concurrency/qlock.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/log.h"
 #include "mongo/server.h"
 
-namespace mongo { 
-    void testNonGreedy();
-}
 
 namespace ThreadedTests {
 
@@ -99,25 +95,13 @@ namespace ThreadedTests {
         enum { N = 4000/*0*/ };
 #endif
         ProgressMeter pm;
-        int wToXSuccessfulUpgradeCount, wToXFailedUpgradeCount;
 
     public:
         MongoMutexTest() : pm(N * nthreads) {
-            wToXSuccessfulUpgradeCount = 0;
-            wToXFailedUpgradeCount = 0;
+
         }
 
         void run() {
-            DEV {
-                // in _DEBUG builds on linux we mprotect each time a writelock
-                // is taken. That can greatly slow down this test if there are
-                // many open files
-                OperationContextImpl txn;
-                DBDirectClient db(&txn);
-
-                db.simpleCommand("admin", NULL, "closeAllDatabases");
-            }
-
             Timer t;
             cout << "MongoMutexTest N:" << N << endl;
             ThreadedTest<nthr>::run();
@@ -129,7 +113,7 @@ namespace ThreadedTests {
         virtual void subthread(int tnumber) {
             Client::initThread("mongomutextest");
 
-            LockState lockState;
+            MMAPV1LockerImpl lockState(1);
             mongo::unittest::log().stream() 
                 << "Thread "
                 << boost::this_thread::get_id()
@@ -144,34 +128,21 @@ namespace ThreadedTests {
                 if( i % 7 == 0 ) {
                     Lock::GlobalRead r(&lockState); // nested test
                     Lock::GlobalRead r2(&lockState);
-                    if( sometimes ) {
-                        Lock::TempRelease t(&lockState);
-                    }
                 }
                 else if( i % 7 == 1 ) {
                     Lock::GlobalRead r(&lockState);
                     ASSERT(lockState.hasAnyReadLock());
-                    ASSERT(lockState.threadState() != 0);
-                    if( sometimes ) {
-                        Lock::TempRelease t(&lockState);
-                    }
                 }
                 else if( i % 7 == 4 && 
                          tnumber == 1 /*only one upgrader legal*/ ) {
                     Lock::GlobalWrite w(&lockState);
                     ASSERT( lockState.isW() );
-                    ASSERT( lockState.isW() );
                     if( i % 7 == 2 ) {
                         Lock::TempRelease t(&lockState);
-                    }
-                    if( sometimes ) { 
-                        w.downgrade();
-                        w.upgrade();
                     }
                 }
                 else if( i % 7 == 2 ) {
                     Lock::GlobalWrite w(&lockState);
-                    ASSERT( lockState.isW() );
                     ASSERT( lockState.isW() );
                     if( sometimes ) {
                         Lock::TempRelease t(&lockState);
@@ -184,7 +155,6 @@ namespace ThreadedTests {
                     }
                     Lock::GlobalRead r(&lockState);
                     ASSERT( lockState.isW() );
-                    ASSERT( lockState.isW() );
                     if( sometimes ) {
                         Lock::TempRelease t(&lockState);
                     }
@@ -192,9 +162,6 @@ namespace ThreadedTests {
                 else if( i % 7 == 5 ) {
                     {
                         Lock::DBRead r(&lockState, "foo");
-                        if( sometimes ) {
-                            Lock::TempRelease t(&lockState);
-                        }
                     }
                     {
                         Lock::DBRead r(&lockState, "bar");
@@ -204,74 +171,49 @@ namespace ThreadedTests {
                     if( i > N/2 ) { 
                         int q = i % 11;
                         if( q == 0 ) { 
-                            char what = 'r';
                             Lock::DBRead r(&lockState, "foo");
-                            ASSERT(lockState.threadState() == what && lockState.isAtLeastReadLocked("foo"));
+                            ASSERT(lockState.isDbLockedForMode("foo", MODE_S));
                             ASSERT(!lockState.isRecursive());
+
                             Lock::DBRead r2(&lockState, "foo");
+                            ASSERT(lockState.isDbLockedForMode("foo", MODE_S));
                             ASSERT(lockState.isRecursive());
-                            ASSERT(lockState.threadState() == what && lockState.isAtLeastReadLocked("foo"));
+
                             Lock::DBRead r3(&lockState, "local");
-                            if( sometimes ) {
-                                Lock::TempRelease t(&lockState);
-                            }
-                            ASSERT(lockState.threadState() == what && lockState.isAtLeastReadLocked("foo"));
-                            ASSERT(lockState.threadState() == what && lockState.isAtLeastReadLocked("local"));
+                            ASSERT(lockState.isDbLockedForMode("foo", MODE_S));
+                            ASSERT(lockState.isDbLockedForMode("local", MODE_S));
                         }
                         else if( q == 1 ) {
                             // test locking local only -- with no preceding lock
                             { 
                                 Lock::DBRead x(&lockState, "local");
-                                //Lock::DBRead y("q");
-                                if( sometimes ) {
-                                    Lock::TempRelease t(&lockState); // we don't temprelease (cant=true) here thus this is just a check that nothing weird happens...
-                                }
                             }
                             {
-                                Lock::DBWrite x(&lockState, "local");
+                                Lock::DBLock x(&lockState, "local", MODE_X);
                                 //  No actual writing here, so no WriteUnitOfWork
                                 if( sometimes ) {
                                     Lock::TempRelease t(&lockState);
                                 }
                             }
                         } else if( q == 1 ) {
-                                { Lock::DBRead  x(&lockState, "admin"); }
-                            { 
-                                Lock::DBWrite x(&lockState, "admin"); 
+                            {
+                                Lock::DBRead  x(&lockState, "admin");
                             }
-                        } else if( q == 2 ) { 
-                            /*Lock::DBWrite x("foo");
-                            Lock::DBWrite y("admin");
-                            { Lock::TempRelease t(&lockState); }*/
+
+                            { 
+                                Lock::DBLock x(&lockState, "admin", MODE_X);
+                            }
                         }
                         else if( q == 3 ) {
-                            Lock::DBWrite x(&lockState, "foo");
+                            Lock::DBLock x(&lockState, "foo", MODE_X);
                             Lock::DBRead y(&lockState, "admin");
-                            { Lock::TempRelease t(&lockState); }
                         }
                         else if( q == 4 ) { 
                             Lock::DBRead x(&lockState, "foo2");
                             Lock::DBRead y(&lockState, "admin");
-                            { Lock::TempRelease t(&lockState); }
-                        }
-                        else if ( q > 4 && q < 8 ) {
-                            static const char * const dbnames[] = {
-                                "bar0", "bar1", "bar2", "bar3", "bar4", "bar5",
-                                "bar6", "bar7", "bar8", "bar9", "bar10" };
-
-                            Lock::DBWrite w(&lockState, dbnames[q]);
-                            {
-                                Lock::UpgradeGlobalLockToExclusive wToX(&lockState);
-                                if (wToX.gotUpgrade()) {
-                                    ++wToXSuccessfulUpgradeCount;
-                                }
-                                else {
-                                    ++wToXFailedUpgradeCount;
-                                }
-                            }
                         }
                         else { 
-                            Lock::DBWrite w(&lockState, "foo");
+                            Lock::DBLock w(&lockState, "foo", MODE_X);
 
                             {
                                 Lock::TempRelease t(&lockState);
@@ -279,9 +221,6 @@ namespace ThreadedTests {
 
                             Lock::DBRead r2(&lockState, "foo");
                             Lock::DBRead r3(&lockState, "local");
-                            if( sometimes ) {
-                                Lock::TempRelease t(&lockState);
-                            }
                         }
                     }
                     else { 
@@ -296,14 +235,12 @@ namespace ThreadedTests {
         }
 
         virtual void validate() {
-            mongo::unittest::log() << "mongomutextest validate" << endl;
-            ASSERT( wToXSuccessfulUpgradeCount >= 39 * N / 2000 );
             {
-                LockState ls;
+                MMAPV1LockerImpl ls(1);
                 Lock::GlobalWrite w(&ls);
             }
             {
-                LockState ls;
+                MMAPV1LockerImpl ls(1);
                 Lock::GlobalRead r(&ls);
             }
         }
@@ -382,23 +319,6 @@ namespace ThreadedTests {
             tp.join();
 
             ASSERT_EQUALS(counter.load(), iterations * 2);
-        }
-    };
-
-    class LockTest {
-    public:
-        void run() {
-            // quick atomicint wrap test
-            // MSGID likely assumes this semantic
-            AtomicUInt32 counter(0xffffffff);
-            counter.fetchAndAdd(1);
-            ASSERT_EQUALS(counter.load(), 0U);
-
-            LockState lockState;
-            writelocktry lk(&lockState, 0);
-
-            ASSERT( lk.got() );
-            ASSERT( lockState.isW() );
         }
     };
 
@@ -868,52 +788,6 @@ namespace ThreadedTests {
         }
     };
 
-    const int QLockTest_ThreadCount = 3;
-    class QLockTest : public ThreadedTest<QLockTest_ThreadCount> {
-    public:
-        bool gotW;
-        QLockTest() : gotW(false), m(), _barrier(QLockTest_ThreadCount) { }
-        void setup() {}
-        ~QLockTest() {}
-    private:
-        QLock m;
-        boost::barrier _barrier;
-        virtual void validate() { }
-        virtual void subthread(int x) {
-            _barrier.wait();
-            int Z = 0;
-            Client::initThread("qtest");
-            if( x == 1 ) { 
-                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1 lock_r()..." << endl;
-                m.lock_r();
-                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1            got" << endl;
-                sleepmillis(400);
-                m.unlock_r();
-                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1 unlock_r()" << endl;
-            }
-            if( x == 2 || x == 4 ) {
-                sleepmillis(x*50);
-                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 2 lock_W()..." << endl;
-                m.lock_W();
-                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 2            got" << endl;
-                gotW = true;
-                m.unlock_W();
-            }
-            if( x == 3 ) {
-                sleepmillis(200);
-
-                Timer t;
-                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 3 lock_r()..." << endl;
-                m.lock_r();
-                verify( gotW );
-                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 3            got" << gotW << endl;
-                m.unlock_r();
-                LOG(Z) << t.millis() << endl;
-                ASSERT( t.millis() > 50 );
-            }
-            cc().shutdown();
-        }
-    };
 
     // Tests waiting on the TicketHolder by running many more threads than can fit into the "hotel", but only
     // max _nRooms threads should ever get in at once
@@ -995,8 +869,6 @@ namespace ThreadedTests {
 
         void setupTests() {
             add< WriteLocksAreGreedy >();
-            add< QLockTest >();
-            add< QLockTest >();
 
             // Slack is a test to see how long it takes for another thread to pick up
             // and begin work after another relinquishes the lock.  e.g. a spin lock 
@@ -1014,8 +886,6 @@ namespace ThreadedTests {
             add< IsAtomicWordAtomic<AtomicUInt64> >();
             add< MVarTest >();
             add< ThreadPoolTest >();
-            add< LockTest >();
-
 
             add< RWLockTest1 >();
             add< RWLockTest2 >();
@@ -1025,5 +895,7 @@ namespace ThreadedTests {
             add< MongoMutexTest >();
             add< TicketHolderWaits >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 }

@@ -29,8 +29,6 @@
 
 #pragma once
 
-#include "mongo/pch.h"
-
 #include "mongo/db/jsobj.h"
 #include "mongo/s/collection_metadata.h"
 #include "mongo/s/chunk_version.h"
@@ -304,10 +302,6 @@ namespace mongo {
     public:
         ShardedConnectionInfo();
 
-        const OID& getID() const { return _id; }
-        bool hasID() const { return _id.isSet(); }
-        void setID( const OID& id );
-
         const ChunkVersion getVersion( const std::string& ns ) const;
         void setVersion( const std::string& ns , const ChunkVersion& version );
 
@@ -324,7 +318,6 @@ namespace mongo {
 
     private:
 
-        OID _id;
         bool _forceVersionOk; // if this is true, then chunk version #s aren't check, and all ops are allowed
 
         typedef std::map<std::string,ChunkVersion> NSVersionMap;
@@ -357,37 +350,15 @@ namespace mongo {
     bool haveLocalShardingInfo( const std::string& ns );
 
     /**
-     * @return true if the current threads shard version is ok, or not in sharded version
-     * Also returns an error message and the Config/ChunkVersions causing conflicts
-     */
-    bool shardVersionOk( const std::string& ns,
-                         std::string& errmsg,
-                         ChunkVersion& received,
-                         ChunkVersion& wanted );
-
-    /**
-     * @return true if we took care of the message and nothing else should be done
-     */
-    struct DbResponse;
-
-    /**
-     * Returns true if the version of this thread is compatible wit hthe global
-     * version of this shard. Also builds an error response if the version was
-     * not compatible.
-     */
-    bool _checkShardVersion(Message &m, DbResponse* dbresponse);
-
-    /**
-     * Returns true if the version of this thread is compatible with the global
-     * version of this shard.
+     * Validates whether the shard chunk version for the specified collection is up to date and if
+     * not, throws SendStaleConfigException.
      *
-     * Note: Last use of this function are for queries.
+     * It is important (but not enforced) that method be called with the collection locked in at
+     * least IS mode in order to ensure that the shard version won't change.
+     *
+     * @param ns Complete collection namespace to be cheched.
      */
-    inline bool checkShardVersion(Message &m, DbResponse* dbresponse) {
-        if( !shardingState.enabled() ) 
-            return true;
-        return _checkShardVersion(m, dbresponse);
-    }
+    void ensureShardVersionOKOrThrow(const std::string& ns);
 
     /**
      * If a migration for the chunk in 'ns' where 'obj' lives is occurring, save this log entry

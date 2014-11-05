@@ -81,7 +81,6 @@ namespace repl {
         if( s.s == MemberState::RS_PRIMARY ) return a("", "this server thinks it is primary", "PRIMARY");
         if( s.s == MemberState::RS_SECONDARY ) return a("", "this server thinks it is a secondary (slave mode)", "SECONDARY");
         if( s.s == MemberState::RS_RECOVERING ) return a("", "recovering/resyncing; after recovery usually auto-transitions to secondary", "RECOVERING");
-        if( s.s == MemberState::RS_FATAL ) return a("", "something bad has occurred and server is not completely offline with regard to the replica set.  fatal error.", "FATAL");
         if( s.s == MemberState::RS_STARTUP2 ) return a("", "loaded config, still determining who is primary", "STARTUP2");
         if( s.s == MemberState::RS_ARBITER ) return a("", "this server is an arbiter only", "ARBITER");
         if( s.s == MemberState::RS_DOWN ) return a("", "member is down, slow, or unreachable", "DOWN");
@@ -367,6 +366,7 @@ namespace repl {
         verify( _self );
 
         MemberState myState = box.getState();
+        const HostAndPort syncTarget = BackgroundSync::get()->getSyncTarget();
 
         // add self
         {
@@ -385,6 +385,12 @@ namespace repl {
             int maintenance = _maintenanceMode;
             if (maintenance) {
                 bb.append("maintenanceMode", maintenance);
+            }
+
+            if ( !syncTarget.empty() &&
+                (myState != MemberState::RS_PRIMARY) &&
+                (myState != MemberState::RS_REMOVED) ) {
+                bb.append("syncingTo", syncTarget.toString());
             }
 
             if (theReplSet) {
@@ -449,15 +455,12 @@ namespace repl {
         b.append("set", name());
         b.appendTimeT("date", time(0));
         b.append("myState", myState.s);
-        const Member *syncTarget = BackgroundSync::get()->getSyncTarget();
-        if ( syncTarget &&
+        if ( !syncTarget.empty() &&
             (myState != MemberState::RS_PRIMARY) &&
             (myState != MemberState::RS_REMOVED) ) {
-            b.append("syncingTo", syncTarget->fullName());
+            b.append("syncingTo", syncTarget.toString());
         }
         b.append("members", v);
-        if( replSetBlind )
-            b.append("blind",true); // to avoid confusion if set...normally never set except for testing.
     }
 } // namespace repl
 } // namespace mongo

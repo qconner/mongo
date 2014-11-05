@@ -27,6 +27,8 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
 #include "mongo/pch.h"
 
 #include "mongo/client/connpool.h"
@@ -103,13 +105,12 @@ namespace mongo {
     // execCommand and not need to worry if it's in a mongod or mongos.
     void Command::execCommand(OperationContext* txn,
                               Command * c,
-                              Client& client,
                               int queryOptions,
                               const char *ns,
                               BSONObj& cmdObj,
                               BSONObjBuilder& result,
                               bool fromRepl ) {
-        execCommandClientBasic(txn, c, client, queryOptions, ns, cmdObj, result, fromRepl);
+        execCommandClientBasic(txn, c, *txn->getClient(), queryOptions, ns, cmdObj, result, fromRepl);
     }
 
     void Command::execCommandClientBasic(OperationContext* txn,
@@ -138,6 +139,8 @@ namespace mongo {
             return;
         }
 
+        c->_commandsExecuted.increment();
+
         std::string errmsg;
         bool ok;
         try {
@@ -154,6 +157,10 @@ namespace mongo {
             ss << "exception: " << e.what();
             errmsg = ss.str();
             result.append( "code" , code );
+        }
+
+        if ( !ok ) {
+            c->_commandsFailed.increment();
         }
 
         appendCommandStatus(result, ok, errmsg);

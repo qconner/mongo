@@ -1,47 +1,40 @@
-// @file d_concurrency.cpp 
-
 /**
-*    Copyright (C) 2008-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2008-2014 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/concurrency/d_concurrency.h"
 
-#include "mongo/db/client.h"
-#include "mongo/db/commands/server_status.h"
-#include "mongo/db/curop.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/concurrency/lock_stat.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/qlock.h"
-#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
 
@@ -53,102 +46,36 @@
 
 namespace mongo {
 
-    class DBTryLockTimeoutException : public std::exception {
+    //  SERVER-14668: Remove or invert sense once MMAPv1 CLL can be default
+    MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableCollectionLocking, bool, true);
+
+    DBTryLockTimeoutException::DBTryLockTimeoutException() {}
+    DBTryLockTimeoutException::~DBTryLockTimeoutException() throw() { }
+
+    class AcquiringParallelWriter {
     public:
-        DBTryLockTimeoutException() {}
-        virtual ~DBTryLockTimeoutException() throw() { }
-    };
 
-    class WrapperForQLock { 
-    public:
-        QLock q;
-        LockStat stats;
+        AcquiringParallelWriter(Locker* ls)
+            : _ls(ls) {
 
-        void lock_R(LockState* lockState) {
-            invariant(lockState->threadState() == 0);
-            lockState->lockedStart('R');
-            q.lock_R(); 
+            _ls->setLockPendingParallelWriter(true);
         }
 
-        void lock_W(LockState* lockState) {
-            if (lockState->threadState()) {
-                log() << "can't lock_W, threadState=" << (int)lockState->threadState() << endl;
-                fassert(16114,false);
-            }
-
-            lockState->lockedStart('W');
-            q.lock_W();
-        }
-
-        // how to count try's that fail is an interesting question. we should get rid of try().
-        bool lock_R_try(LockState* lockState, int millis) {
-            verify(lockState->threadState() == 0);
-            bool got = q.lock_R_try(millis); 
-            if (got) {
-                lockState->lockedStart('R');
-            }
-            return got;
-        }
-        
-        bool lock_W_try(LockState* lockState, int millis) {
-            verify(lockState->threadState() == 0);
-            bool got = q.lock_W_try(millis); 
-            if( got ) {
-                lockState->lockedStart('W');
-            }
-            return got;
-        }
-
-        void unlock_R(LockState* lockState) {
-            wassert(lockState->threadState() == 'R');
-            lockState->unlocked();
-            q.unlock_R();
-        }
-
-        void unlock_W(LockState* lockState) {
-            wassert(lockState->threadState() == 'W');
-            lockState->unlocked();
-            q.unlock_W(); 
-        }
-
-        // todo timing stats? : 
-        void W_to_R()                        { q.W_to_R(); }
-        void R_to_W()                        { q.R_to_W(); }
-        bool w_to_X() { return q.w_to_X(); }
-        void X_to_w() { q.X_to_w(); }
-    };
-
-    static WrapperForQLock& qlk = *new WrapperForQLock();
-
-    /**
-     * SERVER-14978: This class is temporary and is used to aggregate the per-operation lock
-     * acquisition times. It will go away once we have figured out the lock stats reporting story.
-     */
-    class TrackLockAcquireTime {
-        MONGO_DISALLOW_COPYING(TrackLockAcquireTime);
-    public:
-        TrackLockAcquireTime(char type) : _type(type) {
-
-        }
-
-        ~TrackLockAcquireTime() {
-            if (haveClient()) {
-                cc().curop()->lockStat().recordAcquireTimeMicros(_type, _timer.micros());
-            }
+        ~AcquiringParallelWriter() {
+            _ls->setLockPendingParallelWriter(false);
         }
 
     private:
-        char _type;
-        Timer _timer;
+        Locker* const _ls;
     };
 
 
     RWLockRecursive &Lock::ParallelBatchWriterMode::_batchLock = *(new RWLockRecursive("special"));
-    void Lock::ParallelBatchWriterMode::iAmABatchParticipant(LockState* lockState) {
-        lockState->_batchWriter = true;
+    void Lock::ParallelBatchWriterMode::iAmABatchParticipant(Locker* lockState) {
+        lockState->setIsBatchWriter(true);
     }
 
-    Lock::ScopedLock::ParallelBatchWriterSupport::ParallelBatchWriterSupport(LockState* lockState)
+    Lock::ScopedLock::ParallelBatchWriterSupport::ParallelBatchWriterSupport(Locker* lockState)
         : _lockState(lockState) {
         relock();
     }
@@ -158,14 +85,14 @@ namespace mongo {
     }
 
     void Lock::ScopedLock::ParallelBatchWriterSupport::relock() {
-        if (!_lockState->_batchWriter) {
-            AcquiringParallelWriter a(*_lockState);
+        if (!_lockState->isBatchWriter()) {
+            AcquiringParallelWriter a(_lockState);
             _lk.reset( new RWLockRecursive::Shared(ParallelBatchWriterMode::_batchLock) );
         }
     }
 
 
-    Lock::ScopedLock::ScopedLock(LockState* lockState, char type)
+    Lock::ScopedLock::ScopedLock(Locker* lockState, char type)
         : _lockState(lockState), _pbws_lk(lockState), _type(type) {
 
         _lockState->enterScopedLock(this);
@@ -190,12 +117,19 @@ namespace mongo {
     }
 
     void Lock::ScopedLock::recordTime() {
-        if (haveClient()) {
-            cc().curop()->lockStat().recordLockTimeMicros(_type, _timer.micros());
-        }
     }
 
-    Lock::TempRelease::TempRelease(LockState* lockState)
+    void Lock::ScopedLock::_tempRelease() {
+        // TempRelease is only used for global locks
+        invariant(false);
+    }
+
+    void Lock::ScopedLock::_relock() {
+        // TempRelease is only used for global locks
+        invariant(false);
+    }
+
+    Lock::TempRelease::TempRelease(Locker* lockState)
         : cant(lockState->isRecursive()), _lockState(lockState) {
 
         if (cant) {
@@ -203,7 +137,7 @@ namespace mongo {
         }
 
         fassert(16116, _lockState->recursiveCount() == 1);
-        fassert(16117, _lockState->threadState() != 0);
+        fassert(16117, _lockState->isLocked());
         
         scopedLk = _lockState->getCurrentScopedLock();
         fassert(16118, scopedLk);
@@ -220,346 +154,165 @@ namespace mongo {
         }
         
         fassert(16119, scopedLk);
-        fassert(16120, _lockState->threadState() == 0);
+        fassert(16120, !_lockState->isLocked());
 
         _lockState->enterScopedLock(scopedLk);
         scopedLk->relock();
     }
 
     void Lock::GlobalWrite::_tempRelease() { 
-        fassert(16121, !noop);
-        char ts = _lockState->threadState();
-        fassert(16123, ts == 'W');
-        qlk.unlock_W(_lockState);
+        invariant(_lockState->isW());
+
+        invariant(_lockState->unlockAll());
         recordTime();
     }
     void Lock::GlobalWrite::_relock() { 
-        fassert(16125, !noop);
-        char ts = _lockState->threadState();
-        fassert(16126, ts == 0);
+        invariant(!_lockState->isLocked());
 
-        TrackLockAcquireTime a('W');
-        qlk.lock_W(_lockState);
+        _lockState->lockGlobal(MODE_X);
         resetTime();
     }
 
-    void Lock::GlobalRead::_tempRelease() { 
-        fassert(16127, !noop);
-        char ts = _lockState->threadState();
-        fassert(16128, ts == 'R');
-        qlk.unlock_R(_lockState);
-        recordTime();
-    }
-
-    void Lock::GlobalRead::_relock() { 
-        fassert(16129, !noop);
-        char ts = _lockState->threadState();
-        fassert(16130, ts == 0);
-
-        TrackLockAcquireTime a('R');
-        qlk.lock_R(_lockState);
-        resetTime();
-    }
-
-    void Lock::DBWrite::_tempRelease() { 
-        unlockDB();
-    }
-    void Lock::DBWrite::_relock() { 
-        lockDB();
-    }
-    void Lock::DBRead::_tempRelease() {
-        unlockDB();
-    }
-    void Lock::DBRead::_relock() { 
-        lockDB();
-    }
-
-    Lock::GlobalWrite::GlobalWrite(LockState* lockState, int timeoutms)
+    Lock::GlobalWrite::GlobalWrite(Locker* lockState, unsigned timeoutms)
         : ScopedLock(lockState, 'W') {
 
-        char ts = _lockState->threadState();
-        noop = false;
-        if( ts == 'W' ) { 
-            noop = true;
-            return;
-        }
-        dassert( ts == 0 );
-
-        TrackLockAcquireTime a('W');
-        
-        if ( timeoutms != -1 ) {
-            bool success = qlk.lock_W_try(_lockState, timeoutms);
-            if ( !success ) throw DBTryLockTimeoutException(); 
-        }
-        else {
-            qlk.lock_W(_lockState);
+        LockResult result = _lockState->lockGlobal(MODE_X, timeoutms);
+        if (result == LOCK_TIMEOUT) {
+            throw DBTryLockTimeoutException();
         }
 
         resetTime();
     }
+
     Lock::GlobalWrite::~GlobalWrite() {
-        if( noop ) { 
-            return;
-        }
+        // If the lock state is R, this means downgrade happened and this is only for fsyncLock.
+        invariant(_lockState->isW() || _lockState->isR());
 
-        if (_lockState->threadState() == 'R') { // we downgraded
-            qlk.unlock_R(_lockState);
-        }
-        else {
-            qlk.unlock_W(_lockState);
-        }
-
+        _lockState->unlockAll();
         recordTime();
     }
-    void Lock::GlobalWrite::downgrade() { 
-        verify( !noop );
-        verify(_lockState->threadState() == 'W');
 
-        qlk.W_to_R();
-        _lockState->changeLockState('R');
-    }
-
-    // you will deadlock if 2 threads doing this
-    void Lock::GlobalWrite::upgrade() { 
-        verify( !noop );
-        verify(_lockState->threadState() == 'R');
-
-        qlk.R_to_W();
-        _lockState->changeLockState('W');
-    }
-
-    Lock::GlobalRead::GlobalRead(LockState* lockState, int timeoutms)
+    Lock::GlobalRead::GlobalRead(Locker* lockState, unsigned timeoutms)
         : ScopedLock(lockState, 'R') {
 
-        char ts = _lockState->threadState();
-        noop = false;
-        if( ts == 'R' || ts == 'W' ) { 
-            noop = true;
-            return;
-        }
-
-        TrackLockAcquireTime a('R');
-
-        if ( timeoutms != -1 ) {
-            bool success = qlk.lock_R_try(_lockState, timeoutms);
-            if ( !success ) throw DBTryLockTimeoutException(); 
-        }
-        else {
-            // we are unlocked in the qlock/top sense.  lock_R will assert if we are in an in compatible state
-            qlk.lock_R(_lockState); 
+        LockResult result = _lockState->lockGlobal(MODE_S, timeoutms);
+        if (result == LOCK_TIMEOUT) {
+            throw DBTryLockTimeoutException();
         }
 
         resetTime();
     }
 
     Lock::GlobalRead::~GlobalRead() {
-        if( !noop ) {
-            qlk.unlock_R(_lockState);
+        _lockState->unlockAll();
+        recordTime();
+    }
+
+    Lock::DBLock::DBLock(Locker* lockState, const StringData& db, const LockMode mode)
+        : ScopedLock(lockState, mode == MODE_S || mode == MODE_IS ? 'r' : 'w'),
+          _id(RESOURCE_DATABASE, db),
+          _mode(mode) {
+        massert(28539, "need a valid database name", !db.empty() && !nsIsFull(db));
+        lockDB();
+    }
+
+    Lock::DBLock::~DBLock() {
+        unlockDB();
+    }
+
+    void Lock::DBLock::lockDB() {
+        const bool isRead = (_mode == MODE_S || _mode == MODE_IS);
+
+        _lockState->lockGlobal(isRead ? MODE_IS : MODE_IX);
+        if (supportsDocLocking() || enableCollectionLocking) {
+            _lockState->lock(_id, _mode);
+        }
+        else {
+            _lockState->lock(_id, isRead ? MODE_S : MODE_X);
+        }
+
+        resetTime();
+    }
+
+    void Lock::DBLock::relockWithMode(const LockMode newMode) {
+        const bool wasRead = (_mode == MODE_S || _mode == MODE_IS);
+        const bool isRead = (newMode == MODE_S || newMode == MODE_IS);
+
+        invariant (!_lockState->inAWriteUnitOfWork()); // 2PL would delay the unlocking
+        invariant(!wasRead || isRead); // Not allowed to change global intent
+
+        _lockState->unlock(_id);
+        _mode = newMode;
+
+        if (supportsDocLocking() || enableCollectionLocking) {
+            _lockState->lock(_id, _mode);
+            dassert(_lockState->isLockHeldForMode(_id, _mode));
+        }
+        else {
+            LockMode effectiveMode = isRead ? MODE_S : MODE_X;
+            _lockState->lock(_id, effectiveMode);
+            dassert(_lockState->isLockHeldForMode(_id, effectiveMode));
+        }
+    }
+
+    void Lock::DBLock::unlockDB() {
+        _lockState->unlock(_id);
+
+        // The last release reports time the lock was held
+        if (_lockState->unlockAll()) {
             recordTime();
         }
     }
 
-    static bool isLocalOrAdmin(const string& dbName) {
-        return (dbName == "local" || dbName == "admin");
-    }
-
-
-    Lock::DBWrite::DBWrite(LockState* lockState, const StringData& dbOrNs)
-        : ScopedLock(lockState, 'w'),
-          _lockAcquired(false),
-          _ns(dbOrNs.toString()) {
-
-        fassert(16253, !_ns.empty());
-        lockDB();
-    }
-
-    Lock::DBWrite::~DBWrite() {
-        unlockDB();
-    }
-
-    void Lock::DBWrite::lockTop() {
-        switch (_lockState->threadState()) {
-        case 0:
-            _lockState->lockedStart('w');
-            qlk.q.lock_w();
-            break;
-        case 'w':
-            break;
-        default:
-            invariant(!"Invalid thread state");
+    Lock::CollectionLock::CollectionLock(Locker* lockState,
+                                         const StringData& ns,
+                                         LockMode mode)
+        : _id(RESOURCE_COLLECTION, ns),
+          _lockState(lockState) {
+        const bool isRead = (mode == MODE_S || mode == MODE_IS);
+        massert(28538, "need a non-empty collection name", nsIsFull(ns));
+        dassert(_lockState->isDbLockedForMode(nsToDatabaseSubstring(ns),
+                                              isRead ? MODE_IS : MODE_IX));
+        if (supportsDocLocking()) {
+            _lockState->lock(_id, mode);
+        } else if (enableCollectionLocking) {
+            _lockState->lock(_id, isRead ? MODE_S : MODE_X);
         }
     }
 
-    void Lock::DBWrite::lockDB() {
-        if (_lockState->isW()) {
-            return;
-        }
-
-        TrackLockAcquireTime a('w');
-
-        const StringData db = nsToDatabaseSubstring(_ns);
-        const newlm::ResourceId resIdDb(newlm::RESOURCE_DATABASE, db);
-
-        // As weird as it looks, currently the top (global 'w' lock) is acquired after the DB lock
-        // has been acquired in order to avoid deadlock with UpgradeGlobalLockToExclusive, which is
-        // called while holding some form of write lock on the database.
-        //
-        // However, for the local/admin database, since its lock is acquired usually after another
-        // DB lock is already held, the nested database's lock (local or admin) needs to be
-        // acquired after the global lock. Consider the following sequence:
-        // 
-        // T1: Acquires DBWrite on 'other' DB, then 'w'
-        // T2: Wants to flush so it queues behind T1 for 'R' lock
-        // T3: Acquires DBRead on 'local' DB, then blocks on 'r' (T2 has precedence, due to 'R')
-        // T1: Does whatever writes it does and tries to acquire DBWrite on 'local' in order to
-        //     insert in the OpLog, and blocks because of T3's 'r' lock on local.
-        //
-        // This is a deadlock T1 -> T3 -> T2 -> T1.
-        //
-        // Moving the acquisition of local or admin's lock to be after the global lock solves this
-        // problem, which would otherwise break replication.
-        //
-        // TODO: This whole lock ordering mess will go away once we make flush be it's own lock
-        // instead of doing upgrades on the global lock.
-        if (isLocalOrAdmin(db.toString())) {
-            lockTop();
-        }
-
-        _lockState->lock(resIdDb, newlm::MODE_X);
-
-        if (!isLocalOrAdmin(db.toString())) {
-            lockTop();
-        }
-
-        _lockAcquired = true;
-
-        resetTime();
-    }
-
-    void Lock::DBWrite::unlockDB() {
-        if (_lockAcquired) {
-            const StringData db = nsToDatabaseSubstring(_ns);
-            const newlm::ResourceId resIdDb(newlm::RESOURCE_DATABASE, db);
-
-            _lockState->unlock(resIdDb);
-
-            // The last one frees the Global lock
-            if (_lockState->recursiveCount() == 1) {
-                invariant(_lockState->threadState() == 'w');
-                qlk.q.unlock_w();
-                _lockState->unlocked();
-                recordTime();
-            }
-
-            _lockAcquired = false;
+    Lock::CollectionLock::~CollectionLock() {
+        if (supportsDocLocking() || enableCollectionLocking) {
+            _lockState->unlock(_id);
         }
     }
 
+    void Lock::CollectionLock::relockWithMode(LockMode mode, Lock::DBLock& dbLock ) {
+        if (supportsDocLocking() || enableCollectionLocking) {
+            _lockState->unlock(_id);
+        }
 
-    Lock::DBRead::DBRead(LockState* lockState, const StringData& dbOrNs)
-        : ScopedLock(lockState, 'r'),
-          _lockAcquired(false),
-          _ns(dbOrNs.toString()) {
+        dbLock.relockWithMode( mode );
 
-        fassert(16254, !_ns.empty());
-        lockDB();
+        if (supportsDocLocking() || enableCollectionLocking) {
+            _lockState->lock(_id, mode);
+        }
+
     }
 
-    Lock::DBRead::~DBRead() {
-        unlockDB();
+    Lock::ResourceLock::ResourceLock(Locker* lockState, ResourceId rid, LockMode mode)
+            : _rid(rid),
+              _lockState(lockState) {
+        _lockState->lock(_rid, mode);
     }
 
-    void Lock::DBRead::lockTop() {
-        switch (_lockState->threadState()) {
-        case 0:
-            _lockState->lockedStart('r');
-            qlk.q.lock_r();
-            break;
-        case 'r':
-        case 'w':
-            break;
-        default:
-            invariant(false);
-        }
+    Lock::ResourceLock::~ResourceLock() {
+        _lockState->unlock(_rid);
     }
 
-    void Lock::DBRead::lockDB() {
-        if (_lockState->isRW()) {
-            return;
-        }
+    Lock::DBRead::DBRead(Locker* lockState, const StringData& dbOrNs) :
+        DBLock(lockState, nsToDatabaseSubstring(dbOrNs), MODE_S) { }
 
-        TrackLockAcquireTime a('r');
-
-        const StringData db = nsToDatabaseSubstring(_ns);
-        const newlm::ResourceId resIdDb(newlm::RESOURCE_DATABASE, db);
-
-        // Keep the order of acquisition of the 'r' lock the same as it is in DBWrite in order to
-        // avoid deadlocks. See the comment inside DBWrite::lockDB for more information on the
-        // reason for the weird ordering of locks.
-        if (isLocalOrAdmin(db.toString())) {
-            lockTop();
-        }
-
-        _lockState->lock(resIdDb, newlm::MODE_S);
-
-        if (!isLocalOrAdmin(db.toString())) {
-            lockTop();
-        }
-
-        _lockAcquired = true;
-        resetTime();
-    }
-
-    void Lock::DBRead::unlockDB() {
-        if (_lockAcquired) {
-            const StringData db = nsToDatabaseSubstring(_ns);
-            const newlm::ResourceId resIdDb(newlm::RESOURCE_DATABASE, db);
-
-            _lockState->unlock(resIdDb);
-            
-            // The last one frees the Global lock
-            if (_lockState->recursiveCount() == 1) {
-                invariant(_lockState->threadState() == 'r');
-                qlk.q.unlock_r();
-                _lockState->unlocked();
-                recordTime();
-            }
-
-            _lockAcquired = false;
-        }
-    }
-
-
-    Lock::UpgradeGlobalLockToExclusive::UpgradeGlobalLockToExclusive(LockState* lockState)
-            : _lockState(lockState) {
-        fassert( 16187, _lockState->threadState() == 'w' );
-
-        // We're about to temporarily drop w, so stop the lock time stopwatch
-        _lockState->recordLockTime();
-
-        _gotUpgrade = qlk.w_to_X();
-        if ( _gotUpgrade ) {
-            _lockState->changeLockState('W');
-            _lockState->resetLockTime();
-        }
-    }
-
-    Lock::UpgradeGlobalLockToExclusive::~UpgradeGlobalLockToExclusive() {
-        if ( _gotUpgrade ) {
-            fassert(16188, _lockState->threadState() == 'W');
-            _lockState->recordLockTime();
-            qlk.X_to_w();
-            _lockState->changeLockState('w');
-        }
-        else {
-            fassert(16189, _lockState->threadState() == 'w');
-        }
-
-        // Start recording lock time again
-        _lockState->resetLockTime();
-    }
-
-    writelocktry::writelocktry(LockState* lockState, int tryms) :
+    writelocktry::writelocktry(Locker* lockState, int tryms) :
         _got( false ),
         _dbwlock( NULL )
     { 
@@ -577,7 +330,7 @@ namespace mongo {
     }
 
     // note: the 'already' concept here might be a bad idea as a temprelease wouldn't notice it is nested then
-    readlocktry::readlocktry(LockState* lockState, int tryms) :
+    readlocktry::readlocktry(Locker* lockState, int tryms) :
         _got( false ),
         _dbrlock( NULL )
     {
@@ -594,101 +347,4 @@ namespace mongo {
 
     }
 
-    /**
-     * This is passed to the iterator for global environments and aggregates information about the
-     * locks which are currently being held or waited on.
-     */
-    class LockStateAggregator : public GlobalEnvironmentExperiment::ProcessOperationContext {
-    public:
-        LockStateAggregator(bool blockedOnly) 
-            : numWriteLocked(0),
-              numReadLocked(0),
-              _blockedOnly(blockedOnly) {
-
-        }
-
-        virtual void processOpContext(OperationContext* txn) {
-            if (_blockedOnly && !txn->lockState()->hasLockPending()) {
-                return;
-            }
-
-            if (txn->lockState()->isWriteLocked()) {
-                numWriteLocked++;
-            }
-            else {
-                numReadLocked++;
-            }
-        }
-
-        int numWriteLocked;
-        int numReadLocked;
-
-    private:
-        const bool _blockedOnly;
-    };
-
-
-    class GlobalLockServerStatusSection : public ServerStatusSection {
-    public:
-        GlobalLockServerStatusSection() : ServerStatusSection( "globalLock" ){
-            _started = curTimeMillis64();
-        }
-
-        virtual bool includeByDefault() const { return true; }
-
-        virtual BSONObj generateSection( const BSONElement& configElement ) const {
-            BSONObjBuilder t;
-
-            t.append( "totalTime" , (long long)(1000 * ( curTimeMillis64() - _started ) ) );
-            t.append( "lockTime" , qlk.stats.getTimeLocked( 'W' ) );
-
-            // This returns the blocked lock states
-            {
-                BSONObjBuilder ttt( t.subobjStart( "currentQueue" ) );
-
-                LockStateAggregator blocked(true);
-                getGlobalEnvironment()->forEachOperationContext(&blocked);
-
-                ttt.append("total", blocked.numReadLocked + blocked.numWriteLocked);
-                ttt.append("readers", blocked.numReadLocked);
-                ttt.append("writers", blocked.numWriteLocked);
-                ttt.done();
-            }
-
-            // This returns all the active clients (including those holding locks)
-            {
-                BSONObjBuilder ttt( t.subobjStart( "activeClients" ) );
-
-                LockStateAggregator active(false);
-                getGlobalEnvironment()->forEachOperationContext(&active);
-
-                ttt.append("total", active.numReadLocked + active.numWriteLocked);
-                ttt.append("readers", active.numReadLocked);
-                ttt.append("writers", active.numWriteLocked);
-                ttt.done();
-            }
-
-            return t.obj();
-        }
-
-    private:
-        unsigned long long _started;
-
-    } globalLockServerStatusSection;
-
-    class LockStatsServerStatusSection : public ServerStatusSection {
-    public:
-        LockStatsServerStatusSection() : ServerStatusSection( "locks" ){}
-        virtual bool includeByDefault() const { return true; }
-
-        BSONObj generateSection( const BSONElement& configElement ) const {
-            BSONObjBuilder b;
-            b.append(".", qlk.stats.report());
-
-            // TODO: Add per-db lock information here
-
-            return b.obj();
-        }
-
-    } lockStatsServerStatusSection;
 }

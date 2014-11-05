@@ -59,6 +59,7 @@
 #include "mongo/s/d_state.h"
 #include "mongo/s/metadata_loader.h"
 #include "mongo/s/shard.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/queue.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
@@ -592,9 +593,10 @@ namespace mongo {
         } installType = InstallType_None; // compiler complains otherwise
 
         {
-            // DBLock needed since we're now potentially changing the metadata, and don't want
-            // reads/writes to be ongoing.
-            Lock::DBWrite writeLk(txn->lockState(), ns );
+            // Exclusive collection lock needed since we're now potentially changing the metadata,
+            // and don't want reads/writes to be ongoing.
+            Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
+            Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
 
             //
             // Get the metadata now that the load has completed
@@ -827,7 +829,6 @@ namespace mongo {
 
     ShardedConnectionInfo::ShardedConnectionInfo() {
         _forceVersionOk = false;
-        _id.clear();
     }
 
     ShardedConnectionInfo* ShardedConnectionInfo::get( bool create ) {
@@ -870,10 +871,6 @@ namespace mongo {
             shardConnectionPool.addHook(new ShardingConnectionHook(true));
             done = true;
         }
-    }
-
-    void ShardedConnectionInfo::setID( const OID& id ) {
-        _id = id;
     }
 
     class MongodShardCommand : public Command {
@@ -983,31 +980,6 @@ namespace mongo {
             Lock::GlobalWrite lk(txn->lockState());
             return checkConfigOrInit(txn, configdb, authoritative, errmsg, result, true);
         }
-        
-        bool checkMongosID( ShardedConnectionInfo* info, const BSONElement& id, string& errmsg ) {
-            if ( id.type() != jstOID ) {
-                if ( ! info->hasID() ) {
-                    warning() << "bad serverID set in setShardVersion and none in info: " << id << endl;
-                }
-                // TODO: fix this
-                //errmsg = "need serverID to be an OID";
-                //return 0;
-                return true;
-            }
-            
-            OID clientId = id.__oid();
-            if ( ! info->hasID() ) {
-                info->setID( clientId );
-                return true;
-            }
-            
-            if ( clientId != info->getID() ) {
-                errmsg = "server id has changed!";
-                return false;
-            }
-
-            return true;
-        }
 
         bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
 
@@ -1021,10 +993,6 @@ namespace mongo {
 
             lastError.disableForCommand();
             ShardedConnectionInfo* info = ShardedConnectionInfo::get( true );
-
-            // make sure we have the mongos id for writebacks
-            if ( ! checkMongosID( info , cmdObj["serverID"] , errmsg ) ) 
-                return false;
 
             bool authoritative = cmdObj.getBoolField( "authoritative" );
             
@@ -1297,7 +1265,7 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             Client::Context ctx(txn, dbname);
 
             shardingState.appendInfo( result );
@@ -1310,7 +1278,10 @@ namespace mongo {
      * @ return true if not in sharded mode
                      or if version for this client is ok
      */
-    bool shardVersionOk( const string& ns , string& errmsg, ChunkVersion& received, ChunkVersion& wanted ) {
+    static bool shardVersionOk(const string& ns,
+                               string& errmsg,
+                               ChunkVersion& received,
+                               ChunkVersion& wanted) {
 
         if ( ! shardingState.enabled() )
             return true;
@@ -1386,65 +1357,17 @@ namespace mongo {
 
     }
 
-    void usingAShardConnection( const string& addr ) {
+    void ensureShardVersionOKOrThrow(const std::string& ns) {
+        string errmsg;
+        ChunkVersion received;
+        ChunkVersion wanted;
+        if (!shardVersionOk(ns, errmsg, received, wanted)) {
+            StringBuilder sb;
+            sb << "[" << ns << "] shard version not ok: " << errmsg;
+            throw SendStaleConfigException(ns, sb.str(), received, wanted);
+        }
     }
 
-    bool _checkShardVersion(Message &message, DbResponse* dbresponse) {
-        DEV verify( shardingState.enabled() );
-
-        int op = message.operation();
-        if (op < 2000
-                || op >= 3000
-                || op == dbGetMore  // cursors are weird
-           ) {
-            return true;
-        }
-
-        DbMessage dbMsg(message);
-        const char *ns = dbMsg.getns();
-        string errmsg;
-        ChunkVersion received, wanted;
-        if (shardVersionOk(ns, errmsg, received, wanted)) {
-            return true;
-        }
-
-        LOG(1) << "connection sharding metadata does not match for collection " << ns
-               << ", will retry (wanted : " << wanted
-               << ", received : " << received << ")" << endl;
-
-        // Handling of version mismatch on legacy writeOps are no long supported.
-        fassert(18664, op == dbQuery || op == dbGetMore);
-
-        verify(dbresponse);
-        BufBuilder responseBuilder(32768);
-        responseBuilder.skip(sizeof(QueryResult::Value));
-        {
-            BSONObjBuilder errorObjBuilder;
-
-            errorObjBuilder.append("$err", errmsg);
-            errorObjBuilder.append("ns", ns);
-            wanted.addToBSON(errorObjBuilder, "vWanted");
-            received.addToBSON(errorObjBuilder, "vReceived");
-
-            BSONObj obj = errorObjBuilder.obj();
-
-            responseBuilder.appendBuf(obj.objdata(), obj.objsize());
-        }
-
-        QueryResult::View qr = responseBuilder.buf();
-        qr.setResultFlags(ResultFlag_ErrSet | ResultFlag_ShardConfigStale);
-        qr.msgdata().setLen(responseBuilder.len());
-        qr.msgdata().setOperation(opReply);
-        qr.setCursorId(0);
-        qr.setStartingFrom(0);
-        qr.setNReturned(1);
-        responseBuilder.decouple();
-
-        Message* resp = new Message();
-        resp->setData(qr.view2ptr(), true);
-
-        dbresponse->response = resp;
-        dbresponse->responseTo = message.header().getId();
-        return false;
+    void usingAShardConnection( const string& addr ) {
     }
 }

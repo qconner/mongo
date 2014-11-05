@@ -34,8 +34,8 @@ function indexBuildInProgress() {
     indexBuildOpId = -1;
     inprog.forEach(
         function( op ) {
-            // Identify the index build as an insert into the 'test.system.indexes'
-            // namespace.  It is assumed that no other clients are concurrently
+            // Identify the index build as a createIndexes command.
+            // It is assumed that no other clients are concurrently
             // accessing the 'test' database.
             if ( op.op == 'query' && 'createIndexes' in op.query ) {
                 debug(op.opid);
@@ -45,7 +45,8 @@ function indexBuildInProgress() {
                 // but we won't count if they aren't
                 if ( "a_1" == idxSpec.name &&
                      1 == idxSpec.key.a &&
-                     idxSpec.background ) {
+                     idxSpec.background &&
+                     (op.progress.done / op.progress.total) > 0.20) {
                     indexBuildOpId = op.opid;
                 }
             }

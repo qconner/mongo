@@ -28,7 +28,11 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/disallow_copying.h"
+#include "mongo/bson/optime.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -50,18 +54,26 @@ namespace repl {
     class ReplicationCoordinatorExternalState {
         MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalState);
     public:
+
+        class GlobalSharedLockAcquirer;
+        class ScopedLocker;
+
         ReplicationCoordinatorExternalState();
         virtual ~ReplicationCoordinatorExternalState();
 
         /**
-         * Simple wrapper around SyncSourceFeedback::run().  Loops continuously until shutdown() is
-         * called.
+         * Starts the background sync, producer, and sync source feedback threads, and sets up logOp
          */
-        virtual void runSyncSourceFeedback() = 0;
+        virtual void startThreads() = 0;
 
         /**
-         * Performs any necessary external state specific shutdown tasks, such as signaling
-         * the SyncSourceFeedback thread to terminate.
+         * Starts the Master/Slave threads and sets up logOp
+         */
+        virtual void startMasterSlave() = 0;
+
+        /**
+         * Performs any necessary external state specific shutdown tasks, such as cleaning up
+         * the threads it started.
          */
         virtual void shutdown() = 0;
 
@@ -103,16 +115,89 @@ namespace repl {
         virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config) = 0;
 
         /**
+         * Gets the last optime of an operation performed on this host, from stable
+         * storage.
+         */
+        virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn) = 0;
+
+        /**
          * Returns the HostAndPort of the remote client connected to us that initiated the operation
          * represented by "txn".
          */
         virtual HostAndPort getClientHostAndPort(const OperationContext* txn) = 0;
 
         /**
-         * Closes all client connections.
+         * Closes all connections except those marked with the keepOpen property, which should
+         * just be connections used for heartbeating.
          * This is used during stepdown, and transition out of primary.
          */
-        virtual void closeClientConnections() = 0;
+        virtual void closeConnections() = 0;
+
+        /**
+         * Clears all cached sharding metadata on this server.  This is called after stepDown to
+         * ensure that if the node becomes primary again in the future it will reload an up-to-date
+         * version of the sharding data.
+         */
+        virtual void clearShardingState() = 0;
+
+        /**
+         * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
+         */
+        virtual void signalApplierToChooseNewSyncSource() = 0;
+
+        /**
+         * Returns an instance of GlobalSharedLockAcquirer that can be used to acquire the global
+         * shared lock.
+         */
+        virtual GlobalSharedLockAcquirer* getGlobalSharedLockAcquirer() = 0;
+
+        /**
+         * Returns an OperationContext, owned by the caller, that may be used in methods of
+         * the same instance that require an OperationContext.
+         */
+        virtual OperationContext* createOperationContext(const std::string& threadName) = 0;
+
+        /**
+         * Drops all temporary collections on all databases except "local".
+         *
+         * The implementation may assume that the caller has acquired the global exclusive lock
+         * for "txn".
+         */
+        virtual void dropAllTempCollections(OperationContext* txn) = 0;
+    };
+
+    /**
+     * Interface that encapsulates acquiring the global shared lock.
+     */
+    class ReplicationCoordinatorExternalState::GlobalSharedLockAcquirer {
+    public:
+
+        virtual ~GlobalSharedLockAcquirer();
+
+        virtual bool try_lock(OperationContext* txn, const Milliseconds& timeout) = 0;
+    };
+
+    /**
+     * Class used to acquire the global shared lock, using a given implementation of
+     * GlobalSharedLockAcquirer.
+     */
+    class ReplicationCoordinatorExternalState::ScopedLocker {
+    public:
+
+        /**
+         * Takes ownership of the passed in GlobalSharedLockAcquirer.
+         */
+        ScopedLocker(OperationContext* txn,
+                     GlobalSharedLockAcquirer* locker,
+                     const Milliseconds& timeout);
+        ~ScopedLocker();
+
+        bool gotLock() const;
+
+    private:
+
+        boost::scoped_ptr<ReplicationCoordinatorExternalState::GlobalSharedLockAcquirer> _locker;
+        bool _gotLock;
     };
 
 } // namespace repl

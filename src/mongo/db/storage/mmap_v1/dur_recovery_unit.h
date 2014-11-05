@@ -51,16 +51,14 @@ namespace mongo {
         virtual void commitUnitOfWork();
         virtual void endUnitOfWork();
 
-        virtual bool awaitCommit();
+        virtual void commitAndRestart();
 
-        virtual bool commitIfNeeded(bool force = false);
+        virtual bool awaitCommit();
 
         virtual void* writingPtr(void* data, size_t len);
 
         //  The recovery unit takes ownership of change.
         virtual void registerChange(Change* change);
-
-        virtual void syncDataAndTruncateJournal();
 
     private:
         void recordPreimage(char* data, size_t len);

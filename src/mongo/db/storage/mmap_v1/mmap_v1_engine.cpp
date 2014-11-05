@@ -43,17 +43,20 @@
 #endif
 
 #include "mongo/db/mongod_options.h"
+#include "mongo/db/storage/mmap_v1/data_file_sync.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
 #include "mongo/db/storage/mmap_v1/dur_recover.h"
 #include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mmap.h"
+
 
 namespace mongo {
 
@@ -297,6 +300,8 @@ namespace {
     }
 
     void MMAPV1Engine::finishInit() {
+        dataFileSync.go();
+
         // Replays the journal (if needed) and starts the background thread. This requires the
         // ability to create OperationContexts.
         dur::startup();
@@ -319,19 +324,39 @@ namespace {
 
     DatabaseCatalogEntry* MMAPV1Engine::getDatabaseCatalogEntry( OperationContext* opCtx,
                                                                  const StringData& db ) {
-        boost::mutex::scoped_lock lk( _entryMapMutex );
-        MMAPV1DatabaseCatalogEntry*& entry = _entryMap[db.toString()];
-        if ( !entry ) {
-            entry =  new MMAPV1DatabaseCatalogEntry( opCtx,
-                                                     db,
-                                                     storageGlobalParams.dbpath,
-                                                     storageGlobalParams.directoryperdb,
-                                                     false );
+        {
+            boost::mutex::scoped_lock lk(_entryMapMutex);
+            EntryMap::const_iterator iter = _entryMap.find(db.toString());
+            if (iter != _entryMap.end()) {
+                return iter->second;
+            }
         }
+
+        // This is an on-demand database create/open. At this point, we are locked under X lock for
+        // the database (MMAPV1DatabaseCatalogEntry's constructor checks that) so no two threads
+        // can be creating the same database concurrenty. We need to create the database outside of
+        // the _entryMapMutex so we do not deadlock (see SERVER-15880).
+        MMAPV1DatabaseCatalogEntry* entry =
+            new MMAPV1DatabaseCatalogEntry(opCtx,
+                                           db,
+                                           storageGlobalParams.dbpath,
+                                           mmapv1GlobalOptions.directoryperdb,
+                                           false);
+
+        boost::mutex::scoped_lock lk(_entryMapMutex);
+
+        // Sanity check that we are not overwriting something
+        invariant(_entryMap.insert(EntryMap::value_type(db.toString(), entry)).second);
+
         return entry;
     }
 
     Status MMAPV1Engine::closeDatabase( OperationContext* txn, const StringData& db ) {
+        // Before the files are closed, flush any potentially outstanding changes, which might
+        // reference this database. Otherwise we will assert when subsequent applications of the
+        // global journal entries occur, which happen to have write intents for the removed files.
+        getDur().syncDataAndTruncateJournal(txn);
+
         boost::mutex::scoped_lock lk( _entryMapMutex );
         MMAPV1DatabaseCatalogEntry* entry = _entryMap[db.toString()];
         delete entry;
@@ -355,7 +380,7 @@ namespace {
         for ( boost::filesystem::directory_iterator i( path );
               i != boost::filesystem::directory_iterator();
               ++i ) {
-            if (storageGlobalParams.directoryperdb) {
+            if (mmapv1GlobalOptions.directoryperdb) {
                 boost::filesystem::path p = *i;
                 string dbName = p.leaf().string();
                 p /= ( dbName + ".ns" );
@@ -374,6 +399,10 @@ namespace {
         return MongoFile::flushAll( sync );
     }
 
+    bool MMAPV1Engine::isDurable() const {
+        return getDur().isDurable();
+    }
+
     void MMAPV1Engine::cleanShutdown(OperationContext* txn) {
         // wait until file preallocation finishes
         // we would only hang here if the file_allocator code generates a
@@ -383,7 +412,8 @@ namespace {
 
         if (storageGlobalParams.dur) {
             log() << "shutdown: final commit..." << endl;
-            getDur().commitNow(txn);
+
+            getDur().commitAndStopDurThread(txn);
 
             flushAllFiles(true);
         }

@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+
 #include "mongo/db/index/btree_access_method.h"
 
 #include <vector>
@@ -98,17 +100,18 @@ namespace mongo {
                 }
             }
 
-            if (ErrorCodes::UniqueIndexViolation == status.code()) {
-                // We ignore it for some reason in BG indexing.
+            if (ErrorCodes::DuplicateKeyValue == status.code()) {
+                // A document might be indexed multiple times during a background index build
+                // if it moves ahead of the collection scan cursor (e.g. via an update).
                 if (!_btreeState->isReady(txn)) {
-                    DEV log() << "info: key already in index during bg indexing (ok)\n";
+                    LOG(3) << "key " << *i << " already in index during background indexing (ok)";
                     continue;
                 }
             }
 
             // Clean up after ourselves.
             for (BSONObjSet::const_iterator j = keys.begin(); j != i; ++j) {
-                removeOneKey(txn, *j, loc);
+                removeOneKey(txn, *j, loc, options.dupsAllowed);
                 *numInserted = 0;
             }
 
@@ -122,13 +125,12 @@ namespace mongo {
         return ret;
     }
 
-    bool BtreeBasedAccessMethod::removeOneKey(OperationContext* txn,
+    void BtreeBasedAccessMethod::removeOneKey(OperationContext* txn,
                                               const BSONObj& key,
-                                              const DiskLoc& loc) {
-        bool ret = false;
-
+                                              const DiskLoc& loc,
+                                              bool dupsAllowed) {
         try {
-            ret = _newInterface->unindex(txn, key, loc);
+            _newInterface->unindex(txn, key, loc, dupsAllowed);
         } catch (AssertionException& e) {
             log() << "Assertion failure: _unindex failed "
                   << _descriptor->indexNamespace() << endl;
@@ -137,8 +139,6 @@ namespace mongo {
             log() << "  dl:" << loc.toString() << endl;
             logContext();
         }
-
-        return ret;
     }
 
     Status BtreeBasedAccessMethod::newCursor(OperationContext* txn, const CursorOptions& opts, IndexCursor** out) const {
@@ -158,14 +158,8 @@ namespace mongo {
         *numDeleted = 0;
 
         for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
-            bool thisKeyOK = removeOneKey(txn, *i, loc);
-
-            if (thisKeyOK) {
-                ++*numDeleted;
-            } else if (options.logIfError) {
-                log() << "unindex failed (key too big?) " << _descriptor->indexNamespace()
-                      << " key: " << *i;
-            }
+            removeOneKey(txn, *i, loc, options.dupsAllowed);
+            ++*numDeleted;
         }
 
         return Status::OK();
@@ -231,10 +225,11 @@ namespace mongo {
         return cursor->getDiskLoc();
     }
 
-    Status BtreeBasedAccessMethod::validate(OperationContext* txn, int64_t* numKeys) {
+    Status BtreeBasedAccessMethod::validate(OperationContext* txn, bool full, int64_t* numKeys,
+                                            BSONObjBuilder* output) {
         // XXX: long long vs int64_t
         long long keys;
-        _newInterface->fullValidate(txn, &keys);
+        _newInterface->fullValidate(txn, full, &keys, output);
         *numKeys = keys;
         return Status::OK();
     }
@@ -261,20 +256,6 @@ namespace mongo {
         setDifference(data->oldKeys, data->newKeys, &data->removed);
         setDifference(data->newKeys, data->oldKeys, &data->added);
 
-        bool checkForDups = !data->added.empty()
-            && (KeyPattern::isIdKeyPattern(_descriptor->keyPattern()) || _descriptor->unique())
-            && !options.dupsAllowed;
-
-        if (checkForDups) {
-            for (vector<BSONObj*>::iterator i = data->added.begin(); i != data->added.end(); i++) {
-                Status check = _newInterface->dupKeyCheck(txn, **i, record);
-                if (!check.isOK()) {
-                    status->_isValid = false;
-                    return check;
-                }
-            }
-        }
-
         status->_isValid = true;
 
         return Status::OK();
@@ -295,7 +276,10 @@ namespace mongo {
         }
 
         for (size_t i = 0; i < data->removed.size(); ++i) {
-            _newInterface->unindex(txn, *data->removed[i], data->loc);
+            _newInterface->unindex(txn,
+                                   *data->removed[i],
+                                   data->loc,
+                                   data->dupsAllowed);
         }
 
         for (size_t i = 0; i < data->added.size(); ++i) {

@@ -27,6 +27,7 @@
  */
 
 #include "mongo/db/exec/cached_plan.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -94,13 +95,21 @@ namespace mongo {
             _usingBackupChild = true;
             childStatus = _backupChildPlan->work(out);
         }
+        else if (PlanStage::NEED_FETCH == childStatus) {
+            _commonStats.needFetch++;
+        }
+        else if (PlanStage::NEED_TIME == childStatus) {
+            _commonStats.needTime++;
+        }
+        else if (PlanStage::ADVANCED == childStatus) {
+            _commonStats.advanced++;
+        }
+
         return childStatus;
     }
 
     void CachedPlanStage::saveState() {
-        if (! _usingBackupChild) {
-            _mainChildPlan->saveState();
-        }
+        _mainChildPlan->saveState();
 
         if (NULL != _backupChildPlan.get()) {
             _backupChildPlan->saveState();
@@ -109,12 +118,10 @@ namespace mongo {
     }
 
     void CachedPlanStage::restoreState(OperationContext* opCtx) {
+        _mainChildPlan->restoreState(opCtx);
+
         if (NULL != _backupChildPlan.get()) {
             _backupChildPlan->restoreState(opCtx);
-        }
-
-        if (! _usingBackupChild) {
-            _mainChildPlan->restoreState(opCtx);
         }
         ++_commonStats.unyields;
     }

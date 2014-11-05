@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/dbhelpers.h"
@@ -41,6 +43,7 @@
 #include "mongo/db/db.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/json.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
@@ -58,6 +61,7 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/s/d_state.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -126,7 +130,12 @@ namespace mongo {
         PlanExecutor* rawExec;
         size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
         massert(17245, "Could not get executor for query " + query.toString(),
-                getExecutor(txn, collection, cq, &rawExec, options).isOK());
+                getExecutor(txn,
+                            collection,
+                            cq,
+                            PlanExecutor::YIELD_MANUAL,
+                            &rawExec,
+                            options).isOK());
 
         auto_ptr<PlanExecutor> exec(rawExec);
         PlanExecutor::ExecState state;
@@ -144,8 +153,8 @@ namespace mongo {
                            BSONObj& result,
                            bool* nsFound,
                            bool* indexFound) {
-        txn->lockState()->assertAtLeastReadLocked(ns);
-        invariant( database );
+
+        invariant(database);
 
         Collection* collection = database->getCollection( txn, ns );
         if ( !collection ) {
@@ -195,20 +204,20 @@ namespace mongo {
        Returns: true if object exists.
     */
     bool Helpers::getSingleton(OperationContext* txn, const char *ns, BSONObj& result) {
-        Client::Context context(txn, ns);
-        auto_ptr<PlanExecutor> exec(
-            InternalPlanner::collectionScan(txn, ns, context.db()->getCollection(txn, ns)));
+        AutoGetCollectionForRead ctx(txn, ns);
+        auto_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn, ns, ctx.getCollection()));
 
         PlanExecutor::ExecState state = exec->getNext(&result, NULL);
-        context.getClient()->curop()->done();
+        txn->getCurOp()->done();
         return PlanExecutor::ADVANCED == state;
     }
 
     bool Helpers::getLast(OperationContext* txn, const char *ns, BSONObj& result) {
-        Client::Context ctx(txn, ns);
-        Collection* coll = ctx.db()->getCollection( txn, ns );
-        auto_ptr<PlanExecutor> exec(
-            InternalPlanner::collectionScan(txn, ns, coll, InternalPlanner::BACKWARD));
+        AutoGetCollectionForRead autoColl(txn, ns);
+        auto_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn,
+                                                                    ns,
+                                                                    autoColl.getCollection(),
+                                                                    InternalPlanner::BACKWARD));
 
         PlanExecutor::ExecState state = exec->getNext(&result, NULL);
         return PlanExecutor::ADVANCED == state;
@@ -295,10 +304,11 @@ namespace mongo {
                                          const BSONObj& shardKeyPattern,
                                          BSONObj* indexPattern ) {
 
-        Client::ReadContext context(txn, ns);
-        Collection* collection = context.ctx().db()->getCollection( txn, ns );
-        if ( !collection )
+        AutoGetCollectionForRead ctx(txn, ns);
+        Collection* collection = ctx.getCollection();
+        if (!collection) {
             return false;
+        }
 
         // Allow multiKey based on the invariant that shard keys must be single-valued.
         // Therefore, any multi-key index prefixed by shard key cannot be multikey over
@@ -355,8 +365,6 @@ namespace mongo {
                << "begin removal of " << min << " to " << max << " in " << ns
                << " with write concern: " << writeConcern.toBSON() << endl;
 
-        Client& c = cc();
-
         long long numDeleted = 0;
         
         long long millisWaitingForReplication = 0;
@@ -365,7 +373,7 @@ namespace mongo {
             // Scoping for write lock.
             {
                 Client::WriteContext ctx(txn, ns);
-                Collection* collection = ctx.ctx().db()->getCollection( txn, ns );
+                Collection* collection = ctx.getCollection();
                 if ( !collection )
                     break;
 
@@ -378,6 +386,7 @@ namespace mongo {
                                                                        maxInclusive,
                                                                        InternalPlanner::FORWARD,
                                                                        InternalPlanner::IXSCAN_FETCH));
+                exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
                 DiskLoc rloc;
                 BSONObj obj;
@@ -404,6 +413,8 @@ namespace mongo {
 
                 verify(PlanExecutor::ADVANCED == state);
 
+                WriteUnitOfWork wuow(txn);
+
                 if ( onlyRemoveOrphanedDocs ) {
                     // Do a final check in the write lock to make absolutely sure that our
                     // collection hasn't been modified in a way that invalidates our migration
@@ -418,7 +429,7 @@ namespace mongo {
 
                     bool docIsOrphan;
                     if ( metadataNow ) {
-                        KeyPattern kp( metadataNow->getKeyPattern() );
+                        ShardKeyPattern kp( metadataNow->getKeyPattern() );
                         BSONObj key = kp.extractShardKeyFromDoc(obj);
                         docIsOrphan = !metadataNow->keyBelongsToMe( key )
                             && !metadataNow->keyIsPending( key );
@@ -442,7 +453,7 @@ namespace mongo {
                 collection->deleteDocument( txn, rloc, false, false, &deletedId );
                 // The above throws on failure, and so is not logged
                 repl::logOp(txn, "d", ns.c_str(), deletedId, 0, 0, fromMigrate);
-                ctx.commit();
+                wuow.commit();
                 numDeleted++;
             }
 
@@ -452,7 +463,7 @@ namespace mongo {
             if (writeConcern.shouldWaitForOtherNodes() && numDeleted > 0) {
                 repl::ReplicationCoordinator::StatusAndDuration replStatus =
                         repl::getGlobalReplicationCoordinator()->awaitReplication(txn,
-                                                                                  c.getLastOp(),
+                                                                                  txn->getClient()->getLastOp(),
                                                                                   writeConcern);
                 if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
                     warning(LogComponent::kSharding)
@@ -494,9 +505,12 @@ namespace mongo {
         *estChunkSizeBytes = 0;
         *numDocs = 0;
 
-        Client::ReadContext ctx(txn, ns);
-        Collection* collection = ctx.ctx().db()->getCollection( txn, ns );
-        if ( !collection ) return Status( ErrorCodes::NamespaceNotFound, ns );
+        AutoGetCollectionForRead ctx(txn, ns);
+
+        Collection* collection = ctx.getCollection();
+        if (!collection) {
+            return Status(ErrorCodes::NamespaceNotFound, ns);
+        }
 
         // Require single key
         IndexDescriptor *idx =
@@ -540,6 +554,7 @@ namespace mongo {
             InternalPlanner::indexScan(txn, collection, idx, min, max, false));
         // we can afford to yield here because any change to the base data that we might miss  is
         // already being queued and will be migrated in the 'transferMods' stage
+        exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
         DiskLoc loc;
         PlanExecutor::ExecState state;
@@ -568,7 +583,7 @@ namespace mongo {
 
     void Helpers::emptyCollection(OperationContext* txn, const char *ns) {
         Client::Context context(txn, ns);
-        deleteObjects(txn, context.db(), ns, BSONObj(), false);
+        deleteObjects(txn, context.db(), ns, BSONObj(), PlanExecutor::YIELD_MANUAL, false);
     }
 
     Helpers::RemoveSaver::RemoveSaver( const string& a , const string& b , const string& why) 

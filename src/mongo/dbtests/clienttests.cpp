@@ -31,6 +31,7 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
@@ -68,19 +69,19 @@ namespace ClientTests {
             DBDirectClient db(&txn);
 
             db.insert( ns() , BSON( "x" << 2 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
 
             db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
 
             db.dropIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
 
             db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
 
             db.dropIndexes( ns() );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
         }
     };
 
@@ -92,13 +93,13 @@ namespace ClientTests {
             DBDirectClient db(&txn);
 
             db.insert( ns() , BSON( "x" << 2 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
 
             db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
 
             db.reIndex( ns() );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
         }
 
     };
@@ -111,15 +112,15 @@ namespace ClientTests {
             DBDirectClient db(&txn);
 
             db.insert( ns() , BSON( "x" << 2 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
 
             db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
 
             BSONObj out;
             ASSERT( db.runCommand( "test" , BSON( "reIndex" << "reindex2" ) , out ) );
             ASSERT_EQUALS( 2 , out["nIndexes"].number() );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
         }
 
     };
@@ -141,30 +142,23 @@ namespace ClientTests {
             db.insert(ns(), BSON("x" << 1 << "y" << 2));
             db.insert(ns(), BSON("x" << 2 << "y" << 2));
 
-            Collection* collection = ctx.ctx().db()->getCollection( &txn, ns() );
+            Collection* collection = ctx.getCollection();
             ASSERT( collection );
             IndexCatalog* indexCatalog = collection->getIndexCatalog();
 
             ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&txn));
             // _id index
-            ASSERT_EQUALS(1U, db.count("test.system.indexes"));
-            // test.buildindex
-            // test.buildindex_$id
-            // test.system.indexes
-            ASSERT_EQUALS(3U, db.count("test.system.namespaces"));
+            ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
 
             db.ensureIndex(ns(), BSON("y" << 1), true);
 
             ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&txn));
-            ASSERT_EQUALS(1U, db.count("test.system.indexes"));
-            ASSERT_EQUALS(3U, db.count("test.system.namespaces"));
+            ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
 
             db.ensureIndex(ns(), BSON("x" << 1), true);
-            ctx.commit();
 
             ASSERT_EQUALS(2, indexCatalog->numIndexesReady(&txn));
-            ASSERT_EQUALS(2U, db.count("test.system.indexes"));
-            ASSERT_EQUALS(4U, db.count("test.system.namespaces"));
+            ASSERT_EQUALS(2U, db.getIndexSpecs(ns()).size());
         }
     };
 
@@ -278,5 +272,7 @@ namespace ClientTests {
             add<ConnectionStringTests>();
         }
 
-    } all;
+    };
+
+    SuiteInstance<All> all;
 }

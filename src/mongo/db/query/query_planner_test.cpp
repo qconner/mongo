@@ -30,13 +30,14 @@
  * This file contains tests for mongo/db/query/query_planner.cpp
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/db/query/query_planner_test_lib.h"
 
 #include <ostream>
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
@@ -53,6 +54,8 @@ namespace {
     class QueryPlannerTest : public mongo::unittest::Test {
     protected:
         void setUp() {
+            cq = NULL;
+            internalQueryPlannerEnableHashIntersection = true;
             params.options = QueryPlannerParams::INCLUDE_COLLSCAN;
             addIndex(BSON("_id" << 1));
         }
@@ -146,6 +149,15 @@ namespace {
                           const BSONObj& minObj,
                           const BSONObj& maxObj,
                           bool snapshot) {
+
+            // Clean up any previous state from a call to runQueryFull
+            delete cq;
+            cq = NULL;
+
+            for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
+                delete *it;
+            }
+
             solns.clear();
             Status s = CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, hint,
                                                     minObj, maxObj, snapshot,
@@ -198,6 +210,13 @@ namespace {
                                  const BSONObj& minObj,
                                  const BSONObj& maxObj,
                                  bool snapshot) {
+            delete cq;
+            cq = NULL;
+
+            for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
+                delete *it;
+            }
+
             solns.clear();
             Status s = CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, hint,
                                                     minObj, maxObj, snapshot,
@@ -1128,6 +1147,15 @@ namespace {
                                 "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
     }
 
+    TEST_F(QueryPlannerTest, MinMaxSameValue) {
+        addIndex(BSON("a" << 1));
+        runQueryHintMinMax(BSONObj(), BSONObj(), fromjson("{a: 1}"), fromjson("{a: 1}"));
+
+        assertNumSolutions(1U);
+        assertSolutionExists("{fetch: {filter: null, "
+                                "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+    }
+
     TEST_F(QueryPlannerTest, MaxWithoutIndex) {
         runInvalidQueryHintMinMax(BSONObj(), BSONObj(), BSONObj(), fromjson("{a: 1}"));
     }
@@ -1344,6 +1372,19 @@ namespace {
                                 "node: {cscan: {dir: 1, filter: {}}}}}");
     }
 
+    TEST_F(QueryPlannerTest, CantUseHashedIndexToProvideSortWithIndexablePred) {
+        addIndex(BSON("x" << "hashed"));
+        runQuerySortProj(BSON("x" << BSON("$in" << BSON_ARRAY(0 << 1))), BSON("x" << 1), BSONObj());
+
+        ASSERT_EQUALS(getNumSolutions(), 2U);
+        assertSolutionExists("{sort: {pattern: {x: 1}, limit: 0, node: "
+                               "{fetch: {node: "
+                                 "{ixscan: {pattern: {x: 'hashed'}}}}}}}");
+        assertSolutionExists("{sort: {pattern: {x: 1}, limit: 0, node: "
+                               "{cscan: {dir: 1, filter: {x: {$in: [0, 1]}}}}}}");
+    }
+
+
     TEST_F(QueryPlannerTest, CantUseTextIndexToProvideSort) {
         addIndex(BSON("x" << 1 << "_fts" << "text" << "_ftsx" << 1));
         runQuerySortProj(BSONObj(), BSON("x" << 1), BSONObj());
@@ -1362,13 +1403,42 @@ namespace {
                                 "node: {cscan: {dir: 1, filter: {}}}}}");
     }
 
-    TEST_F(QueryPlannerTest, CantUseCompoundGeoIndexToProvideSort) {
+    TEST_F(QueryPlannerTest, CantUseNonCompoundGeoIndexToProvideSortWithIndexablePred) {
+        addIndex(BSON("x" << "2dsphere"));
+        runQuerySortProj(fromjson("{x: {$geoIntersects: {$geometry: {type: 'Point',"
+                                  "                                  coordinates: [0, 0]}}}}"),
+                         BSON("x" << 1),
+                         BSONObj());
+
+        ASSERT_EQUALS(getNumSolutions(), 2U);
+        assertSolutionExists("{sort: {pattern: {x: 1}, limit: 0, node: "
+                               "{fetch: {node: "
+                                 "{ixscan: {pattern: {x: '2dsphere'}}}}}}}");
+        assertSolutionExists("{sort: {pattern: {x: 1}, limit: 0, node: "
+                               "{cscan: {dir: 1}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, CantUseCompoundGeoIndexToProvideSortIfNoGeoPred) {
         addIndex(BSON("x" << 1 << "y" << "2dsphere"));
         runQuerySortProj(BSONObj(), BSON("x" << 1), BSONObj());
 
         ASSERT_EQUALS(getNumSolutions(), 1U);
         assertSolutionExists("{sort: {pattern: {x: 1}, limit: 0, "
                                 "node: {cscan: {dir: 1, filter: {}}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, CanUseCompoundGeoIndexToProvideSortWithGeoPred) {
+        addIndex(BSON("x" << 1 << "y" << "2dsphere"));
+        runQuerySortProj(fromjson("{x: 1, y: {$geoIntersects: {$geometry: {type: 'Point',"
+                                  "                                        coordinates: [0, 0]}}}}"),
+                         BSON("x" << 1),
+                         BSONObj());
+
+        ASSERT_EQUALS(getNumSolutions(), 2U);
+        assertSolutionExists("{fetch: {node: "
+                                 "{ixscan: {pattern: {x: 1, y: '2dsphere'}}}}}");
+        assertSolutionExists("{sort: {pattern: {x: 1}, limit: 0, node: "
+                               "{cscan: {dir: 1}}}}");
     }
 
     TEST_F(QueryPlannerTest, BasicSortWithIndexablePred) {
@@ -2556,6 +2626,28 @@ namespace {
                                     "{ixscan: {pattern: {d: 1, c: 1}}}]}}}}}}");
     }
 
+    // SERVER-15286:  Make sure that at least the explodeForSort() path bails out
+    // when it finds that there are no union of point interval fields to explode.
+    // We could convert this into a MERGE_SORT plan, but we don't yet do this
+    // optimization.
+    TEST_F(QueryPlannerTest, CantExplodeOrForSort2) {
+        addIndex(BSON("a" << 1));
+
+        runQuerySortProj(fromjson("{$or: [{a: {$gt: 1, $lt: 3}}, {a: {$gt: 6, $lt: 10}}]}"),
+                         BSON("a" << -1),
+                         BSONObj());
+
+        assertNumSolutions(3U);
+        assertSolutionExists("{sort: {pattern: {a: -1}, limit: 0, node: {cscan: {dir: 1}}}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1}}}}}");
+        assertSolutionExists("{sort: {pattern: {a: -1}, limit: 0, node: "
+                                "{fetch: {filter: null, node: {or: {nodes: ["
+                                    "{ixscan: {pattern: {a: 1}, bounds: "
+                                        "{a: [[1,3,false,false]]}}},"
+                                    "{ixscan: {pattern: {a: 1}, bounds: "
+                                        "{a: [[6,10,false,false]]}}}]}}}}}}");
+    }
+
     // SERVER-13754: too many scans in an $or explosion.
     TEST_F(QueryPlannerTest, TooManyToExplodeOr) {
         addIndex(BSON("a" << 1 << "e" << 1));
@@ -2588,6 +2680,26 @@ namespace {
                                 "{or: {nodes: ["
                                     "{fetch: {node: {ixscan: {pattern: {b: 1, e: 1}}}}},"
                                     "{fetch: {node: {ixscan: {pattern: {d: 1, e: 1}}}}}]}}}}");
+    }
+
+    // SERVER-15696: Make sure explodeForSort copies filters on IXSCAN stages to all of the
+    // scans resulting from the explode. Regex is the easiest way to have the planner create
+    // an index scan which filters using the index key.
+    TEST_F(QueryPlannerTest, ExplodeIxscanWithFilter) {
+        addIndex(BSON("a" << 1 << "b" << 1));
+
+        runQuerySortProj(fromjson("{$and: [{b: {$regex: 'foo', $options: 'i'}},"
+                                          "{a: {$in: [1, 2]}}]}"),
+                         BSON("b" << 1), BSONObj());
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{sort: {pattern: {b: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+        assertSolutionExists("{fetch: {node: {mergeSort: {nodes: "
+                                "[{ixscan: {pattern: {a:1, b:1},"
+                                           "filter: {b: {$regex: 'foo', $options: 'i'}}}},"
+                                 "{ixscan: {pattern: {a:1, b:1},"
+                                           "filter: {b: {$regex: 'foo', $options: 'i'}}}}]}}}}");
+
     }
 
     TEST_F(QueryPlannerTest, InWithSortAndLimitTrailingField) {
@@ -4411,6 +4523,36 @@ namespace {
         assertNumSolutions(internalQueryEnumerationMaxOrSolutions);
     }
 
+    // Ensure that disabling AND_HASH intersection works properly.
+    TEST_F(QueryPlannerTest, IntersectDisableAndHash) {
+        bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection;
+
+        // Turn index intersection on but disable hash-based intersection.
+        internalQueryPlannerEnableHashIntersection = false;
+        params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+
+        addIndex(BSON("a" << 1));
+        addIndex(BSON("b" << 1));
+        addIndex(BSON("c" << 1));
+
+        runQuery(fromjson("{a: {$gt: 1}, b: 1, c: 1}"));
+
+        // We should do an AND_SORT intersection of {b: 1} and {c: 1}, but no AND_HASH plans.
+        assertNumSolutions(4U);
+        assertSolutionExists("{fetch: {filter: {b: 1, c: 1}, node: {ixscan: "
+                                "{pattern: {a: 1}, bounds: {a: [[1,Infinity,false,true]]}}}}}");
+        assertSolutionExists("{fetch: {filter: {a:{$gt:1},c:1}, node: {ixscan: "
+                                "{pattern: {b: 1}, bounds: {b: [[1,1,true,true]]}}}}}");
+        assertSolutionExists("{fetch: {filter: {a:{$gt:1},b:1}, node: {ixscan: "
+                                "{pattern: {c: 1}, bounds: {c: [[1,1,true,true]]}}}}}");
+        assertSolutionExists("{fetch: {filter: {a:{$gt:1}}, node: {andSorted: {nodes: ["
+                                    "{ixscan: {filter: null, pattern: {b:1}}},"
+                                    "{ixscan: {filter: null, pattern: {c:1}}}]}}}}");
+
+        // Restore the old value of the has intersection switch.
+        internalQueryPlannerEnableHashIntersection = oldEnableHashIntersection;
+    }
+
     //
     // Index intersection cases for SERVER-12825: make sure that
     // we don't generate an ixisect plan if a compound index is
@@ -4891,13 +5033,13 @@ namespace {
         ASSERT_OK(cqStatus);
         boost::scoped_ptr<CanonicalQuery> scopedCq(cq);
 
-        PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
+        boost::scoped_ptr<PlanCacheIndexTree> indexTree(new PlanCacheIndexTree());
         indexTree->setIndexEntry(IndexEntry(BSON("a" << 1)));
 
         map<BSONObj, size_t> indexMap;
 
         // Null filter.
-        Status s = QueryPlanner::tagAccordingToCache(NULL, indexTree, indexMap);
+        Status s = QueryPlanner::tagAccordingToCache(NULL, indexTree.get(), indexMap);
         ASSERT_NOT_OK(s);
 
         // Null indexTree.
@@ -4905,12 +5047,12 @@ namespace {
         ASSERT_NOT_OK(s);
 
         // Index not found.
-        s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree, indexMap);
+        s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
         ASSERT_NOT_OK(s);
 
         // Index found once added to the map.
         indexMap[BSON("a" << 1)] = 0;
-        s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree, indexMap);
+        s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
         ASSERT_OK(s);
 
         // Regenerate canonical query in order to clear tags.
@@ -4922,7 +5064,7 @@ namespace {
         PlanCacheIndexTree* child = new PlanCacheIndexTree();
         child->setIndexEntry(IndexEntry(BSON("a" << 1)));
         indexTree->children.push_back(child);
-        s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree, indexMap);
+        s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
         ASSERT_NOT_OK(s);
     }
 

@@ -61,9 +61,16 @@ namespace mongo {
             return _recoveryUnit.get();
         }
 
-        virtual LockState* lockState() const {
-            // TODO: Eventually, this should return an actual LockState object. For now,
-            //       LockState depends on the whole world and is not necessary for testing.
+        virtual RecoveryUnit* releaseRecoveryUnit() {
+            return _recoveryUnit.release();
+        }
+
+        virtual void setRecoveryUnit(RecoveryUnit* unit) {
+            _recoveryUnit.reset(unit);
+        }
+
+        virtual Locker* lockState() const {
+            // TODO: This should return an actual object if necessary for testing.
             return NULL;
         }
 
@@ -71,8 +78,7 @@ namespace mongo {
                                           const std::string &name,
                                           unsigned long long progressMeterTotal,
                                           int secondsBetween) {
-            invariant(false);
-            return NULL;
+            return &_pm;
         }
 
         virtual void checkForInterrupt(bool heedMutex = true) const { }
@@ -97,12 +103,9 @@ namespace mongo {
             return 0;
         }
 
-        virtual Transaction* getTransaction() {
-            return NULL;
-        }
-
     private:
-        boost::scoped_ptr<RecoveryUnit> _recoveryUnit;
+        std::auto_ptr<RecoveryUnit> _recoveryUnit;
+        ProgressMeter _pm;
     };
 
 }  // namespace mongo

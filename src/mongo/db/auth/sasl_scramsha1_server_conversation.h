@@ -35,17 +35,17 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/auth/sasl_conversation.h"
+#include "mongo/db/auth/sasl_server_conversation.h"
 
 namespace mongo {
     /**
-     *  Server side authentication session for SASL PLAIN.
+     *  Server side authentication session for SASL SCRAM-SHA-1.
      */
-    class SaslSCRAMSHA1ServerConversation : public SaslConversation {
+    class SaslSCRAMSHA1ServerConversation : public SaslServerConversation {
         MONGO_DISALLOW_COPYING(SaslSCRAMSHA1ServerConversation);
     public:
         /**
-         * Implements the server side of a SASL PLAIN mechanism session.
+         * Implements the server side of a SASL SCRAM-SHA-1 mechanism session.
          **/
         explicit SaslSCRAMSHA1ServerConversation(SaslAuthenticationSession* saslAuthSession); 
 
@@ -65,16 +65,16 @@ namespace mongo {
          * Parse client-first-message and generate server-first-message
          **/
         StatusWith<bool> _firstStep(std::vector<std::string>& input, std::string* outputData);
-        
-        /** 
+
+        /**
          * Parse client-final-message and generate server-final-message
-         **/  
+         **/
         StatusWith<bool> _secondStep(const std::vector<string>& input, std::string* outputData);
-        
+
         int _step;
         std::string _authMessage;
         User::CredentialData _creds;
-        
+
         // client and server nonce concatenated
         std::string _nonce;
     };

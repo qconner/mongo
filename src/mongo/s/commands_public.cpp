@@ -54,11 +54,13 @@
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/s/client_info.h"
+#include "mongo/s/cluster_explain.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/config.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/distlock.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/s/strategy.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/scripting/engine.h"
@@ -970,6 +972,45 @@ namespace mongo {
 
                 return true;
             }
+
+            Status explain(OperationContext* txn,
+                           const std::string& dbname,
+                           const BSONObj& cmdObj,
+                           ExplainCommon::Verbosity verbosity,
+                           BSONObjBuilder* out) const {
+                const string fullns = parseNs(dbname, cmdObj);
+
+                // Extract the targeting query.
+                BSONObj targetingQuery;
+                if (Object == cmdObj["query"].type()) {
+                    targetingQuery = cmdObj["query"].Obj();
+                }
+
+                BSONObjBuilder explainCmdBob;
+                ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+
+                // We will time how long it takes to run the commands on the shards.
+                Timer timer;
+
+                vector<Strategy::CommandResult> shardResults;
+                STRATEGY->commandOp(dbname,
+                                    explainCmdBob.obj(),
+                                    0,
+                                    fullns,
+                                    targetingQuery,
+                                    &shardResults);
+
+                long long millisElapsed = timer.millis();
+
+                const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults,
+                                                                                    cmdObj);
+
+                return ClusterExplain::buildExplainResult(shardResults,
+                                                          mongosStageName,
+                                                          millisElapsed,
+                                                          out);
+            }
+
         } countCmd;
 
         class CollectionStats : public PublicGridCommand {
@@ -1141,9 +1182,19 @@ namespace mongo {
                 massert( 13002 ,  "shard internal error chunk manager should never be null" , cm );
 
                 BSONObj filter = cmdObj.getObjectField("query");
-                uassert(13343,  "query for sharded findAndModify must have shardkey", cm->hasShardKey(filter));
 
-                ChunkPtr chunk = cm->findChunkForDoc(filter);
+                StatusWith<BSONObj> status =
+                    cm->getShardKeyPattern().extractShardKeyFromQuery(filter);
+
+                // Bad query
+                if (!status.isOK())
+                    return appendCommandStatus(result, status.getStatus());
+
+                BSONObj shardKey = status.getValue();
+                uassert(13343, "query for sharded findAndModify must have shardkey",
+                        !shardKey.isEmpty());
+
+                ChunkPtr chunk = cm->findIntersectingChunk(shardKey);
                 ShardConnection conn( chunk->getShard() , fullns );
                 BSONObj res;
                 bool ok = conn->runCommand( conf->getName() , cmdObj , res );
@@ -1195,11 +1246,14 @@ namespace mongo {
                 BSONObj keyPattern = cmdObj.getObjectField( "keyPattern" );
 
                 uassert( 13408, "keyPattern must equal shard key",
-                         cm->getShardKey().key() == keyPattern );
+                         cm->getShardKeyPattern().toBSON() == keyPattern );
                 uassert( 13405, str::stream() << "min value " << min << " does not have shard key",
-                         cm->hasShardKey(min) );
+                         cm->getShardKeyPattern().isShardKey(min) );
                 uassert( 13406, str::stream() << "max value " << max << " does not have shard key",
-                         cm->hasShardKey(max) );
+                         cm->getShardKeyPattern().isShardKey(max) );
+
+                min = cm->getShardKeyPattern().normalizeShardKey(min);
+                max = cm->getShardKeyPattern().normalizeShardKey(max);
 
                 // yes these are doubles...
                 double size = 0;
@@ -1264,6 +1318,45 @@ namespace mongo {
             virtual bool passOptions() const { return true; }
             virtual string getFullNS( const string& dbName , const BSONObj& cmdObj ) {
                 return dbName + "." + cmdObj.firstElement().embeddedObjectUserCheck()["ns"].valuestrsafe();
+            }
+            virtual std::string parseNs(const std::string& dbName, const BSONObj& cmdObj) const {
+                return dbName + "." + cmdObj.firstElement()
+                                            .embeddedObjectUserCheck()["ns"]
+                                            .valuestrsafe();
+            }
+
+            Status explain(OperationContext* txn,
+                           const std::string& dbname,
+                           const BSONObj& cmdObj,
+                           ExplainCommon::Verbosity verbosity,
+                           BSONObjBuilder* out) const {
+                const string fullns = parseNs(dbname, cmdObj);
+
+                BSONObjBuilder explainCmdBob;
+                ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+
+                // We will time how long it takes to run the commands on the shards.
+                Timer timer;
+
+                Strategy::CommandResult singleResult;
+                Status commandStat = STRATEGY->commandOpUnsharded(dbname,
+                                                                  explainCmdBob.obj(),
+                                                                  0,
+                                                                  fullns,
+                                                                  &singleResult);
+                if (!commandStat.isOK()) {
+                    return commandStat;
+                }
+
+                long long millisElapsed = timer.millis();
+
+                vector<Strategy::CommandResult> shardResults;
+                shardResults.push_back(singleResult);
+
+                return ClusterExplain::buildExplainResult(shardResults,
+                                                          ClusterExplain::kSingleShard,
+                                                          millisElapsed,
+                                                          out);
             }
 
         } groupCmd;
@@ -1398,7 +1491,7 @@ namespace mongo {
 
                 ChunkManagerPtr cm = conf->getChunkManager( fullns );
                 massert( 13091 , "how could chunk manager be null!" , cm );
-                if(cm->getShardKey().key() == BSON("files_id" << 1)) {
+                if(cm->getShardKeyPattern().toBSON() == BSON("files_id" << 1)) {
                     BSONObj finder = BSON("files_id" << cmdObj.firstElement());
 
                     vector<Strategy::CommandResult> results;
@@ -1409,7 +1502,7 @@ namespace mongo {
                     result.appendElements(res);
                     return res["ok"].trueValue();
                 }
-                else if (cm->getShardKey().key() == BSON("files_id" << 1 << "n" << 1)) {
+                else if (cm->getShardKeyPattern().toBSON() == BSON("files_id" << 1 << "n" << 1)) {
                     int n = 0;
                     BSONObj lastResult;
 
@@ -1763,6 +1856,11 @@ namespace mongo {
                     }
                 }
 
+                if (customOut.hasField("inline") && shardedOutput) {
+                    errmsg = "cannot specify inline and sharded output at the same time";
+                    return false;
+                }
+
                 // modify command to run on shards with output to tmp collection
                 string badShardedField;
                 verify( maxChunkSizeBytes < 0x7fffffff );
@@ -1940,11 +2038,12 @@ namespace mongo {
                         confOut->getAllShards( shardSet );
                         vector<Shard> outShards( shardSet.begin() , shardSet.end() );
 
-                        confOut->shardCollection( finalColLong ,
-                                                  sortKey ,
-                                                  true ,
-                                                  &sortedSplitPts ,
-                                                  &outShards );
+                        ShardKeyPattern sortKeyPattern(sortKey);
+                        confOut->shardCollection(finalColLong,
+                                                 sortKeyPattern,
+                                                 true,
+                                                 &sortedSplitPts,
+                                                 &outShards);
 
                     }
 
@@ -2556,7 +2655,7 @@ namespace mongo {
                 string ns = parseNs( dbname, cmdObj );
                 ActionSet actions;
                 actions.addAction(ActionType::listIndexes);
-                out->push_back(Privilege(ResourcePattern::forCollectionName( ns ), actions));
+                out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
 
             bool run(OperationContext* txn, const string& dbName,
@@ -2588,6 +2687,7 @@ namespace mongo {
                                          false,
                                          str::stream() << "no such cmd: " << commandName);
             anObjBuilder.append("code", ErrorCodes::CommandNotFound);
+            Command::unknownCommands.increment();
             return;
         }
         ClientInfo *client = ClientInfo::get();

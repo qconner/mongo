@@ -26,14 +26,14 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/pipeline_d.h"
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
@@ -63,8 +63,8 @@ namespace {
         }
 
         bool isCapped(const NamespaceString& ns) {
-            Client::ReadContext ctx(_ctx->opCtx, ns.ns());
-            Collection* collection = ctx.ctx().db()->getCollection(_ctx->opCtx, ns);
+            AutoGetCollectionForRead ctx(_ctx->opCtx, ns.ns());
+            Collection* collection = ctx.getCollection();
             return collection && collection->isCapped();
         }
 
@@ -74,14 +74,13 @@ namespace {
     };
 }
 
-    boost::shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
+    shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
             OperationContext* txn,
             Collection* collection,
             const intrusive_ptr<Pipeline>& pPipeline,
             const intrusive_ptr<ExpressionContext>& pExpCtx) {
         // get the full "namespace" name
         const string& fullName = pExpCtx->ns.ns();
-        pExpCtx->opCtx->lockState()->assertAtLeastReadLocked(fullName);
 
         // We will be modifying the source vector as we go
         Pipeline::SourceContainer& sources = pPipeline->sources;
@@ -178,8 +177,14 @@ namespace {
                                              projectionForQuery,
                                              &cq,
                                              whereCallback);
+
             PlanExecutor* rawExec;
-            if (status.isOK() && getExecutor(txn, collection, cq, &rawExec, runnerOptions).isOK()) {
+            if (status.isOK() && getExecutor(txn,
+                                             collection,
+                                             cq,
+                                             PlanExecutor::YIELD_AUTO,
+                                             &rawExec,
+                                             runnerOptions).isOK()) {
                 // success: The PlanExecutor will handle sorting for us using an index.
                 exec.reset(rawExec);
                 sortInRunner = true;
@@ -204,12 +209,19 @@ namespace {
                                              whereCallback));
 
             PlanExecutor* rawExec;
-            uassertStatusOK(getExecutor(txn, collection, cq, &rawExec, runnerOptions));
+            uassertStatusOK(getExecutor(txn,
+                                        collection,
+                                        cq,
+                                        PlanExecutor::YIELD_AUTO,
+                                        &rawExec,
+                                        runnerOptions));
             exec.reset(rawExec);
         }
 
 
-        // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved.
+        // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved. We
+        // deregister the PlanExecutor so that it can be registered with ClientCursor.
+        exec->deregisterExec();
         exec->saveState();
 
         // Put the PlanExecutor into a DocumentSourceCursor and add it to the front of the pipeline.

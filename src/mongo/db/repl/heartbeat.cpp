@@ -44,6 +44,7 @@
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/server.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/background.h"
@@ -56,94 +57,6 @@
 namespace mongo {
 namespace repl {
 
-    MONGO_FP_DECLARE(rsDelayHeartbeatResponse);
-
-namespace {
-    /**
-     * Returns true if there is no data on this server. Useful when starting replication.
-     * The "local" database does NOT count except for "rs.oplog" collection.
-     * Used to set the hasData field on replset heartbeat command response.
-     */
-    bool replHasDatabases(OperationContext* txn) {
-        vector<string> names;
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
-        storageEngine->listDatabases(&names);
-
-        if( names.size() >= 2 ) return true;
-        if( names.size() == 1 ) {
-            if( names[0] != "local" )
-                return true;
-            // we have a local database.  return true if oplog isn't empty
-            {
-                Lock::DBRead lk(txn->lockState(), repl::rsoplog);
-                BSONObj o;
-                if( Helpers::getFirst(txn, repl::rsoplog, o) )
-                    return true;
-            }
-        }
-        return false;
-    }
-    
-} // namespace
-
-    /* { replSetHeartbeat : <setname> } */
-    class CmdReplSetHeartbeat : public ReplSetCommand {
-    public:
-        void help(stringstream& h) const { h << "internal"; }
-        CmdReplSetHeartbeat() : ReplSetCommand("replSetHeartbeat") { }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::internal);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-
-            MONGO_FAIL_POINT_BLOCK(rsDelayHeartbeatResponse, delay) {
-                const BSONObj& data = delay.getData();
-                sleepsecs(data["delay"].numberInt());
-            }
-
-            /* we don't call ReplSetCommand::check() here because heartbeat
-               checks many things that are pre-initialization. */
-            if (!getGlobalReplicationCoordinator()->getSettings().usingReplSets()) {
-                errmsg = "not running with --replSet";
-                return false;
-            }
-
-            if ( replSetBlind ) {
-                errmsg = str::stream() << "node is blind";
-                return false;
-            }
-
-            /* we want to keep heartbeat connections open when relinquishing primary.  
-               tag them here. */
-            {
-                AbstractMessagingPort *mp = cc().port();
-                if( mp )
-                    mp->tag |= ScopedConn::keepOpen;
-            }
-
-            ReplSetHeartbeatArgs args;
-            Status status = args.initialize(cmdObj);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            // ugh.
-            if (args.getCheckEmpty()) {
-                result.append("hasData", replHasDatabases(txn));
-            }
-
-            ReplSetHeartbeatResponse response;
-            status = getGlobalReplicationCoordinator()->processHeartbeat(args, &response);
-            if (status.isOK())
-                response.addToBSON(&result);
-            return appendCommandStatus(result, status);
-        }
-    } cmdReplSetHeartbeat;
-
     MONGO_FP_DECLARE(rsStopHeartbeatRequest);
 
     bool requestHeartbeat(const std::string& setName,
@@ -153,10 +66,6 @@ namespace {
                           int myCfgVersion,
                           int& theirCfgVersion,
                           bool checkEmpty) {
-        if( replSetBlind ) {
-            return false;
-        }
-
         MONGO_FAIL_POINT_BLOCK(rsStopHeartbeatRequest, member) {
             const BSONObj& data = member.getData();
             const std::string& stopMember = data["member"].str();
@@ -200,8 +109,6 @@ namespace {
         task::repeat(task, 2000);
     }
 
-    void startSyncThread();
-
     /** called during repl set startup.  caller expects it to return fairly quickly.
         note ReplSet object is only created once we get a config - so this won't run
         until the initiation.
@@ -213,13 +120,13 @@ namespace {
         if (myConfig().arbiterOnly) {
             return;
         }
-
+        
         // this ensures that will have bgsync's s_instance at all points where it is needed
         // so that we needn't check for its existence
         BackgroundSync* sync = BackgroundSync::get();
 
-        boost::thread t(startSyncThread);
-
+        boost::thread t(runSyncThread);
+                        
         boost::thread producer(stdx::bind(&BackgroundSync::producerThread, sync));
         boost::thread feedback(stdx::bind(&SyncSourceFeedback::run,
                                           &theReplSet->syncSourceFeedback));

@@ -28,6 +28,7 @@
 
 #include "mongo/db/exec/merge_sort.h"
 
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/mongoutils/str.h"
@@ -152,6 +153,11 @@ namespace mongo {
                 if (PlanStage::NEED_TIME == code) {
                     ++_commonStats.needTime;
                 }
+                else if (PlanStage::NEED_FETCH == code) {
+                    *out = id;
+                    ++_commonStats.needFetch;
+                }
+
                 return code;
             }
         }
@@ -192,6 +198,7 @@ namespace mongo {
     }
 
     void MergeSortStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
         for (size_t i = 0; i < _children.size(); ++i) {
             _children[i]->restoreState(opCtx);

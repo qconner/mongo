@@ -26,10 +26,13 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/exec/projection.h"
 
 #include "mongo/db/diskloc.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
@@ -231,6 +234,13 @@ namespace mongo {
                 Status status(ErrorCodes::InternalError, ss);
                 *out = WorkingSetCommon::allocateStatusMember( _ws, status);
             }
+        }
+        else if (PlanStage::NEED_TIME == status) {
+            _commonStats.needTime++;
+        }
+        else if (PlanStage::NEED_FETCH == status) {
+            _commonStats.needFetch++;
+            *out = id;
         }
 
         return status;

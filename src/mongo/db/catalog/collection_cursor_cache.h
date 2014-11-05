@@ -55,8 +55,8 @@ namespace mongo {
         // -----------------
 
         /**
-         * @param collectionGoingAway should be tru if the Collection instance is going away
-         *                            this could be because the db is being closed, or the
+         * @param collectionGoingAway Pass as true if the Collection instance is going away.
+         *                            This could be because the db is being closed, or the
          *                            collection/db is being dropped.
          */
         void invalidateAll( bool collectionGoingAway );
@@ -94,7 +94,7 @@ namespace mongo {
         CursorId registerCursor( ClientCursor* cc );
         void deregisterCursor( ClientCursor* cc );
 
-        bool eraseCursor( CursorId id, bool checkAuth );
+        bool eraseCursor(OperationContext* txn, CursorId id, bool checkAuth );
 
         void getCursorIds( std::set<CursorId>* openCursors );
         std::size_t numCursors();

@@ -33,6 +33,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
+#include "mongo/bson/optime.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/repl_coordinator_external_state.h"
 #include "mongo/util/net/hostandport.h"
@@ -43,9 +44,12 @@ namespace repl {
     class ReplicationCoordinatorExternalStateMock : public ReplicationCoordinatorExternalState {
         MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalStateMock);
     public:
+        class GlobalSharedLockAcquirer;
+
         ReplicationCoordinatorExternalStateMock();
         virtual ~ReplicationCoordinatorExternalStateMock();
-        virtual void runSyncSourceFeedback();
+        virtual void startThreads();
+        virtual void startMasterSlave();
         virtual void shutdown();
         virtual void forwardSlaveHandshake();
         virtual void forwardSlaveProgress();
@@ -54,7 +58,14 @@ namespace repl {
         virtual HostAndPort getClientHostAndPort(const OperationContext* txn);
         virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* txn);
         virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config);
-        virtual void closeClientConnections();
+        virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
+        virtual void closeConnections();
+        virtual void clearShardingState();
+        virtual void signalApplierToChooseNewSyncSource();
+        virtual ReplicationCoordinatorExternalState::GlobalSharedLockAcquirer*
+                getGlobalSharedLockAcquirer();
+        virtual OperationContext* createOperationContext(const std::string& threadName);
+        virtual void dropAllTempCollections(OperationContext* txn);
 
         /**
          * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"
@@ -67,11 +78,66 @@ namespace repl {
          */
         void setLocalConfigDocument(const StatusWith<BSONObj>& localConfigDocument);
 
+        /**
+         * Sets the return value for subsequent calls to getClientHostAndPort().
+         */
+        void setClientHostAndPort(const HostAndPort& clientHostAndPort);
+
+        /**
+         * Sets the value that will be passed to the constructor of any future
+         * GlobalSharedLockAcuirers created and returned by getGlobalSharedLockAcquirer().
+         */
+        void setCanAcquireGlobalSharedLock(bool canAcquire);
+
+        /**
+         * Sets the return value for subsequent calls to loadLastOpTimeApplied.
+         */
+        void setLastOpTime(const StatusWith<OpTime>& lastApplied);
+
+        /**
+         * Sets the return value for subsequent calls to storeLocalConfigDocument().
+         * If "status" is Status::OK(), the subsequent calls will call the underlying funtion.
+         */ 
+        void setStoreLocalConfigDocumentStatus(Status status);
+
+        /**
+         * Sets whether or not subsequent calls to storeLocalConfigDocument() should hang
+         * indefinitely or not based on the value of "hang".
+         */
+        void setStoreLocalConfigDocumentToHang(bool hang);
+
     private:
         StatusWith<BSONObj> _localRsConfigDocument;
+        StatusWith<OpTime>  _lastOpTime;
         std::vector<HostAndPort> _selfHosts;
+        bool _canAcquireGlobalSharedLock;
+        Status _storeLocalConfigDocumentStatus;
+        // mutex and cond var for controlling stroeLocalConfigDocument()'s hanging
+        boost::mutex _shouldHangMutex;
+        boost::condition _shouldHangCondVar;
+        bool _storeLocalConfigDocumentShouldHang;
         bool _connectionsClosed;
+        HostAndPort _clientHostAndPort;
     };
+
+    class ReplicationCoordinatorExternalStateMock::GlobalSharedLockAcquirer :
+            public ReplicationCoordinatorExternalState::GlobalSharedLockAcquirer {
+    public:
+
+        /**
+         * The canAcquireLock argument determines what the return value of calls to try_lock will
+         * be.
+         */
+        GlobalSharedLockAcquirer(bool canAcquireLock);
+        virtual ~GlobalSharedLockAcquirer();
+
+        virtual bool try_lock(OperationContext* txn, const Milliseconds& timeout);
+
+    private:
+
+        const bool _canAcquireLock;
+    };
+
 
 } // namespace repl
 } // namespace mongo

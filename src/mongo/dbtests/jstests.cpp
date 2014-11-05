@@ -29,12 +29,14 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include <limits>
 
 #include "mongo/base/parse_number.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
@@ -2157,7 +2159,9 @@ namespace JSTests {
             add< RoundTripTests::MD5 >();
             add< RoundTripTests::NullString >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace JavaJSTests
 

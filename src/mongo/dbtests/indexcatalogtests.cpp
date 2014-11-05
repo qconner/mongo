@@ -33,20 +33,24 @@ namespace IndexCatalogTests {
     public:
         IndexIteratorTests() {
             OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, _ns);
+            Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(_ns), MODE_X);
+            Client::Context ctx(&txn, _ns);
+            WriteUnitOfWork wuow(&txn);
 
-            _db = ctx.ctx().db();
+            _db = ctx.db();
             _coll = _db->createCollection(&txn, _ns);
             _catalog = _coll->getIndexCatalog();
-            ctx.commit();
+            wuow.commit();
         }
 
         ~IndexIteratorTests() {
             OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, _ns);
+            Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(_ns), MODE_X);
+            Client::Context ctx(&txn, _ns);
+            WriteUnitOfWork wuow(&txn);
 
             _db->dropCollection(&txn, _ns);
-            ctx.commit();
+            wuow.commit();
         }
 
         void run() {
@@ -55,8 +59,10 @@ namespace IndexCatalogTests {
 
             int numFinishedIndexesStart = _catalog->numIndexesReady(&txn);
 
+            WriteUnitOfWork wuow(&txn);
             Helpers::ensureIndex(&txn, _coll, BSON("x" << 1), false, "_x_0");
             Helpers::ensureIndex(&txn, _coll, BSON("y" << 1), false, "_y_0");
+            wuow.commit();
 
             ASSERT_TRUE(_catalog->numIndexesReady(&txn) == numFinishedIndexesStart+2);
 
@@ -77,7 +83,6 @@ namespace IndexCatalogTests {
                 }
             }
 
-            ctx.commit();
             ASSERT_TRUE(indexesIterated == _catalog->numIndexesReady(&txn));
             ASSERT_TRUE(foundIndex);
         }
@@ -95,5 +100,7 @@ namespace IndexCatalogTests {
         void setupTests() {
             add<IndexIteratorTests>();
         }
-    } indexCatalogTests;
+    };
+
+    SuiteInstance<IndexCatalogTests> indexCatalogTests;
 }

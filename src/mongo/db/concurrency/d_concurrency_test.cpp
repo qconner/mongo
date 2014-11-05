@@ -28,11 +28,10 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/thread.hpp>
+#include <string>
 
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/lock_mgr_test_help.h"
 #include "mongo/unittest/unittest.h"
 
 
@@ -41,42 +40,227 @@
 
 namespace mongo {
 
-    // These two tests ensure that we have preserved the behaviour of TempRelease
-    TEST(DConcurrency, TempReleaseOneDB) {
-        LockState ls;
+    TEST(DConcurrency, GlobalRead) {
+        MMAPV1LockerImpl ls(1);
+        Lock::GlobalRead globalRead(&ls);
+        ASSERT(ls.isR());
+    }
 
-        Lock::DBRead r1(&ls, "db1");
+    TEST(DConcurrency, GlobalWrite) {
+        MMAPV1LockerImpl ls(1);
+        Lock::GlobalWrite globalWrite(&ls);
+        ASSERT(ls.isW());
+    }
+
+    TEST(DConcurrency, GlobalWriteAndGlobalRead) {
+        MMAPV1LockerImpl ls(1);
+
+        Lock::GlobalWrite globalWrite(&ls);
+        ASSERT(ls.isW());
+
+        {
+            Lock::GlobalRead globalRead(&ls);
+            ASSERT(ls.isW());
+        }
+
+        ASSERT(ls.isW());
+    }
+
+    TEST(DConcurrency, readlocktryTimeout) {
+        MMAPV1LockerImpl ls(1);
+        writelocktry globalWrite(&ls, 0);
+        ASSERT(globalWrite.got());
+
+        {
+            MMAPV1LockerImpl lsTry(2);
+            readlocktry lockTry(&lsTry, 1);
+            ASSERT(!lockTry.got());
+        }
+    }
+
+    TEST(DConcurrency, writelocktryTimeout) {
+        MMAPV1LockerImpl ls(1);
+        writelocktry globalWrite(&ls, 0);
+        ASSERT(globalWrite.got());
+
+        {
+            MMAPV1LockerImpl lsTry(2);
+            writelocktry lockTry(&lsTry, 1);
+            ASSERT(!lockTry.got());
+        }
+    }
+
+    TEST(DConcurrency, readlocktryNoTimeoutDueToFlushLockS) {
+        MMAPV1LockerImpl ls(1);
+        AutoAcquireFlushLockForMMAPV1Commit autoFlushLock(&ls);
+
+        MMAPV1LockerImpl lsTry(2);
+        readlocktry lockTry(&lsTry, 1);
+
+        ASSERT(lockTry.got());
+    }
+
+    TEST(DConcurrency, writelocktryTimeoutDueToFlushLockS) {
+        MMAPV1LockerImpl ls(1);
+        AutoAcquireFlushLockForMMAPV1Commit autoFlushLock(&ls);
+
+        MMAPV1LockerImpl lsTry(2);
+        writelocktry lockTry(&lsTry, 1);
+
+        ASSERT(!lockTry.got());
+    }
+
+    TEST(DConcurrency, readlocktryTimeoutDueToFlushLockX) {
+        MMAPV1LockerImpl ls(1);
+        AutoAcquireFlushLockForMMAPV1Commit autoFlushLock(&ls);
+        autoFlushLock.upgradeFlushLockToExclusive();
+
+        MMAPV1LockerImpl lsTry(2);
+        readlocktry lockTry(&lsTry, 1);
+
+        ASSERT(!lockTry.got());
+    }
+
+    TEST(DConcurrency, writelocktryTimeoutDueToFlushLockX) {
+        MMAPV1LockerImpl ls(1);
+        AutoAcquireFlushLockForMMAPV1Commit autoFlushLock(&ls);
+        autoFlushLock.upgradeFlushLockToExclusive();
+
+        MMAPV1LockerImpl lsTry(2);
+        writelocktry lockTry(&lsTry, 1);
+
+        ASSERT(!lockTry.got());
+    }
+
+    TEST(DConcurrency, TempReleaseGlobalWrite) {
+        MMAPV1LockerImpl ls(1);
+        Lock::GlobalWrite globalWrite(&ls);
 
         {
             Lock::TempRelease tempRelease(&ls);
+            ASSERT(!ls.isLocked());
         }
 
-        ls.assertAtLeastReadLocked("db1");
+        ASSERT(ls.isW());
     }
 
-    TEST(DConcurrency, TempReleaseRecursive) {
-        LockState ls;
+    TEST(DConcurrency, DBReadTakesS) {
+        MMAPV1LockerImpl ls(1);
 
-        Lock::DBRead r1(&ls, "db1");
-        Lock::DBRead r2(&ls, "db2");
+        Lock::DBRead dbRead(&ls, "db");
 
-        {
-            Lock::TempRelease tempRelease(&ls);
-
-            ls.assertAtLeastReadLocked("db1");
-            ls.assertAtLeastReadLocked("db2");
-        }
-
-        ls.assertAtLeastReadLocked("db1");
-        ls.assertAtLeastReadLocked("db2");
+        const ResourceId resIdDb(RESOURCE_DATABASE, string("db"));
+        ASSERT(ls.getLockMode(resIdDb) == MODE_S);
     }
 
-    TEST(DConcurrency, MultipleDBLocks) {
-        LockState ls;
+    TEST(DConcurrency, DBLockTakesX) {
+        MMAPV1LockerImpl ls(1);
 
-        Lock::DBWrite r1(&ls, "db1");
+        Lock::DBLock dbWrite(&ls, "db", MODE_X);
+
+        const ResourceId resIdDb(RESOURCE_DATABASE, string("db"));
+        ASSERT(ls.getLockMode(resIdDb) == MODE_X);
+    }
+
+    TEST(DConcurrency, MultipleWriteDBLocksOnSameThread) {
+        MMAPV1LockerImpl ls(1);
+
+        Lock::DBLock r1(&ls, "db1", MODE_X);
+        Lock::DBLock r2(&ls, "db1", MODE_X);
+
+        ASSERT(ls.isWriteLocked("db1"));
+    }
+
+    TEST(DConcurrency, MultipleConflictingDBLocksOnSameThread) {
+        MMAPV1LockerImpl ls(1);
+
+        Lock::DBLock r1(&ls, "db1", MODE_X);
         Lock::DBRead r2(&ls, "db1");
 
-        ls.assertWriteLocked("db1");
+        ASSERT(ls.isWriteLocked("db1"));
     }
+
+    TEST(DConcurrency, IsDbLockedForSMode) {
+        const std::string dbName("db");
+
+        MMAPV1LockerImpl ls(1);
+
+        Lock::DBLock dbLock(&ls, dbName, MODE_S);
+
+        ASSERT(ls.isDbLockedForMode(dbName, MODE_IS));
+        ASSERT(!ls.isDbLockedForMode(dbName, MODE_IX));
+        ASSERT(ls.isDbLockedForMode(dbName, MODE_S));
+        ASSERT(!ls.isDbLockedForMode(dbName, MODE_X));
+    }
+
+    TEST(DConcurrency, IsDbLockedForXMode) {
+        const std::string dbName("db");
+
+        MMAPV1LockerImpl ls(1);
+
+        Lock::DBLock dbLock(&ls, dbName, MODE_X);
+
+        ASSERT(ls.isDbLockedForMode(dbName, MODE_IS));
+        ASSERT(ls.isDbLockedForMode(dbName, MODE_IX));
+        ASSERT(ls.isDbLockedForMode(dbName, MODE_S));
+        ASSERT(ls.isDbLockedForMode(dbName, MODE_X));
+    }
+
+    TEST(DConcurrency, IsCollectionLocked_DB_Locked_IS) {
+        const std::string ns("db1.coll");
+
+        MMAPV1LockerImpl ls(1);
+
+        Lock::DBLock dbLock(&ls, "db1", MODE_IS);
+
+        {
+            Lock::CollectionLock collLock(&ls, ns, MODE_IS);
+
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_IS));
+            ASSERT(!ls.isCollectionLockedForMode(ns, MODE_IX));
+
+            // TODO: This is TRUE because Lock::CollectionLock converts IS lock to S
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_S));
+
+            ASSERT(!ls.isCollectionLockedForMode(ns, MODE_X));
+        }
+
+        {
+            Lock::CollectionLock collLock(&ls, ns, MODE_S);
+
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_IS));
+            ASSERT(!ls.isCollectionLockedForMode(ns, MODE_IX));
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_S));
+            ASSERT(!ls.isCollectionLockedForMode(ns, MODE_X));
+        }
+    }
+
+    TEST(DConcurrency, IsCollectionLocked_DB_Locked_IX) {
+        const std::string ns("db1.coll");
+
+        MMAPV1LockerImpl ls(1);
+
+        Lock::DBLock dbLock(&ls, "db1", MODE_IX);
+
+        {
+            Lock::CollectionLock collLock(&ls, ns, MODE_IX);
+
+            // TODO: This is TRUE because Lock::CollectionLock converts IX lock to X
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_IS));
+
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_IX));
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_S));
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_X));
+        }
+
+        {
+            Lock::CollectionLock collLock(&ls, ns, MODE_X);
+
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_IS));
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_IX));
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_S));
+            ASSERT(ls.isCollectionLockedForMode(ns, MODE_X));
+        }
+    }
+
 } // namespace mongo

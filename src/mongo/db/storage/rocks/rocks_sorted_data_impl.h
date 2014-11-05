@@ -30,6 +30,8 @@
 
 #include "mongo/db/storage/sorted_data_interface.h"
 
+#include <atomic>
+
 #include <rocksdb/db.h>
 
 #include "mongo/bson/ordering.h"
@@ -62,7 +64,8 @@ namespace mongo {
     class RocksSortedDataImpl : public SortedDataInterface {
         MONGO_DISALLOW_COPYING( RocksSortedDataImpl );
     public:
-        RocksSortedDataImpl( rocksdb::DB* db, rocksdb::ColumnFamilyHandle* cf, Ordering order );
+        RocksSortedDataImpl(rocksdb::DB* db, boost::shared_ptr<rocksdb::ColumnFamilyHandle> cf,
+                            std::string ident, Ordering order);
 
         virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* txn, bool dupsAllowed);
 
@@ -71,15 +74,19 @@ namespace mongo {
                               const DiskLoc& loc,
                               bool dupsAllowed);
 
-        virtual bool unindex(OperationContext* txn, const BSONObj& key, const DiskLoc& loc);
+        virtual void unindex(OperationContext* txn, const BSONObj& key, const DiskLoc& loc,
+                             bool dupsAllowed);
 
         virtual Status dupKeyCheck(OperationContext* txn, const BSONObj& key, const DiskLoc& loc);
 
-        virtual void fullValidate(OperationContext* txn, long long* numKeysOut);
+        virtual void fullValidate(OperationContext* txn, bool full, long long* numKeysOut,
+                                  BSONObjBuilder* output) const;
 
         virtual bool isEmpty(OperationContext* txn);
 
         virtual Status touch(OperationContext* txn) const;
+
+        virtual long long numEntries(OperationContext* txn) const;
 
         virtual Cursor* newCursor(OperationContext* txn, int direction) const;
 
@@ -96,21 +103,21 @@ namespace mongo {
     private:
         typedef DiskLoc RecordId;
 
-        RocksRecoveryUnit* _getRecoveryUnit( OperationContext* opCtx ) const;
-
         rocksdb::DB* _db; // not owned
 
         // Each index is stored as a single column family, so this stores the handle to the
         // relevant column family
-        rocksdb::ColumnFamilyHandle* _columnFamily; // not owned
+        boost::shared_ptr<rocksdb::ColumnFamilyHandle> _columnFamily;
+
+        std::string _ident;
 
         // used to construct RocksCursors
         const Ordering _order;
 
-        /**
-         * Creates an error code message out of a key
-         */
-        std::string dupKeyError(const BSONObj& key) const;
+        std::atomic<long long> _numEntries;
+
+        const std::string _numEntriesKey;
+
     };
 
 } // namespace mongo

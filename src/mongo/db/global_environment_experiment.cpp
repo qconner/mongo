@@ -31,6 +31,7 @@
 #include "mongo/db/global_environment_experiment.h"
 
 #include "mongo/db/operation_context.h"
+#include "mongo/util/assert_util.h"
 
 
 namespace mongo {
@@ -56,6 +57,29 @@ namespace mongo {
         }
 
         globalEnvironmentExperiment = newGlobalEnvironment;
+    }
+
+    bool supportsDocLocking() {
+        if (hasGlobalEnvironment()) {
+            StorageEngine* globalStorageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+            if (globalStorageEngine != NULL) {
+                return globalStorageEngine->supportsDocLocking();
+            }
+        }
+
+        return false;
+    }
+
+    bool isMMAPV1() {
+        if (hasGlobalEnvironment()) {
+            StorageEngine* globalStorageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+            if (globalStorageEngine != NULL) {
+                return globalStorageEngine->isMmapV1();
+            }
+        }
+
+        // For the purpose of unit-tests, which were written to assume MMAP V1-like behaviour
+        return true;
     }
 
 }  // namespace mongo

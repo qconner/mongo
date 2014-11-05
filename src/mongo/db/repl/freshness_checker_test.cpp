@@ -38,49 +38,76 @@
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/freshness_checker.h"
+#include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 namespace repl {
 namespace {
 
+    using unittest::assertGet;
+
     typedef ReplicationExecutor::RemoteCommandRequest RemoteCommandRequest;
 
+    bool stringContains(const std::string &haystack, const std::string& needle) {
+        return haystack.find(needle) != std::string::npos;
+    }
+
     class FreshnessCheckerTest : public mongo::unittest::Test {
-    public:
-        FreshnessCheckerTest();
+    protected:
+        void startTest(const OpTime& lastOpTimeApplied,
+                       const ReplicaSetConfig& currentConfig,
+                       int selfIndex,
+                       const std::vector<HostAndPort>& hosts);
+        void waitOnChecker();
+        FreshnessChecker::ElectionAbortReason shouldAbortElection() const;
+
+        int64_t countLogLinesContaining(const std::string& needle) {
+            return std::count_if(getCapturedLogMessages().begin(),
+                                 getCapturedLogMessages().end(),
+                                 stdx::bind(stringContains,
+                                            stdx::placeholders::_1,
+                                            needle));
+        }
+
+        NetworkInterfaceMock* _net;
+        boost::scoped_ptr<ReplicationExecutor> _executor;
+        boost::scoped_ptr<boost::thread> _executorThread;
+
+    private:
         void freshnessCheckerRunner(const ReplicationExecutor::CallbackData& data,
-                                    FreshnessChecker* checker,
-                                    const ReplicationExecutor::EventHandle& evh,
-                                    const OpTime& lastOpTimeApplied, 
+                                    const OpTime& lastOpTimeApplied,
                                     const ReplicaSetConfig& currentConfig,
                                     int selfIndex,
                                     const std::vector<HostAndPort>& hosts);
-    protected:
-        NetworkInterfaceMockWithMap* _net;
-        boost::scoped_ptr<ReplicationExecutor> _executor;
-        boost::scoped_ptr<boost::thread> _executorThread;
-        Status _lastStatus;
-
-    private:
         void setUp();
         void tearDown();
+
+        boost::scoped_ptr<FreshnessChecker> _checker;
+        ReplicationExecutor::EventHandle _checkerDoneEvent;
     };
 
-    FreshnessCheckerTest::FreshnessCheckerTest() : _lastStatus(Status::OK()) {}
-
     void FreshnessCheckerTest::setUp() {
-        _net = new NetworkInterfaceMockWithMap;
+        _net = new NetworkInterfaceMock;
         _executor.reset(new ReplicationExecutor(_net, 1 /* prng seed */));
         _executorThread.reset(new boost::thread(stdx::bind(&ReplicationExecutor::run,
                                                            _executor.get())));
+        _checker.reset(new  FreshnessChecker);
     }
 
     void FreshnessCheckerTest::tearDown() {
-        _net->unblockAll();
         _executor->shutdown();
         _executorThread->join();
+    }
+
+    void FreshnessCheckerTest::waitOnChecker() {
+        _executor->waitForEvent(_checkerDoneEvent);
+    }
+
+    FreshnessChecker::ElectionAbortReason FreshnessCheckerTest::shouldAbortElection() const {
+        return _checker->shouldAbortElection();
     }
 
     ReplicaSetConfig assertMakeRSConfig(const BSONObj& configBson) {
@@ -105,63 +132,35 @@ namespace {
     // This is necessary because the run method must be scheduled in the Replication Executor
     // for correct concurrency operation.
     void FreshnessCheckerTest::freshnessCheckerRunner(
-        const ReplicationExecutor::CallbackData& data,
-        FreshnessChecker* checker,
-        const ReplicationExecutor::EventHandle& evh,
-        const OpTime& lastOpTimeApplied, 
-        const ReplicaSetConfig& currentConfig,
-        int selfIndex,
-        const std::vector<HostAndPort>& hosts) {
+            const ReplicationExecutor::CallbackData& data,
+            const OpTime& lastOpTimeApplied,
+            const ReplicaSetConfig& currentConfig,
+            int selfIndex,
+            const std::vector<HostAndPort>& hosts) {
+
         invariant(data.status.isOK());
-        _lastStatus = checker->start(data.executor, 
-                                     evh, 
-                                     lastOpTimeApplied, 
-                                     currentConfig, 
-                                     selfIndex, 
-                                     hosts);
+        StatusWith<ReplicationExecutor::EventHandle> evh = _checker->start(data.executor,
+                                                                           lastOpTimeApplied,
+                                                                           currentConfig,
+                                                                           selfIndex,
+                                                                           hosts);
+        _checkerDoneEvent = assertGet(evh);
     }
 
-    TEST_F(FreshnessCheckerTest, OneNode) {
-        // Only one node in the config.  We are freshest and not tied.
-        ReplicaSetConfig config = assertMakeRSConfig(
-                BSON("_id" << "rs0" <<
-                     "version" << 1 <<
-                     "members" << BSON_ARRAY(
-                             BSON("_id" << 1 << "host" << "h1"))));
-        
-        StatusWith<ReplicationExecutor::EventHandle> evh = _executor->makeEvent();
-        ASSERT_OK(evh.getStatus());
-
-        Date_t now(0);
-        std::vector<HostAndPort> hosts;
-        hosts.push_back(config.getMemberAt(0).getHostAndPort());
-
-        FreshnessChecker checker;
-        
-        StatusWith<ReplicationExecutor::CallbackHandle> cbh = 
-            _executor->scheduleWork(
-                stdx::bind(&FreshnessCheckerTest::freshnessCheckerRunner,
-                           this,
-                           stdx::placeholders::_1,
-                           &checker,
-                           evh.getValue(),
-                           OpTime(0,0),
-                           config,
-                           0,
-                           hosts));
-        ASSERT_OK(cbh.getStatus());
-        _executor->wait(cbh.getValue());
-
-        ASSERT_OK(_lastStatus);
-
-        _executor->waitForEvent(evh.getValue());
-
-        bool weAreFreshest(false);
-        bool tied(false);
-        checker.getResults(&weAreFreshest, &tied);
-        ASSERT_TRUE(weAreFreshest);
-        ASSERT_FALSE(tied);
-        
+    void FreshnessCheckerTest::startTest(const OpTime& lastOpTimeApplied,
+                                         const ReplicaSetConfig& currentConfig,
+                                         int selfIndex,
+                                         const std::vector<HostAndPort>& hosts) {
+        _executor->wait(
+            assertGet(
+                _executor->scheduleWork(
+                    stdx::bind(&FreshnessCheckerTest::freshnessCheckerRunner,
+                               this,
+                               stdx::placeholders::_1,
+                               lastOpTimeApplied,
+                               currentConfig,
+                               selfIndex,
+                               hosts))));
     }
 
     TEST_F(FreshnessCheckerTest, TwoNodes) {
@@ -172,54 +171,37 @@ namespace {
                      "members" << BSON_ARRAY(
                          BSON("_id" << 1 << "host" << "h0") <<
                          BSON("_id" << 2 << "host" << "h1"))));
-        
-        StatusWith<ReplicationExecutor::EventHandle> evh = _executor->makeEvent();
-        ASSERT_OK(evh.getStatus());
 
-        Date_t now(0);
         std::vector<HostAndPort> hosts;
-        hosts.push_back(config.getMemberAt(0).getHostAndPort());
         hosts.push_back(config.getMemberAt(1).getHostAndPort());
-
         const BSONObj freshRequest = makeFreshRequest(config, OpTime(0,0), 0);
 
-        _net->addResponse(RemoteCommandRequest(HostAndPort("h1"),
-                                               "admin",
-                                               freshRequest),
-                          StatusWith<BSONObj>(BSON("ok" << 1 <<
-                                                   "id" << 2 <<
-                                                   "set" << "rs0" <<
-                                                   "who" << "h1" <<
-                                                   "cfgver" << 1 <<
-                                                   "opTime" << Date_t(OpTime(0,0).asDate()))));
-
-        FreshnessChecker checker;
-        StatusWith<ReplicationExecutor::CallbackHandle> cbh = 
-            _executor->scheduleWork(
-                stdx::bind(&FreshnessCheckerTest::freshnessCheckerRunner,
-                           this,
-                           stdx::placeholders::_1,
-                           &checker,
-                           evh.getValue(),
-                           OpTime(0,0),
-                           config,
-                           0,
-                           hosts));
-        ASSERT_OK(cbh.getStatus());
-        _executor->wait(cbh.getValue());
-
-        ASSERT_OK(_lastStatus);
-
-        _executor->waitForEvent(evh.getValue());
-
-        bool weAreFreshest(false);
-        bool tied(false);
-        checker.getResults(&weAreFreshest, &tied);
-        ASSERT_TRUE(weAreFreshest);
-        ASSERT_TRUE(tied);
-        
+        startTest(OpTime(0, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           BSON("ok" << 1 <<
+                                                "id" << 2 <<
+                                                "set" << "rs0" <<
+                                                "who" << "h1" <<
+                                                "cfgver" << 1 <<
+                                                "opTime" << Date_t(OpTime(0,0).asDate())),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FreshnessTie);
     }
-
 
     TEST_F(FreshnessCheckerTest, ShuttingDown) {
         // Two nodes, we are node h1.  Shutdown happens while we're scheduling remote commands.
@@ -229,57 +211,865 @@ namespace {
                      "members" << BSON_ARRAY(
                          BSON("_id" << 1 << "host" << "h0") <<
                          BSON("_id" << 2 << "host" << "h1"))));
-        
-        StatusWith<ReplicationExecutor::EventHandle> evh = _executor->makeEvent();
-        ASSERT_OK(evh.getStatus());
 
-        Date_t now(0);
         std::vector<HostAndPort> hosts;
-        hosts.push_back(config.getMemberAt(0).getHostAndPort());
+        hosts.push_back(config.getMemberAt(1).getHostAndPort());
+
+        startTest(
+                OpTime(0, 0),
+                config,
+                0,
+                hosts);
+        _executor->shutdown();
+        waitOnChecker();
+
+        // This seems less than ideal, but if we are shutting down, the next phase of election
+        // cannot proceed anyway.
+        ASSERT_EQUALS(shouldAbortElection(),FreshnessChecker::None);
+
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshest) {
+        // other responds as fresher than us
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1"))));
+
+        std::vector<HostAndPort> hosts;
+        hosts.push_back(config.getMemberAt(1).getHostAndPort());
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           BSON("ok" << 1 <<
+                                                "id" << 2 <<
+                                                "set" << "rs0" <<
+                                                "who" << "h1" <<
+                                                "cfgver" << 1 <<
+                                                "fresher" << true <<
+                                                "opTime" << Date_t(OpTime(0,0).asDate())),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+        ASSERT_EQUALS(1, countLogLinesContaining("not electing self, we are not freshest"));
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTime) {
+        // other responds with a later optime than ours
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1"))));
+
+        std::vector<HostAndPort> hosts;
         hosts.push_back(config.getMemberAt(1).getHostAndPort());
 
         const BSONObj freshRequest = makeFreshRequest(config, OpTime(0,0), 0);
-        _net->addResponse(RemoteCommandRequest(HostAndPort("h1"),
-                                               "admin",
-                                               freshRequest),
-                          StatusWith<BSONObj>(BSON("ok" << 1 <<
-                                                   "id" << 2 <<
-                                                   "set" << "rs0" <<
-                                                   "who" << "h1" <<
-                                                   "cfgver" << 1 <<
-                                                   "opTime" << Date_t(OpTime(0,0).asDate()))),
-                          true /* isBlocked */);
 
-        FreshnessChecker checker;
-        StatusWith<ReplicationExecutor::CallbackHandle> cbh = 
-            _executor->scheduleWork(
-                stdx::bind(&FreshnessCheckerTest::freshnessCheckerRunner,
-                           this,
-                           stdx::placeholders::_1,
-                           &checker,
-                           evh.getValue(),
-                           OpTime(0,0),
-                           config,
-                           0,
-                           hosts));
-        ASSERT_OK(cbh.getStatus());
+        startTest(OpTime(0, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           BSON("ok" << 1 <<
+                                                "id" << 2 <<
+                                                "set" << "rs0" <<
+                                                "who" << "h1" <<
+                                                "cfgver" << 1 <<
+                                                "opTime" << Date_t(OpTime(10,0).asDate())),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
 
-        _executor->wait(cbh.getValue());
-        ASSERT_OK(_lastStatus);
-
-        _executor->shutdown();
-        _net->unblockAll();
-        _executor->waitForEvent(evh.getValue());
-
-        bool weAreFreshest(false);
-        bool tied(false);
-        checker.getResults(&weAreFreshest, &tied);
-        // This seems less than ideal, but if we are shutting down, the next phase of election
-        // cannot proceed anyway.
-        ASSERT_TRUE(weAreFreshest);
-        ASSERT_FALSE(tied); 
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
     }
 
+    TEST_F(FreshnessCheckerTest, ElectWrongTypeInFreshnessResponse) {
+        // other responds with "opTime" field of non-Date value, causing not freshest
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1"))));
+
+        std::vector<HostAndPort> hosts;
+        hosts.push_back(config.getMemberAt(1).getHostAndPort());
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           BSON("ok" << 1 <<
+                                                "id" << 2 <<
+                                                "set" << "rs0" <<
+                                                "who" << "h1" <<
+                                                "cfgver" << 1 <<
+                                                "opTime" << 3),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+
+        stopCapturingLogMessages();
+
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+        ASSERT_EQUALS(1, countLogLinesContaining("wrong type for opTime argument in replSetFresh "
+                                                 "response: NumberInt32"));
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectVetoed) {
+        // other responds with veto
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1"))));
+
+        std::vector<HostAndPort> hosts;
+        hosts.push_back(config.getMemberAt(1).getHostAndPort());
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           BSON("ok" << 1 <<
+                                                "id" << 2 <<
+                                                "set" << "rs0" <<
+                                                "who" << "h1" <<
+                                                "cfgver" << 1 <<
+                                                "veto" << true <<
+                                                "errmsg" << "I'd rather you didn't" <<
+                                                "opTime" << Date_t(OpTime(0,0).asDate())),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+
+        stopCapturingLogMessages();
+
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+        ASSERT_EQUALS(1, countLogLinesContaining("not electing self, h1:27017 would veto with '"
+                                                 "errmsg: \"I'd rather you didn't\"'"));
+    }
+
+    int findIdForMember(const ReplicaSetConfig& rsConfig, const HostAndPort& host) {
+        const MemberConfig* member = rsConfig.findMemberByHostAndPort(host);
+        ASSERT_TRUE(member != NULL) << "No host named " << host.toString() << " in config";
+        return member->getId();
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestManyNodes) {
+        // one other responds as fresher than us
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1") <<
+                         BSON("_id" << 3 << "host" << "h2") <<
+                         BSON("_id" << 4 << "host" << "h3") <<
+                         BSON("_id" << 5 << "host" << "h4"))));
+
+        std::vector<HostAndPort> hosts;
+        for (ReplicaSetConfig::MemberIterator mem = ++config.membersBegin();
+                mem != config.membersEnd();
+                ++mem) {
+            hosts.push_back(mem->getHostAndPort());
+        }
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        unordered_set<HostAndPort> seen;
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            const HostAndPort target = noi->getRequest().target;
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT(seen.insert(target).second) << "Already saw " << target;
+            BSONObjBuilder responseBuilder;
+            responseBuilder <<
+                "ok" << 1 <<
+                "id" << findIdForMember(config, target) <<
+                "set" << "rs0" <<
+                "who" << target.toString() <<
+                "cfgver" << 1 <<
+                "opTime" << Date_t(OpTime(0,0).asDate());
+            if (target.host() == "h1") {
+                responseBuilder << "fresher" << true;
+            }
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           responseBuilder.obj(),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+        ASSERT_EQUALS(1, countLogLinesContaining("not electing self, we are not freshest"));
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTimeManyNodes) {
+        // one other responds with a later optime than ours
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1") <<
+                         BSON("_id" << 3 << "host" << "h2") <<
+                         BSON("_id" << 4 << "host" << "h3") <<
+                         BSON("_id" << 5 << "host" << "h4"))));
+        
+        std::vector<HostAndPort> hosts;
+        for (ReplicaSetConfig::MemberIterator mem = config.membersBegin();
+                mem != config.membersEnd();
+                ++mem) {
+            if (HostAndPort("h0") == mem->getHostAndPort()) {
+                continue;
+            }
+            hosts.push_back(mem->getHostAndPort());
+        }
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        unordered_set<HostAndPort> seen;
+        _net->enterNetwork();
+
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            const HostAndPort target = noi->getRequest().target;
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT(seen.insert(target).second) << "Already saw " << target;
+            BSONObjBuilder responseBuilder;
+            if (target.host() == "h4") {
+                responseBuilder <<
+                    "ok" << 1 <<
+                    "id" << findIdForMember(config, target) <<
+                    "set" << "rs0" <<
+                    "who" << target.toString() <<
+                    "cfgver" << 1 <<
+                    "opTime" << Date_t(OpTime(20,0).asDate());
+                _net->scheduleResponse(
+                        noi,
+                        startDate + 20,
+                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                               responseBuilder.obj(),
+                                               Milliseconds(8))));
+            }
+            else {
+                responseBuilder <<
+                    "ok" << 1 <<
+                    "id" << findIdForMember(config, target) <<
+                    "set" << "rs0" <<
+                    "who" << target.toString() <<
+                    "cfgver" << 1 <<
+                    "opTime" << Date_t(OpTime(10,0).asDate());
+                _net->scheduleResponse(
+                        noi,
+                        startDate + 10,
+                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                               responseBuilder.obj(),
+                                               Milliseconds(8))));
+            }
+        }
+        _net->runUntil(startDate + 10);
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(0, countLogLinesContaining("not electing self, we are not freshest"));
+        _net->runUntil(startDate + 20);
+        ASSERT_EQUALS(startDate + 20, _net->now());
+        _net->exitNetwork();
+        waitOnChecker();
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectWrongTypeInFreshnessResponseManyNodes) {
+        // one other responds with "opTime" field of non-Date value, causing not freshest
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1") <<
+                         BSON("_id" << 3 << "host" << "h2") <<
+                         BSON("_id" << 4 << "host" << "h3") <<
+                         BSON("_id" << 5 << "host" << "h4"))));
+
+        std::vector<HostAndPort> hosts;
+        for (ReplicaSetConfig::MemberIterator mem = ++config.membersBegin();
+                mem != config.membersEnd();
+                ++mem) {
+            hosts.push_back(mem->getHostAndPort());
+        }
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        unordered_set<HostAndPort> seen;
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            const HostAndPort target = noi->getRequest().target;
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT(seen.insert(target).second) << "Already saw " << target;
+            BSONObjBuilder responseBuilder;
+            responseBuilder <<
+                "ok" << 1 <<
+                "id" << findIdForMember(config, target) <<
+                "set" << "rs0" <<
+                "who" << target.toString() <<
+                "cfgver" << 1;
+            if (target.host() == "h1") {
+                responseBuilder << "opTime" << 3;
+            }
+            else {
+                responseBuilder << "opTime" << Date_t(OpTime(0,0).asDate());
+            }
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           responseBuilder.obj(),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+        ASSERT_EQUALS(1, countLogLinesContaining("wrong type for opTime argument in replSetFresh "
+                                                 "response: NumberInt32"));
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectVetoedManyNodes) {
+        // one other responds with veto
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1") <<
+                         BSON("_id" << 3 << "host" << "h2") <<
+                         BSON("_id" << 4 << "host" << "h3") <<
+                         BSON("_id" << 5 << "host" << "h4"))));
+
+        std::vector<HostAndPort> hosts;
+        for (ReplicaSetConfig::MemberIterator mem = ++config.membersBegin();
+                mem != config.membersEnd();
+                ++mem) {
+            hosts.push_back(mem->getHostAndPort());
+        }
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        unordered_set<HostAndPort> seen;
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            const HostAndPort target = noi->getRequest().target;
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT(seen.insert(target).second) << "Already saw " << target;
+            BSONObjBuilder responseBuilder;
+            responseBuilder <<
+                "ok" << 1 <<
+                "id" << findIdForMember(config, target) <<
+                "set" << "rs0" <<
+                "who" << target.toString() <<
+                "cfgver" << 1 <<
+                "opTime" << Date_t(OpTime(0,0).asDate());
+            if (target.host() == "h1") {
+                responseBuilder << "veto" << true << "errmsg" << "I'd rather you didn't";
+            }
+            _net->scheduleResponse(
+                    noi,
+                    startDate + 10,
+                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                           responseBuilder.obj(),
+                                           Milliseconds(8))));
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+        ASSERT_EQUALS(1, countLogLinesContaining("not electing self, h1:27017 would veto with '"
+                                                 "errmsg: \"I'd rather you didn't\"'"));
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectVetoedAndTiedFreshnessManyNodes) {
+        // one other responds with veto and another responds with tie
+        startCapturingLogMessages();
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1") <<
+                         BSON("_id" << 3 << "host" << "h2") <<
+                         BSON("_id" << 4 << "host" << "h3") <<
+                         BSON("_id" << 5 << "host" << "h4"))));
+        
+        std::vector<HostAndPort> hosts;
+        for (ReplicaSetConfig::MemberIterator mem = config.membersBegin();
+                mem != config.membersEnd();
+                ++mem) {
+            if (HostAndPort("h0") == mem->getHostAndPort()) {
+                continue;
+            }
+            hosts.push_back(mem->getHostAndPort());
+        }
+
+        const BSONObj freshRequest = makeFreshRequest(config, OpTime(10,0), 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        unordered_set<HostAndPort> seen;
+        _net->enterNetwork();
+
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            const HostAndPort target = noi->getRequest().target;
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT(seen.insert(target).second) << "Already saw " << target;
+            BSONObjBuilder responseBuilder;
+            if (target.host() == "h4") {
+                responseBuilder <<
+                    "ok" << 1 <<
+                    "id" << findIdForMember(config, target) <<
+                    "set" << "rs0" <<
+                    "who" << target.toString() <<
+                    "cfgver" << 1 <<
+                    "veto" << true <<
+                    "errmsg" << "I'd rather you didn't" <<
+                    "opTime" << Date_t(OpTime(10,0).asDate());
+                _net->scheduleResponse(
+                        noi,
+                        startDate + 20,
+                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                               responseBuilder.obj(),
+                                               Milliseconds(8))));
+            }
+            else {
+                responseBuilder <<
+                    "ok" << 1 <<
+                    "id" << findIdForMember(config, target) <<
+                    "set" << "rs0" <<
+                    "who" << target.toString() <<
+                    "cfgver" << 1 <<
+                    "opTime" << Date_t(OpTime(10,0).asDate());
+                _net->scheduleResponse(
+                        noi,
+                        startDate + 10,
+                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                               responseBuilder.obj(),
+                                               Milliseconds(8))));
+            }
+        }
+        _net->runUntil(startDate + 10);
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(0, countLogLinesContaining("not electing self, h4:27017 would veto with '"
+                                                 "errmsg: \"I'd rather you didn't\"'"));
+        _net->runUntil(startDate + 20);
+        ASSERT_EQUALS(startDate + 20, _net->now());
+        _net->exitNetwork();
+        waitOnChecker();
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+        ASSERT_EQUALS(1, countLogLinesContaining("not electing self, h4:27017 would veto with '"
+                                                 "errmsg: \"I'd rather you didn't\"'"));
+    }
+
+    TEST_F(FreshnessCheckerTest, ElectManyNodesNotAllRespond) {
+        ReplicaSetConfig config = assertMakeRSConfig(
+                BSON("_id" << "rs0" <<
+                     "version" << 1 <<
+                     "members" << BSON_ARRAY(
+                         BSON("_id" << 1 << "host" << "h0") <<
+                         BSON("_id" << 2 << "host" << "h1") <<
+                         BSON("_id" << 3 << "host" << "h2") <<
+                         BSON("_id" << 4 << "host" << "h3") <<
+                         BSON("_id" << 5 << "host" << "h4"))));
+
+        std::vector<HostAndPort> hosts;
+        for (ReplicaSetConfig::MemberIterator mem = ++config.membersBegin();
+                mem != config.membersEnd();
+                ++mem) {
+            hosts.push_back(mem->getHostAndPort());
+        }
+
+        const OpTime lastOpTimeApplied(10,0);
+        const BSONObj freshRequest = makeFreshRequest(config, lastOpTimeApplied, 0);
+
+        startTest(OpTime(10, 0), config, 0, hosts);
+        const Date_t startDate = _net->now();
+        unordered_set<HostAndPort> seen;
+        _net->enterNetwork();
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
+            const HostAndPort target = noi->getRequest().target;
+            ASSERT_EQUALS("admin", noi->getRequest().dbname);
+            ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+            ASSERT(seen.insert(target).second) << "Already saw " << target;
+            if (target.host() == "h2" || target.host() == "h3") {
+                _net->scheduleResponse(
+                        noi,
+                        startDate + 10,
+                        ResponseStatus(ErrorCodes::NoSuchKey, "No response"));
+            }
+            else {
+                BSONObjBuilder responseBuilder;
+                responseBuilder <<
+                    "ok" << 1 <<
+                    "id" << findIdForMember(config, target) <<
+                    "set" << "rs0" <<
+                    "who" << target.toString() <<
+                    "cfgver" << 1 <<
+                    "opTime" << Date_t(OpTime(0,0).asDate());
+                _net->scheduleResponse(
+                        noi,
+                        startDate + 10,
+                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                               responseBuilder.obj(),
+                                               Milliseconds(8))));
+            }
+        }
+        _net->runUntil(startDate + 10);
+        _net->exitNetwork();
+        ASSERT_EQUALS(startDate + 10, _net->now());
+        waitOnChecker();
+        ASSERT_EQUALS(shouldAbortElection(),FreshnessChecker::None);
+    }
+
+    class FreshnessScatterGatherTest : public mongo::unittest::Test {
+    public:
+        virtual void setUp() {
+            int selfConfigIndex = 0;
+            OpTime lastOpTimeApplied(100, 0);
+
+            ReplicaSetConfig config;
+            config.initialize(BSON("_id" << "rs0" <<
+                                   "version" << 1 <<
+                                   "members" << BSON_ARRAY(
+                                       BSON("_id" << 0 << "host" << "host0") <<
+                                       BSON("_id" << 1 << "host" << "host1") <<
+                                       BSON("_id" << 2 << "host" << "host2"))));
+
+            std::vector<HostAndPort> hosts;
+            for (ReplicaSetConfig::MemberIterator mem = ++config.membersBegin();
+                    mem != config.membersEnd();
+                    ++mem) {
+                hosts.push_back(mem->getHostAndPort());
+            }
+
+            _checker.reset(new FreshnessChecker::Algorithm(lastOpTimeApplied,
+                                                           config,
+                                                           selfConfigIndex,
+                                                           hosts));
+
+        }
+
+        virtual void tearDown() {
+            _checker.reset(NULL);
+        }
+
+    protected:
+        bool hasReceivedSufficientResponses() {
+            return _checker->hasReceivedSufficientResponses();
+        }
+
+        void processResponse(const RemoteCommandRequest& request, const ResponseStatus& response) {
+            _checker->processResponse(request, response);
+        }
+
+        FreshnessChecker::ElectionAbortReason shouldAbortElection() const {
+            return _checker->shouldAbortElection();
+        }
+
+        ResponseStatus lessFresh() {
+            BSONObjBuilder bb;
+            bb.append("ok", 1.0);
+            bb.appendDate("opTime", OpTime(10, 0).asDate());
+            return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
+        }
+
+        ResponseStatus moreFreshViaOpTime() {
+            BSONObjBuilder bb;
+            bb.append("ok", 1.0);
+            bb.appendDate("opTime", OpTime(110, 0).asDate());
+            return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
+        }
+
+        ResponseStatus wrongTypeForOpTime() {
+            BSONObjBuilder bb;
+            bb.append("ok", 1.0);
+            bb.append("opTime", std::string("several minutes ago"));
+            return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
+        }
+
+        ResponseStatus unauthorized() {
+            BSONObjBuilder bb;
+            bb.append("ok", 0.0);
+            bb.append("code", ErrorCodes::Unauthorized);
+            bb.append("errmsg", "Unauthorized");
+            return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
+        }
+
+        ResponseStatus tiedForFreshness() {
+            BSONObjBuilder bb;
+            bb.append("ok", 1.0);
+            bb.appendDate("opTime", OpTime(100, 0).asDate());
+            return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
+        }
+
+        ResponseStatus moreFresh() {
+            return ResponseStatus(NetworkInterfaceMock::Response(BSON("ok" << 1.0 <<
+                                                                      "fresher" << true),
+                                                                 Milliseconds(10)));
+        }
+
+        ResponseStatus veto() {
+            return ResponseStatus(NetworkInterfaceMock::Response(BSON("ok" << 1.0 <<
+                                                                      "veto" << true <<
+                                                                      "errmsg" << "vetoed!"),
+                                                                 Milliseconds(10)));
+        }
+
+        RemoteCommandRequest requestFrom(std::string hostname) {
+            return RemoteCommandRequest(HostAndPort(hostname),
+                                        "", // the non-hostname fields do not matter in Freshness
+                                        BSONObj(),
+                                        Milliseconds(0));
+        }
+    private:
+        scoped_ptr<FreshnessChecker::Algorithm> _checker;
+    };
+
+    TEST_F(FreshnessScatterGatherTest, BothNodesLessFresh) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), lessFresh());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), lessFresh());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(),FreshnessChecker::None);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeFresher) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), moreFresh());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeFresherViaOpTime) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), moreFreshViaOpTime());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeVetoes) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), veto());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeWrongTypeForOpTime) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), wrongTypeForOpTime());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeTiedForFreshness) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), tiedForFreshness());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), lessFresh());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FreshnessTie);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeTiedAndSecondFresher) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), tiedForFreshness());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), moreFresh());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeTiedAndSecondFresherViaOpTime) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), tiedForFreshness());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), moreFreshViaOpTime());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeTiedAndSecondVetoes) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), tiedForFreshness());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), veto());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeTiedAndSecondWrongTypeForOpTime) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+        
+        processResponse(requestFrom("host1"), tiedForFreshness());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), wrongTypeForOpTime());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, FirstNodeLessFreshAndSecondWrongTypeForOpTime) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host1"), lessFresh());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), wrongTypeForOpTime());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, SecondNodeTiedAndFirstWrongTypeForOpTime) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), wrongTypeForOpTime());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, NotEnoughVotersDueNetworkErrors) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host1"),
+                        ResponseStatus(Status(ErrorCodes::NetworkTimeout, "")));
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"),
+                        ResponseStatus(Status(ErrorCodes::NetworkTimeout, "")));
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::QuorumUnreachable);
+    }
+
+    TEST_F(FreshnessScatterGatherTest, NotEnoughVotersDueToUnauthorized) {
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host1"), unauthorized());
+        ASSERT_FALSE(hasReceivedSufficientResponses());
+
+        processResponse(requestFrom("host2"), unauthorized());
+        ASSERT_TRUE(hasReceivedSufficientResponses());
+        ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::QuorumUnreachable);
+    }
 
 }  // namespace
 }  // namespace repl

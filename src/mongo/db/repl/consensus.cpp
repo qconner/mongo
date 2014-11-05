@@ -44,81 +44,6 @@ namespace mongo {
 
 namespace repl {
 
-    /** the first cmd called by a node seeking election and it's a basic sanity 
-        test: do any of the nodes it can reach know that it can't be the primary?
-        */
-    class CmdReplSetFresh : public ReplSetCommand {
-    public:
-        void help(stringstream& h) const { h << "internal"; }
-        CmdReplSetFresh() : ReplSetCommand("replSetFresh") { }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::internal);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const string&,
-                         BSONObj& cmdObj,
-                         int,
-                         string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
-            if (!status.isOK())
-                return appendCommandStatus(result, status);
-
-            ReplicationCoordinator::ReplSetFreshArgs parsedArgs;
-            parsedArgs.id = cmdObj["id"].Int();
-            parsedArgs.setName = cmdObj["set"].checkAndGetStringData();
-            parsedArgs.who = HostAndPort(cmdObj["who"].String());
-            parsedArgs.cfgver = cmdObj["cfgver"].Int();
-            parsedArgs.opTime = OpTime(cmdObj["opTime"].Date());
-
-            status = getGlobalReplicationCoordinator()->processReplSetFresh(parsedArgs, &result);
-            return appendCommandStatus(result, status);
-        }
-    } cmdReplSetFresh;
-
-    class CmdReplSetElect : public ReplSetCommand {
-    public:
-        void help(stringstream& h) const { h << "internal"; }
-        CmdReplSetElect() : ReplSetCommand("replSetElect") { }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::internal);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-    private:
-        virtual bool run(OperationContext* txn,
-                         const string&,
-                         BSONObj& cmdObj,
-                         int,
-                         string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-            DEV log() << "replSet received elect msg " << cmdObj.toString() << rsLog;
-            else LOG(2) << "replSet received elect msg " << cmdObj.toString() << rsLog;
-
-            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
-            if (!status.isOK())
-                return appendCommandStatus(result, status);
-
-            ReplicationCoordinator::ReplSetElectArgs parsedArgs;
-            parsedArgs.set = cmdObj["set"].checkAndGetStringData();
-            parsedArgs.whoid = cmdObj["whoid"].Int();
-            parsedArgs.cfgver = cmdObj["cfgver"].Int();
-            parsedArgs.round = cmdObj["round"].OID();
-
-            status = getGlobalReplicationCoordinator()->processReplSetElect(parsedArgs, &result);
-            return appendCommandStatus(result, status);
-        }
-    } cmdReplSetElect;
-
     void Consensus::electCmdReceived(const StringData& set,
                                      unsigned whoid,
                                      int cfgver,
@@ -208,7 +133,7 @@ namespace repl {
         return !( vUp * 2 > _totalVotes() );
     }
 
-    const time_t LeaseTime = 3;
+    const time_t LeaseTime = 30;
 
     SimpleMutex Consensus::lyMutex("ly");
 

@@ -43,15 +43,15 @@
 #include "mongo/db/repl/master_slave.h"
 
 #include <pcrecpp.h>
-
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
@@ -163,14 +163,13 @@ namespace repl {
 
     void ReplSource::ensureMe(OperationContext* txn) {
         string myname = getHostName();
-        bool exists = false;
-        {
-            Client::ReadContext ctx(txn, "local");
-            // local.me is an identifier for a server for getLastError w:2+
-            exists = Helpers::getSingleton(txn, "local.me", _me);
-        }
+
+        // local.me is an identifier for a server for getLastError w:2+
+        bool exists = Helpers::getSingleton(txn, "local.me", _me);
+
         if (!exists || !_me.hasField("host") || _me["host"].String() != myname) {
-            Client::WriteContext ctx(txn, "local");
+            Lock::DBLock dblk(txn->lockState(), "local", MODE_X);
+            WriteUnitOfWork wunit(txn);
             // clean out local.me
             Helpers::emptyCollection(txn, "local.me");
 
@@ -180,7 +179,7 @@ namespace repl {
             b.append("host", myname);
             _me = b.obj();
             Helpers::putSingleton(txn, "local.me", _me);
-            ctx.commit();
+            wunit.commit();
         }
         _me = _me.getOwned();
     }
@@ -337,6 +336,36 @@ namespace repl {
         replAllDead = 0;
     }
 
+    bool replHandshake(DBClientConnection *conn, const OID& myRID) {
+        string myname = getHostName();
+
+        BSONObjBuilder cmd;
+        cmd.append("handshake", myRID);
+
+        BSONObj res;
+        bool ok = conn->runCommand( "admin" , cmd.obj() , res );
+        // ignoring for now on purpose for older versions
+        LOG( ok ? 1 : 0 ) << "replHandshake res not: " << ok << " res: " << res << endl;
+        return true;
+    }
+
+    bool ReplSource::_connect(OplogReader* reader, const HostAndPort& host, const OID& myRID) {
+        if (reader->conn()) {
+            return true;
+        }
+
+        if (!reader->connect(host)) {
+            return false;
+        }
+
+        if (!replHandshake(reader->conn(), myRID)) {
+            return false;
+        }
+
+        return true;
+    }
+
+
     void ReplSource::forceResync( OperationContext* txn, const char *requester ) {
         BSONObj info;
         {
@@ -344,14 +373,15 @@ namespace repl {
             invariant(txn->lockState()->isW());
             Lock::TempRelease tempRelease(txn->lockState());
 
-            if (!oplogReader.connect(HostAndPort(hostName), 
-                                     getGlobalReplicationCoordinator()->getMyRID())) {
+            if (!_connect(&oplogReader, HostAndPort(hostName), 
+                          getGlobalReplicationCoordinator()->getMyRID())) {
                 msgassertedNoTrace( 14051 , "unable to connect to resync");
             }
             /* todo use getDatabaseNames() method here */
             bool ok = oplogReader.conn()->runCommand( "admin", BSON( "listDatabases" << 1 ), info );
             massert( 10385 ,  "Unable to get database list", ok );
         }
+
         BSONObjIterator i( info.getField( "databases" ).embeddedObject() );
         while( i.moreWithEOO() ) {
             BSONElement e = i.next();
@@ -829,8 +859,7 @@ namespace repl {
         if ( !oplogReader.more() ) {
             if ( tailing ) {
                 LOG(2) << "repl: tailing & no new activity\n";
-                if( oplogReader.awaitCapable() )
-                    okResultCode = 0; // don't sleep
+                okResultCode = 0; // don't sleep
 
             }
             else {
@@ -911,7 +940,7 @@ namespace repl {
                 if ( moreInitialSyncsPending || !oplogReader.more() ) {
                     Lock::GlobalWrite lk(txn->lockState());
                     
-                    if (oplogReader.awaitCapable() && tailing) {
+                    if (tailing) {
                         okResultCode = 0; // don't sleep
                     }
 
@@ -1021,8 +1050,9 @@ namespace repl {
             return -1;
         }
 
-        if ( !oplogReader.connect(HostAndPort(hostName), 
-                                  getGlobalReplicationCoordinator()->getMyRID()) ) {
+        if ( !_connect(&oplogReader, 
+                       HostAndPort(hostName), 
+                       getGlobalReplicationCoordinator()->getMyRID()) ) {
             LOG(4) << "repl:  can't connect to sync source" << endl;
             return -1;
         }
@@ -1340,9 +1370,10 @@ namespace repl {
                 BSONObjBuilder b;
                 b.append(_id);
                 BSONObj result;
-                Client::ReadContext ctx(txn, ns );
-                if( Helpers::findById(txn, ctx.ctx().db(), ns, b.done(), result) )
+                AutoGetCollectionForRead ctx(txn, ns );
+                if (Helpers::findById(txn, ctx.getDb(), ns, b.done(), result)) {
                     _dummy_z += result.objsize(); // touch
+                }
             }
         }
         catch( DBException& ) {

@@ -1,5 +1,5 @@
 /*
- *    Copyright (C) 2012 10gen, Inc.  All Rights Reserved.
+ *    Copyright (C) 2012 10gen, Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -47,7 +47,8 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-    SaslAuthenticationSession::SaslSessionFactoryFn SaslAuthenticationSession::create = NULL;
+    SaslAuthenticationSession::SaslAuthenticationSessionFactoryFn
+        SaslAuthenticationSession::create = NULL;
 
     // Mechanism name constants.
     const char SaslAuthenticationSession::mechanismCRAMMD5[] = "CRAM-MD5";
@@ -55,7 +56,7 @@ namespace mongo {
     const char SaslAuthenticationSession::mechanismSCRAMSHA1[] = "SCRAM-SHA-1";
     const char SaslAuthenticationSession::mechanismGSSAPI[] = "GSSAPI";
     const char SaslAuthenticationSession::mechanismPLAIN[] = "PLAIN";
-    
+
     /**
      * Standard method in mongodb for determining if "authenticatedUser" may act as "requestedUser."
      *

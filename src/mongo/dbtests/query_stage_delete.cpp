@@ -32,6 +32,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/operation_context_impl.h"
@@ -53,13 +54,11 @@ namespace QueryStageDelete {
                 bob.append("foo", static_cast<long long int>(i));
                 _client.insert(ns(), bob.obj());
             }
-            ctx.commit();
         }
 
         virtual ~QueryStageDeleteBase() {
             Client::WriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
-            ctx.commit();
         }
 
         void remove(const BSONObj& obj) {
@@ -109,7 +108,7 @@ namespace QueryStageDelete {
         void run() {
             Client::WriteContext ctx(&_txn, ns());
 
-            Collection* coll = ctx.ctx().db()->getCollection(&_txn, ns());
+            Collection* coll = ctx.getCollection();
 
             // Get the DiskLocs that would be returned by an in-order scan.
             vector<DiskLoc> locs;
@@ -157,8 +156,6 @@ namespace QueryStageDelete {
             }
 
             ASSERT_EQUALS(numObj() - 1, stats->docsDeleted);
-
-            ctx.commit();
         }
     };
 
@@ -170,6 +167,8 @@ namespace QueryStageDelete {
             // Stage-specific tests below.
             add<QueryStageDeleteInvalidateUpcomingObject>();
         }
-    } all;
+    };
+
+    SuiteInstance<All> all;
 
 }

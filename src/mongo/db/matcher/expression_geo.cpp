@@ -28,6 +28,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/pch.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/geo/geoparser.h"
@@ -47,116 +49,96 @@ namespace mongo {
     GeoExpression::GeoExpression() : field(""), predicate(INVALID) {}
     GeoExpression::GeoExpression(const std::string& f) : field(f), predicate(INVALID) {}
 
-    bool GeoExpression::parseLegacyQuery(const BSONObj &obj) {
-        // The only legacy syntax is {$within: {.....}}
+    Status GeoExpression::parseQuery(const BSONObj &obj) {
         BSONObjIterator outerIt(obj);
-        if (!outerIt.more()) { return false; }
-        BSONElement withinElt = outerIt.next();
-        if (outerIt.more()) { return false; }
-        if (!withinElt.isABSONObj()) { return false; }
-        if (!equals(withinElt.fieldName(), "$within") && !equals(withinElt.fieldName(), "$geoWithin")) {
-            return false;
-        }
-        BSONObj withinObj = withinElt.embeddedObject();
-
-        bool hasGeometry = false;
-
-        BSONObjIterator withinIt(withinObj);
-        while (withinIt.more()) {
-            BSONElement elt = withinIt.next();
-            if (equals(elt.fieldName(), "$uniqueDocs")) {
-                warning() << "deprecated $uniqueDocs option: " << obj.toString() << endl;
-                // return false;
-            }
-            else if (elt.isABSONObj()) {
-                hasGeometry = geoContainer->parseFrom(elt.wrap());
-            }
-            else {
-                warning() << "bad geo query: " << obj.toString() << endl;
-                return false;
-            }
+        // "within" / "geoWithin" / "geoIntersects"
+        BSONElement queryElt = outerIt.next();
+        if (outerIt.more()) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "can't parse extra field: " << outerIt.next());
         }
 
-        predicate = GeoExpression::WITHIN;
-
-        return hasGeometry;
-    }
-
-    bool GeoExpression::parseNewQuery(const BSONObj &obj) {
-        // pointA = { "type" : "Point", "coordinates": [ 40, 5 ] }
-        // t.find({ "geo" : { "$intersect" : { "$geometry" : pointA} } })
-        // t.find({ "geo" : { "$within" : { "$geometry" : polygon } } })
-        // where field.name is "geo"
-        BSONElement e = obj.firstElement();
-        if (!e.isABSONObj()) { return false; }
-
-        BSONObj::MatchType matchType = static_cast<BSONObj::MatchType>(e.getGtLtOp());
+        BSONObj::MatchType matchType = static_cast<BSONObj::MatchType>(queryElt.getGtLtOp());
         if (BSONObj::opGEO_INTERSECTS == matchType) {
             predicate = GeoExpression::INTERSECT;
         } else if (BSONObj::opWITHIN == matchType) {
             predicate = GeoExpression::WITHIN;
         } else {
-            return false;
+            // eoo() or unknown query predicate.
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "invalid geo query predicate: " << obj);
         }
 
-        bool hasGeometry = false;
-        BSONObjIterator argIt(e.embeddedObject());
-        while (argIt.more()) {
-            BSONElement e = argIt.next();
-            if (mongoutils::str::equals(e.fieldName(), "$geometry")) {
-                if (e.isABSONObj()) {
-                    BSONObj embeddedObj = e.embeddedObject();
-                     if (geoContainer->parseFrom(embeddedObj)) {
-                         hasGeometry = true;
-                     }
-                }
+        // Parse geometry after predicates.
+        if (Object != queryElt.type()) return Status(ErrorCodes::BadValue, "geometry must be an object");
+        BSONObj geoObj = queryElt.Obj();
+
+        BSONObjIterator geoIt(geoObj);
+
+        while (geoIt.more()) {
+            BSONElement elt = geoIt.next();
+            if (str::equals(elt.fieldName(), "$uniqueDocs")) {
+                // Deprecated "$uniqueDocs" field
+                warning() << "deprecated $uniqueDocs option: " << obj.toString() << endl;
+            } else {
+                // The element must be a geo specifier. "$box", "$center", "$geometry", etc.
+                geoContainer.reset(new GeometryContainer());
+                Status status = geoContainer->parseFromQuery(elt);
+                if (!status.isOK()) return status;
             }
         }
 
-        // Don't want to give the error below if we could not pull any geometry out.
-        if (!hasGeometry) { return false; }
-
-        if (GeoExpression::WITHIN == predicate) {
-            // Why do we only deal with $within {polygon}?
-            // 1. Finding things within a point is silly and only valid
-            // for points and degenerate lines/polys.
-            //
-            // 2. Finding points within a line is easy but that's called intersect.
-            // Finding lines within a line is kind of tricky given what S2 gives us.
-            // Doing line-within-line is a valid yet unsupported feature,
-            // though I wonder if we want to preserve orientation for lines or
-            // allow (a,b),(c,d) to be within (c,d),(a,b).  Anyway, punt on
-            // this for now.
-            uassert(16672, "$within not supported with provided geometry: " + obj.toString(),
-                    geoContainer->supportsContains());
+        if (geoContainer == NULL) {
+            return Status(ErrorCodes::BadValue, "geo query doesn't have any geometry");
         }
 
-        return hasGeometry;
+        return Status::OK();
     }
 
-    bool GeoExpression::parseFrom(const BSONObj &obj) {
-        geoContainer.reset(new GeometryContainer());
-        if (!(parseLegacyQuery(obj) || parseNewQuery(obj)))
-            return false;
+    Status GeoExpression::parseFrom(const BSONObj &obj) {
+        // Initialize geoContainer and parse BSON object
+        Status status = parseQuery(obj);
+        if (!status.isOK()) return status;
+
+        // Why do we only deal with $within {polygon}?
+        // 1. Finding things within a point is silly and only valid
+        // for points and degenerate lines/polys.
+        //
+        // 2. Finding points within a line is easy but that's called intersect.
+        // Finding lines within a line is kind of tricky given what S2 gives us.
+        // Doing line-within-line is a valid yet unsupported feature,
+        // though I wonder if we want to preserve orientation for lines or
+        // allow (a,b),(c,d) to be within (c,d),(a,b).  Anyway, punt on
+        // this for now.
+        if (GeoExpression::WITHIN == predicate && !geoContainer->supportsContains()) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "$within not supported with provided geometry: " << obj);
+        }
 
         // Big polygon with strict winding order is represented as an S2Loop in SPHERE CRS.
         // So converting the query to SPHERE CRS makes things easier than projecting all the data
         // into STRICT_SPHERE CRS.
         if (STRICT_SPHERE == geoContainer->getNativeCRS()) {
-            if (!geoContainer->supportsProject(SPHERE))
-                return false;
+            if (!geoContainer->supportsProject(SPHERE)) {
+                return Status(ErrorCodes::BadValue,
+                              "only polygon supported with strict winding order");
+            }
             geoContainer->projectInto(SPHERE);
         }
 
         // $geoIntersect queries are hardcoded to *always* be in SPHERE CRS
         // TODO: This is probably bad semantics, should not do this
         if (GeoExpression::INTERSECT == predicate) {
-            if (!geoContainer->supportsProject(SPHERE))
-                return false;
+            if (!geoContainer->supportsProject(SPHERE)) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream()
+                                      << "$geoIntersect not supported with provided geometry: "
+                                      << obj);
+            }
             geoContainer->projectInto(SPHERE);
         }
 
-        return true;
+        return Status::OK();
     }
 
     //
@@ -196,7 +178,7 @@ namespace mongo {
                 if (!e.isABSONObj()) { return false; }
                 BSONObj embeddedObj = e.embeddedObject();
 
-                if ((GeoParser::isPoint(embeddedObj) && GeoParser::parsePoint(embeddedObj, centroid.get()))
+                if (GeoParser::parseQueryPoint(e, centroid.get()).isOK()
                     || GeoParser::parsePointWithMaxDistance(embeddedObj, centroid.get(), &maxDistance)) {
                     uassert(18522, "max distance must be non-negative", maxDistance >= 0.0);
                     hasGeometry = true;
@@ -252,12 +234,12 @@ namespace mongo {
             if (equals(e.fieldName(), "$geometry")) {
                 if (e.isABSONObj()) {
                     BSONObj embeddedObj = e.embeddedObject();
-                    uassert(16885, "$near requires a point, given " + embeddedObj.toString(),
-                            GeoParser::isPoint(embeddedObj));
-                    if (!GeoParser::parsePoint(embeddedObj, centroid.get())) {
-                        return Status(ErrorCodes::BadValue, mongoutils::str::stream() <<
-                                      "invalid point in geo near query $geometry argument: " <<
-                                      embeddedObj);
+                    Status status = GeoParser::parseQueryPoint(e, centroid.get());
+                    if (!status.isOK()) {
+                        return Status(ErrorCodes::BadValue,
+                                      str::stream()
+                                              << "invalid point in geo near query $geometry argument: "
+                                              << embeddedObj << "  " << status.reason());
                     }
                     uassert(16681, "$near requires geojson point, given " + embeddedObj.toString(),
                             (SPHERE == centroid->crs));
@@ -343,7 +325,7 @@ namespace mongo {
             return false;
 
         GeometryContainer geometry;
-        if ( !geometry.parseFrom( e.Obj() ) )
+        if ( !geometry.parseFromStorage( e ).isOK() )
                 return false;
 
         // Never match big polygon

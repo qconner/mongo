@@ -30,14 +30,16 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/insert.h"
@@ -125,6 +127,12 @@ namespace mongo {
                 return false;
             }
 
+            if (NamespaceString::oplog(source) != NamespaceString::oplog(target)) {
+                errmsg =
+                    "If either the source or target of a rename is an oplog name, both must be";
+                return false;
+            }
+
             if (!fromRepl) { // If it got through on the master, need to allow it here too
                 Status sourceStatus = userAllowedWriteNS(source);
                 if (!sourceStatus.isOK()) {
@@ -137,6 +145,12 @@ namespace mongo {
                     errmsg = "error with target namespace: " + targetStatus.reason();
                     return false;
                 }
+            }
+
+            if (NamespaceString(source).coll() == "system.indexes"
+                || NamespaceString(target).coll() == "system.indexes") {
+                errmsg = "renaming system.indexes is not allowed";
+                return false;
             }
 
             Database* const sourceDB = dbHolder().get(txn, nsToDatabase(source));
@@ -177,8 +191,7 @@ namespace mongo {
             // Dismissed on success
             ScopeGuard indexBuildRestorer = MakeGuard(IndexBuilder::restoreIndexes, indexesInProg);
 
-            bool unused;
-            Database* const targetDB = dbHolder().getOrCreate(txn, nsToDatabase(target), unused);
+            Database* const targetDB = dbHolder().openDb(txn, nsToDatabase(target));
 
             {
                 WriteUnitOfWork wunit(txn);
@@ -217,6 +230,8 @@ namespace mongo {
                     indexBuildRestorer.Dismiss();
                     return true;
                 }
+
+                wunit.commit();
             }
 
             // If we get here, we are renaming across databases, so we must copy all the data and
@@ -230,9 +245,12 @@ namespace mongo {
                 options.setNoIdIndex();
 
                 if (sourceColl->isCapped()) {
-                    // TODO stop assuming storageSize == cappedSize
+                    const CollectionOptions sourceOpts =
+                        sourceColl->getCatalogEntry()->getCollectionOptions(txn);
+
                     options.capped = true;
-                    options.cappedSize = sourceColl->getRecordStore()->storageSize(txn);
+                    options.cappedSize = sourceOpts.cappedSize;
+                    options.cappedMaxDocs = sourceOpts.cappedMaxDocs;
                 }
 
                 WriteUnitOfWork wunit(txn);

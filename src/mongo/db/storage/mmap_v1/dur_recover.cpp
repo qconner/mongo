@@ -52,6 +52,7 @@
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage/mmap_v1/durop.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/checksum.h"
@@ -63,6 +64,15 @@
 using namespace mongoutils;
 
 namespace mongo {
+
+    /**
+     * Thrown when a journal section is corrupt. This is considered OK as long as it occurs while
+     * processing the last file. Processing stops at the first corrupt section.
+     *
+     * Any logging about the nature of the corruption should happen before throwing as this class
+     * contains no data.
+     */
+    class JournalSectionCorruptException {};
 
     namespace dur {
 
@@ -127,9 +137,10 @@ namespace mongo {
                 verify( doDurOpsRecovering );
                 bool ok = uncompress((const char *)compressed, compressedLen, &_uncompressed);
                 if( !ok ) { 
-                    // it should always be ok (i think?) as there is a previous check to see that the JSectFooter is ok
+                    // We check the checksum before we uncompress, but this may still fail as the
+                    // checksum isn't foolproof.
                     log() << "couldn't uncompress journal section" << endl;
-                    msgasserted(15874, "couldn't uncompress journal section");
+                    throw JournalSectionCorruptException();
                 }
                 const char *p = _uncompressed.c_str();
                 verify( compressedLen == _h.sectionLen() - sizeof(JSectFooter) - sizeof(JSectHeader) );
@@ -178,7 +189,11 @@ namespace mongo {
                         const unsigned limit = std::min((unsigned)Namespace::MaxNsLenWithNUL,
                                                         _entries->remaining());
                         const unsigned len = strnlen(_lastDbName, limit);
-                        massert(13533, "problem processing journal file during recovery", _lastDbName[len] == '\0');
+                        if (_lastDbName[len] != '\0') {
+                            log() << "problem processing journal file during recovery";
+                            throw JournalSectionCorruptException();
+                        }
+
                         _entries->skip(len+1); // skip '\0' too
                         _entries->read(lenOrOpCode); // read this for the fall through
                     }
@@ -354,10 +369,10 @@ namespace mongo {
         }
 
         void RecoveryJob::applyEntries(const vector<ParsedJournalEntry> &entries) {
-            bool apply = (storageGlobalParams.durOptions &
-                          StorageGlobalParams::DurScanOnly) == 0;
-            bool dump = storageGlobalParams.durOptions &
-                        StorageGlobalParams::DurDumpJournal;
+            bool apply = (mmapv1GlobalOptions.journalOptions &
+                          MMAPV1Options::JournalScanOnly) == 0;
+            bool dump = mmapv1GlobalOptions.journalOptions &
+                        MMAPV1Options::JournalDumpJournal;
             if( dump )
                 log() << "BEGIN section" << endl;
 
@@ -374,10 +389,15 @@ namespace mongo {
             LockMongoFilesShared lkFiles; // for RecoveryJob::Last
             scoped_lock lk(_mx);
 
-            /** todo: we should really verify the checksum to see that seqNumber is ok?
-                      that is expensive maybe there is some sort of checksum of just the header 
-                      within the header itself
-            */
+            // Check the footer checksum before doing anything else.
+            if (_recovering) {
+                verify( ((const char *)h) + sizeof(JSectHeader) == p );
+                if (!f->checkHash(h, len + sizeof(JSectHeader))) {
+                    log() << "journal section checksum doesn't match";
+                    throw JournalSectionCorruptException();
+                }
+            }
+
             if( _recovering && _lastDataSyncedFromLastRun > h->seqNumber + ExtraKeepTimeMs ) {
                 if( h->seqNumber != _lastSeqMentionedInConsoleLog ) {
                     static int n;
@@ -420,14 +440,6 @@ namespace mongo {
                 entries.push_back(e);
             }
 
-            // after the entries check the footer checksum
-            if( _recovering ) {
-                verify( ((const char *)h) + sizeof(JSectHeader) == p );
-                if( !f->checkHash(h, len + sizeof(JSectHeader)) ) { 
-                    msgasserted(13594, "journal checksum doesn't match");
-                }
-            }
-
             // got all the entries for one group commit.  apply them:
             applyEntries(entries);
         }
@@ -446,25 +458,25 @@ namespace mongo {
                     JHeader h;
                     br.read(h);
 
-                    /* [dm] not automatically handled.  we should eventually handle this automatically.  i think:
-                       (1) if this is the final journal file
-                       (2) and the file size is just the file header in length (or less) -- this is a bit tricky to determine if prealloced
-                       then can just assume recovery ended cleanly and not error out (still should log).
-                    */
-                    uassert(13537, 
-                        "journal file header invalid. This could indicate corruption in a journal file, or perhaps a crash where sectors in file header were in flight written out of order at time of crash (unlikely but possible).", 
-                        h.valid());
+                    if (!h.valid()) {
+                        log() << "Journal file header invalid. This could indicate corruption, or "
+                              << "an unclean shutdown while writing the first section in a journal "
+                              << "file.";
+                        throw JournalSectionCorruptException();
+                    }
 
                     if( !h.versionOk() ) {
                         log() << "journal file version number mismatch got:" << hex << h._version                             
                             << " expected:" << hex << (unsigned) JHeader::CurrentVersion 
                             << ". if you have just upgraded, recover with old version of mongod, terminate cleanly, then upgrade." 
                             << endl;
+                        // Not using JournalSectionCurruptException as we don't want to ignore
+                        // journal files on upgrade.
                         uasserted(13536, str::stream() << "journal version number mismatch " << h._version);
                     }
                     fileId = h.fileId;
-                    if (storageGlobalParams.durOptions &
-                        StorageGlobalParams::DurDumpJournal) {
+                    if (mmapv1GlobalOptions.journalOptions &
+                        MMAPV1Options::JournalDumpJournal) {
                         log() << "JHeader::fileId=" << fileId << endl;
                     }
                 }
@@ -474,8 +486,8 @@ namespace mongo {
                     JSectHeader h;
                     br.peek(h);
                     if( h.fileId != fileId ) {
-                        if (debug || (storageGlobalParams.durOptions &
-                                      StorageGlobalParams::DurDumpJournal)) {
+                        if (debug || (mmapv1GlobalOptions.journalOptions &
+                                      MMAPV1Options::JournalDumpJournal)) {
                             log() << "Ending processFileBuffer at differing fileId want:" << fileId << " got:" << h.fileId << endl;
                             log() << "  sect len:" << h.sectionLen() << " seqnum:" << h.seqNumber << endl;
                         }
@@ -492,8 +504,13 @@ namespace mongo {
                     uassert(ErrorCodes::Interrupted, "interrupted during journal recovery", !inShutdown());
                 }
             }
-            catch( BufReader::eof& ) {
-                if (storageGlobalParams.durOptions & StorageGlobalParams::DurDumpJournal)
+            catch (const BufReader::eof&) {
+                if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalDumpJournal)
+                    log() << "ABRUPT END" << endl;
+                return true; // abrupt end
+            }
+            catch (const JournalSectionCorruptException&) {
+                if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalDumpJournal)
                     log() << "ABRUPT END" << endl;
                 return true; // abrupt end
             }
@@ -542,9 +559,9 @@ namespace mongo {
 
             close();
 
-            if (storageGlobalParams.durOptions & StorageGlobalParams::DurScanOnly) {
+            if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalScanOnly) {
                 uasserted(13545, str::stream() << "--durOptions "
-                                               << (int) StorageGlobalParams::DurScanOnly
+                                               << (int) MMAPV1Options::JournalScanOnly
                                                << " (scan only) specified");
             }
 

@@ -1,5 +1,5 @@
 /*
- *    Copyright (C) 2014 10gen, Inc.  All Rights Reserved.
+ *    Copyright (C) 2014 10gen, Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,10 +36,10 @@
 #include "mongo/db/auth/authentication_session.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/db/auth/sasl_authentication_session.h"
-#include "mongo/db/auth/sasl_conversation.h"
+#include "mongo/db/auth/sasl_server_conversation.h"
 
 namespace mongo {
-    
+
     /**
      * Authentication session data for the server side of SASL authentication.
      */
@@ -60,11 +60,11 @@ namespace mongo {
         virtual Status step(const StringData& inputData, std::string* outputData);
 
         virtual std::string getPrincipalId() const;
-    
+
         virtual const char* getMechanism() const;
 
     private:
         std::string _mechanism;
-        boost::scoped_ptr<SaslConversation> _saslConversation;
+        boost::scoped_ptr<SaslServerConversation> _saslConversation;
     };
 }  // namespace mongo

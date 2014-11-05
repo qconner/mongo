@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/db/storage/mmap_v1/record_store_v1_test_help.h"
 
 #include <algorithm>
@@ -37,6 +39,7 @@
 
 #include "mongo/db/storage/mmap_v1/extent.h"
 #include "mongo/db/storage/mmap_v1/record.h"
+#include "mongo/db/storage/record_fetcher.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/log.h"
@@ -92,17 +95,17 @@ namespace mongo {
     }
 
     void DummyRecordStoreV1MetaData::setStats( OperationContext* txn,
-                                               long long dataSizeIncrement,
-                                               long long numRecordsIncrement ) {
-        _dataSize = dataSizeIncrement;
-        _numRecords = numRecordsIncrement;
+                                               long long dataSize,
+                                               long long numRecords ) {
+        _dataSize = dataSize;
+        _numRecords = numRecords;
     }
 
     namespace {
         DiskLoc myNull;
     }
 
-    const DiskLoc& DummyRecordStoreV1MetaData::deletedListEntry( int bucket ) const {
+    DiskLoc DummyRecordStoreV1MetaData::deletedListEntry( int bucket ) const {
         invariant( bucket >= 0 );
         if ( static_cast<size_t>( bucket ) >= _deletedLists.size() )
             return myNull;
@@ -119,8 +122,18 @@ namespace mongo {
         _deletedLists[bucket] = loc;
     }
 
+    DiskLoc DummyRecordStoreV1MetaData::deletedListLegacyGrabBag() const {
+        return _deletedListLegacyGrabBag;
+    }
+
+    void DummyRecordStoreV1MetaData::setDeletedListLegacyGrabBag(OperationContext* txn,
+                                                                   const DiskLoc& loc) {
+        _deletedListLegacyGrabBag = loc;
+    }
+
     void DummyRecordStoreV1MetaData::orphanDeletedList(OperationContext* txn) {
-        invariant( false );
+        // They will be recreated on demand.
+        _deletedLists.clear();
     }
 
     const DiskLoc& DummyRecordStoreV1MetaData::firstExtent(OperationContext* txn) const {
@@ -185,15 +198,6 @@ namespace mongo {
         return _maxCappedDocs;
     }
 
-    double DummyRecordStoreV1MetaData::paddingFactor() const {
-        return _paddingFactor;
-    }
-
-    void DummyRecordStoreV1MetaData::setPaddingFactor( OperationContext* txn,
-                                                       double paddingFactor ) {
-        _paddingFactor = paddingFactor;
-    }
-
     // -----------------------------------------
 
     DummyExtentManager::~DummyExtentManager() {
@@ -250,13 +254,21 @@ namespace mongo {
     void DummyExtentManager::freeExtent( OperationContext* txn, DiskLoc extent ) {
         // XXX
     }
-    void DummyExtentManager::freeListStats( int* numExtents, int64_t* totalFreeSize ) const {
-        invariant( false );
+    void DummyExtentManager::freeListStats(OperationContext* txn,
+                                           int* numExtents,
+                                           int64_t* totalFreeSizeBytes) const {
+        invariant(false);
+    }
+
+    RecordFetcher* DummyExtentManager::recordNeedsFetch( const DiskLoc& loc ) const {
+        return NULL;
     }
 
     Record* DummyExtentManager::recordForV1( const DiskLoc& loc ) const {
-        invariant( static_cast<size_t>( loc.a() ) < _extents.size() );
-        invariant( static_cast<size_t>( loc.getOfs() ) < _extents[loc.a()].length );
+        if ( static_cast<size_t>( loc.a() ) >= _extents.size() )
+            return NULL;
+        if ( static_cast<size_t>( loc.getOfs() ) >= _extents[loc.a()].length )
+            return NULL;
         char* root = _extents[loc.a()].data;
         return reinterpret_cast<Record*>( root + loc.getOfs() );
     }
@@ -369,6 +381,7 @@ namespace {
     void initializeV1RS(OperationContext* txn,
                         const LocAndSize* records,
                         const LocAndSize* drecs,
+                        const LocAndSize* legacyGrabBag,
                         DummyExtentManager* em,
                         DummyRecordStoreV1MetaData* md) {
         invariant(records || drecs); // if both are NULL nothing is being created...
@@ -383,6 +396,7 @@ namespace {
             ExtentSizes extentSizes;
             accumulateExtentSizeRequirements(records, &extentSizes);
             accumulateExtentSizeRequirements(drecs, &extentSizes);
+            accumulateExtentSizeRequirements(legacyGrabBag, &extentSizes);
             invariant(!extentSizes.empty());
 
             const int maxExtent = extentSizes.rbegin()->first;
@@ -495,13 +509,41 @@ namespace {
             }
         }
 
+        if (legacyGrabBag && !legacyGrabBag[0].loc.isNull()) {
+            invariant(!md->isCapped()); // capped should have an empty legacy grab bag.
+
+            int grabBagIdx = 0;
+            DiskLoc* prevNextPtr = NULL;
+            while (!legacyGrabBag[grabBagIdx].loc.isNull()) {
+                const DiskLoc loc = legacyGrabBag[grabBagIdx].loc;
+                const int size = legacyGrabBag[grabBagIdx].size;
+                invariant(size >= Record::HeaderSize);
+
+                if (grabBagIdx == 0) {
+                    md->setDeletedListLegacyGrabBag(txn, loc);
+                }
+                else {
+                    *prevNextPtr = loc;
+                }
+
+                DeletedRecord* drec = &em->recordForV1(loc)->asDeleted();
+                drec->lengthWithHeaders() = size;
+                drec->extentOfs() = 0;
+                drec->nextDeleted() = DiskLoc();
+                prevNextPtr = &drec->nextDeleted();
+
+                grabBagIdx++;
+            }
+        }
+
         // Make sure we set everything up as requested.
-        assertStateV1RS(txn, records, drecs, em, md);
+        assertStateV1RS(txn, records, drecs, legacyGrabBag, em, md);
     }
 
     void assertStateV1RS(OperationContext* txn,
                          const LocAndSize* records,
                          const LocAndSize* drecs,
+                         const LocAndSize* legacyGrabBag,
                          const ExtentManager* em,
                          const DummyRecordStoreV1MetaData* md) {
         invariant(records || drecs); // if both are NULL nothing is being asserted...
@@ -598,6 +640,28 @@ namespace {
                 }
                 // both the expected and actual deleted lists must be done at this point
                 ASSERT_EQUALS(drecs[drecIdx].loc, DiskLoc());
+            }
+
+            if (legacyGrabBag) {
+                int grabBagIdx = 0;
+                DiskLoc actualLoc = md->deletedListLegacyGrabBag();
+                while (!actualLoc.isNull()) {
+                    const DeletedRecord* actualDrec = &em->recordForV1(actualLoc)->asDeleted();
+                    const int actualSize = actualDrec->lengthWithHeaders();
+
+                    ASSERT_EQUALS(actualLoc, legacyGrabBag[grabBagIdx].loc);
+                    ASSERT_EQUALS(actualSize, legacyGrabBag[grabBagIdx].size);
+
+                    grabBagIdx++;
+                    actualLoc = actualDrec->nextDeleted();
+                }
+
+                // both the expected and actual deleted lists must be done at this point
+                ASSERT_EQUALS(legacyGrabBag[grabBagIdx].loc, DiskLoc());
+            }
+            else {
+                // Unless a test is actually using the grabBag it should be empty
+                ASSERT_EQUALS(md->deletedListLegacyGrabBag(), DiskLoc());
             }
         }
         catch (...) {

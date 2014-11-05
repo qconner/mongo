@@ -54,6 +54,7 @@ namespace mongo {
     class OperationContext;
 
     class RecordIterator;
+    class RecordFetcher;
 
     class OpDebug;
 
@@ -130,14 +131,18 @@ namespace mongo {
 
         BSONObj docFor(OperationContext* txn, const DiskLoc& loc) const;
 
+        /**
+         * @param out - contents set to the right docs if exists, or nothing.
+         * @return true iff loc exists
+         */
+        bool findDoc(OperationContext* txn, const DiskLoc& loc, BSONObj* out) const;
+
         // ---- things that should move to a CollectionAccessMethod like thing
         /**
-         * canonical to get all would be
-         * getIterator( DiskLoc(), false, CollectionScanParams::FORWARD )
+         * Default arguments will return all items in the collection.
          */
         RecordIterator* getIterator( OperationContext* txn,
                                      const DiskLoc& start = DiskLoc(),
-                                     bool tailable = false,
                                      const CollectionScanParams::Direction& dir = CollectionScanParams::FORWARD ) const;
 
         /**
@@ -181,6 +186,18 @@ namespace mongo {
                                             bool enforceQuota );
 
         /**
+         * If the document at 'loc' is unlikely to be in physical memory, the storage
+         * engine gives us back a RecordFetcher functor which we can invoke in order
+         * to page fault on that record.
+         *
+         * Returns NULL if the document does not need to be fetched.
+         *
+         * Caller takes ownership of the returned RecordFetcher*.
+         */
+        RecordFetcher* documentNeedsFetch( OperationContext* txn,
+                                           const DiskLoc& loc ) const;
+
+        /**
          * updates the document @ oldLocation with newDoc
          * if the document fits in the old space, it is put there
          * if not, it is moved
@@ -197,7 +214,8 @@ namespace mongo {
          */
         Status updateDocumentWithDamages( OperationContext* txn,
                                           const DiskLoc& loc,
-                                          const char* damangeSource,
+                                          const RecordData& oldRec,
+                                          const char* damageSource,
                                           const mutablebson::DamageVector& damages );
 
         // -----------
@@ -256,6 +274,10 @@ namespace mongo {
                 return 5;
             return static_cast<int>( dataSize( txn ) / n );
         }
+
+        uint64_t getIndexSize(OperationContext* opCtx,
+                              BSONObjBuilder* details = NULL,
+                              int scale = 1);
 
         // --- end suspect things
 

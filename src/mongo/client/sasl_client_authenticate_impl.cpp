@@ -196,21 +196,30 @@ namespace {
             return ex.toStatus();
         }
 
-        SaslClientSession session;
-        Status status = configureSession(&session, client, targetDatabase, saslParameters);
+        std::string mechanism;
+        Status status = bsonExtractStringField(saslParameters, 
+                                               saslCommandMechanismFieldName,
+                                               &mechanism);
+        if(!status.isOK()) {
+            return status;
+        }
+
+        boost::scoped_ptr<SaslClientSession> session(SaslClientSession::create(mechanism));
+        status = configureSession(session.get(), client, targetDatabase, saslParameters);
+       
         if (!status.isOK())
             return status;
 
         BSONObj saslFirstCommandPrefix = BSON(
                 saslStartCommandName << 1 <<
                 saslCommandMechanismFieldName <<
-                session.getParameter(SaslClientSession::parameterMechanism));
+                session->getParameter(SaslClientSession::parameterMechanism));
 
         BSONObj saslFollowupCommandPrefix = BSON(saslContinueCommandName << 1);
         BSONObj saslCommandPrefix = saslFirstCommandPrefix;
         BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
         bool isServerDone = false;
-        while (!session.isDone()) {
+        while (!session->isDone()) {
             std::string payload;
             BSONType type;
 
@@ -221,7 +230,7 @@ namespace {
             LOG(saslLogLevel) << "sasl client input: " << base64::encode(payload) << endl;
 
             std::string responsePayload;
-            status = session.step(payload, &responsePayload);
+            status = session->step(payload, &responsePayload);
             if (!status.isOK())
                 return status;
 

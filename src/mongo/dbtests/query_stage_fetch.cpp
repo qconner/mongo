@@ -34,10 +34,10 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/mock_stage.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
@@ -57,8 +57,7 @@ namespace QueryStageFetch {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(), false,
-                                                   CollectionScanParams::FORWARD);
+            RecordIterator* it = coll->getIterator(&_txn);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
                 out->insert(nextLoc);
@@ -89,12 +88,14 @@ namespace QueryStageFetch {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
+
             WorkingSet ws;
 
             // Add an object to the DB.
@@ -102,7 +103,6 @@ namespace QueryStageFetch {
             set<DiskLoc> locs;
             getLocs(&locs, coll);
             ASSERT_EQUALS(size_t(1), locs.size());
-            ctx.commit();
 
             // Create a mock stage that returns the WSM.
             auto_ptr<MockStage> mockStage(new MockStage(&ws));
@@ -114,7 +114,6 @@ namespace QueryStageFetch {
                 mockMember.loc = *locs.begin();
                 mockMember.obj = coll->docFor(&_txn, mockMember.loc);
                 // Points into our DB.
-                ASSERT_FALSE(mockMember.obj.isOwned());
                 mockStage->pushBack(mockMember);
 
                 mockMember.state = WorkingSetMember::OWNED_OBJ;
@@ -148,13 +147,16 @@ namespace QueryStageFetch {
     class FetchStageFilter : public QueryStageFetchBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-
-            Database* db = ctx.ctx().db();
+            Lock::DBLock lk(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X);
+            Client::Context ctx(&_txn, ns());
+            Database* db = ctx.db();
             Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
+
             WorkingSet ws;
 
             // Add an object to the DB.
@@ -199,7 +201,6 @@ namespace QueryStageFetch {
             // No more data to fetch, so, EOF.
             state = fetchStage->work(&id);
             ASSERT_EQUALS(PlanStage::IS_EOF, state);
-            ctx.commit();
         }
     };
 
@@ -211,6 +212,8 @@ namespace QueryStageFetch {
             add<FetchStageAlreadyFetched>();
             add<FetchStageFilter>();
         }
-    }  queryStageFetchAll;
+    };
+
+    SuiteInstance<All> queryStageFetchAll;
 
 }  // namespace QueryStageFetch

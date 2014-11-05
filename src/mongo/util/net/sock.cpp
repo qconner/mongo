@@ -56,6 +56,7 @@
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/socket_poll.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
 
@@ -150,6 +151,12 @@ namespace mongo {
     }
 
     // --- SockAddr
+    SockAddr::SockAddr() {
+        addressSize = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        sa.ss_family = AF_UNSPEC;
+        _isValid = true;
+    }
 
     SockAddr::SockAddr(int sourcePort) {
         memset(as<sockaddr_in>().sin_zero, 0, sizeof(as<sockaddr_in>().sin_zero));
@@ -157,6 +164,7 @@ namespace mongo {
         as<sockaddr_in>().sin_port = htons(sourcePort);
         as<sockaddr_in>().sin_addr.s_addr = htonl(INADDR_ANY);
         addressSize = sizeof(sockaddr_in);
+        _isValid = true;
     }
 
     SockAddr::SockAddr(const char * _iporhost , int port) {
@@ -174,50 +182,54 @@ namespace mongo {
             as<sockaddr_un>().sun_family = AF_UNIX;
             strcpy(as<sockaddr_un>().sun_path, target.c_str());
             addressSize = sizeof(sockaddr_un);
+            _isValid = true;
+            return;
         }
-        else {
-            addrinfo* addrs = NULL;
-            addrinfo hints;
-            memset(&hints, 0, sizeof(addrinfo));
-            hints.ai_socktype = SOCK_STREAM;
-            //hints.ai_flags = AI_ADDRCONFIG; // This is often recommended but don't do it. 
-                                              // SERVER-1579
-            hints.ai_flags |= AI_NUMERICHOST; // first pass tries w/o DNS lookup
-            hints.ai_family = (IPv6Enabled() ? AF_UNSPEC : AF_INET);
 
-            StringBuilder ss;
-            ss << port;
-            int ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
+        addrinfo* addrs = NULL;
+        addrinfo hints;
+        memset(&hints, 0, sizeof(addrinfo));
+        hints.ai_socktype = SOCK_STREAM;
+        //hints.ai_flags = AI_ADDRCONFIG; // This is often recommended but don't do it. 
+                                          // SERVER-1579
+        hints.ai_flags |= AI_NUMERICHOST; // first pass tries w/o DNS lookup
+        hints.ai_family = (IPv6Enabled() ? AF_UNSPEC : AF_INET);
 
-            // old C compilers on IPv6-capable hosts return EAI_NODATA error
+        StringBuilder ss;
+        ss << port;
+        int ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
+
+        // old C compilers on IPv6-capable hosts return EAI_NODATA error
 #ifdef EAI_NODATA
-            int nodata = (ret == EAI_NODATA);
+        int nodata = (ret == EAI_NODATA);
 #else
-            int nodata = false;
+        int nodata = false;
 #endif
-            if ( (ret == EAI_NONAME || nodata) ) {
-                // iporhost isn't an IP address, allow DNS lookup
-                hints.ai_flags &= ~AI_NUMERICHOST;
-                ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
-            }
-
-            if (ret) {
-                // we were unsuccessful
-                if( target != "0.0.0.0" ) { // don't log if this as it is a 
-                                            // CRT construction and log() may not work yet.
-                    log() << "getaddrinfo(\"" << target << "\") failed: " << 
-                        getAddrInfoStrError(ret) << endl;
-                }
-                *this = SockAddr(port);
-            }
-            else {
-                //TODO: handle other addresses in linked list;
-                fassert(16501, addrs->ai_addrlen <= sizeof(sa));
-                memcpy(&sa, addrs->ai_addr, addrs->ai_addrlen);
-                addressSize = addrs->ai_addrlen;
-                freeaddrinfo(addrs);
-            }
+        if ( (ret == EAI_NONAME || nodata) ) {
+            // iporhost isn't an IP address, allow DNS lookup
+            hints.ai_flags &= ~AI_NUMERICHOST;
+            ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
         }
+
+        if (ret) {
+            // we were unsuccessful
+            if( target != "0.0.0.0" ) { // don't log if this as it is a
+                                        // CRT construction and log() may not work yet.
+                log() << "getaddrinfo(\"" << target << "\") failed: " <<
+                    getAddrInfoStrError(ret) << endl;
+                _isValid = false;
+                return;
+            }
+            *this = SockAddr(port);
+            return;
+        }
+
+        //TODO: handle other addresses in linked list;
+        fassert(16501, addrs->ai_addrlen <= sizeof(sa));
+        memcpy(&sa, addrs->ai_addr, addrs->ai_addrlen);
+        addressSize = addrs->ai_addrlen;
+        freeaddrinfo(addrs);
+        _isValid = true;
     }
 
     bool SockAddr::isLocalHost() const {
@@ -341,11 +353,11 @@ namespace mongo {
     // If an ip address is passed in, just return that.  If a hostname is passed
     // in, look up its ip and return that.  Returns "" on failure.
     string hostbyname(const char *hostname) {
-        string addr =  SockAddr(hostname, 0).getAddr();
-        if (addr == "0.0.0.0")
+        SockAddr sockAddr(hostname, 0);
+        if (!sockAddr.isValid() || sockAddr.getAddr() == "0.0.0.0")
             return "";
         else
-            return addr;
+            return sockAddr.getAddr();
     }
    
     //  --- my --
@@ -455,15 +467,6 @@ namespace mongo {
 
     void Socket::close() {
         if ( _fd >= 0 ) {
-#ifdef MONGO_SSL
-            if (_sslConnection.get()) {
-                try {
-                    _sslManager->SSL_shutdown( _sslConnection.get() );
-                }
-                catch (const SocketException&) { // SSL_shutdown may throw if the connection fails
-                }  
-            }
-#endif
             // Stop any blocking reads/writes, and prevent new reads/writes
 #if defined(_WIN32)
             shutdown( _fd, SD_BOTH );
@@ -821,6 +824,12 @@ namespace mongo {
     // isStillConnected() polls the socket at max every Socket::errorPollIntervalSecs to determine
     // if any disconnection-type events have happened on the socket.
     bool Socket::isStillConnected() {
+        if (_fd == -1) {
+            // According to the man page, poll will respond with POLLVNAL for invalid or
+            // unopened descriptors, but it doesn't seem to be properly implemented in
+            // some platforms - it can return 0 events and 0 for revent. Hence this workaround.
+            return false;
+        }
 
         if ( errorPollIntervalSecs < 0 ) return true;
         if ( ! isPollSupported() ) return true; // nothing we can do
@@ -945,7 +954,7 @@ namespace mongo {
             WSADATA d;
             if ( WSAStartup(MAKEWORD(2,2), &d) != 0 ) {
                 log() << "ERROR: wsastartup failed " << errnoWithDescription() << endl;
-                _exit(EXIT_NTSERVICE_ERROR);
+                quickExit(EXIT_NTSERVICE_ERROR);
             }
         }
     } winsock_init;

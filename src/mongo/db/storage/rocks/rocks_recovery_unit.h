@@ -30,9 +30,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <stack>
 #include <string>
+#include <vector>
+#include <unordered_map>
 
 #include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
@@ -43,15 +46,22 @@
 namespace rocksdb {
     class DB;
     class Snapshot;
-    class WriteBatch;
+    class WriteBatchWithIndex;
+    class Comparator;
+    class Status;
+    class ColumnFamilyHandle;
+    class Slice;
+    class Iterator;
 }
 
 namespace mongo {
 
+    class OperationContext;
+
     class RocksRecoveryUnit : public RecoveryUnit {
         MONGO_DISALLOW_COPYING(RocksRecoveryUnit);
     public:
-        RocksRecoveryUnit( rocksdb::DB* db, bool defaultCommit );
+        RocksRecoveryUnit(rocksdb::DB* db, bool defaultCommit = false);
         virtual ~RocksRecoveryUnit();
 
         virtual void beginUnitOfWork();
@@ -59,31 +69,64 @@ namespace mongo {
 
         virtual void endUnitOfWork();
 
-        virtual bool commitIfNeeded(bool force = false);
-
         virtual bool awaitCommit();
 
-        virtual void* writingPtr(void* data, size_t len);
+        virtual void commitAndRestart();
 
-        virtual void syncDataAndTruncateJournal();
+        virtual void* writingPtr(void* data, size_t len);
 
         virtual void registerChange(Change* change);
 
         // local api
 
-        rocksdb::WriteBatch* writeBatch();
+        // we need to call this during cleanShutdown(), to make sure that the destructor doesn't try
+        // to commit (or rollback) the changes
+        void destroy();
+
+        rocksdb::WriteBatchWithIndex* writeBatch();
 
         const rocksdb::Snapshot* snapshot();
 
+        // to support tailable cursors
+        void releaseSnapshot();
+
+        rocksdb::Status Get(rocksdb::ColumnFamilyHandle* columnFamily, const rocksdb::Slice& key,
+                            std::string* value);
+
+        rocksdb::Iterator* NewIterator(rocksdb::ColumnFamilyHandle* columnFamily);
+
+        void incrementCounter(const rocksdb::Slice& counterKey,
+                              std::atomic<long long>* counter, long long delta);
+
+        long long getDeltaCounter(const rocksdb::Slice& counterKey);
+
+        struct Counter {
+            std::atomic<long long>* _value;
+            long long _delta;
+            Counter() : Counter(nullptr, 0) {}
+            Counter(std::atomic<long long>* value, long long delta) : _value(value), _delta(delta) {}
+        };
+
+        typedef std::unordered_map<std::string, Counter> CounterMap;
+
+        static RocksRecoveryUnit* getRocksRecoveryUnit(OperationContext* opCtx);
+
     private:
+        void _destroyInternal();
+
         rocksdb::DB* _db; // not owned
         bool _defaultCommit;
 
-        boost::scoped_ptr<rocksdb::WriteBatch> _writeBatch; // owned
-        int _depth;
+        boost::scoped_ptr<rocksdb::WriteBatchWithIndex> _writeBatch; // owned
 
         // bare because we need to call ReleaseSnapshot when we're done with this
         const rocksdb::Snapshot* _snapshot; // owned
+
+        CounterMap _deltaCounters;
+
+        std::vector<Change*> _changes;
+
+        bool _destroyed;
     };
 
 }

@@ -273,7 +273,7 @@ namespace mongo {
 
     BSONObj DBClientCursor::nextSafe() {
         BSONObj o = next();
-        if( strcmp(o.firstElementFieldName(), "$err") == 0 ) {
+        if( this->wasError && strcmp(o.firstElementFieldName(), "$err") == 0 ) {
             std::string s = "nextSafe(): " + o.toString();
             LOG(5) << s;
             uasserted(13106, s);
@@ -350,9 +350,6 @@ namespace mongo {
     }
 
     DBClientCursor::~DBClientCursor() {
-        if (!this)
-            return;
-
         DESTRUCTOR_GUARD (
 
         if ( cursorId && _ownCursor && ! inShutdown() ) {

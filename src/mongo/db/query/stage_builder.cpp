@@ -26,13 +26,15 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/query/stage_builder.h"
 
 #include "mongo/db/client.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/count.h"
+#include "mongo/db/exec/count_scan.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/geo_near.h"
@@ -299,7 +301,7 @@ namespace mongo {
             params.fieldNo = dn->fieldNo;
             return new DistinctScan(txn, params, ws);
         }
-        else if (STAGE_COUNT == root->getType()) {
+        else if (STAGE_COUNT_SCAN == root->getType()) {
             const CountNode* cn = static_cast<const CountNode*>(root);
 
             if (NULL == collection) {
@@ -307,7 +309,7 @@ namespace mongo {
                 return NULL;
             }
 
-            CountParams params;
+            CountScanParams params;
 
             params.descriptor =
                 collection->getIndexCatalog()->findIndexByKeyPattern(txn, cn->indexKeyPattern);
@@ -316,7 +318,7 @@ namespace mongo {
             params.endKey = cn->endKey;
             params.endKeyInclusive = cn->endKeyInclusive;
 
-            return new Count(txn, params, ws);
+            return new CountScan(txn, params, ws);
         }
         else {
             mongoutils::str::stream ss;

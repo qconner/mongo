@@ -29,12 +29,14 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include <string>
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/db.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/index_names.h"
@@ -524,10 +526,10 @@ namespace NamespaceTests {
 
                 OperationContextImpl txn;
 
-                Lock::DBWrite lk(txn.lockState(), dbName);
+                Lock::DBLock lk(txn.lockState(), dbName, MODE_X);
 
                 bool justCreated;
-                Database* db = dbHolder().getOrCreate(&txn, dbName, justCreated);
+                Database* db = dbHolder().openDb(&txn, dbName, &justCreated);
                 ASSERT(justCreated);
 
                 Collection* committedColl;
@@ -567,10 +569,10 @@ namespace NamespaceTests {
 
                 OperationContextImpl txn;
 
-                Lock::DBWrite lk(txn.lockState(), dbName);
+                Lock::DBLock lk(txn.lockState(), dbName, MODE_X);
 
                 bool justCreated;
-                Database* db = dbHolder().getOrCreate(&txn, dbName, justCreated);
+                Database* db = dbHolder().openDb(&txn, dbName, &justCreated);
                 ASSERT(justCreated);
 
                 {
@@ -633,6 +635,9 @@ namespace NamespaceTests {
             add< DatabaseTests::RollbackDropCollection >();
 #endif
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
+
 } // namespace NamespaceTests
 

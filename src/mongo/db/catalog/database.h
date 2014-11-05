@@ -56,10 +56,7 @@ namespace mongo {
     */
     class Database {
     public:
-        // you probably need to be in dbHolderMutex when constructing this
-        Database(OperationContext* txn,
-                 const StringData& name,
-                 DatabaseCatalogEntry* dbEntry ); // not owner here
+        Database(const StringData& name, DatabaseCatalogEntry* dbEntry);
 
         // must call close first
         ~Database();
@@ -90,11 +87,6 @@ namespace mongo {
         const char* getProfilingNS() const { return _profileName.c_str(); }
 
         void getStats( OperationContext* opCtx, BSONObjBuilder* output, double scale = 1 );
-
-        long long getIndexSizeForCollection( OperationContext* opCtx,
-                                             Collection* collections,
-                                             BSONObjBuilder* details = NULL,
-                                             int scale = 1 );
 
         const DatabaseCatalogEntry* getDatabaseCatalogEntry() const;
 
@@ -136,11 +128,12 @@ namespace mongo {
         const std::string& getSystemIndexesName() const { return _indexesName; }
     private:
 
-        void _clearCollectionCache( const StringData& fullns );
+        void _clearCollectionCache(OperationContext* txn, const StringData& fullns );
 
-        void _clearCollectionCache_inlock( const StringData& fullns );
+        void _clearCollectionCache_inlock(OperationContext* txn, const StringData& fullns );
 
-        class CollectionCacheChange; // to allow rollback actions for invalidating above cache
+        class AddCollectionChange;
+        class RemoveCollectionChange;
 
         const std::string _name; // "alleyinsider"
 

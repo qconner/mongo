@@ -39,8 +39,10 @@
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/time_support.h"
 
+
 namespace mongo {
 
+    class Client;
     class Command;
     class CurOp;
 
@@ -199,12 +201,11 @@ namespace mongo {
         BSONObj query() const { return _query.get();  }
         void appendQuery( BSONObjBuilder& b , const StringData& name ) const { _query.append( b , name ); }
         
-        void enter( Client::Context * context );
+        void enter(const char* ns, int dbProfileLevel);
         void reset();
         void reset( const HostAndPort& remote, int op );
         void markCommand() { _isCommand = true; }
         OpDebug& debug()           { return _debug; }
-        int profileLevel() const   { return _dbprofile; }
         string getNS() const { return _ns.toString(); }
 
         bool shouldDBProfile( int ms ) const {
@@ -219,7 +220,6 @@ namespace mongo {
         /** if this op is running */
         bool active() const { return _active; }
 
-        bool displayInCurop() const { return _active && ! _suppressFromCurop; }
         int getOp() const { return _op; }
 
         //
@@ -305,16 +305,13 @@ namespace mongo {
         void kill(); 
         bool killPendingStrict() const { return _killPending.load(); }
         bool killPending() const { return _killPending.loadRelaxed(); }
+        void yielded() { _numYields++; }
         int numYields() const { return _numYields; }
-        void suppressFromCurop() { _suppressFromCurop = true; }
         
         long long getExpectedLatencyMs() const { return _expectedLatencyMs; }
         void setExpectedLatencyMs( long long latency ) { _expectedLatencyMs = latency; }
 
         void recordGlobalTime(bool isWriteLocked, long long micros) const;
-        
-        const LockStat& lockStat() const { return _lockStat; }
-        LockStat& lockStat() { return _lockStat; }
 
         /**
          * this should be used very sparingly
@@ -334,7 +331,6 @@ namespace mongo {
         long long _start;
         long long _end;
         bool _active;
-        bool _suppressFromCurop; // unless $all is set
         int _op;
         bool _isCommand;
         int _dbprofile;                  // 0=off, 1=slow, 2=all
@@ -347,7 +343,6 @@ namespace mongo {
         ProgressMeter _progressMeter;
         AtomicInt32 _killPending;
         int _numYields;
-        LockStat _lockStat;
         
         // this is how much "extra" time a query might take
         // a writebacklisten for example will block for 30s 

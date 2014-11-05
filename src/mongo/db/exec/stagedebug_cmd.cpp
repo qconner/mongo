@@ -121,7 +121,7 @@ namespace mongo {
             // TODO A write lock is currently taken here to accommodate stages that perform writes
             //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
             //      execution trees.
-            Lock::DBWrite lk(txn->lockState(), dbname);
+            Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
             Client::Context ctx(txn, dbname);
 
             // Make sure the collection is valid.
@@ -147,11 +147,15 @@ namespace mongo {
             // TODO: Do we want to do this for the user?  I think so.
             PlanStage* rootFetch = new FetchStage(txn, ws.get(), userRoot, NULL, collection);
 
-            PlanExecutor runner(ws.release(), rootFetch, collection);
+            PlanExecutor* rawExec;
+            Status execStatus = PlanExecutor::make(txn, ws.release(), rootFetch, collection,
+                                                   PlanExecutor::YIELD_MANUAL, &rawExec);
+            fassert(28536, execStatus);
+            boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             BSONArrayBuilder resultBuilder(result.subarrayStart("results"));
 
-            for (BSONObj obj; PlanExecutor::ADVANCED == runner.getNext(&obj, NULL); ) {
+            for (BSONObj obj; PlanExecutor::ADVANCED == exec->getNext(&obj, NULL); ) {
                 resultBuilder.append(obj);
             }
 

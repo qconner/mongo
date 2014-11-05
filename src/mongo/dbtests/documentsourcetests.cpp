@@ -34,13 +34,13 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/storage_options.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace DocumentSourceTests {
@@ -171,19 +171,21 @@ namespace DocumentSourceTests {
             void createSource() {
                 // clean up first if this was called before
                 _source.reset();
-                _registration.reset();
                 _exec.reset();
 
                 Client::WriteContext ctx(&_opCtx, ns);
                 CanonicalQuery* cq;
                 uassertStatusOK(CanonicalQuery::canonicalize(ns, /*query=*/BSONObj(), &cq));
                 PlanExecutor* execBare;
-                uassertStatusOK(getExecutor(&_opCtx, ctx.ctx().db()->getCollection(&_opCtx, ns),
-                                            cq, &execBare));
+                uassertStatusOK(getExecutor(&_opCtx,
+                                            ctx.getCollection(),
+                                            cq,
+                                            PlanExecutor::YIELD_MANUAL,
+                                            &execBare));
 
                 _exec.reset(execBare);
                 _exec->saveState();
-                _registration.reset(new ScopedExecutorRegistration(_exec.get()));
+                _exec->registerExec();
 
                 _source = DocumentSourceCursor::create(ns, _exec, _ctx);
             }
@@ -193,7 +195,6 @@ namespace DocumentSourceTests {
         private:
             // It is important that these are ordered to ensure correct destruction order.
             boost::shared_ptr<PlanExecutor> _exec;
-            boost::scoped_ptr<ScopedExecutorRegistration> _registration;
             intrusive_ptr<ExpressionContext> _ctx;
             intrusive_ptr<DocumentSourceCursor> _source;
         };
@@ -1985,6 +1986,8 @@ namespace DocumentSourceTests {
             add<DocumentSourceMatch::RedactSafePortion>();
             add<DocumentSourceMatch::Coalesce>();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace DocumentSourceTests

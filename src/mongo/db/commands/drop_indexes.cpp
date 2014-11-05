@@ -36,10 +36,11 @@
 #include <vector>
 
 #include "mongo/db/background.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
@@ -103,7 +104,7 @@ namespace mongo {
 
         CmdDropIndexes() : Command("dropIndexes", false, "deleteIndexes") { }
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& anObjBuilder, bool fromRepl) {
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             WriteUnitOfWork wunit(txn);
             bool ok = wrappedRun(txn, dbname, jsobj, errmsg, anObjBuilder);
             if (!ok) {
@@ -239,7 +240,7 @@ namespace mongo {
 
             LOG(0) << "CMD: reIndex " << toDeleteNs << endl;
 
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             Client::Context ctx(txn, toDeleteNs);
 
             Collection* collection = ctx.db()->getCollection( txn, toDeleteNs );
@@ -286,7 +287,6 @@ namespace mongo {
             }
 
             MultiIndexBlock indexer(txn, collection);
-            indexer.allowBackgroundBuilding();
             // do not want interruption as that will leave us without indexes.
 
             Status status = indexer.init(all);

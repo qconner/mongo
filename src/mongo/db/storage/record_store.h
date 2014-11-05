@@ -47,6 +47,7 @@ namespace mongo {
     class NamespaceDetails;
     class OperationContext;
     class Record;
+    class RecordFetcher;
 
     class RecordStoreCompactAdaptor;
     class RecordStore;
@@ -103,7 +104,9 @@ namespace mongo {
         virtual void saveState() = 0;
 
         // Returns true if collection still exists, false otherwise.
-        virtual bool restoreState() = 0;
+        // The state of the iterator may be restored into a different context
+        // than the one it was created in.
+        virtual bool restoreState(OperationContext* txn) = 0;
 
         // normally this will just go back to the RecordStore and convert
         // but this gives the iterator an oppurtnity to optimize
@@ -145,6 +148,14 @@ namespace mongo {
 
         virtual RecordData dataFor( OperationContext* txn, const DiskLoc& loc) const = 0;
 
+        /**
+         * @param out - If the record exists, the contents of this are set.
+         * @return true iff there is a Record for loc
+         */
+        virtual bool findRecord( OperationContext* txn,
+                                 const DiskLoc& loc,
+                                 RecordData* out ) const = 0;
+
         virtual void deleteRecord( OperationContext* txn, const DiskLoc& dl ) = 0;
 
         virtual StatusWith<DiskLoc> insertRecord( OperationContext* txn,
@@ -171,18 +182,36 @@ namespace mongo {
 
         virtual Status updateWithDamages( OperationContext* txn,
                                           const DiskLoc& loc,
-                                          const char* damangeSource,
+                                          const RecordData& oldRec,
+                                          const char* damageSource,
                                           const mutablebson::DamageVector& damages ) = 0;
+
+        /**
+         * Storage engines which do not support document-level locking hold locks at
+         * collection or database granularity. As an optimization, these locks can be yielded
+         * when a record needs to be fetched from secondary storage. If this method returns
+         * non-NULL, then it indicates that the query system layer should yield and reacquire its
+         * locks.
+         *
+         * The return value is a functor that should be invoked when the locks are yielded;
+         * it should access the record at 'loc' so that a potential page fault is triggered
+         * out of the lock.
+         *
+         * The caller is responsible for deleting the return value.
+         *
+         * Storage engines which support document-level locking need not implement this.
+         */
+        virtual RecordFetcher* recordNeedsFetch( OperationContext* txn,
+                                                 const DiskLoc& loc ) const { return NULL; }
+
         /**
          * returned iterator owned by caller
-         * canonical to get all would be
-         * getIterator( txn, DiskLoc(), false, CollectionScanParams::FORWARD )
+         * Default arguments return all items in record store.
          */
         virtual RecordIterator* getIterator( OperationContext* txn,
                                              const DiskLoc& start = DiskLoc(),
-                                             bool tailable = false,
                                              const CollectionScanParams::Direction& dir =
-                                             CollectionScanParams::FORWARD
+                                                     CollectionScanParams::FORWARD
                                              ) const = 0;
 
         /**
@@ -259,6 +288,19 @@ namespace mongo {
         virtual Status setCustomOption( OperationContext* txn,
                                         const BSONElement& option,
                                         BSONObjBuilder* info = NULL ) = 0;
+
+        /**
+         * Return the DiskLoc of an oplog entry as close to startingPosition as possible without
+         * being higher. If there are no entries <= startingPosition, return DiskLoc().
+         *
+         * If you don't implement the oplogStartHack, just use the default implementation which
+         * returns an Invalid DiskLoc.
+         */
+        virtual DiskLoc oplogStartHack(OperationContext* txn,
+                                       const DiskLoc& startingPosition) const {
+            return DiskLoc().setInvalid();
+        }
+
     protected:
         std::string _ns;
     };

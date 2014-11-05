@@ -31,7 +31,7 @@
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/client.h"
+#include "mongo/db/ops/update_request.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_delete_document.h"
@@ -61,7 +61,6 @@ namespace mongo {
 
         WriteBatchExecutor( OperationContext* txn,
                             const BSONObj& defaultWriteConcern,
-                            Client* client,
                             OpCounters* opCounters,
                             LastError* le );
 
@@ -72,6 +71,12 @@ namespace mongo {
         void executeBatch( const BatchedCommandRequest& request, BatchedCommandResponse* response );
 
         const WriteBatchStats& getStats() const;
+
+        /**
+         * Does basic validation of the batch request. Returns a non-OK status if
+         * any problems with the batch are found.
+         */
+        static Status validateBatch( const BatchedCommandRequest& request );
 
     private:
         /**
@@ -138,10 +143,6 @@ namespace mongo {
 
         // Default write concern, if one isn't provide in the batches.
         const BSONObj _defaultWriteConcern;
-
-        // Client object to issue writes on behalf of.
-        // Not owned here.
-        Client* _client;
 
         // OpCounters object to update - needed for stats reporting
         // Not owned here.

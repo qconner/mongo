@@ -33,17 +33,13 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/storage/mmap_v1/extent.h"
-#include "mongo/db/storage/mmap_v1/extent_manager.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
-// #include "mongo/db/structure/catalog/namespace_details.h"  // XXX SERVER-13640
 #include "mongo/db/storage/record_store.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/fail_point_service.h"
@@ -64,13 +60,11 @@ namespace QueryStageCollectionScan {
                 bob.append("foo", i);
                 _client.insert(ns(), bob.obj());
             }
-            ctx.commit();
         }
 
         virtual ~QueryStageCollectionScanBase() {
             Client::WriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
-            ctx.commit();
         }
 
         void remove(const BSONObj& obj) {
@@ -78,11 +72,11 @@ namespace QueryStageCollectionScan {
         }
 
         int countResults(CollectionScanParams::Direction direction, const BSONObj& filterObj) {
-            Client::ReadContext ctx(&_txn, ns());
+            AutoGetCollectionForRead ctx(&_txn, ns());
 
             // Configure the scan.
             CollectionScanParams params;
-            params.collection = ctx.ctx().db()->getCollection( &_txn, ns() );
+            params.collection = ctx.getCollection();
             params.direction = direction;
             params.tailable = false;
 
@@ -94,11 +88,16 @@ namespace QueryStageCollectionScan {
             // Make a scan and have the runner own it.
             WorkingSet* ws = new WorkingSet();
             PlanStage* ps = new CollectionScan(&_txn, params, ws, filterExpr.get());
-            PlanExecutor runner(ws, ps, params.collection);
+
+            PlanExecutor* rawExec;
+            Status status = PlanExecutor::make(&_txn, ws, ps, params.collection,
+                                               PlanExecutor::YIELD_MANUAL, &rawExec);
+            ASSERT_OK(status);
+            boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             // Use the runner to count the number of objects scanned.
             int count = 0;
-            for (BSONObj obj; PlanExecutor::ADVANCED == runner.getNext(&obj, NULL); ) { ++count; }
+            for (BSONObj obj; PlanExecutor::ADVANCED == exec->getNext(&obj, NULL); ) { ++count; }
             return count;
         }
 
@@ -188,21 +187,26 @@ namespace QueryStageCollectionScan {
     class QueryStageCollscanObjectsInOrderForward : public QueryStageCollectionScanBase {
     public:
         void run() {
-            Client::ReadContext ctx(&_txn, ns());
+            AutoGetCollectionForRead ctx(&_txn, ns());
 
             // Configure the scan.
             CollectionScanParams params;
-            params.collection = ctx.ctx().db()->getCollection( &_txn, ns() );
+            params.collection = ctx.getCollection();
             params.direction = CollectionScanParams::FORWARD;
             params.tailable = false;
 
             // Make a scan and have the runner own it.
             WorkingSet* ws = new WorkingSet();
             PlanStage* ps = new CollectionScan(&_txn, params, ws, NULL);
-            PlanExecutor runner(ws, ps, params.collection);
+
+            PlanExecutor* rawExec;
+            Status status = PlanExecutor::make(&_txn, ws, ps, params.collection,
+                                               PlanExecutor::YIELD_MANUAL, &rawExec);
+            ASSERT_OK(status);
+            boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             int count = 0;
-            for (BSONObj obj; PlanExecutor::ADVANCED == runner.getNext(&obj, NULL); ) {
+            for (BSONObj obj; PlanExecutor::ADVANCED == exec->getNext(&obj, NULL); ) {
                 // Make sure we get the objects in the order we want
                 ASSERT_EQUALS(count, obj["foo"].numberInt());
                 ++count;
@@ -219,19 +223,24 @@ namespace QueryStageCollectionScan {
     class QueryStageCollscanObjectsInOrderBackward : public QueryStageCollectionScanBase {
     public:
         void run() {
-            Client::ReadContext ctx(&_txn, ns());
+            AutoGetCollectionForRead ctx(&_txn, ns());
 
             CollectionScanParams params;
-            params.collection = ctx.ctx().db()->getCollection( &_txn, ns() );
+            params.collection = ctx.getCollection();
             params.direction = CollectionScanParams::BACKWARD;
             params.tailable = false;
 
             WorkingSet* ws = new WorkingSet();
             PlanStage* ps = new CollectionScan(&_txn, params, ws, NULL);
-            PlanExecutor runner(ws, ps, params.collection);
+
+            PlanExecutor* rawExec;
+            Status status = PlanExecutor::make(&_txn, ws, ps, params.collection,
+                                               PlanExecutor::YIELD_MANUAL, &rawExec);
+            ASSERT_OK(status);
+            boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             int count = 0;
-            for (BSONObj obj; PlanExecutor::ADVANCED == runner.getNext(&obj, NULL); ) {
+            for (BSONObj obj; PlanExecutor::ADVANCED == exec->getNext(&obj, NULL); ) {
                 ++count;
                 ASSERT_EQUALS(numObj() - count, obj["foo"].numberInt());
             }
@@ -250,7 +259,7 @@ namespace QueryStageCollectionScan {
         void run() {
             Client::WriteContext ctx(&_txn, ns());
 
-            Collection* coll = ctx.ctx().db()->getCollection( &_txn, ns() );
+            Collection* coll = ctx.getCollection();
 
             // Get the DiskLocs that would be returned by an in-order scan.
             vector<DiskLoc> locs;
@@ -297,7 +306,6 @@ namespace QueryStageCollectionScan {
                     ++count;
                 }
             }
-            ctx.commit();
 
             ASSERT_EQUALS(numObj(), count);
         }
@@ -312,7 +320,7 @@ namespace QueryStageCollectionScan {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Collection* coll = ctx.ctx().db()->getCollection(&_txn, ns());
+            Collection* coll = ctx.getCollection();
 
             // Get the DiskLocs that would be returned by an in-order scan.
             vector<DiskLoc> locs;
@@ -359,7 +367,6 @@ namespace QueryStageCollectionScan {
                     ++count;
                 }
             }
-            ctx.commit();
 
             ASSERT_EQUALS(numObj(), count);
         }
@@ -380,6 +387,8 @@ namespace QueryStageCollectionScan {
             add<QueryStageCollscanInvalidateUpcomingObject>();
             add<QueryStageCollscanInvalidateUpcomingObjectBackward>();
         }
-    } all;
+    };
+
+    SuiteInstance<All> all;
 
 }

@@ -230,12 +230,20 @@ add_option( "mm", "use main memory instead of memory mapped files" , 0 , True )
 add_option( "ssl" , "Enable SSL" , 0 , True )
 add_option( "ssl-fips-capability", "Enable the ability to activate FIPS 140-2 mode", 0, True );
 add_option( "rocksdb" , "Enable RocksDB" , 0 , False )
+add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
+            type="choice", choices=["on", "off"], const="on", default="on")
+add_option( "replication-implementation",
+            "Controls what implementation is used for the replication system", "?", False,
+            type="choice", choices=["impl", "legacy"], const="impl", default="impl" )
 
 # library choices
 js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
 add_option( "js-engine", "JavaScript scripting engine implementation", 1, False,
            type='choice', default=js_engine_choices[0], choices=js_engine_choices)
 add_option( "libc++", "use libc++ (experimental, requires clang)", 0, True )
+
+add_option( "use-glibcxx-debug",
+            "Enable the glibc++ debug implementations of the C++ standard libary", 0, True )
 
 # mongo feature options
 add_option( "noshell", "don't build shell" , 0 , True )
@@ -284,10 +292,12 @@ add_option( "use-system-tcmalloc", "use system version of tcmalloc library", 0, 
 
 add_option( "use-system-pcre", "use system version of pcre library", 0, True )
 
+add_option( "use-system-wiredtiger", "use system version of wiredtiger library", 0, True)
+
 # library choices
 boost_choices = ['1.49', '1.56']
 add_option( "internal-boost", "Specify internal boost version to use", 1, True,
-           type='choice', default=boost_choices[1], choices=boost_choices)
+           type='choice', default=boost_choices[0], choices=boost_choices)
 
 add_option( "use-system-boost", "use system version of boost libraries", 0, True )
 
@@ -300,6 +310,9 @@ add_option( "use-system-stemmer", "use system version of stemmer", 0, True )
 add_option( "use-system-yaml", "use system version of yaml", 0, True )
 
 add_option( "use-system-all" , "use all system libraries", 0 , True )
+
+# deprecated
+add_option( "use-new-tools" , "put new tools in the tarball", 0 , False )
 
 add_option( "use-cpu-profiler",
             "Link against the google-perftools profiler library",
@@ -315,7 +328,7 @@ add_option('propagate-shell-environment',
            0, False)
 
 if darwin:
-    osx_version_choices = ['10.6', '10.7', '10.8', '10.9']
+    osx_version_choices = ['10.7', '10.8', '10.9', '10.10']
     add_option("osx-version-min", "minimum OS X version to support", 1, True,
                type = 'choice', default = osx_version_choices[0], choices = osx_version_choices)
 
@@ -463,7 +476,7 @@ envDict = dict(BUILD_ROOT=buildDir,
                ARCHIVE_ADDITIONS=[],
                PYTHON=utils.find_python(),
                SERVER_ARCHIVE='${SERVER_DIST_BASENAME}${DIST_ARCHIVE_SUFFIX}',
-               tools=["default", "gch", "jsheader", "mergelib", "unittest"],
+               tools=["default", "gch", "jsheader", "mergelib", "mongo_unittest", "textfile"],
                UNITTEST_ALIAS='unittests',
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
@@ -665,9 +678,11 @@ extraLibPlaces = []
 
 env['EXTRACPPPATH'] = []
 env['EXTRALIBPATH'] = []
+env['EXTRABINPATH'] = []
 
 def addExtraLibs( s ):
     for x in s.split(","):
+        env.Append( EXTRABINPATH=[ x + "/bin" ] )
         env.Append( EXTRACPPPATH=[ x + "/include" ] )
         env.Append( EXTRALIBPATH=[ x + "/lib" ] )
         env.Append( EXTRALIBPATH=[ x + "/lib64" ] )
@@ -724,8 +739,6 @@ elif linux:
 
     if static:
         env.Append( LINKFLAGS=" -static " )
-    if has_option( "static-libstdc++" ):
-        env.Append( LINKFLAGS=["-static-libstdc++", "-static-libgcc"] )
 
 elif solaris:
      env.Append( CPPDEFINES=[ "__sunos__" ] )
@@ -787,7 +800,14 @@ elif windows:
     #  C++ exception specification ignored except to indicate a function is not __declspec(nothrow
     #  A function is declared using exception specification, which Visual C++ accepts but does not
     #  implement
-    env.Append( CCFLAGS=["/wd4355", "/wd4800", "/wd4267", "/wd4244", "/wd4290"] )
+    # c4068
+    #  unknown pragma -- added so that we can specify unknown pragmas for other compilers
+    # c4351
+    #  on extremely old versions of MSVC (pre 2k5), default constructing an array member in a
+    #  constructor's initialization list would not zero the array members "in some cases".
+    #  since we don't target MSVC versions that old, this warning is safe to ignore.
+    env.Append( CCFLAGS=["/wd4355", "/wd4800", "/wd4267", "/wd4244",
+                         "/wd4290", "/wd4068", "/wd4351"] )
 
     # some warnings we should treat as errors:
     # c4099
@@ -873,6 +893,9 @@ elif windows:
 env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
 if nix:
 
+    if has_option( "static-libstdc++" ):
+        env.Append( LINKFLAGS=["-static-libstdc++", "-static-libgcc"] )
+
     if has_option( "distcc" ):
         env["CXX"] = "distcc " + env["CXX"]
 
@@ -955,6 +978,7 @@ if "uname" in dir(os):
 
 if has_option( "ssl" ):
     env.Append( CPPDEFINES=["MONGO_SSL"] )
+    env.Append( MONGO_CRYPTO=["openssl"] )
     if windows:
         env.Append( LIBS=["libeay32"] )
         env.Append( LIBS=["ssleay32"] )
@@ -963,6 +987,11 @@ if has_option( "ssl" ):
         env.Append( LIBS=["crypto"] )
     if has_option("ssl-fips-capability"):
         env.Append( CPPDEFINES=["MONGO_SSL_FIPS"] )
+else:
+    env.Append( MONGO_CRYPTO=["tom"] )
+
+env['MONGO_REPL_IMPL'] = get_option('replication-implementation')
+wiredtiger = (get_option('wiredtiger') == 'on')
 
 try:
     umask = os.umask(022)
@@ -990,6 +1019,7 @@ env['MONGO_MODULES'] = [m.name for m in mongo_modules]
 # --- check system ---
 
 def doConfigure(myenv):
+    global wiredtiger
 
     # Check that the compilers work.
     #
@@ -1130,7 +1160,25 @@ def doConfigure(myenv):
         env.Append( CPPDEFINES=[("_WIN32_WINNT", "0x" + win_version_min[0])] )
         env.Append( CPPDEFINES=[("NTDDI_VERSION", "0x" + win_version_min[0] + win_version_min[1])] )
 
-    if using_gcc() or using_clang():
+    def CheckForx86(context):
+        # See http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
+        test_body = """
+        #if defined(__i386) || defined(_M_IX86)
+        /* x86 32-bit */
+        #else
+        #error not 32-bit x86
+        #endif
+        """
+        context.Message('Checking if target architecture is 32-bit x86...')
+        ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+        context.Result(ret)
+        return ret
+
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckForx86' : CheckForx86,
+    })
+
+    if conf.CheckForx86():
 
         # If we are using GCC or clang to target 32 or x86, set the ISA minimum to 'nocona',
         # and the tuning to 'generic'. The choice of 'nocona' is selected because it
@@ -1143,27 +1191,15 @@ def doConfigure(myenv):
         # contemporaries, the generic scheduling should be appropriate for a wide range of
         # deployed hardware.
 
-        def CheckForx86(context):
-            # See http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
-            test_body = """
-            #if defined(__i386) || defined(_M_IX86)
-            /* x86 32-bit */
-            #else
-            #error not 32-bit x86
-            #endif
-            """
-            context.Message('Checking if target architecture is 32-bit x86...')
-            ret = context.TryCompile(textwrap.dedent(test_body), ".c")
-            context.Result(ret)
-            return ret
+        if using_gcc() or using_clang():
+                myenv.Append( CCFLAGS=['-march=nocona', '-mtune=generic'] )
 
-        conf = Configure(myenv, help=False, custom_tests = {
-            'CheckForx86' : CheckForx86,
-        })
-
-        if conf.CheckForx86():
-            myenv.Append( CCFLAGS=['-march=nocona', '-mtune=generic'] )
-        conf.Finish()
+        # Wiredtiger only supports 64-bit architecture, and will fail to compile on 32-bit
+        # so disable WiredTiger automatically on 32-bit since wiredtiger is on by default
+        if wiredtiger == True:
+            print "WARNING: WiredTiger is not supported on 32-bit platforms, disabling support"
+            wiredtiger = False
+    conf.Finish()
 
     # Enable PCH if we are on using gcc or clang and the 'Gch' tool is enabled. Otherwise,
     # remove any pre-compiled header since the compiler may try to use it if it exists.
@@ -1452,12 +1488,25 @@ def doConfigure(myenv):
             cxx11_mode = "on"
             myenv = cxx11Env
 
-    # If we are using a modern libstdc++ and this is a debug build and we control all C++
-    # dependencies, then turn on the debugging features in libstdc++.
-    if debugBuild and usingLibStdCxx and haveGoodLibStdCxx:
-        # We can't do this if we are using any system C++ libraries.
-        if (not using_system_version_of_cxx_libraries()):
-            myenv.Append(CPPDEFINES=["_GLIBCXX_DEBUG"]);
+    # rocksdb requires C++11 mode
+    if has_option("rocksdb") and cxx11_mode == "off":
+        print("--rocksdb requires C++11 mode to be enabled");
+        Exit(1)
+
+    if has_option("use-glibcxx-debug"):
+        # If we are using a modern libstdc++ and this is a debug build and we control all C++
+        # dependencies, then turn on the debugging features in libstdc++.
+        if not debugBuild:
+            print("--use-glibcxx-debug requires --dbg=on")
+            Exit(1)
+        if not usingLibStdCxx or not haveGoodLibStdCxx:
+            print("--use-glibcxx-debug is only compatible with the GNU implementation of the "
+                  "C++ standard libary, and requires minimum version 4.6")
+            Exit(1)
+        if using_system_version_of_cxx_libraries():
+            print("--use-glibcxx-debug not compatible with system versions of C++ libraries.")
+            Exit(1)
+        myenv.Append(CPPDEFINES=["_GLIBCXX_DEBUG"]);
 
     # Check if we are on a POSIX system by testing if _POSIX_VERSION is defined.
     def CheckPosixSystem(context):
@@ -1516,7 +1565,9 @@ def doConfigure(myenv):
 
         sanitizer_list = get_option('sanitize').split(',')
 
-        using_asan = 'address' in sanitizer_list or 'leak' in sanitizer_list
+        using_lsan = 'leak' in sanitizer_list
+        using_asan = 'address' in sanitizer_list or using_lsan
+
         if using_asan:
             if get_option('allocator') == 'tcmalloc':
                 print("Cannot use address or leak sanitizer with tcmalloc")
@@ -1530,8 +1581,10 @@ def doConfigure(myenv):
         # --sanitize=address,leak:   -fsanitize=address, detect_leaks=1
         # --sanitize=address:        -fsanitize=address
         #
-        if 'leak' in sanitizer_list:
-            myenv['ENV']['ASAN_OPTIONS'] = "detect_leaks=1"
+        if using_lsan:
+            if using_asan:
+                myenv['ENV']['ASAN_OPTIONS'] = "detect_leaks=1"
+            myenv['ENV']['LSAN_OPTIONS'] = "suppressions=%s" % myenv.File("#etc/lsan.suppressions").abspath
             if 'address' in sanitizer_list:
                 sanitizer_list.remove('leak')
 
@@ -1544,12 +1597,34 @@ def doConfigure(myenv):
             print( 'Failed to enable sanitizers with flag: ' + sanitizer_option )
             Exit(1)
 
+        blackfiles_map = {
+            "address" : myenv.File("#etc/asan.blacklist"),
+            "leak" : myenv.File("#etc/asan.blacklist"),
+            "thread" : myenv.File("#etc/tsan.blacklist"),
+            "undefined" : myenv.File("#etc/ubsan.blacklist"),
+        }
+
+        blackfiles = set([v for (k, v) in blackfiles_map.iteritems() if k in sanitizer_list])
+        blacklist_options=["-fsanitize-blacklist=%s" % blackfile for blackfile in blackfiles]
+
+        for blacklist_option in blacklist_options:
+            if AddToCCFLAGSIfSupported(myenv, blacklist_option):
+                myenv.Append(LINKFLAGS=[blacklist_option])
+
         llvm_symbolizer = get_option('llvm-symbolizer')
-        if not os.path.isabs(llvm_symbolizer):
+        if os.path.isabs(llvm_symbolizer):
+            if not myenv.File(llvm_symbolizer).exists():
+                print("WARNING: Specified symbolizer '%s' not found" % llvm_symbolizer)
+                llvm_symbolizer = None
+        else:
             llvm_symbolizer = myenv.WhereIs(llvm_symbolizer)
+
         if llvm_symbolizer:
-            if using_asan:
-                myenv['ENV']['ASAN_SYMBOLIZER_PATH'] = llvm_symbolizer
+            myenv['ENV']['ASAN_SYMBOLIZER_PATH'] = llvm_symbolizer
+            myenv['ENV']['LSAN_SYMBOLIZER_PATH'] = llvm_symbolizer
+        elif using_lsan:
+            print("Using the leak sanitizer requires a valid symbolizer")
+            Exit(1)
 
     # When using msvc,
     # check for min version of VS2013 for fixes in std::list::splice
@@ -1737,10 +1812,42 @@ def doConfigure(myenv):
         context.Result(ret)
         return ret
 
+    # not all C++11-enabled gcc versions have type properties
+    def CheckCXX11IsTriviallyCopyable(context):
+        test_body = """
+        #include <type_traits>
+        int main(int argc, char **argv) {
+            class Trivial {
+                int trivial1;
+                double trivial2;
+                struct {
+                    float trivial3;
+                    short trivial4;
+                } trivial_member;
+            };
+
+            class NotTrivial {
+                int x, y;
+                NotTrivial(const NotTrivial& o) : x(o.y), y(o.x) {}
+            };
+
+            static_assert(std::is_trivially_copyable<Trivial>::value,
+                          "I should be trivially copyable");
+            static_assert(!std::is_trivially_copyable<NotTrivial>::value,
+                          "I should not be trivially copyable");
+            return 0;
+        }
+        """
+        context.Message('Checking for C++11 is_trivially_copyable support... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
+        context.Result(ret)
+        return ret
+
     conf = Configure(myenv, help=False, custom_tests = {
         'CheckCXX11Atomics': CheckCXX11Atomics,
         'CheckGCCAtomicBuiltins': CheckGCCAtomicBuiltins,
         'CheckGCCSyncBuiltins': CheckGCCSyncBuiltins,
+        'CheckCXX11IsTriviallyCopyable': CheckCXX11IsTriviallyCopyable,
     })
 
     # Figure out what atomics mode to use by way of the tests defined above.
@@ -1770,6 +1877,10 @@ def doConfigure(myenv):
         else:
             if conf.CheckGCCSyncBuiltins():
                 conf.env.Append(CPPDEFINES=["MONGO_HAVE_GCC_SYNC_BUILTINS"])
+
+    if (cxx11_mode == "on") and conf.CheckCXX11IsTriviallyCopyable():
+        conf.env.Append(CPPDEFINES=['MONGO_HAVE_STD_IS_TRIVIALLY_COPYABLE'])
+
     myenv = conf.Finish()
 
     conf = Configure(myenv)
@@ -1787,6 +1898,12 @@ def doConfigure(myenv):
 
     if use_system_version_of_library("yaml"):
         conf.FindSysLibDep("yaml", ["yaml-cpp"])
+
+    if wiredtiger and use_system_version_of_library("wiredtiger"):
+        if not conf.CheckCXXHeader( "wiredtiger.h" ):
+            print( "Cannot find wiredtiger headers" )
+            Exit(1)
+        conf.FindSysLibDep("wiredtiger", ["wiredtiger"])
 
     if use_system_version_of_library("boost"):
         if not conf.CheckCXXHeader( "boost/filesystem/operations.hpp" ):
@@ -2093,6 +2210,7 @@ Export("debugBuild optBuild")
 Export("enforce_glibc")
 Export("s3push")
 Export("use_clang")
+Export("wiredtiger")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])

@@ -43,6 +43,7 @@
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/util/log.h"
 
@@ -348,12 +349,7 @@ namespace mongo {
         if( full || errored ) retryNext = false;
 
         if( ! retryNext && pcState ){
-
-            if( errored && pcState->conn ){
-                // Connection will cleanup for itself. Do nothing.
-            }
-            else if( initialized ){
-
+            if (initialized && !errored) {
                 verify( pcState->cursor );
                 verify( pcState->conn );
 
@@ -664,7 +660,9 @@ namespace mongo {
                         warning() << "Weird shift of primary detected" << endl;
 
                     compatiblePrimary = primary && state->primary && primary == state->primary;
-                    compatibleManager = manager && state->manager && manager->compatibleWith( state->manager, shard );
+                    compatibleManager = manager &&
+                                        state->manager &&
+                                        manager->compatibleWith(*state->manager, shard.getName());
 
                     if( compatiblePrimary || compatibleManager ){
                         // If we're compatible, don't need to retry unless forced

@@ -43,7 +43,7 @@ namespace mongo {
 namespace repl {
 
     /**
-     * Repsonse structure for the replSetHeartbeat command.
+     * Response structure for the replSetHeartbeat command.
      */
     class ReplSetHeartbeatResponse {
     public:
@@ -64,6 +64,13 @@ namespace repl {
          */
         BSONObj toBSON() const;
 
+        /**
+         * Returns toBSON().toString()
+         */
+        const std::string toString() const { return toBSON().toString(); }
+
+        bool hasDataSet() const { return _hasDataSet; }
+        bool hasData() const { return _hasData; }
         bool isMismatched() const { return _mismatch; }
         bool isReplSet() const { return _isReplSet; }
         bool isStateDisagreement() const { return _stateDisagreement; }
@@ -98,6 +105,11 @@ namespace repl {
          * Sets _stateDisagreement to true.
          */
         void noteStateDisagreement() { _stateDisagreement = true; }
+
+        /**
+         * Sets _hasData to true, and _hasDataSet to true to indicate _hasData has been modified
+         */
+        void noteHasData() { _hasDataSet = _hasData = true;}
 
         /**
          * Sets _setName to "name".
@@ -135,7 +147,7 @@ namespace repl {
          * Sets _opTime to "time" and sets _opTimeSet to true to indicate that the value
          * of _opTime has been modified.
          */
-        void setOpTime(Date_t time) { _opTimeSet = true; _opTime = time; }
+        void setOpTime(OpTime time) { _opTimeSet = true; _opTime = time; }
 
         /**
          * Sets _syncingTo to "syncingTo".
@@ -164,6 +176,9 @@ namespace repl {
 
         bool _electableSet;
         bool _electable;
+
+        bool _hasDataSet;
+        bool _hasData;
 
         bool _mismatch;
         bool _isReplSet;

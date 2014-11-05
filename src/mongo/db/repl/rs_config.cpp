@@ -34,8 +34,9 @@
 
 #include <boost/algorithm/string.hpp>
 
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/heartbeat.h"
 #include "mongo/db/repl/isself.h"
@@ -85,20 +86,19 @@ namespace {
 
         BSONObj newConfigBSON = asBson();
 
-        log() << "replSet info saving a newer config version to local.system.replset: "
+        log() << "replSet info saving a newer config version to " << rsConfigNs << ": "
               << newConfigBSON << rsLog;
         {
-            Client::WriteContext cx(txn, rsConfigNs);
+            Lock::DBLock lk(txn->lockState(), NamespaceString(rsConfigNs).db(), MODE_X);
+            WriteUnitOfWork uow(txn);
 
-            //theReplSet->lastOpTimeWritten = ??;
-            //rather than above, do a logOp()? probably
             Helpers::putSingletonGod(txn,
                                      rsConfigNs.c_str(),
                                      newConfigBSON,
                                      false/*logOp=false; local db so would work regardless...*/);
             if( !comment.isEmpty() && (!theReplSet || theReplSet->isPrimary()) )
                 logOpInitiate(txn, comment);
-            cx.commit();
+            uow.commit();
         }
         log() << "replSet saveConfigLocally done" << rsLog;
     }
@@ -616,13 +616,13 @@ namespace {
         _heartbeatTimeout(DEFAULT_HB_TIMEOUT) {
     }
 
-    ReplSetConfig* ReplSetConfig::make(BSONObj cfg, bool force) {
+    ReplSetConfig* ReplSetConfig::make(OperationContext* txn, BSONObj cfg, bool force) {
         auto_ptr<ReplSetConfig> ret(new ReplSetConfig());
-        ret->init(cfg, force);
+        ret->init(txn, cfg, force);
         return ret.release();
     }
 
-    void ReplSetConfig::init(BSONObj cfg, bool force) {
+    void ReplSetConfig::init(OperationContext* txn, BSONObj cfg, bool force) {
         clear();
         from(cfg);
         if( force ) {
@@ -634,14 +634,14 @@ namespace {
         _ok = true;
     }
 
-    ReplSetConfig* ReplSetConfig::make(const HostAndPort& h) {
+    ReplSetConfig* ReplSetConfig::make(OperationContext* txn, const HostAndPort& h) {
         auto_ptr<ReplSetConfig> ret(new ReplSetConfig());
-        ret->init(h);
+        ret->init(txn, h);
         return ret.release();
     }
 
-    ReplSetConfig* ReplSetConfig::makeDirect() {
-        DBDirectClient cli;
+    ReplSetConfig* ReplSetConfig::makeDirect(OperationContext* txn) {
+        DBDirectClient cli(txn);
         BSONObj config = cli.findOne(rsConfigNs, Query()).getOwned();
 
         // Check for no local config
@@ -649,10 +649,10 @@ namespace {
             return new ReplSetConfig();
         }
 
-        return make(config, false);
+        return make(txn, config, false);
     }
 
-    void ReplSetConfig::init(const HostAndPort& h) {
+    void ReplSetConfig::init(OperationContext* txn, const HostAndPort& h) {
         LOG(2) << "ReplSetConfig load " << h.toString() << rsLog;
 
         clear();
@@ -706,7 +706,7 @@ namespace {
                 }
 
                 // on startup, socket is not listening yet
-                DBDirectClient cli;
+                DBDirectClient cli(txn);
                 cfg = cli.findOne( rsConfigNs, Query() ).getOwned();
                 count = cli.count(rsConfigNs);
             }

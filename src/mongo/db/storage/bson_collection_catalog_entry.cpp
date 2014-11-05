@@ -37,8 +37,8 @@ namespace mongo {
     }
 
     CollectionOptions BSONCollectionCatalogEntry::getCollectionOptions( OperationContext* txn ) const {
-        // TODO: support everything
-        return CollectionOptions();
+        MetaData md = _getMetaData( txn );
+        return md.options;
     }
 
     int BSONCollectionCatalogEntry::getTotalIndexCount( OperationContext* txn ) const {
@@ -104,9 +104,27 @@ namespace mongo {
         return md.indexes[offset].ready;
     }
 
+    // --------------------------
+
+    void BSONCollectionCatalogEntry::IndexMetaData::updateTTLSetting( long long newExpireSeconds ) {
+        BSONObjBuilder b;
+        for ( BSONObjIterator bi( spec ); bi.more(); ) {
+            BSONElement e = bi.next();
+            if ( e.fieldNameStringData() == "expireAfterSeconds" ) {
+                continue;
+            }
+            b.append( e );
+        }
+
+        b.append( "expireAfterSeconds", newExpireSeconds );
+        spec = b.obj();
+    }
+
+    // --------------------------
+
     int BSONCollectionCatalogEntry::MetaData::findIndexOffset( const StringData& name ) const {
         for ( unsigned i = 0; i < indexes.size(); i++ )
-            if ( indexes[i].spec["name"].String() == name )
+            if ( indexes[i].name() == name )
                 return i;
         return -1;
     }
@@ -122,9 +140,21 @@ namespace mongo {
         return true;
     }
 
+    void BSONCollectionCatalogEntry::MetaData::rename( const StringData& toNS ) {
+        ns = toNS.toString();
+        for ( size_t i = 0; i < indexes.size(); i++ ) {
+            BSONObj spec = indexes[i].spec;
+            BSONObjBuilder b;
+            b.append( "ns", toNS );
+            b.appendElementsUnique( spec );
+            indexes[i].spec = b.obj();
+        }
+    }
+
     BSONObj BSONCollectionCatalogEntry::MetaData::toBSON() const {
         BSONObjBuilder b;
         b.append( "ns", ns );
+        b.append( "options", options.toBSON() );
         {
             BSONArrayBuilder arr( b.subarrayStart( "indexes" ) );
             for ( unsigned i = 0; i < indexes.size(); i++ ) {
@@ -143,6 +173,10 @@ namespace mongo {
 
     void BSONCollectionCatalogEntry::MetaData::parse( const BSONObj& obj ) {
         ns = obj["ns"].valuestrsafe();
+
+        if ( obj["options"].isABSONObj() ) {
+            options.parse( obj["options"].Obj() );
+        }
 
         BSONElement e = obj["indexes"];
         if ( e.isABSONObj() ) {

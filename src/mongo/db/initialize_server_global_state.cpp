@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+
 #include "mongo/pch.h"
 
 #include "mongo/db/initialize_server_global_state.h"
@@ -43,6 +45,7 @@
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/auth/security_key.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logger/logger.h"
@@ -59,6 +62,7 @@
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/quick_exit.h"
 
 namespace fs = boost::filesystem;
 
@@ -72,7 +76,7 @@ namespace mongo {
             
             if (cur == serverGlobalParams.parentProc || cur == serverGlobalParams.leaderProc) {
                 // signal indicates successful start allowing us to exit
-                _exit(0);
+                quickExit(0);
             } 
         }
     }
@@ -110,7 +114,7 @@ namespace mongo {
             pid_t child1 = fork();
             if (child1 == -1) {
                 cout << "ERROR: stage 1 fork() failed: " << errnoWithDescription();
-                _exit(EXIT_ABRUPT);
+                quickExit(EXIT_ABRUPT);
             }
             else if (child1) {
                 // this is run in the original parent process
@@ -126,15 +130,15 @@ namespace mongo {
                         cout << "child process started successfully, parent exiting" << endl;
                     }
 
-                    _exit(WEXITSTATUS(pstat));
+                    quickExit(WEXITSTATUS(pstat));
                 }
 
-                _exit(50);
+                quickExit(50);
             }
 
             if ( chdir("/") < 0 ) {
                 cout << "Cant chdir() while forking server process: " << strerror(errno) << endl;
-                ::_exit(-1);
+                quickExit(-1);
             }
             setsid();
 
@@ -143,7 +147,7 @@ namespace mongo {
             pid_t child2 = fork();
             if (child2 == -1) {
                 cout << "ERROR: stage 2 fork() failed: " << errnoWithDescription();
-                _exit(EXIT_ABRUPT);
+                quickExit(EXIT_ABRUPT);
             }
             else if (child2) {
                 // this is run in the middle process
@@ -152,10 +156,10 @@ namespace mongo {
                 waitpid(child2, &pstat, 0);
 
                 if ( WIFEXITED(pstat) ) {
-                    _exit( WEXITSTATUS(pstat) );
+                    quickExit( WEXITSTATUS(pstat) );
                 }
 
-                _exit(51);
+                quickExit(51);
             }
 
             // this is run in the final child process (the server)
@@ -184,7 +188,7 @@ namespace mongo {
 
     void forkServerOrDie() {
         if (!forkServer())
-            _exit(EXIT_FAILURE);
+            quickExit(EXIT_FAILURE);
     }
 
     MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
@@ -313,7 +317,7 @@ namespace mongo {
      *
      * TODO: Remove once exit() executes safely in mongo server processes.
      */
-    static void shortCircuitExit() { _exit(EXIT_FAILURE); }
+    static void shortCircuitExit() { quickExit(EXIT_FAILURE); }
 
     MONGO_INITIALIZER(RegisterShortCircuitExitHandler)(InitializerContext*) {
         if (std::atexit(&shortCircuitExit) != 0)

@@ -60,10 +60,10 @@ DB.prototype.runCommand = function( obj, extra ){
 
 DB.prototype._dbCommand = DB.prototype.runCommand;
 
-DB.prototype.adminCommand = function( obj ){
+DB.prototype.adminCommand = function( obj, extra ){
     if ( this._name == "admin" )
-        return this.runCommand( obj );
-    return this.getSiblingDB( "admin" ).runCommand( obj );
+        return this.runCommand( obj, extra );
+    return this.getSiblingDB( "admin" ).runCommand( obj, extra );
 }
 
 DB.prototype._adminCommand = DB.prototype.adminCommand; // alias old name
@@ -86,6 +86,20 @@ DB.prototype._adminCommand = DB.prototype.adminCommand; // alias old name
     </li>
     <li> max: maximum number of objects if capped (optional).</li>
     <li> usePowerOf2Sizes: if true, set usePowerOf2Sizes allocation for the collection.</li>
+    <li>
+        storageEngine: BSON document containing storage engine specific options. Format:
+                       {
+                           storageEngine: {
+                               storageEngine1: {
+                                   ...
+                               },
+                               storageEngine2: {
+                                   ...
+                               },
+                               ...
+                           }
+                       }
+    </li>
     </ul>
 
     <p>Example:</p>
@@ -108,6 +122,8 @@ DB.prototype.createCollection = function(name, opt) {
         cmd.size = options.size;
     if (options.usePowerOf2Sizes != undefined) 
         cmd.flags = options.usePowerOf2Sizes ? 1 : 0;
+    if (options.storageEngine != undefined)
+        cmd.storageEngine = options.storageEngine;
     var res = this._dbCommand(cmd);
     return res;
 }
@@ -249,12 +265,25 @@ DB.prototype.copyDatabase = function(fromdb, todb, fromhost, username, password)
     assert( isString(fromdb) && fromdb.length );
     assert( isString(todb) && todb.length );
     fromhost = fromhost || "";
-    if ( username && password ) {
-        var n = this._adminCommand( { copydbgetnonce : 1, fromhost:fromhost } );
-        return this._adminCommand( { copydb:1, fromhost:fromhost, fromdb:fromdb, todb:todb, username:username, nonce:n.nonce, key:this.__pwHash( n.nonce, username, password ) } );
-    } else {
+
+    var mechanism = this._getDefaultAuthenticationMechanism();
+    assert(mechanism == "SCRAM-SHA-1" || mechanism == "MONGODB-CR");
+
+    // Check for no auth or copying from localhost
+    if (!username || !password || fromhost == "") {
         return this._adminCommand( { copydb:1, fromhost:fromhost, fromdb:fromdb, todb:todb } );
     }
+
+    // Use the copyDatabase native helper for SCRAM-SHA-1
+    if (mechanism == "SCRAM-SHA-1") {
+        return this.getMongo().copyDatabaseWithSCRAM(fromdb, todb, fromhost, username, password);
+    }
+
+    // Fall back to MONGODB-CR
+    var n = this._adminCommand({ copydbgetnonce : 1, fromhost:fromhost});
+    return this._adminCommand({ copydb:1, fromhost:fromhost, fromdb:fromdb, todb:todb,
+                                username:username, nonce:n.nonce,
+                                key:this.__pwHash(n.nonce, username, password) });
 }
 
 /**
@@ -285,6 +314,7 @@ DB.prototype.help = function() {
     print("\tdb.getCollectionNames()");
     print("\tdb.getLastError() - just returns the err msg string");
     print("\tdb.getLastErrorObj() - return full status object");
+    print("\tdb.getLogComponents()");
     print("\tdb.getMongo() get the server connection object");
     print("\tdb.getMongo().setSlaveOk() allow queries on a replication slave server");
     print("\tdb.getName()");
@@ -309,6 +339,7 @@ DB.prototype.help = function() {
     print("\tdb.resetError()");
     print("\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into { cmdObj : 1 }");
     print("\tdb.serverStatus()");
+    print("\tdb.setLogLevel(level,<component>)");
     print("\tdb.setProfilingLevel(level,<slowms>) 0=off 1=slow 2=all");
     print("\tdb.setWriteConcern( <write concern doc> ) - sets the write concern for writes to the db");
     print("\tdb.unsetWriteConcern( <write concern doc> ) - unsets the write concern for writes to the db");
@@ -656,14 +687,14 @@ DB.tsToSeconds = function(x){
   *                          of date than that, it can't recover without a complete resync
 */
 DB.prototype.getReplicationInfo = function() { 
-    var db = this.getSiblingDB("local");
+    var localdb = this.getSiblingDB("local");
 
     var result = { };
     var oplog;
-    if (db.system.namespaces.findOne({name:"local.oplog.rs"}) != null) {
+    if (localdb.system.namespaces.findOne({name:"local.oplog.rs"}) != null) {
         oplog = 'oplog.rs';
     }
-    else if (db.system.namespaces.findOne({name:"local.oplog.$main"}) != null) {
+    else if (localdb.system.namespaces.findOne({name:"local.oplog.$main"}) != null) {
         oplog = 'oplog.$main';
     }
     else {
@@ -671,14 +702,14 @@ DB.prototype.getReplicationInfo = function() {
         return result;
     }
 
-    var ol_entry = db.system.namespaces.findOne({name:"local."+oplog});
+    var ol_entry = localdb.system.namespaces.findOne({name:"local."+oplog});
     if( ol_entry && ol_entry.options ) {
         result.logSizeMB = ol_entry.options.size / ( 1024 * 1024 );
     } else {
         result.errmsg  = "local."+oplog+", or its options, not found in system.namespaces collection";
         return result;
     }
-    ol = db.getCollection(oplog);
+    ol = localdb.getCollection(oplog);
 
     result.usedMB = ol.stats().size / ( 1024 * 1024 );
     result.usedMB = Math.ceil( result.usedMB * 100 ) / 100;
@@ -803,12 +834,41 @@ DB.prototype.serverBuildInfo = function(){
     return this._adminCommand( "buildinfo" );
 }
 
+// Used to trim entries from the metrics.commands that have never been executed
+pruneServerStatus = function(tree) {
+    var result = { };
+    for (var i in tree) {
+        if (!tree.hasOwnProperty(i))
+            continue;
+        if (tree[i].hasOwnProperty("total")) {
+            if (tree[i].total > 0) {
+                result[i] = tree[i];
+            }
+            continue;
+        }
+        if (i == "<UNKNOWN>") {
+            if(tree[i] > 0) {
+                result[i] = tree[i];
+            }
+            continue;
+        }
+        // Handles nested commands
+        var subStatus = pruneServerStatus(tree[i]);
+        if (Object.keys(subStatus).length > 0) {
+            result[i] = tree[i];
+        }
+    }
+    return result;
+}
+
 DB.prototype.serverStatus = function( options ){
     var cmd = { serverStatus : 1 };
     if ( options ) {
         Object.extend( cmd, options );
     }
-    return this._adminCommand( cmd );
+    var res = this._adminCommand( cmd );
+    res.metrics.commands = pruneServerStatus(res.metrics.commands);
+    return res;
 }
 
 DB.prototype.hostInfo = function(){
@@ -973,9 +1033,9 @@ DB.prototype._updateUserV1 = function(name, updateObject, writeConcern) {
         setObj["roles"] = updateObject.roles;
     }
 
-    db.system.users.update({user : name, userSource : null},
-                           {$set : setObj});
-    var err = db.getLastError(writeConcern['w'], writeConcern['wtimeout']);
+    this.system.users.update({user : name, userSource : null},
+                             {$set : setObj});
+    var err = this.getLastError(writeConcern['w'], writeConcern['wtimeout']);
     if (err) {
         throw Error("Updating user failed: " + err);
     }
@@ -1011,7 +1071,7 @@ DB.prototype.logout = function(){
 // For backwards compatibility
 DB.prototype.removeUser = function( username, writeConcern ) {
     print("WARNING: db.removeUser has been deprecated, please use db.dropUser instead");
-    return db.dropUser(username, writeConcern);
+    return this.dropUser(username, writeConcern);
 }
 
 DB.prototype.dropUser = function( username, writeConcern ){
@@ -1041,7 +1101,7 @@ DB.prototype.dropUser = function( username, writeConcern ){
 DB.prototype._removeUserV1 = function(username, writeConcern) {
     this.getCollection( "system.users" ).remove( { user : username } );
 
-    var le = db.getLastErrorObj(writeConcern['w'], writeConcern['wtimeout']);
+    var le = this.getLastErrorObj(writeConcern['w'], writeConcern['wtimeout']);
 
     if (le.err) {
         throw Error( "Couldn't remove user: " + le.err );
@@ -1069,7 +1129,20 @@ DB.prototype.__pwHash = function( nonce, username, pass ) {
     return hex_md5(nonce + username + _hashPassword(username, pass));
 }
 
-DB.prototype._defaultAuthenticationMechanism = "MONGODB-CR";
+DB.prototype._defaultAuthenticationMechanism = null;
+
+DB.prototype._getDefaultAuthenticationMechanism = function() {
+    // Use the default auth mechanism if set on the command line.
+    if (this._defaultAuthenticationMechanism != null)
+        return this._defaultAuthenticationMechanism;
+
+    // Use MONGODB-CR for v2.6 and earlier.
+    if (this.isMaster().maxWireVersion < 3) {
+        return "MONGODB-CR";
+    }
+    return "SCRAM-SHA-1";
+}
+
 DB.prototype._defaultGssapiServiceName = null;
 
 DB.prototype._authOrThrow = function () {
@@ -1088,7 +1161,7 @@ DB.prototype._authOrThrow = function () {
     }
 
     if (params.mechanism === undefined)
-        params.mechanism = this._defaultAuthenticationMechanism;
+        params.mechanism = this._getDefaultAuthenticationMechanism();
 
     if (params.db !== undefined) {
         throw Error("Do not override db field on db.auth(). Use getMongo().auth(), instead.");
@@ -1322,5 +1395,12 @@ DB.prototype.unsetWriteConcern = function() {
     delete this._writeConcern;
 };
 
+DB.prototype.getLogComponents = function() {
+    return this.getMongo().getLogComponents();
+}
+
+DB.prototype.setLogLevel = function(logLevel, component) {
+    return this.getMongo().setLogLevel(logLevel, component);
+}
 
 }());

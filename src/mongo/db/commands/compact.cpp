@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+
 #include <string>
 #include <vector>
 
@@ -97,7 +99,7 @@ namespace mongo {
                 return false;
             }
 
-            NamespaceString ns(db,coll);
+            NamespaceString ns(db, coll);
             if ( !ns.isNormal() ) {
                 errmsg = "bad namespace name";
                 return false;
@@ -144,7 +146,7 @@ namespace mongo {
                 compactOptions.validateDocuments = cmdObj["validate"].trueValue();
 
 
-            Lock::DBWrite lk(txn->lockState(), ns.ns());
+            Lock::DBLock lk(txn->lockState(), db, MODE_X);
             BackgroundOperation::assertNoBgOpInProgForNs(ns.ns());
             Client::Context ctx(txn, ns);
 

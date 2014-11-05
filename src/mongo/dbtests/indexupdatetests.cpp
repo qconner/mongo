@@ -28,14 +28,15 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_environment_d.h"
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/index/btree_based_bulk_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/platform/cstdint.h"
 
@@ -60,11 +61,10 @@ namespace IndexUpdateTests {
         }
         ~IndexBuildBase() {
             _client.dropCollection( _ns );
-            _ctx.commit(); // just for testing purposes
             getGlobalEnvironment()->unsetKillAllOperations();
         }
         Collection* collection() {
-            return _ctx.ctx().db()->getCollection( &_txn, _ns );
+            return _ctx.getCollection();
         }
     protected:
     // QUERY_MIGRATION
@@ -341,14 +341,20 @@ namespace IndexUpdateTests {
         void run() {
             // Create a new collection.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( &_txn, _ns );
-            Collection* coll = db->createCollection( &_txn, _ns );
+            Collection* coll;
+            {
+                WriteUnitOfWork wunit(&_txn);
+                db->dropCollection( &_txn, _ns );
+                coll = db->createCollection( &_txn, _ns );
 
-            coll->insertDocument( &_txn, BSON( "_id" << 1 << "a" << "dup" ), true );
-            coll->insertDocument( &_txn, BSON( "_id" << 2 << "a" << "dup" ), true );
+                coll->insertDocument( &_txn, BSON( "_id" << 1 << "a" << "dup" ), true );
+                coll->insertDocument( &_txn, BSON( "_id" << 2 << "a" << "dup" ), true );
+                wunit.commit();
+            }
 
             MultiIndexBlock indexer(&_txn, coll);
             indexer.allowBackgroundBuilding();
+            indexer.allowInterruption();
             indexer.ignoreUniqueConstraint();
 
             const BSONObj spec = BSON("name" << "a"
@@ -373,14 +379,20 @@ namespace IndexUpdateTests {
         void run() {
             // Create a new collection.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( &_txn, _ns );
-            Collection* coll = db->createCollection( &_txn, _ns );
+            Collection* coll;
+            {
+                WriteUnitOfWork wunit(&_txn);
+                db->dropCollection( &_txn, _ns );
+                coll = db->createCollection( &_txn, _ns );
 
-            coll->insertDocument( &_txn, BSON( "_id" << 1 << "a" << "dup" ), true );
-            coll->insertDocument( &_txn, BSON( "_id" << 2 << "a" << "dup" ), true );
+                coll->insertDocument( &_txn, BSON( "_id" << 1 << "a" << "dup" ), true );
+                coll->insertDocument( &_txn, BSON( "_id" << 2 << "a" << "dup" ), true );
+                wunit.commit();
+            }
 
             MultiIndexBlock indexer(&_txn, coll);
             indexer.allowBackgroundBuilding();
+            indexer.allowInterruption();
             // indexer.ignoreUniqueConstraint(); // not calling this
 
             const BSONObj spec = BSON("name" << "a"
@@ -402,22 +414,30 @@ namespace IndexUpdateTests {
         void run() {
             // Create a new collection.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( &_txn, _ns );
-            Collection* coll = db->createCollection( &_txn, _ns );
+            Collection* coll;
+            DiskLoc loc1;
+            DiskLoc loc2;
+            {
+                WriteUnitOfWork wunit(&_txn);
+                db->dropCollection( &_txn, _ns );
+                coll = db->createCollection( &_txn, _ns );
 
-            StatusWith<DiskLoc> loc1 = coll->insertDocument(&_txn,
-                                                            BSON("_id" << 1 << "a" << "dup"),
-                                                            true);
-            StatusWith<DiskLoc> loc2 = coll->insertDocument(&_txn,
-                                                            BSON("_id" << 2 << "a" << "dup"),
-                                                            true);
-
-            ASSERT_OK(loc1.getStatus());
-            ASSERT_OK(loc2.getStatus());
-
+                StatusWith<DiskLoc> swLoc1 = coll->insertDocument(&_txn,
+                                                                BSON("_id" << 1 << "a" << "dup"),
+                                                                true);
+                StatusWith<DiskLoc> swLoc2 = coll->insertDocument(&_txn,
+                                                                BSON("_id" << 2 << "a" << "dup"),
+                                                                true);
+                ASSERT_OK(swLoc1.getStatus());
+                ASSERT_OK(swLoc2.getStatus());
+                loc1 = swLoc1.getValue();
+                loc2 = swLoc2.getValue();
+                wunit.commit();
+            }
 
             MultiIndexBlock indexer(&_txn, coll);
             indexer.allowBackgroundBuilding();
+            indexer.allowInterruption();
             // indexer.ignoreUniqueConstraint(); // not calling this
 
             const BSONObj spec = BSON("name" << "a"
@@ -433,7 +453,7 @@ namespace IndexUpdateTests {
 
             // either loc1 or loc2 should be in dups but not both.
             ASSERT_EQUALS(dups.size(), 1U);
-            ASSERT(dups.count(loc1.getValue()) || dups.count(loc2.getValue()));
+            ASSERT(dups.count(loc1) || dups.count(loc2));
         }
     };
 
@@ -443,14 +463,19 @@ namespace IndexUpdateTests {
         void run() {
             // Create a new collection.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( &_txn, _ns );
-            Collection* coll = db->createCollection( &_txn, _ns );
-            // Drop all indexes including id index.
-            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-            // Insert some documents with enforceQuota=true.
-            int32_t nDocs = 1000;
-            for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( &_txn, BSON( "a" << i ), true );
+            Collection* coll;
+            {
+                WriteUnitOfWork wunit(&_txn);
+                db->dropCollection( &_txn, _ns );
+                coll = db->createCollection( &_txn, _ns );
+                // Drop all indexes including id index.
+                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
+                // Insert some documents with enforceQuota=true.
+                int32_t nDocs = 1000;
+                for( int32_t i = 0; i < nDocs; ++i ) {
+                    coll->insertDocument( &_txn, BSON( "a" << i ), true );
+                }
+                wunit.commit();
             }
             // Initialize curop.
             _txn.getCurOp()->reset();
@@ -472,13 +497,18 @@ namespace IndexUpdateTests {
         void run() {
             // Create a new collection.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( &_txn, _ns );
-            Collection* coll = db->createCollection( &_txn, _ns );
-            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-            // Insert some documents.
-            int32_t nDocs = 1000;
-            for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( &_txn, BSON( "a" << i ), true );
+            Collection* coll;
+            {
+                WriteUnitOfWork wunit(&_txn);
+                db->dropCollection( &_txn, _ns );
+                coll = db->createCollection( &_txn, _ns );
+                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
+                // Insert some documents.
+                int32_t nDocs = 1000;
+                for( int32_t i = 0; i < nDocs; ++i ) {
+                    coll->insertDocument( &_txn, BSON( "a" << i ), true );
+                }
+                wunit.commit();
             }
             // Initialize curop.
             _txn.getCurOp()->reset();
@@ -500,16 +530,21 @@ namespace IndexUpdateTests {
         void run() {
             // Recreate the collection as capped, without an _id index.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( &_txn, _ns );
-            CollectionOptions options;
-            options.capped = true;
-            options.cappedSize = 10 * 1024;
-            Collection* coll = db->createCollection( &_txn, _ns, options );
-            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-            // Insert some documents.
-            int32_t nDocs = 1000;
-            for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( &_txn, BSON( "_id" << i ), true );
+            Collection* coll;
+            {
+                WriteUnitOfWork wunit(&_txn);
+                db->dropCollection( &_txn, _ns );
+                CollectionOptions options;
+                options.capped = true;
+                options.cappedSize = 10 * 1024;
+                coll = db->createCollection( &_txn, _ns, options );
+                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
+                // Insert some documents.
+                int32_t nDocs = 1000;
+                for( int32_t i = 0; i < nDocs; ++i ) {
+                    coll->insertDocument( &_txn, BSON( "_id" << i ), true );
+                }
+                wunit.commit();
             }
             // Initialize curop.
             _txn.getCurOp()->reset();
@@ -533,16 +568,21 @@ namespace IndexUpdateTests {
         void run() {
             // Recreate the collection as capped, without an _id index.
             Database* db = _ctx.ctx().db();
-            db->dropCollection( &_txn, _ns );
-            CollectionOptions options;
-            options.capped = true;
-            options.cappedSize = 10 * 1024;
-            Collection* coll = db->createCollection( &_txn, _ns, options );
-            coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-            // Insert some documents.
-            int32_t nDocs = 1000;
-            for( int32_t i = 0; i < nDocs; ++i ) {
-                coll->insertDocument( &_txn, BSON( "_id" << i ), true );
+            Collection* coll;
+            {
+                WriteUnitOfWork wunit(&_txn);
+                db->dropCollection( &_txn, _ns );
+                CollectionOptions options;
+                options.capped = true;
+                options.cappedSize = 10 * 1024;
+                coll = db->createCollection( &_txn, _ns, options );
+                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
+                // Insert some documents.
+                int32_t nDocs = 1000;
+                for( int32_t i = 0; i < nDocs; ++i ) {
+                    coll->insertDocument( &_txn, BSON( "_id" << i ), true );
+                }
+                wunit.commit();
             }
             // Initialize curop.
             _txn.getCurOp()->reset();
@@ -569,6 +609,8 @@ namespace IndexUpdateTests {
             for( int32_t i = 0; i < nDocs; ++i ) {
                 _client.insert( _ns, BSON( "a" << i ) );
             }
+            // Start with just _id
+            ASSERT_EQUALS( 1U, _client.getIndexSpecs(_ns).size());
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.  killAll() rather than kill() is required because the direct
@@ -578,10 +620,8 @@ namespace IndexUpdateTests {
             _client.ensureIndex( _ns, BSON( "a" << 1 ) );
             // only want to interrupt the index build
             getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is listed in system.indexes because the index build completed.
-            ASSERT_EQUALS( 1U,
-                           _client.count( "unittests.system.indexes",
-                                          BSON( "ns" << _ns << "name" << "a_1" ) ) );
+            // The new index is listed in getIndexSpecs because the index build completed.
+            ASSERT_EQUALS( 2U, _client.getIndexSpecs(_ns).size());
         }
     };
 
@@ -589,12 +629,13 @@ namespace IndexUpdateTests {
     class HelpersEnsureIndexInterruptDisallowed : public IndexBuildBase {
     public:
         void run() {
-            WriteUnitOfWork wunit (&_txn);
             // Insert some documents.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
                 _client.insert( _ns, BSON( "a" << i ) );
             }
+            // Start with just _id
+            ASSERT_EQUALS( 1U, _client.getIndexSpecs(_ns).size());
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.
@@ -602,12 +643,9 @@ namespace IndexUpdateTests {
             // The call is not interrupted.
             Helpers::ensureIndex( &_txn, collection(), BSON( "a" << 1 ), false, "a_1" );
             // only want to interrupt the index build
-            wunit.commit();
             getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is listed in system.indexes because the index build completed.
-            ASSERT_EQUALS( 1U,
-                           _client.count( "unittests.system.indexes",
-                                          BSON( "ns" << _ns << "name" << "a_1" ) ) );
+            // The new index is listed in getIndexSpecs because the index build completed.
+            ASSERT_EQUALS( 2U, _client.getIndexSpecs(_ns).size());
         }
     };
     // QUERY_MIGRATION
@@ -662,7 +700,9 @@ namespace IndexUpdateTests {
             memcpy( infoRecord->data(), indexInfo.objdata(), indexInfo.objsize() );
             addRecordToRecListInExtent( infoRecord, infoLoc );
 
-            return new IndexCatalog::IndexBuildBlock( _ctx.ctx().db()->getCollection( _ns )->getIndexCatalog(), name, infoLoc );
+            return new IndexCatalog::IndexBuildBlock( _ctx.getCollection()->getIndexCatalog(),
+                                                     name,
+                                                     infoLoc );
         }
     };
 #endif

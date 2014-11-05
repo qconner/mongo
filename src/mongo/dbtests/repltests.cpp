@@ -29,12 +29,14 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/pch.h"
 
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/db.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
@@ -58,12 +60,13 @@ namespace ReplTests {
 
     class Base {
     protected:
+        repl::ReplicationCoordinator* _prevGlobGoordinator;
         mutable OperationContextImpl _txn;
         mutable DBDirectClient _client;
 
     public:
-        Base() : _client(&_txn) {
-
+        Base() : _prevGlobGoordinator(getGlobalReplicationCoordinator())
+               , _client(&_txn) {
             ReplSettings replSettings;
             replSettings.oplogSize = 5 * 1024 * 1024;
             replSettings.master = true;
@@ -74,6 +77,7 @@ namespace ReplTests {
             createOplog(&_txn);
 
             Client::WriteContext ctx(&_txn, ns());
+            WriteUnitOfWork wuow(&_txn);
 
             Collection* c = ctx.ctx().db()->getCollection(&_txn, ns());
             if ( ! c ) {
@@ -81,14 +85,13 @@ namespace ReplTests {
             }
 
             ASSERT(c->getIndexCatalog()->haveIdIndex(&_txn));
-            ctx.commit();
+            wuow.commit();
         }
         ~Base() {
             try {
-                ReplSettings replSettings;
-                replSettings.oplogSize = 10 * 1024 * 1024;
                 delete getGlobalReplicationCoordinator();
-                setGlobalReplicationCoordinator(new ReplicationCoordinatorMock(replSettings));
+                setGlobalReplicationCoordinator(_prevGlobGoordinator);
+                _prevGlobGoordinator = NULL;
 
                 deleteAll( ns() );
                 deleteAll( cllNS() );
@@ -139,8 +142,7 @@ namespace ReplTests {
             }
 
             int count = 0;
-            RecordIterator* it = coll->getIterator( &_txn, DiskLoc(), false,
-                                                    CollectionScanParams::FORWARD );
+            RecordIterator* it = coll->getIterator(&_txn);
             for ( ; !it->isEOF(); it->getNext() ) {
                 ++count;
             }
@@ -160,8 +162,7 @@ namespace ReplTests {
             }
 
             int count = 0;
-            RecordIterator* it = coll->getIterator( &_txn, DiskLoc(), false,
-                                                    CollectionScanParams::FORWARD );
+            RecordIterator* it = coll->getIterator(&_txn);
             for ( ; !it->isEOF(); it->getNext() ) {
                 ++count;
             }
@@ -170,15 +171,13 @@ namespace ReplTests {
         }
         void applyAllOperations() {
             Lock::GlobalWrite lk(_txn.lockState());
-            WriteUnitOfWork wunit(&_txn);
             vector< BSONObj > ops;
             {
                 Client::Context ctx(&_txn,  cllNS() );
                 Database* db = ctx.db();
                 Collection* coll = db->getCollection( &_txn, cllNS() );
 
-                RecordIterator* it = coll->getIterator( &_txn, DiskLoc(), false,
-                                                        CollectionScanParams::FORWARD );
+                RecordIterator* it = coll->getIterator(&_txn);
                 while ( !it->isEOF() ) {
                     DiskLoc currLoc = it->getNext();
                     ops.push_back(coll->docFor(&_txn, currLoc));
@@ -191,35 +190,35 @@ namespace ReplTests {
                 b.append("host", "localhost");
                 b.appendTimestamp("syncedTo", 0);
                 ReplSource a(&_txn, b.obj());
+                WriteUnitOfWork wunit(&_txn);
                 for( vector< BSONObj >::iterator i = ops.begin(); i != ops.end(); ++i ) {
                     if ( 0 ) {
                         mongo::unittest::log() << "op: " << *i << endl;
                     }
                     a.applyOperation( &_txn, ctx.db(), *i );
                 }
+                wunit.commit();
             }
-            wunit.commit();
         }
         void printAll( const char *ns ) {
             Lock::GlobalWrite lk(_txn.lockState());
-            WriteUnitOfWork wunit(&_txn);
             Client::Context ctx(&_txn,  ns );
 
             Database* db = ctx.db();
             Collection* coll = db->getCollection( &_txn, ns );
             if ( !coll ) {
+                WriteUnitOfWork wunit(&_txn);
                 coll = db->createCollection( &_txn, ns );
+                wunit.commit();
             }
 
-            RecordIterator* it = coll->getIterator( &_txn, DiskLoc(), false,
-                                                    CollectionScanParams::FORWARD );
+            RecordIterator* it = coll->getIterator(&_txn);
             ::mongo::log() << "all for " << ns << endl;
             while ( !it->isEOF() ) {
                 DiskLoc currLoc = it->getNext();
                 ::mongo::log() << coll->docFor(&_txn, currLoc).toString() << endl;
             }
             delete it;
-            wunit.commit();
         }
         // These deletes don't get logged.
         void deleteAll( const char *ns ) const {
@@ -233,8 +232,7 @@ namespace ReplTests {
             }
 
             vector< DiskLoc > toDelete;
-            RecordIterator* it = coll->getIterator( &_txn, DiskLoc(), false,
-                                                    CollectionScanParams::FORWARD );
+            RecordIterator* it = coll->getIterator(&_txn);
             while ( !it->isEOF() ) {
                 toDelete.push_back( it->getNext() );
             }
@@ -1521,7 +1519,9 @@ namespace ReplTests {
             add< ReplSetMemberCfgEquality >();
             add< ShouldRetry >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace ReplTests
 

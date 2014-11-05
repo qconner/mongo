@@ -20,6 +20,7 @@ env.Library(
         "query_solution.cpp",
     ],
     LIBDEPS=[
+        "explain_common",
         "index_bounds",
         "lite_parsed_query",
         "$BUILD_DIR/mongo/bson",
@@ -38,6 +39,7 @@ env.Library(
         "new_find.cpp",
         "plan_executor.cpp",
         "plan_ranker.cpp",
+        "plan_yield_policy.cpp",
         "stage_builder.cpp",
     ],
     LIBDEPS=[
@@ -78,6 +80,16 @@ env.Library(
         "$BUILD_DIR/mongo/index_names",
         "$BUILD_DIR/mongo/mongohasher",
         "$BUILD_DIR/mongo/server_parameters",
+    ],
+)
+
+env.Library(
+    target="explain_common",
+    source=[
+        "explain_common.cpp"
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/bson",
     ],
 )
 
@@ -188,6 +200,16 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "query_planner_test_lib",
+    ],
+)
+
+env.CppUnitTest(
+    target="planner_analysis_test",
+    source=[
+        "planner_analysis_test.cpp"
+    ],
+    LIBDEPS=[
+        "query_planner",
     ],
 )
 

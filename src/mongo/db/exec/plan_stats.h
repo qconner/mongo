@@ -35,10 +35,10 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/geo/hash.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/net/listen.h" // for Listener::getElapsedTimeMillis()
 
 namespace mongo {
 
@@ -64,6 +64,7 @@ namespace mongo {
                         invalidates(0),
                         advanced(0),
                         needTime(0),
+                        needFetch(0),
                         executionTimeMillis(0),
                         isEOF(false) { }
         // String giving the type of the stage. Not owned.
@@ -78,6 +79,7 @@ namespace mongo {
         // How many times was this state the return value of work(...)?
         size_t advanced;
         size_t needTime;
+        size_t needFetch;
 
         // BSON representation of a MatchExpression affixed to this node. If there
         // is no filter affixed, then 'filter' should be an empty BSONObj.
@@ -92,38 +94,12 @@ namespace mongo {
         // TODO: once we've picked a plan, collect different (or additional) stats for display to
         // the user, eg. time_t totalTimeSpent;
 
+        // TODO: keep track of the total yield time / fetch time done for a plan.
+
         bool isEOF;
     private:
         // Default constructor is illegal.
         CommonStats();
-    };
-
-    /**
-     * This class increments a counter by the time elapsed since its construction when
-     * it goes out of scope.
-     */
-    class ScopedTimer {
-    public:
-        ScopedTimer(long long* counter) : _counter(counter) {
-            _start = curTimeMillis64();
-        }
-
-        ~ScopedTimer() {
-            long long elapsed = curTimeMillis64() - _start;
-            *_counter += elapsed;
-        }
-
-    private:
-        // Default constructor disallowed.
-        ScopedTimer();
-
-        MONGO_DISALLOW_COPYING(ScopedTimer);
-
-        // Reference to the counter that we are incrementing with the elapsed time.
-        long long* _counter;
-
-        // Time at which the timer was constructed.
-        long long _start;
     };
 
     // The universal container for a stage's stats.
@@ -232,7 +208,7 @@ namespace mongo {
     };
 
     struct CollectionScanStats : public SpecificStats {
-        CollectionScanStats() : docsTested(0) { }
+        CollectionScanStats() : docsTested(0), direction(1) { }
 
         virtual SpecificStats* clone() const {
             CollectionScanStats* specific = new CollectionScanStats(*this);
@@ -241,16 +217,39 @@ namespace mongo {
 
         // How many documents did we check against our filter?
         size_t docsTested;
+
+        // >0 if we're traversing the collection forwards. <0 if we're traversing it
+        // backwards.
+        int direction;
     };
 
     struct CountStats : public SpecificStats {
-        CountStats() : isMultiKey(false),
-                       keysExamined(0) { }
-
-        virtual ~CountStats() { }
+        CountStats() : nCounted(0), nSkipped(0), trivialCount(false) { }
 
         virtual SpecificStats* clone() const {
             CountStats* specific = new CountStats(*this);
+            return specific;
+        }
+
+        // The result of the count.
+        long long nCounted;
+
+        // The number of results we skipped over.
+        long long nSkipped;
+
+        // A "trivial count" is one that we can answer by calling numRecords() on the
+        // collection, without actually going through any query logic.
+        bool trivialCount;
+    };
+
+    struct CountScanStats : public SpecificStats {
+        CountScanStats() : isMultiKey(false),
+                           keysExamined(0) { }
+
+        virtual ~CountScanStats() { }
+
+        virtual SpecificStats* clone() const {
+            CountScanStats* specific = new CountScanStats(*this);
             // BSON objects have to be explicitly copied.
             specific->keyPattern = keyPattern.getOwned();
             return specific;
@@ -319,6 +318,20 @@ namespace mongo {
         size_t docsExamined;
     };
 
+    struct GroupStats : public SpecificStats {
+        GroupStats() : nGroups(0) { }
+
+        virtual ~GroupStats() { }
+
+        virtual SpecificStats* clone() const {
+            GroupStats* specific = new GroupStats(*this);
+            return specific;
+        }
+
+        // The total number of groups.
+        size_t nGroups;
+    };
+
     struct IDHackStats : public SpecificStats {
         IDHackStats() : keysExamined(0),
                         docsExamined(0) { }
@@ -369,9 +382,6 @@ namespace mongo {
         // used.
         BSONObj indexBounds;
 
-        // Contains same information as indexBounds with the addition of inclusivity of bounds.
-        std::string indexBoundsVerbose;
-
         // >1 if we're traversing the index along with its order. <1 if we're traversing it
         // against the order.
         int direction;
@@ -403,6 +413,14 @@ namespace mongo {
         }
 
         size_t limit;
+    };
+
+    struct MockStats : public SpecificStats {
+        MockStats() { }
+
+        virtual SpecificStats* clone() const {
+            return new MockStats(*this);
+        }
     };
 
     struct MultiPlanStats : public SpecificStats {
@@ -522,6 +540,9 @@ namespace mongo {
         IntervalStats() :
             numResultsFound(0),
             numResultsBuffered(0),
+            minDistanceAllowed(-1),
+            maxDistanceAllowed(-1),
+            inclusiveMaxDistanceAllowed(false),
             minDistanceFound(-1),
             maxDistanceFound(-1),
             minDistanceBuffered(-1),
@@ -530,6 +551,10 @@ namespace mongo {
 
         long long numResultsFound;
         long long numResultsBuffered;
+
+        double minDistanceAllowed;
+        double maxDistanceAllowed;
+        bool inclusiveMaxDistanceAllowed;
 
         double minDistanceFound;
         double maxDistanceFound;

@@ -26,6 +26,7 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/assert_util.h"
@@ -105,5 +106,7 @@ namespace {
             add< GetLastErrorCommandFailure >();
             add< GetLastErrorFromDup >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 }

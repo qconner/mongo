@@ -974,11 +974,6 @@ namespace mongo {
          */
         virtual void resetIndexCache();
 
-        /**
-         * @deprecated use getIndexSpecs
-         */
-        virtual std::auto_ptr<DBClientCursor> getIndexes( const std::string &ns );
-
         virtual std::list<BSONObj> getIndexSpecs( const std::string &ns, int options = 0 );
 
         virtual void dropIndex( const std::string& ns , BSONObj keys );
@@ -1307,6 +1302,7 @@ namespace mongo {
         }
 
         std::string getServerAddress() const { return _serverString; }
+        const HostAndPort& getServerHostAndPort() const { return _server; }
 
         virtual void killCursor( long long cursorID );
         virtual bool callRead( Message& toSend , Message& response ) { return call( toSend , response ); }

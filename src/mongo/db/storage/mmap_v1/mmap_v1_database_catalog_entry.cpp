@@ -1,38 +1,41 @@
-// mmap_v1_database_catalog_entry.cpp
-
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2014 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
+
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 
 #include <utility>
 
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/client.h"
 #include "mongo/db/index/2d_access_method.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/index/btree_based_access_method.h"
@@ -40,16 +43,17 @@
 #include "mongo/db/index/hash_access_method.h"
 #include "mongo/db/index/haystack_access_method.h"
 #include "mongo/db/index/s2_access_method.h"
-#include "mongo/db/pdfile_version.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/mmap_v1/btree/btree_interface.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details_collection_entry.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details_rsv1_metadata.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/data_file.h"
 #include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
 #include "mongo/db/storage/mmap_v1/record_store_v1_capped.h"
 #include "mongo/db/storage/mmap_v1/record_store_v1_simple.h"
+#include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -114,7 +118,11 @@ namespace mongo {
           _extentManager( name, path, directoryPerDB ),
           _namespaceIndex( _path, name.toString() ) {
 
+        invariant(txn->lockState()->isDbLockedForMode(name, MODE_X));
+
         try {
+            WriteUnitOfWork wunit(txn);
+
             Status s = _extentManager.init(txn);
             if ( !s.isOK() ) {
                 msgasserted( 16966, str::stream() << "_extentManager.init failed: " << s.toString() );
@@ -162,7 +170,16 @@ namespace mongo {
                         }
                     }
                 }
+
+                DataFileVersion version = _extentManager.getFileFormat(txn);
+                if (version.isCompatibleWithCurrentCode() && !version.mayHave28Freelist()) {
+                    // Any DB that can be opened and written to gets this flag set.
+                    version.setMayHave28Freelist();
+                    _extentManager.setFileFormat(txn, version);
+                }
             }
+
+            wunit.commit();
         }
         catch(std::exception& e) {
             log() << "warning database " << path << " " << name << " could not be opened";
@@ -173,7 +190,6 @@ namespace mongo {
             else {
                 log() << e.what() << endl;
             }
-            _extentManager.reset();
             throw;
         }
     }
@@ -185,6 +201,12 @@ namespace mongo {
             delete i->second;
         }
         _collections.clear();
+    }
+
+    intmax_t dbSize( const string& database ); // from repair_database.cpp
+
+    int64_t MMAPV1DatabaseCatalogEntry::sizeOnDisk( OperationContext* opCtx ) const {
+        return static_cast<int64_t>( dbSize( name() ) );
     }
 
     void MMAPV1DatabaseCatalogEntry::_removeFromCache(RecoveryUnit* ru,
@@ -410,7 +432,7 @@ namespace mongo {
 
             int freeListSize = 0;
             int64_t freeListSpace = 0;
-            _extentManager.freeListStats( &freeListSize, &freeListSpace );
+            _extentManager.freeListStats(opCtx, &freeListSize, &freeListSpace);
 
             BSONObjBuilder extentFreeList( output->subobjStart( "extentFreeList" ) );
             extentFreeList.append( "num", freeListSize );
@@ -420,13 +442,11 @@ namespace mongo {
 
             {
 
-                int major = 0;
-                int minor = 0;
-                _extentManager.getFileFormat( opCtx, &major, &minor );
+                const DataFileVersion version = _extentManager.getFileFormat(opCtx);
 
                 BSONObjBuilder dataFileVersion( output->subobjStart( "dataFileVersion" ) );
-                dataFileVersion.append( "major", major );
-                dataFileVersion.append( "minor", minor );
+                dataFileVersion.append( "major", version.majorRaw() );
+                dataFileVersion.append( "minor", version.minorRaw() );
                 dataFileVersion.done();
             }
         }
@@ -437,42 +457,33 @@ namespace mongo {
         if ( _extentManager.numFiles() == 0 )
             return false;
 
-        int major = 0;
-        int minor = 0;
+        const DataFileVersion version = _extentManager.getFileFormat(opCtx);
 
-        _extentManager.getFileFormat( opCtx, &major, &minor );
+        invariant(version.isCompatibleWithCurrentCode());
 
-        invariant( major == PDFILE_VERSION );
-
-        return minor == PDFILE_VERSION_MINOR_22_AND_OLDER;
+        return !version.is24IndexClean();
     }
 
     void MMAPV1DatabaseCatalogEntry::markIndexSafe24AndUp( OperationContext* opCtx ) {
         if ( _extentManager.numFiles() == 0 )
             return;
 
-        int major = 0;
-        int minor = 0;
+        DataFileVersion version = _extentManager.getFileFormat(opCtx);
 
-        _extentManager.getFileFormat( opCtx, &major, &minor );
+        invariant(version.isCompatibleWithCurrentCode());
 
-        invariant( major == PDFILE_VERSION );
+        if (version.is24IndexClean())
+            return; // nothing to do
 
-        if ( minor == PDFILE_VERSION_MINOR_24_AND_NEWER )
-            return;
-
-        invariant( minor == PDFILE_VERSION_MINOR_22_AND_OLDER );
-
-        DataFile* df = _extentManager.getFile( opCtx, 0 );
-        opCtx->recoveryUnit()->writingInt(df->getHeader()->versionMinor) =
-            PDFILE_VERSION_MINOR_24_AND_NEWER;
+        version.setIs24IndexClean();
+        _extentManager.setFileFormat(opCtx, version);
     }
 
     bool MMAPV1DatabaseCatalogEntry::currentFilesCompatible( OperationContext* opCtx ) const {
         if ( _extentManager.numFiles() == 0 )
             return true;
 
-        return _extentManager.getOpenFile( 0 )->getHeader()->isCurrentVersion();
+        return _extentManager.getOpenFile( 0 )->getHeader()->version.isCompatibleWithCurrentCode();
     }
 
     void MMAPV1DatabaseCatalogEntry::getCollectionNamespaces( std::list<std::string>* tofill ) const {

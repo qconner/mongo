@@ -31,6 +31,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -51,7 +52,9 @@ namespace mongo {
             , _callLogOp(false)
             , _fromMigration(false)
             , _fromReplication(false)
-            , _lifecycle(NULL) {}
+            , _lifecycle(NULL)
+            , _isExplain(false)
+            , _yieldPolicy(PlanExecutor::YIELD_MANUAL) {}
 
         const NamespaceString& getNamespaceString() const {
             return _nsString;
@@ -136,6 +139,22 @@ namespace mongo {
             return _txn;
         }
 
+        inline void setExplain(bool value = true) {
+            _isExplain = value;
+        }
+
+        inline bool isExplain() const {
+            return _isExplain;
+        }
+
+        inline void setYieldPolicy(PlanExecutor::YieldPolicy yieldPolicy) {
+            _yieldPolicy = yieldPolicy;
+        }
+
+        inline PlanExecutor::YieldPolicy getYieldPolicy() const {
+            return _yieldPolicy;
+        }
+
         const std::string toString() const {
             return str::stream()
                         << " query: " << _query
@@ -145,7 +164,8 @@ namespace mongo {
                         << " multi: " << _multi
                         << " callLogOp: " << _callLogOp
                         << " fromMigration: " << _fromMigration
-                        << " fromReplications: " << _fromReplication;
+                        << " fromReplications: " << _fromReplication
+                        << " isExplain: " << _isExplain;
         }
     private:
 
@@ -183,6 +203,13 @@ namespace mongo {
 
         // The lifecycle data, and events used during the update request.
         UpdateLifecycle* _lifecycle;
+
+        // Whether or not we are requesting an explained update. Explained updates are read-only.
+        bool _isExplain;
+
+        // Whether or not the update should yield. Defaults to YIELD_MANUAL.
+        PlanExecutor::YieldPolicy _yieldPolicy;
+
     };
 
 } // namespace mongo

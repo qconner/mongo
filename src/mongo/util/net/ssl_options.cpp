@@ -25,6 +25,8 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_options.h"
@@ -70,6 +72,11 @@ namespace mongo {
         options->addOptionChaining("net.ssl.weakCertificateValidation",
                 "sslWeakCertificateValidation", moe::Switch, "allow client to connect without "
                 "presenting a certificate");
+
+        // Alias for --sslWeakCertificateValidation.
+        options->addOptionChaining("net.ssl.allowConnectionsWithoutCertificates",
+                "sslAllowConnectionsWithoutCertificates", moe::Switch,
+                "allow client to connect without presenting a certificate");
 
         options->addOptionChaining("net.ssl.allowInvalidHostnames", "sslAllowInvalidHostnames",
                 moe::Switch, "Allow server certificates to provide non-matching hostnames");
@@ -224,6 +231,10 @@ namespace mongo {
             sslGlobalParams.sslWeakCertificateValidation =
                 params["net.ssl.weakCertificateValidation"].as<bool>();
         }
+        else if (params.count("net.ssl.allowConnectionsWithoutCertificates")) {
+            sslGlobalParams.sslWeakCertificateValidation =
+                params["net.ssl.allowConnectionsWithoutCertificates"].as<bool>();
+        }
         if (params.count("net.ssl.allowInvalidHostnames")) {
             sslGlobalParams.sslAllowInvalidHostnames =
                 params["net.ssl.allowInvalidHostnames"].as<bool>();
@@ -316,6 +327,18 @@ namespace mongo {
         }
         if (params.count("ssl.FIPSMode")) {
             sslGlobalParams.sslFIPSMode = true;
+        }
+        return Status::OK();
+    }
+
+    Status validateSSLMongoShellOptions(const moe::Environment& params) {
+        // Users must specify either a CAFile or allowInvalidCertificates if ssl=true.
+        if (params.count("ssl") &&
+                params["ssl"].as<bool>() == true &&
+                !params.count("ssl.CAFile") &&
+                !params.count("ssl.allowInvalidCertificates")) {
+            return Status(ErrorCodes::BadValue,
+                    "need to either provide sslCAFile or specify sslAllowInvalidCertificates");
         }
         return Status::OK();
     }

@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/db/storage/mmap_v1/btree/key.h"
 
 #include "mongo/bson/util/builder.h"
@@ -97,7 +99,7 @@ namespace mongo {
             return x == 0 ? 0 : 1;
         }
         case jstOID:
-            return memcmp(l.value(), r.value(), 12);
+            return memcmp(l.value(), r.value(), OID::kOIDSize);
         case Code:
         case Symbol:
         case String:
@@ -276,7 +278,7 @@ namespace mongo {
                 break;
             case jstOID:
                 b.appendUChar(coid|bits);
-                b.appendBuf(&e.__oid(), sizeof(OID));
+                b.appendBuf(e.__oid().view().view(), OID::kOIDSize);
                 break;
             case BinData:
                 {
@@ -396,9 +398,12 @@ namespace mongo {
                         break;
                     }
                 case coid:
-                    b.appendOID("", (OID *) p);
-                    p += sizeof(OID);
-                    break;
+                    {
+                       OID oid = OID::from(p);
+                       b.appendOID("", &oid);
+                       p += OID::kOIDSize;
+                       break;
+                    }
                 case cbindata:
                     {
                         int len = binDataCodeToLength(*p);
@@ -509,10 +514,10 @@ namespace mongo {
             }
         case coid:
             {
-                int res = memcmp(l, r, sizeof(OID));
-                if( res ) 
+                int res = memcmp(l, r, OID::kOIDSize);
+                if( res )
                     return res;
-                l += 12; r += 12;
+                l += OID::kOIDSize; r += OID::kOIDSize;
                 break;
             }
         default:

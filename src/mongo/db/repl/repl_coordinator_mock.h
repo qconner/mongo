@@ -58,12 +58,20 @@ namespace repl {
 
         virtual MemberState getCurrentMemberState() const;
 
+        virtual Seconds getSlaveDelaySecs() const;
+
+        virtual void clearSyncSourceBlacklist();
+
         virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
                 const OperationContext* txn,
                 const OpTime& ts,
                 const WriteConcernOptions& writeConcern);
 
-        virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOp(
+        virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
+                const OperationContext* txn,
+                const WriteConcernOptions& writeConcern);
+
+        virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpApplied(
                 const OperationContext* txn,
                 const WriteConcernOptions& writeConcern);
 
@@ -72,11 +80,6 @@ namespace repl {
                                 const Milliseconds& waitTime,
                                 const Milliseconds& stepdownTime);
 
-        virtual Status stepDownAndWaitForSecondary(OperationContext* txn,
-                                                   const Milliseconds& initialWaitTime,
-                                                   const Milliseconds& stepdownTime,
-                                                   const Milliseconds& postStepdownWaitTime);
-
         virtual bool isMasterForReportingPurposes();
 
         virtual bool canAcceptWritesForDatabase(const StringData& dbName);
@@ -84,19 +87,35 @@ namespace repl {
         virtual Status checkIfWriteConcernCanBeSatisfied(
                 const WriteConcernOptions& writeConcern) const;
 
-        virtual Status canServeReadsFor(OperationContext* txn,
-                                        const NamespaceString& ns,
-                                        bool slaveOk);
+        virtual Status checkCanServeReadsFor(OperationContext* txn,
+                                             const NamespaceString& ns,
+                                             bool slaveOk);
 
         virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
 
-        virtual Status setLastOptime(OperationContext* txn, const OID& rid, const OpTime& ts);
+        virtual Status setLastOptimeForSlave(OperationContext* txn,
+                                             const OID& rid,
+                                             const OpTime& ts);
 
         virtual Status setMyLastOptime(OperationContext* txn, const OpTime& ts);
 
+        virtual void setMyHeartbeatMessage(const std::string& msg);
+
+        virtual OpTime getMyLastOptime() const;
+
         virtual OID getElectionId();
 
-        virtual OID getMyRID();
+        virtual OID getMyRID() const;
+
+        virtual int getMyId() const;
+
+        virtual bool setFollowerMode(const MemberState& newState);
+
+        virtual bool isWaitingForApplierToDrain();
+
+        virtual void signalDrainComplete();
+
+        virtual void signalUpstreamUpdater();
 
         virtual void prepareReplSetUpdatePositionCommand(OperationContext* txn,
                                                          BSONObjBuilder* cmdBuilder);
@@ -107,13 +126,15 @@ namespace repl {
 
         virtual Status processReplSetGetStatus(BSONObjBuilder* result);
 
+        virtual void fillIsMasterForReplSet(IsMasterResponse* result);
+
+        virtual void appendSlaveInfoData(BSONObjBuilder* result);
+
         virtual void processReplSetGetConfig(BSONObjBuilder* result);
 
-        virtual bool setMaintenanceMode(OperationContext* txn, bool activate);
+        virtual Status setMaintenanceMode(OperationContext* txn, bool activate);
 
-        virtual Status processReplSetMaintenance(OperationContext* txn,
-                                                 bool activate,
-                                                 BSONObjBuilder* resultObj);
+        virtual bool getMaintenanceMode();
 
         virtual Status processReplSetSyncFrom(const HostAndPort& target,
                                               BSONObjBuilder* resultObj);
@@ -147,15 +168,23 @@ namespace repl {
         virtual Status processHandshake(const OperationContext* txn,
                                         const HandshakeArgs& handshake);
 
-        virtual void waitUpToOneSecondForOptimeChange(const OpTime& ot);
-
         virtual bool buildsIndexes();
 
-        virtual std::vector<BSONObj> getHostsWrittenTo(const OpTime& op);
+        virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op);
+
+        virtual std::vector<HostAndPort> getOtherNodesInReplSet() const;
 
         virtual BSONObj getGetLastErrorDefault();
 
         virtual Status checkReplEnabledForCommand(BSONObjBuilder* result);
+
+        virtual HostAndPort chooseNewSyncSource();
+
+        virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
+
+        virtual void resetLastOpTimeFromOplog(OperationContext* txn);
+
+        virtual bool shouldChangeSyncSource(const HostAndPort& currentSource);
 
     private:
 

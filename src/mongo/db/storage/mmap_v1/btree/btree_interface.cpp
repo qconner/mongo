@@ -41,14 +41,12 @@ namespace mongo {
                                   typename BtreeLogic<OnDiskFormat>::Builder* builder)
             : _builder(builder), _trans(trans) { }
 
-        virtual ~BtreeBuilderInterfaceImpl() { }
-
         Status addKey(const BSONObj& key, const DiskLoc& loc) {
             return _builder->addKey(key, loc);
         }
 
     private:
-        typename BtreeLogic<OnDiskFormat>::Builder* _builder;
+        boost::scoped_ptr<typename BtreeLogic<OnDiskFormat>::Builder> _builder;
 
         // Not owned here.
         OperationContext* _trans;
@@ -87,14 +85,16 @@ namespace mongo {
             return _btree->insert(txn, key, loc, dupsAllowed);
         }
 
-        virtual bool unindex(OperationContext* txn,
+        virtual void unindex(OperationContext* txn,
                              const BSONObj& key,
-                             const DiskLoc& loc) {
+                             const DiskLoc& loc,
+                             bool dupsAllowed) {
 
-            return _btree->unindex(txn, key, loc);
+            _btree->unindex(txn, key, loc);
         }
 
-        virtual void fullValidate(OperationContext* txn, long long *numKeysOut) {
+        virtual void fullValidate(OperationContext* txn, bool full, long long *numKeysOut,
+                                  BSONObjBuilder* output) const {
             *numKeysOut = _btree->fullValidate(txn, NULL, false, false, 0);
         }
 
@@ -193,7 +193,9 @@ namespace mongo {
             }
 
             virtual void advance() {
-                _btree->advance(_txn, &_bucket, &_ofs, _direction);
+                if (!_bucket.isNull()) {
+                    _btree->advance(_txn, &_bucket, &_ofs, _direction);
+                }
             }
 
             virtual void savePosition() {
@@ -203,7 +205,7 @@ namespace mongo {
                 }
             }
 
-            virtual void restorePosition() {
+            virtual void restorePosition(OperationContext* txn) {
                 if (!_bucket.isNull()) {
                     _btree->restorePosition(_txn,
                                             _savedKey,

@@ -55,6 +55,7 @@
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
@@ -66,9 +67,7 @@
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/rs.h"
-#include "mongo/db/repl/rs_config.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/logger/ramlog.h"
@@ -107,11 +106,15 @@ namespace {
     WriteConcernOptions getDefaultWriteConcern() {
         ReplicationCoordinator* replCoordinator =
                 mongo::repl::getGlobalReplicationCoordinator();
-        mongo::Status status =
+
+        if (replCoordinator->getReplicationMode() ==
+                mongo::repl::ReplicationCoordinator::modeReplSet) {
+            mongo::Status status =
                 replCoordinator->checkIfWriteConcernCanBeSatisfied(DefaultWriteConcern);
 
-        if (status.isOK()) {
-            return DefaultWriteConcern;
+            if (status.isOK()) {
+              return DefaultWriteConcern;
+            }
         }
 
         return WriteConcernOptions(1, WriteConcernOptions::NONE, 0);
@@ -129,8 +132,9 @@ namespace mongo {
     class MoveTimingHelper {
     public:
         MoveTimingHelper( const string& where , const string& ns , BSONObj min , BSONObj max ,
-                          int total , string* cmdErrmsg )
-            : _where( where ) , _ns( ns ) , _next( 0 ) , _total( total ) , _cmdErrmsg( cmdErrmsg ) {
+                          int total, string* cmdErrmsg, string toShard, string fromShard )
+            : _where( where ) , _ns( ns ) , _to( toShard ), _from( fromShard ), _next( 0 ),
+            _total( total ) , _cmdErrmsg( cmdErrmsg ) {
             _b.append( "min" , min );
             _b.append( "max" , max );
         }
@@ -139,6 +143,12 @@ namespace mongo {
             // even if logChange doesn't throw, bson does
             // sigh
             try {
+                if ( !_to.empty() ){
+                    _b.append( "to", _to );
+                }
+                if ( !_from.empty() ){
+                    _b.append( "from", _from );
+                }
                 if ( _next != _total ) {
                     _b.append( "note" , "aborted" );
                 }
@@ -186,6 +196,8 @@ namespace mongo {
 
         string _where;
         string _ns;
+        string _to;
+        string _from;
 
         int _next;
         int _total; // expected # of steps
@@ -216,7 +228,7 @@ namespace mongo {
                     const BSONObj& max ,
                     const BSONObj& shardKeyPattern ) {
         ShardKeyPattern shardKey( shardKeyPattern );
-        BSONObj k = shardKey.extractKeyFromQueryOrDoc( obj );
+        BSONObj k = shardKey.extractShardKeyFromDoc( obj );
         return k.woCompare( min ) >= 0 && k.woCompare( max ) < 0;
     }
 
@@ -266,11 +278,14 @@ namespace mongo {
             log() << "MigrateFromStatus::done About to acquire global write lock to exit critical "
                     "section" << endl;
 
-
             _deleteNotifyExec.reset( NULL );
 
-            Lock::GlobalWrite lk(txn->lockState());
-            log() << "MigrateFromStatus::done Global lock acquired" << endl;
+            // TODO: Change this. This is a bad hack for protecting some of the data structures
+            // below that were not properly synchronized with the intended latches in some
+            // usages.
+            Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(_ns), MODE_IX);
+            Lock::CollectionLock collLock(txn->lockState(), _ns, MODE_X);
+            log() << "MigrateFromStatus::done coll lock for " << _ns << " acquired" << endl;
 
             {
                 scoped_spinlock lk( _trackerLocks );
@@ -398,10 +413,10 @@ namespace mongo {
             long long size = 0;
 
             {
-                Client::ReadContext cx(txn, _ns);
+                AutoGetCollectionForRead ctx(txn, _ns);
 
-                xfer( txn, cx.ctx().db(), &_deleted, b, "deleted", size, false );
-                xfer( txn, cx.ctx().db(), &_reload, b, "reload", size, true );
+                xfer(txn, ctx.getDb(), &_deleted, b, "deleted", size, false);
+                xfer(txn, ctx.getDb(), &_reload, b, "reload", size, true);
             }
 
             b.append( "size" , size );
@@ -420,8 +435,8 @@ namespace mongo {
                               long long maxChunkSize,
                               string& errmsg,
                               BSONObjBuilder& result ) {
-            Client::ReadContext ctx(txn, _ns);
-            Collection* collection = ctx.ctx().db()->getCollection( txn, _ns );
+            AutoGetCollectionForRead ctx(txn, _ns);
+            Collection* collection = ctx.getCollection();
             if ( !collection ) {
                 errmsg = "ns not found, should be impossible";
                 return false;
@@ -430,9 +445,16 @@ namespace mongo {
             invariant( _deleteNotifyExec.get() == NULL );
             WorkingSet* ws = new WorkingSet();
             DeleteNotificationStage* dns = new DeleteNotificationStage();
+            PlanExecutor* deleteNotifyExec;
             // Takes ownership of 'ws' and 'dns'.
-            PlanExecutor* deleteNotifyExec = new PlanExecutor(ws, dns, collection);
-            deleteNotifyExec->registerExecInternalPlan();
+            Status execStatus = PlanExecutor::make(txn,
+                                                   ws,
+                                                   dns,
+                                                   collection,
+                                                   PlanExecutor::YIELD_MANUAL,
+                                                   &deleteNotifyExec);
+            invariant(execStatus.isOK());
+            deleteNotifyExec->registerExec();
             _deleteNotifyExec.reset(deleteNotifyExec);
 
             // Allow multiKey based on the invariant that shard keys must be single-valued.
@@ -454,6 +476,9 @@ namespace mongo {
 
             auto_ptr<PlanExecutor> exec(
                 InternalPlanner::indexScan(txn, collection, idx, min, max, false));
+            // We can afford to yield here because any change to the base data that we might
+            // miss is already being queued and will migrate in the 'transferMods' stage.
+            exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
             // use the average object size to estimate how many objects a full chunk would carry
             // do that while traversing the chunk's range using the sharding index, below
@@ -504,6 +529,7 @@ namespace mongo {
                 scoped_spinlock lk( _trackerLocks );
                 log() << "moveChunk number of documents: " << _cloneLocs.size() << migrateLog;
             }
+            txn->recoveryUnit()->commitAndRestart();
             return true;
         }
 
@@ -517,9 +543,9 @@ namespace mongo {
 
             int allocSize;
             {
-                Client::ReadContext ctx(txn, _ns);
-                Collection* collection = ctx.ctx().db()->getCollection( txn, _ns );
-                verify( collection );
+                AutoGetCollectionForRead ctx(txn, _ns);
+                Collection* collection = ctx.getCollection();
+                invariant(collection);
                 scoped_spinlock lk( _trackerLocks );
                 allocSize =
                     std::min(BSONObjMaxUserSize,
@@ -530,8 +556,8 @@ namespace mongo {
             while ( 1 ) {
                 bool filledBuffer = false;
                 
-                Client::ReadContext ctx(txn, _ns);
-                Collection* collection = ctx.ctx().db()->getCollection( txn, _ns );
+                AutoGetCollectionForRead ctx(txn, _ns);
+                Collection* collection = ctx.getCollection();
 
                 scoped_spinlock lk( _trackerLocks );
                 set<DiskLoc>::iterator i = _cloneLocs.begin();
@@ -542,7 +568,11 @@ namespace mongo {
                     invariant( collection );
 
                     DiskLoc dl = *i;
-                    BSONObj o = collection->docFor( txn, dl );
+                    BSONObj o;
+                    if ( !collection->findDoc( txn, dl, &o ) ) {
+                        // doc was deleted
+                        continue;
+                    }
 
                     // use the builder size instead of accumulating 'o's size so that we take into consideration
                     // the overhead of BSONArray indices, and *always* append one doc
@@ -566,10 +596,13 @@ namespace mongo {
         }
 
         void aboutToDelete( const DiskLoc& dl ) {
-            // not needed right now
-            // but trying to prevent a future bug
-            scoped_spinlock lk( _trackerLocks ); 
+            // Even though above we call findDoc to check for existance
+            // that check only works for non-mmapv1 engines, and this is needed
+            // for mmapv1.
 
+            // lock not needed right now
+            // but trying to prevent a future bug
+            scoped_spinlock lk( _trackerLocks );
             _cloneLocs.erase( dl );
         }
 
@@ -676,12 +709,10 @@ namespace mongo {
                 return NULL;
             }
             virtual std::vector<PlanStage*> getChildren() const {
-                invariant( false );
                 vector<PlanStage*> empty;
                 return empty;
             }
             virtual StageType stageType() const {
-                invariant( false );
                 return STAGE_NOTIFY_DELETE;
             }
         };
@@ -820,11 +851,17 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            // 1. parse options
-            // 2. make sure my view is complete and lock
-            // 3. start migrate
-            //    in a read lock, get all DiskLoc and sort so we can do as little seeking as possible
-            //    tell to start transferring
+            // 1. Parse options
+            // 2. Make sure my view is complete and lock the distributed lock to ensure shard
+            //    metadata stability.
+            // 3. Migration
+            //    Retrieve all DiskLocs, which need to be migrated in order to do as little seeking
+            //    as possible during transfer. Retrieval of the DiskLocs happens under a collection
+            //    lock, but then the collection lock is dropped. This opens up an opportunity for
+            //    repair or compact to invalidate these DiskLocs, because these commands do not
+            //    synchronized with migration. Note that data modifications are not a problem,
+            //    because we are registered for change notifications.
+            //
             // 4. pause till migrate caught up
             // 5. LOCK
             //    a) update my config, essentially locking
@@ -863,8 +900,17 @@ namespace mongo {
             else {
                 repl::ReplicationCoordinator* replCoordinator =
                         repl::getGlobalReplicationCoordinator();
+
+                if (replCoordinator->getReplicationMode() ==
+                        repl::ReplicationCoordinator::modeMasterSlave &&
+                    writeConcern.shouldWaitForOtherNodes()) {
+                    warning() << "moveChunk cannot check if secondary throttle setting "
+                              << writeConcern.toBSON()
+                              << " can be enforced in a master slave configuration";
+                }
+
                 Status status = replCoordinator->checkIfWriteConcernCanBeSatisfied(writeConcern);
-                if (!status.isOK()) {
+                if (!status.isOK() && status != ErrorCodes::NoReplicationEnabled) {
                     warning() << status.toString() << endl;
                     return appendCommandStatus(result, status);
                 }
@@ -951,7 +997,8 @@ namespace mongo {
                 return false;
             }
 
-            MoveTimingHelper timing( "from" , ns , min , max , 6 /* steps */ , &errmsg );
+            MoveTimingHelper timing( "from" , ns , min , max , 6 /* steps */ , &errmsg,
+                toShardName, fromShardName );
 
             log() << "received moveChunk request: " << cmdObj << migrateLog;
 
@@ -974,13 +1021,13 @@ namespace mongo {
             collLock.setLockMessage(str::stream() << "migrating chunk [" << minKey << ", " << maxKey
                                                   << ") in " << ns);
 
-            if (!collLock.tryAcquire(&errmsg)) {
+            Status acquisitionStatus = collLock.tryAcquire();
+            if (!acquisitionStatus.isOK()) {
+                errmsg = stream() << "could not acquire collection lock for " << ns
+                                  << " to migrate chunk [" << minKey << "," << maxKey << ")"
+                                  << causedBy(acquisitionStatus);
 
-                errmsg = str::stream() << "could not acquire collection lock for " << ns
-                                       << " to migrate chunk [" << minKey << "," << maxKey << ")"
-                                       << causedBy(errmsg);
-
-                warning() << errmsg;
+                warning() << errmsg << endl;
                 return false;
             }
 
@@ -1072,7 +1119,8 @@ namespace mongo {
             }
 
             {
-                // this gets a read lock, so we know we have a checkpoint for mods
+                // See comment at the top of the function for more information on what
+                // synchronization is used here.
                 if (!migrateFromStatus.storeCurrentLocs(txn, maxChunkSize, errmsg, result)) {
                     warning() << errmsg << endl;
                     return false;
@@ -1130,7 +1178,7 @@ namespace mongo {
             // Track last result from TO shard for sanity check
             BSONObj res;
             for ( int i=0; i<86400; i++ ) { // don't want a single chunk move to take more than a day
-                invariant(!txn->lockState()->threadState());
+                invariant(!txn->lockState()->isLocked());
 
                 // Exponential sleep backoff, up to 1024ms. Don't sleep much on the first few
                 // iterations, since we want empty chunk migrations to be fast.
@@ -1226,11 +1274,10 @@ namespace mongo {
             }
 
             // Ensure distributed lock still held
-            string lockHeldMsg;
-            bool lockHeld = collLock.verifyLockHeld(&lockHeldMsg);
-            if ( !lockHeld ) {
+            Status lockStatus = collLock.checkStatus();
+            if (!lockStatus.isOK()) {
                 errmsg = str::stream() << "not entering migrate critical section because "
-                                       << lockHeldMsg;
+                                       << lockStatus.toString();
                 warning() << errmsg << endl;
                 return false;
             }
@@ -1246,7 +1293,8 @@ namespace mongo {
                 myVersion.incMajor();
 
                 {
-                    Lock::DBWrite lk(txn->lockState(), ns );
+                    Lock::DBLock lk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
+                    Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
                     verify( myVersion > shardingState.getVersion( ns ) );
 
                     // bump the metadata's version up and "forget" about the chunk being moved
@@ -1281,7 +1329,9 @@ namespace mongo {
                     log() << "moveChunk migrate commit not accepted by TO-shard: " << res
                           << " resetting shard version to: " << origShardVersion << migrateLog;
                     {
-                        Lock::GlobalWrite lk(txn->lockState());
+                        Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
+                        Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
+
                         log() << "moveChunk global lock acquired to reset shard version from "
                               "failed migration"
                               << endl;
@@ -1453,7 +1503,8 @@ namespace mongo {
                           << "failed migration" << endl;
 
                     {
-                        Lock::GlobalWrite lk(txn->lockState());
+                        Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
+                        Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
 
                         // Revert the metadata back to the state before "forgetting"
                         // about the chunk.
@@ -1660,7 +1711,9 @@ namespace mongo {
 
             if ( getState() != DONE ) {
                 // Unprotect the range if needed/possible on unsuccessful TO migration
-                Lock::DBWrite lk(txn->lockState(), ns);
+                Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
+                Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
+
                 string errMsg;
                 if (!shardingState.forgetPending(txn, ns, min, max, epoch, &errMsg)) {
                     warning() << errMsg << endl;
@@ -1675,20 +1728,13 @@ namespace mongo {
             verify( getState() == READY );
             verify( ! min.isEmpty() );
             verify( ! max.isEmpty() );
-            
-            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                    repl::ReplicationCoordinator::modeReplSet) {
-                replSetMajorityCount = repl::theReplSet->config().getMajority();
-            } else {
-                replSetMajorityCount = 0;
-            }
 
             log() << "starting receiving-end of migration of chunk " << min << " -> " << max <<
                     " for collection " << ns << " from " << from
                   << " at epoch " << epoch.toString() << endl;
 
             string errmsg;
-            MoveTimingHelper timing( "to" , ns , min , max , 5 /* steps */ , &errmsg );
+            MoveTimingHelper timing( "to" , ns , min , max , 5 /* steps */ , &errmsg, "", "" );
 
             ScopedDbConnection conn(from);
             conn->getLastError(); // just test connection
@@ -1707,13 +1753,14 @@ namespace mongo {
                     if ( entry["options"].isABSONObj() )
                         options = entry["options"].Obj();
 
+                    WriteUnitOfWork wuow(txn);
                     Status status = userCreateNS( txn, db, ns, options, true, false );
                     if ( !status.isOK() ) {
                         warning() << "failed to create collection [" << ns << "] "
                                   << " with options " << options << ": " << status;
                     }
+                    wuow.commit();
                 }
-                ctx.commit();
             }
 
             {                
@@ -1721,14 +1768,11 @@ namespace mongo {
                 
                 vector<BSONObj> indexSpecs;
                 {
-                    auto_ptr<DBClientCursor> indexes = conn->getIndexes( ns );
-                    
-                    while ( indexes->more() ) {
-                        indexSpecs.push_back( indexes->nextSafe().getOwned() );
-                    }
+                    const std::list<BSONObj> indexes = conn->getIndexSpecs(ns);
+                    indexSpecs.insert(indexSpecs.begin(), indexes.begin(), indexes.end());
                 }
 
-                Lock::DBWrite lk(txn->lockState(),  ns);
+                Lock::DBLock lk(txn->lockState(),  nsToDatabaseSubstring(ns), MODE_X);
                 Client::Context ctx(txn,  ns);
                 Database* db = ctx.db();
                 Collection* collection = db->getCollection( txn, ns );
@@ -1813,7 +1857,9 @@ namespace mongo {
 
                 {
                     // Protect the range by noting that we're now starting a migration to it
-                    Lock::DBWrite lk(txn->lockState(), ns);
+                    Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
+                    Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
+
                     if (!shardingState.notePending(txn, ns, min, max, epoch, &errmsg)) {
                         warning() << errmsg << endl;
                         setState(FAIL);
@@ -1892,7 +1938,6 @@ namespace mongo {
                             }
 
                             Helpers::upsert( txn, ns, o, true );
-                            cx.commit();
                         }
                         thisTime++;
                         numCloned++;
@@ -1956,7 +2001,7 @@ namespace mongo {
                             return;
                         }
                         
-                        if (opReplicatedEnough(txn, lastOpApplied))
+                        if (opReplicatedEnough(txn, lastOpApplied, writeConcern))
                             break;
                         
                         if ( i > 100 ) {
@@ -1994,7 +2039,7 @@ namespace mongo {
 
                     log() << "Waiting for replication to catch up before entering critical section"
                           << endl;
-                    if ( flushPendingWrites(txn, lastOpApplied ) )
+                    if (flushPendingWrites(txn, lastOpApplied, writeConcern))
                         break;
                     sleepsecs(1);
                 }
@@ -2041,7 +2086,7 @@ namespace mongo {
                     // 1) The from side has told us that it has locked writes (COMMIT_START)
                     // 2) We've checked at least one more time for un-transmitted mods
                     if ( getState() == COMMIT_START && transferAfterCommit == true ) {
-                        if ( flushPendingWrites(txn, lastOpApplied ) )
+                        if (flushPendingWrites(txn, lastOpApplied, writeConcern))
                             break;
                     }
                     
@@ -2095,26 +2140,25 @@ namespace mongo {
             bool didAnything = false;
 
             if ( xfer["deleted"].isABSONObj() ) {
+                Lock::DBLock dlk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
                 Helpers::RemoveSaver rs( "moveChunk" , ns , "removedDuring" );
 
                 BSONObjIterator i( xfer["deleted"].Obj() );
                 while ( i.more() ) {
-                    Client::WriteContext cx(txn, ns);
+                    Lock::CollectionLock clk(txn->lockState(), ns, MODE_X);
+                    Client::Context ctx(txn, ns);
 
                     BSONObj id = i.next().Obj();
 
                     // do not apply deletes if they do not belong to the chunk being migrated
                     BSONObj fullObj;
-                    if ( Helpers::findById( txn, cx.ctx().db(), ns.c_str(), id, fullObj ) ) {
-                        if ( ! isInRange( fullObj , min , max , shardKeyPattern ) ) {
+                    if (Helpers::findById(txn, ctx.db(), ns.c_str(), id, fullObj)) {
+                        if (!isInRange(fullObj , min , max , shardKeyPattern)) {
                             log() << "not applying out of range deletion: " << fullObj << migrateLog;
 
                             continue;
                         }
                     }
-
-                    Lock::DBWrite lk(txn->lockState(), ns);
-                    Client::Context ctx(txn, ns);
 
                     if (serverGlobalParams.moveParanoia) {
                         rs.goingToDelete(fullObj);
@@ -2124,13 +2168,13 @@ namespace mongo {
                                   ctx.db(),
                                   ns,
                                   id,
+                                  PlanExecutor::YIELD_MANUAL,
                                   true /* justOne */,
                                   true /* logOp */,
                                   false /* god */,
                                   true /* fromMigrate */);
 
-                    *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
-                    cx.commit();
+                    *lastOpApplied = ctx.getClient()->getLastOp().asDate();
                     didAnything = true;
                 }
             }
@@ -2160,7 +2204,6 @@ namespace mongo {
                     Helpers::upsert( txn, ns , it , true );
 
                     *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
-                    cx.commit();
                     didAnything = true;
                 }
             }
@@ -2184,22 +2227,41 @@ namespace mongo {
             return false;
         }
 
-        bool opReplicatedEnough(const OperationContext* txn, const ReplTime& lastOpApplied) {
-            // if replication is on, try to force enough secondaries to catch up
-            // TODO opReplicatedEnough should eventually honor priorities and geo-awareness
-            //      for now, we try to replicate to a sensible number of secondaries
-            WriteConcernOptions writeConcern;
-            writeConcern.wTimeout = -1;
-            writeConcern.wMode = "majority";
-            return repl::getGlobalReplicationCoordinator()->awaitReplication(txn, lastOpApplied,
-                    writeConcern).status.isOK();
+        /**
+         * Returns true if the majority of the nodes and the nodes corresponding to the given
+         * writeConcern (if not empty) have applied till the specified lastOp.
+         */
+        bool opReplicatedEnough(const OperationContext* txn,
+                                const ReplTime& lastOpApplied,
+                                const WriteConcernOptions& writeConcern) {
+            WriteConcernOptions majorityWriteConcern;
+            majorityWriteConcern.wTimeout = -1;
+            majorityWriteConcern.wMode = "majority";
+            Status majorityStatus = repl::getGlobalReplicationCoordinator()->awaitReplication(
+                    txn, lastOpApplied, majorityWriteConcern).status;
+
+            if (!writeConcern.shouldWaitForOtherNodes()) {
+                return majorityStatus.isOK();
+            }
+
+            // Also enforce the user specified write concern after "majority" so it covers
+            // the union of the 2 write concerns.
+
+            WriteConcernOptions userWriteConcern(writeConcern);
+            userWriteConcern.wTimeout = -1;
+            Status userStatus = repl::getGlobalReplicationCoordinator()->awaitReplication(
+                    txn, lastOpApplied, userWriteConcern).status;
+
+            return majorityStatus.isOK() && userStatus.isOK();
         }
 
-        bool flushPendingWrites(OperationContext* txn, const ReplTime& lastOpApplied ) {
-            if (!opReplicatedEnough(txn, lastOpApplied)) {
+        bool flushPendingWrites(OperationContext* txn,
+                                const ReplTime& lastOpApplied,
+                                const WriteConcernOptions& writeConcern) {
+            if (!opReplicatedEnough(txn, lastOpApplied, writeConcern)) {
                 OpTime op( lastOpApplied );
-                OCCASIONALLY warning() << "migrate commit waiting for " << replSetMajorityCount 
-                                       << " slaves for '" << ns << "' " << min << " -> " << max 
+                OCCASIONALLY warning() << "migrate commit waiting for a majority of slaves for '"
+                                       << ns << "' " << min << " -> " << max
                                        << " waiting for: " << op
                                        << migrateLog;
                 return false;
@@ -2208,6 +2270,7 @@ namespace mongo {
             log() << "migrate commit succeeded flushing to secondaries for '" << ns << "' " << min << " -> " << max << migrateLog;
 
             {
+                // Get global lock to wait for write to be commited to journal.
                 Lock::GlobalRead lk(txn->lockState());
 
                 // if durability is on, force a write to journal
@@ -2238,13 +2301,13 @@ namespace mongo {
 
             if ( getState() != STEADY )
                 return false;
-            setState(COMMIT_START);
-            
+
             boost::xtime xt;
             boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
             xt.sec += 30;
 
             scoped_lock lock(m_active);
+            setState(COMMIT_START);
             while ( active ) {
                 if ( ! isActiveCV.timed_wait( lock.boost(), xt ) ){
                     // TIMEOUT
@@ -2274,6 +2337,7 @@ namespace mongo {
             isActiveCV.notify_all(); 
         }
 
+        // Lock order: m_active -> stateMutex
         mutable mongo::mutex m_active;
         bool active;
         boost::condition isActiveCV;
@@ -2291,8 +2355,6 @@ namespace mongo {
         long long numCatchup;
         long long numSteady;
         WriteConcernOptions writeConcern;
-
-        int replSetMajorityCount;
 
         // protects state
         mutable mutex stateMutex;
@@ -2433,8 +2495,17 @@ namespace mongo {
             else {
                 repl::ReplicationCoordinator* replCoordinator =
                         repl::getGlobalReplicationCoordinator();
+
+                if (replCoordinator->getReplicationMode() ==
+                        repl::ReplicationCoordinator::modeMasterSlave &&
+                    writeConcern.shouldWaitForOtherNodes()) {
+                    warning() << "recvChunk cannot check if secondary throttle setting "
+                              << writeConcern.toBSON()
+                              << " can be enforced in a master slave configuration";
+                }
+
                 Status status = replCoordinator->checkIfWriteConcernCanBeSatisfied(writeConcern);
-                if (!status.isOK()) {
+                if (!status.isOK() && status != ErrorCodes::NoReplicationEnabled) {
                     warning() << status.toString() << endl;
                     return appendCommandStatus(result, status);
                 }

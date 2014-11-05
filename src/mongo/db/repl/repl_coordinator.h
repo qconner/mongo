@@ -49,7 +49,10 @@ namespace mongo {
 
 namespace repl {
 
+    class BackgroundSync;
     class HandshakeArgs;
+    class IsMasterResponse;
+    class OplogReader;
     class ReplSetHeartbeatArgs;
     class ReplSetHeartbeatResponse;
     class UpdatePositionArgs;
@@ -134,24 +137,48 @@ namespace repl {
         virtual MemberState getCurrentMemberState() const = 0;
 
         /**
+         * Returns how slave delayed this node is configured to be.
+         *
+         * Raises a DBException if this node is not a member of the current replica set
+         * configuration.
+         */
+        virtual Seconds getSlaveDelaySecs() const = 0;
+
+        /**
+         * Clears the list of sync sources we have blacklisted.
+         */
+        virtual void clearSyncSourceBlacklist() = 0;
+
+        /**
          * Blocks the calling thread for up to writeConcern.wTimeout millis, or until "ts" has been
          * replicated to at least a set of nodes that satisfies the writeConcern, whichever comes
          * first. A writeConcern.wTimeout of 0 indicates no timeout (block forever) and a
-         * writeConcern.wTimeout of -1 indicates return immediately after checking. Will return a
-         * Status with ErrorCodes::ExceededTimeLimit if the writeConcern.wTimeout is reached before
-         * the data has been sufficiently replicated, a Status with ErrorCodes::NotMaster if the
-         * node is not Primary/Master, or a Status with ErrorCodes::UnknownReplWriteConcern if
-         * the writeConcern.wMode contains a write concern mode that is not known.
+         * writeConcern.wTimeout of -1 indicates return immediately after checking. Return codes:
+         * ErrorCodes::ExceededTimeLimit if the writeConcern.wTimeout is reached before
+         *     the data has been sufficiently replicated
+         * ErrorCodes::NotMaster if the node is not Primary/Master
+         * ErrorCodes::UnknownReplWriteConcern if the writeConcern.wMode contains a write concern
+         *     mode that is not known
+         * ErrorCodes::ShutdownInProgress if we are mid-shutdown
+         * ErrorCodes::Interrupted if the operation was killed with killop()
          */
         virtual StatusAndDuration awaitReplication(const OperationContext* txn,
-                                                    const OpTime& ts,
-                                                    const WriteConcernOptions& writeConcern) = 0;
+                                                   const OpTime& ts,
+                                                   const WriteConcernOptions& writeConcern) = 0;
 
         /**
          * Like awaitReplication(), above, but waits for the replication of the last operation
          * performed on the client associated with "txn".
          */
-        virtual StatusAndDuration awaitReplicationOfLastOp(
+        virtual StatusAndDuration awaitReplicationOfLastOpForClient(
+                const OperationContext* txn,
+                const WriteConcernOptions& writeConcern) = 0;
+
+        /**
+         * Like awaitReplication(), above, but waits for the replication of the last operation
+         * applied to this node.
+         */
+        virtual StatusAndDuration awaitReplicationOfLastOpApplied(
                 const OperationContext* txn,
                 const WriteConcernOptions& writeConcern) = 0;
 
@@ -163,30 +190,11 @@ namespace repl {
          * ErrorCodes::NotMaster if you are no longer primary when trying to step down,
          * ErrorCodes::SecondaryAheadOfPrimary if we are primary but there is another node that
          * seems to be ahead of us in replication, and Status::OK otherwise.
-         * TODO(spencer): SERVER-14251 This should block writes while waiting for other nodes to
-         * catch up, and then should wait till a secondary is completely caught up rather than
-         * within 10 seconds.
          */
         virtual Status stepDown(OperationContext* txn,
                                 bool force,
                                 const Milliseconds& waitTime,
                                 const Milliseconds& stepdownTime) = 0;
-
-        /**
-         * Behaves similarly to stepDown except that after stepping down as primary it waits for
-         * up to 'postStepdownWaitTime' for one other node to match this node's optime exactly.
-         * TODO(spencer): This method should be removed and all callers should use shutDown, after
-         * shutdown has been fixed to block new writes while waiting for secondaries to catch up.
-         */
-        virtual Status stepDownAndWaitForSecondary(OperationContext* txn,
-                                                   const Milliseconds& initialWaitTime,
-                                                   const Milliseconds& stepdownTime,
-                                                   const Milliseconds& postStepdownWaitTime) = 0;
-
-        /**
-         * TODO a way to trigger an action on replication of a given operation
-         */
-        // handle_t onReplication(OpTime ts, writeConcern, callbackFunction); // TODO
 
         /**
          * Returns true if the node can be considered master for the purpose of introspective
@@ -209,9 +217,9 @@ namespace repl {
          * Checks if the current replica set configuration can satisfy the given write concern.
          *
          * Things that are taken into consideration include:
-         * 1. If the set has enough members.
-         * 2. If the tag exists.
-         * 3. If there are enough members for the tag specified.
+         * 1. If the set has enough data-bearing members.
+         * 2. If the write concern mode exists.
+         * 3. If there are enough members for the write concern mode specified.
          */
         virtual Status checkIfWriteConcernCanBeSatisfied(
                 const WriteConcernOptions& writeConcern) const = 0;
@@ -220,9 +228,9 @@ namespace repl {
          * Returns Status::OK() if it is valid for this node to serve reads on the given collection
          * and an errorcode indicating why the node cannot if it cannot.
          */
-        virtual Status canServeReadsFor(OperationContext* txn,
-                                        const NamespaceString& ns,
-                                        bool slaveOk) = 0;
+        virtual Status checkCanServeReadsFor(OperationContext* txn,
+                                             const NamespaceString& ns,
+                                             bool slaveOk) = 0;
 
         /**
          * Returns true if this node should ignore unique index constraints on new documents.
@@ -231,24 +239,27 @@ namespace repl {
         virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx) = 0;
 
         /**
-         * Updates our internal tracking of the last OpTime applied for the given member of the set
-         * identified by "rid".  Also updates all bookkeeping related to tracking what the last
-         * OpTime applied by all tag groups that "rid" is a part of.  This is called when
-         * secondaries notify the member they are syncing from of their progress in replication.
-         * This information is used by awaitReplication to satisfy write concerns.  It is *not* used
-         * in elections, we maintain a separate view of member optimes in the topology coordinator
-         * based on incoming heartbeat messages, which is used in elections.
-         *
-         * @returns ErrorCodes::NodeNotFound if the member cannot be found in sync progress tracking
-         * @returns Status::OK() otherwise
+         * Updates our internal tracking of the last OpTime applied for the given slave
+         * identified by "rid".  Only valid to call in master/slave mode
          * TODO(spencer): Remove txn argument and make into a void function when legacy is gone.
          */
-        virtual Status setLastOptime(OperationContext* txn, const OID& rid, const OpTime& ts) = 0;
+        virtual Status setLastOptimeForSlave(
+                OperationContext* txn, const OID& rid, const OpTime& ts) = 0;
 
         /**
-         * Delegates to setLastOptime using our RID as the rid argument.
+         * Updates our internal tracking of the last OpTime applied to this node.
          */
         virtual Status setMyLastOptime(OperationContext* txn, const OpTime& ts) = 0;
+
+        /**
+         * Updates our the message we include in heartbeat responses.
+         */
+        virtual void setMyHeartbeatMessage(const std::string& msg) = 0;
+
+        /**
+         * Returns the last optime recorded by setMyLastOptime.
+         */
+        virtual OpTime getMyLastOptime() const = 0;
 
         /**
          * Retrieves and returns the current election id, which is a unique id that is local to
@@ -261,7 +272,51 @@ namespace repl {
          * Returns the RID for this node.  The RID is used to identify this node to our sync source
          * when sending updates about our replication progress.
          */
-        virtual OID getMyRID() = 0;
+        virtual OID getMyRID() const = 0;
+
+        /**
+         * Returns the id for this node as specified in the current replica set configuration.
+         */
+        virtual int getMyId() const = 0;
+
+        /**
+         * Sets this node into a specific follower mode.
+         *
+         * Returns true if the follower mode was successfully set.  Returns false if the
+         * node is or becomes a leader before setFollowerMode completes.
+         *
+         * Follower modes are RS_STARTUP2 (initial sync), RS_SECONDARY, RS_ROLLBACK and
+         * RS_RECOVERING.  They are the valid states of a node whose topology coordinator has the
+         * follower role.
+         *
+         * This is essentially an interface that allows the applier to prevent the node from
+         * becoming a candidate or accepting reads, depending on circumstances in the oplog
+         * application process.
+         */
+        virtual bool setFollowerMode(const MemberState& newState) = 0;
+
+        /**
+         * Returns true if the coordinator wants the applier to pause application.
+         *
+         * If this returns true, the applier should call signalDrainComplete() when it has
+         * completed draining its operation buffer and no further ops are being applied.
+         */
+        virtual bool isWaitingForApplierToDrain() = 0;
+
+        /**
+         * Signals that a previously requested pause and drain of the applier buffer
+         * has completed.
+         *
+         * This is an interface that allows the applier to reenable writes after
+         * a successful election triggers the draining of the applier buffer.
+         */
+        virtual void signalDrainComplete() = 0;
+
+        /**
+         * Signals the sync source feedback thread to wake up and send a handshake and
+         * replSetUpdatePosition command to our sync source.
+         */
+        virtual void signalUpstreamUpdater() = 0;
 
         /**
          * Prepares a BSONObj describing an invocation of the replSetUpdatePosition command that can
@@ -286,15 +341,33 @@ namespace repl {
         virtual Status processReplSetGetStatus(BSONObjBuilder* result) = 0;
 
         /**
+         * Handles an incoming isMaster command for a replica set node.  Should not be
+         * called on a master-slave or standalone node.
+         */
+        virtual void fillIsMasterForReplSet(IsMasterResponse* result) = 0;
+
+        /**
+         * Adds to "result" a description of the slaveInfo data structure used to map RIDs to their
+         * last known optimes.
+         */
+        virtual void appendSlaveInfoData(BSONObjBuilder* result) = 0;
+
+        /**
          * Handles an incoming replSetGetConfig command. Adds BSON to 'result'.
          */
         virtual void processReplSetGetConfig(BSONObjBuilder* result) = 0;
 
         /**
          * Toggles maintenanceMode to the value expressed by 'activate'
-         * return true, if the change worked and false otherwise
+         * return Status::OK if the change worked, NotSecondary if it failed because we are
+         * PRIMARY, and OperationFailed if we are not currently in maintenance mode
          */
-        virtual bool setMaintenanceMode(OperationContext* txn, bool activate) = 0;
+        virtual Status setMaintenanceMode(OperationContext* txn, bool activate) = 0;
+
+        /**
+         * Retrieves the current count of maintenanceMode and returns 'true' if greater than 0.
+         */
+        virtual bool getMaintenanceMode() = 0;
 
         /**
          * Handles an incoming replSetSyncFrom command. Adds BSON to 'result'
@@ -303,16 +376,6 @@ namespace repl {
          */
         virtual Status processReplSetSyncFrom(const HostAndPort& target,
                                               BSONObjBuilder* resultObj) = 0;
-
-        /**
-         * Handles an incoming replSetMaintenance command. 'activate' indicates whether to activate
-         * or deactivate maintenanceMode.
-         * returns Status::OK() if maintenanceMode is successfully changed, otherwise returns a
-         * Status containing an error message about the failure
-         */
-        virtual Status processReplSetMaintenance(OperationContext* txn,
-                                                 bool activate,
-                                                 BSONObjBuilder* resultObj) = 0;
 
         /**
          * Handles an incoming replSetFreeze command. Adds BSON to 'resultObj' 
@@ -400,10 +463,14 @@ namespace repl {
                                            BSONObjBuilder* resultObj) = 0;
 
         /**
-         * Handles an incoming replSetUpdatePosition command, updating each nodes oplog progress.
-         * returns Status::OK() if the all updates are processed correctly, ErrorCodes::NodeNotFound
-         * if any updating node cannot be found in the config, or any of the normal replset
-         * command ErrorCodes.
+         * Handles an incoming replSetUpdatePosition command, updating each node's oplog progress.
+         * Returns Status::OK() if all updates are processed correctly, NodeNotFound
+         * if any updating node cannot be found in the config, InvalidReplicaSetConfig if the
+         * "cfgver" sent in any of the updates doesn't match our config version, or
+         * NotMasterOrSecondaryCode if we are in state REMOVED or otherwise don't have a valid
+         * replica set config.
+         * If a non-OK status is returned, it is unspecified whether none or some of the updates
+         * were applied.
          */
         virtual Status processReplSetUpdatePosition(OperationContext* txn,
                                                     const UpdatePositionArgs& updates) = 0;
@@ -415,15 +482,11 @@ namespace repl {
          * node is being chained through.
          *
          * Returns ErrorCodes::NodeNotFound if no replica set member exists with the given member ID
+         * and ErrorCodes::NotMasterOrSecondaryCode if we're in state REMOVED or otherwise don't
+         * have a valid config.
          */
         virtual Status processHandshake(const OperationContext* txn,
                                         const HandshakeArgs& handshake) = 0;
-
-        /**
-         * Returns once the oplog's most recent entry changes or after one second, whichever
-         * occurs first.
-         */
-        virtual void waitUpToOneSecondForOptimeChange(const OpTime& ot) = 0;
 
         /**
          * Returns a bool indicating whether or not this node builds indexes.
@@ -431,10 +494,16 @@ namespace repl {
         virtual bool buildsIndexes() = 0;
 
         /**
-         * Returns a vector containing BSONObjs describing each member that has applied operation
-         * at OpTime 'op'.
+         * Returns a vector of members that have applied the operation with OpTime 'op'.
          */
-        virtual std::vector<BSONObj> getHostsWrittenTo(const OpTime& op) = 0;
+        virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op) = 0;
+
+        /**
+         * Returns a vector of the members other than ourself in the replica set, as specified in
+         * the replica set config.  Invalid to call if we are not in replica set mode.  Returns
+         * an empty vector if we do not have a valid config.
+         */
+        virtual std::vector<HostAndPort> getOtherNodesInReplSet() const = 0;
 
         /**
          * Returns a BSONObj containing a representation of the current default write concern.
@@ -450,6 +519,28 @@ namespace repl {
          * NotYetInitialized in the absence of a valid config. Also adds error info to "result".
          */
         virtual Status checkReplEnabledForCommand(BSONObjBuilder* result) = 0;
+
+        /**
+         * Chooses a viable sync source, or, if none available, returns empty HostAndPort.
+         */
+        virtual HostAndPort chooseNewSyncSource() = 0;
+
+        /**
+         * Blacklists choosing 'host' as a sync source until time 'until'.
+         */
+        virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) = 0;
+
+        /**
+         * Loads the optime from the last op in the oplog into the coordinator's lastOpApplied
+         * value.
+         */
+        virtual void resetLastOpTimeFromOplog(OperationContext* txn) = 0;
+
+        /**
+         * Determines if a new sync source should be considered.
+         * currentSource: the current sync source
+         */
+        virtual bool shouldChangeSyncSource(const HostAndPort& currentSource) = 0;
 
     protected:
 

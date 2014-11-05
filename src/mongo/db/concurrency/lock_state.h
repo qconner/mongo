@@ -28,13 +28,14 @@
 
 #pragma once
 
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/lock_mgr_new.h"
+#include <queue>
 
+#include "mongo/db/concurrency/fast_map_noalloc.h"
+#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/db/concurrency/locker.h"
 
 namespace mongo {
-namespace newlm {
-    
+
     /**
      * Notfication callback, which stores the last notification result and signals a condition
      * variable, which can be waited on.
@@ -51,8 +52,10 @@ namespace newlm {
 
         /**
          * Uninterruptible blocking method, which waits for the notification to fire.
+         *
+         * @param timeoutMs How many milliseconds to wait before returning LOCK_TIMEOUT.
          */
-        LockResult wait();
+        LockResult wait(unsigned timeoutMs);
 
     private:
 
@@ -75,200 +78,233 @@ namespace newlm {
      *
      * All instances reference a single global lock manager.
      *
-     * TODO: At some point, this will have to be renamed to LockState.
+     * @param IsForMMAPV1 Whether to compile-in the flush lock functionality, which is specific to
+     *          the way the MMAP V1 (legacy) storag engine does commit concurrency control.
      */
-    class Locker {
-        MONGO_DISALLOW_COPYING(Locker);
+    template<bool IsForMMAPV1>
+    class LockerImpl : public Locker {
     public:
 
         /**
-         * Instantiates a new lock space with the specified unique identifier used for
-         * disambiguation.
+         * Instantiates new locker. Must be given a unique identifier for disambiguation. Lockers
+         * having the same identifier will not conflict on lock acquisition.
          */
-        explicit Locker(uint64_t id);
-        ~Locker();
+        LockerImpl(LockerId id);
 
-        inline uint64_t getId() const { return _id; }
+        virtual ~LockerImpl();
+
+        virtual LockerId getId() const { return _id; }
+
+        virtual LockResult lockGlobal(LockMode mode, unsigned timeoutMs = UINT_MAX);
+        virtual void downgradeGlobalXtoSForMMAPV1();
+        virtual bool unlockAll();
+
+        virtual void beginWriteUnitOfWork();
+        virtual void endWriteUnitOfWork();
+
+        virtual bool inAWriteUnitOfWork() const { return _wuowNestingLevel > 0; }
+
+        virtual LockResult lock(const ResourceId& resId,
+                                LockMode mode, 
+                                unsigned timeoutMs = UINT_MAX,
+                                bool checkDeadlock = false);
+
+        virtual void downgrade(const ResourceId& resId, LockMode newMode);
+
+        virtual bool unlock(const ResourceId& resId);
+
+        virtual LockMode getLockMode(const ResourceId& resId) const;
+        virtual bool isLockHeldForMode(const ResourceId& resId, LockMode mode) const;
+        virtual bool isDbLockedForMode(const StringData& dbName, LockMode mode) const;
+        virtual bool isCollectionLockedForMode(const StringData& ns, LockMode mode) const;
+
+        virtual ResourceId getWaitingResource() const;
+
+        virtual void getLockerInfo(LockerInfo* lockerInfo) const;
+
+        virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut);
+
+        virtual void restoreLockState(const LockSnapshot& stateToRestore);
 
         /**
-         * Shortcut for lockExtended, which blocks until a request is granted or deadlocked. Refer
-         * to the comments for lockExtended.
+         * Posts a request to the lock manager for the specified lock to be acquired and returns
+         * immediately.
          *
-         * @return All LockResults except for LOCK_WAITING, because it blocks.
+         * NOTE: Must only be used to implement the actual lock call and for unit tests, because
+         * it skips any internal consistency checks.
          */
-        LockResult lock(const ResourceId& resId, LockMode mode);
-
-        /**
-         * Acquires lock on the specified resource in the specified mode and returns the outcome
-         * of the operation. See the details for LockResult for more information on what the
-         * different results mean.
-         *
-         * Acquiring the same resource twice increments the reference count of the lock so each
-         * call to lock must be matched with a call to unlock.
-         *
-         * @param resId Id of the resource to be locked.
-         * @param mode Mode in which the resource should be locked. Lock upgrades are allowed.
-         * @param notify This value cannot be NULL. If the return value is not LOCK_WAITING, this
-         *               pointer can be freed and will not be used any more.
-         *
-         *               If the return value is LOCK_WAITING, the notification method will be
-         *               called at some point into the future, when the lock either becomes granted
-         *               or a deadlock is discovered. If unlock is called before the lock becomes
-         *               granted, the notification will not be invoked.
-         *
-         *               If the return value is LOCK_WAITING, the notification object *must* live
-         *               at least until the notfy method has been invoked or unlock has been called
-         *               for the resource it was assigned to. Failure to do so will cause the lock
-         *               manager to call into an invalid memory location.
-         */
-        LockResult lockExtended(const ResourceId& resId,
-                                LockMode mode,
-                                LockGrantNotification* notify);
-
-        /**
-         * Releases a lock previously acquired through a lock call. It is an error to try to
-         * release lock which has not been previously acquired (invariant violation).
-         */
-        void unlock(const ResourceId& resId);
-
-        /**
-         * Checks whether the lock held for a particular resource covers the specified mode.
-         *
-         * For example MODE_X covers MODE_S.
-         */
-        bool isLockHeldForMode(const ResourceId& resId, LockMode mode) const;
-
-        /**
-         * Dumps all locks, on the global lock manager to the log for debugging purposes.
-         */
-        static void dumpGlobalLockManager();
-
-
-        //
-        // Methods used for unit-testing only
-        //
-
-        /**
-         * Used for testing purposes only - changes the global lock manager. Doesn't delete the
-         * previous instance, so make sure that it doesn't leak.
-         */
-        static void changeGlobalLockManagerForTestingOnly(LockManager* newLockMgr);
+        LockResult lockImpl(const ResourceId& resId, LockMode mode);
 
     private:
 
-        // Shortcut to do the lookup in _requests. Must be called with the spinlock acquired.
-        LockRequest* _find(const ResourceId& resId) const;
+        friend class AutoYieldFlushLockForMMAPV1Commit;
+
+        typedef FastMapNoAlloc<ResourceId, LockRequest, 16> LockRequestsMap;
 
 
-        typedef std::map<const ResourceId, LockRequest*> LockRequestsMap;
-        typedef std::pair<const ResourceId, LockRequest*> LockRequestsPair;
+        /**
+         * The main functionality of the unlock method, except accepts iterator in order to avoid
+         * additional lookups during unlockAll.
+         */
+        bool _unlockImpl(LockRequestsMap::Iterator& it);
 
-        const uint64_t _id;
+        /**
+         * MMAP V1 locking code yields and re-acquires the flush lock occasionally in order to
+         * allow the flush thread proceed. This call returns in what mode the flush lock should be
+         * acquired. It is based on the type of the operation (IS for readers, IX for writers).
+         */
+        LockMode _getModeForMMAPV1FlushLock() const;
+
+
+        // Used to disambiguate different lockers
+        const LockerId _id;
 
         // The only reason we have this spin lock here is for the diagnostic tools, which could
         // iterate through the LockRequestsMap on a separate thread and need it to be stable.
-        // Apart from that, all accesses to the Locker are always from a single thread.
+        // Apart from that, all accesses to the LockerImpl are always from a single thread.
         //
         // This has to be locked inside const methods, hence the mutable.
         mutable SpinLock _lock;
         LockRequestsMap _requests;
 
+        // Reuse the notification object across requests so we don't have to create a new mutex
+        // and condition variable every time.
         CondVarLockGrantNotification _notify;
-    };
-    
-} // namespace newlm
+
+        // Delays release of exclusive/intent-exclusive locked resources until the write unit of
+        // work completes. Value of 0 means we are not inside a write unit of work.
+        int _wuowNestingLevel;
+        std::queue<ResourceId> _resourcesToUnlockAtEndOfUnitOfWork;
+
+        // For maintaining locking timing statistics
+        Timer _timer;
 
 
-    /**
-     * One of these exists per OperationContext and serves as interface for acquiring locks and
-     * obtaining lock statistics for this particular operation.
-     *
-     * TODO: It is only temporary that this class inherits from Locker. Both will eventually be
-     * merged and most of the code in LockState will go away (i.e., once we move the GlobalLock to
-     * be its own lock resource under the lock manager).
-     */
-    class LockState : public newlm::Locker {
+        //////////////////////////////////////////////////////////////////////////////////////////
+        //
+        // Methods merged from LockState, which should eventually be removed or changed to methods
+        // on the LockerImpl interface.
+        //
+
     public:
-        LockState();
 
-        void dump() const;
+        virtual void dump() const;
 
-        BSONObj reportState();
-        void reportState(BSONObjBuilder* b);
-        
-        unsigned recursiveCount() const { return _recursive; }
+        virtual unsigned recursiveCount() const { return _recursive; }
 
-        /**
-         * Indicates the mode of acquisition of the GlobalLock by this particular thread. The
-         * return values are '0' (no global lock is held), 'r', 'w', 'R', 'W'. See the commends of
-         * QLock for more information on what these modes mean.
+        virtual bool isW() const;
+        virtual bool isR() const;
+        virtual bool hasAnyReadLock() const;
+
+        virtual bool isLocked() const;
+        virtual bool isWriteLocked() const;
+        virtual bool isWriteLocked(const StringData& ns) const;
+        virtual bool isRecursive() const;
+
+        virtual void assertWriteLocked(const StringData& ns) const;
+
+        /** 
+         * Pending means we are currently trying to get a lock.
          */
-        char threadState() const { return _threadState; }
-        
-        bool isRW() const; // RW
-        bool isW() const; // W
-        bool hasAnyReadLock() const; // explicitly rR
-        
-        bool isLocked() const;
-        bool isWriteLocked() const;
-        bool isWriteLocked(const StringData& ns) const;
-        bool isAtLeastReadLocked(const StringData& ns) const;
-        bool isLockedForCommitting() const;
-        bool isRecursive() const;
-
-        void assertWriteLocked(const StringData& ns) const;
-        void assertAtLeastReadLocked(const StringData& ns) const;
-
-        /** pending means we are currently trying to get a lock */
-        bool hasLockPending() const { return _lockPending || _lockPendingParallelWriter; }
+        virtual bool hasLockPending() const { return getWaitingResource().isValid() || _lockPendingParallelWriter; }
 
         // ----
 
-
-        void lockedStart( char newState ); // RWrw
-        void unlocked(); // _threadState = 0
-        
-        /**
-         * you have to be locked already to call this
-         * this is mostly for W_to_R or R_to_W
-         */
-        void changeLockState( char newstate );
-        
         // Those are only used for TempRelease. Eventually they should be removed.
-        void enterScopedLock(Lock::ScopedLock* lock);
-        Lock::ScopedLock* getCurrentScopedLock() const;
-        void leaveScopedLock(Lock::ScopedLock* lock);
+        virtual void enterScopedLock(Lock::ScopedLock* lock);
+        virtual Lock::ScopedLock* getCurrentScopedLock() const;
+        virtual void leaveScopedLock(Lock::ScopedLock* lock);
+
+        virtual void recordLockTime() { _scopedLk->recordTime(); }
+        virtual void resetLockTime() { _scopedLk->resetTime(); }
+
+        virtual void setIsBatchWriter(bool newValue) { _batchWriter = newValue; }
+        virtual bool isBatchWriter() const { return _batchWriter; }
+        virtual void setLockPendingParallelWriter(bool newValue) { 
+            _lockPendingParallelWriter = newValue;
+        }
+
+    private:
 
         bool _batchWriter;
+        bool _lockPendingParallelWriter;
 
-        void recordLockTime() { _scopedLk->recordTime(); }
-        void resetLockTime() { _scopedLk->resetTime(); }
-        
-    private:
         unsigned _recursive;           // we allow recursively asking for a lock; we track that here
-
-        // global lock related
-        char _threadState;             // 0, 'r', 'w', 'R', 'W'
 
         // for temprelease
         // for the nonrecursive case. otherwise there would be many
         // the first lock goes here, which is ok since we can't yield recursive locks
-        Lock::ScopedLock* _scopedLk;   
-        
-        bool _lockPending;
-        bool _lockPendingParallelWriter;
-
-        friend class AcquiringParallelWriter;
+        Lock::ScopedLock* _scopedLk;
     };
 
-        
-    class AcquiringParallelWriter {
+    typedef LockerImpl<true> MMAPV1LockerImpl;
+
+
+    /**
+     * At global synchronization points, such as drop database we are running under a global
+     * exclusive lock and without an active write unit of work, doing changes which require global
+     * commit. This utility allows the flush lock to be temporarily dropped so the flush thread
+     * could run in such circumstances. Should not be used where write units of work are used,
+     * because these have different mechanism of yielding the flush lock.
+     */
+    class AutoYieldFlushLockForMMAPV1Commit {
     public:
-        AcquiringParallelWriter( LockState& ls );
-        ~AcquiringParallelWriter();
+        AutoYieldFlushLockForMMAPV1Commit(Locker* locker);
+        ~AutoYieldFlushLockForMMAPV1Commit();
 
     private:
-        LockState& _ls;
+        MMAPV1LockerImpl* _locker;
     };
+
+
+    /**
+     * This explains how the MMAP V1 durability system is implemented.
+     *
+     * Every server operation (OperationContext), must call Locker::lockGlobal as the first lock
+     * action (it is illegal to acquire any other locks without calling this first). This action
+     * acquires the global and flush locks in the appropriate modes (IS for read operations, IX
+     * for write operations). Having the flush lock in one of these modes indicates to the flush
+     * thread that there is an active reader or writer.
+     *
+     * Whenever the flush thread(dur.cpp) activates, it goes through the following steps :
+     *
+     * Acquire the flush lock in S mode using AutoAcquireFlushLockForMMAPV1Commit. This waits until
+     * all current write activity on the system completes and does not allow any new operations to
+     * start.
+     *
+     * Once the S lock is granted, the flush thread writes the journal entries to disk (it is
+     * guaranteed that there will not be any modifications) and applies them to the shared view.
+     *
+     * After that, it upgrades the S lock to X and remaps the private view.
+     *
+     * NOTE: There should be only one usage of this class and this should be in dur.cpp
+     */
+    class AutoAcquireFlushLockForMMAPV1Commit {
+    public:
+        AutoAcquireFlushLockForMMAPV1Commit(Locker* locker);
+        ~AutoAcquireFlushLockForMMAPV1Commit();
+
+        /**
+         * We need the exclusive lock in order to do the shared view remap.
+         */
+        void upgradeFlushLockToExclusive();
+
+        /**
+         * Allows the acquired flush lock to be prematurely released. This is helpful for the case
+         * where we know that we won't be doing a remap after gathering the write intents, so the
+         * rest can be done outside of flush lock.
+         */
+        void release();
+
+    private:
+        MMAPV1LockerImpl* _locker;
+        bool _isReleased;;
+    };
+
+
+    /**
+     * Retrieves the global lock manager instance.
+     */
+    LockManager* getGlobalLockManager();
 
 } // namespace mongo

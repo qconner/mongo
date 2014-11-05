@@ -36,18 +36,15 @@
 namespace mongo {
 
     /**
-     * Iterates over a collection using multiple underlying iterators. The extents of the
-     * collection are assigned to the iterators in a round-robin fashion.
+     * Iterates over a collection using multiple underlying RecordIterators.
      *
-     * This is a special stage which is used only for the parallelCollectionScan command
-     * (see parallel_collection_scan.cpp).
+     * This is a special stage which is not used automatically by queries. It is intended for
+     * special commands that work with RecordIterators. For example, it is used by the
+     * parallelCollectionScan and repairCursor commands
      */
     class MultiIteratorStage : public PlanStage {
     public:
-        MultiIteratorStage(OperationContext* txn, WorkingSet* ws, Collection* collection)
-            : _txn(txn),
-              _collection(collection),
-              _ws(ws) { }
+        MultiIteratorStage(OperationContext* txn, WorkingSet* ws, Collection* collection);
 
         ~MultiIteratorStage() { }
 
@@ -92,6 +89,10 @@ namespace mongo {
 
         // Not owned by us.
         WorkingSet* _ws;
+
+        // We allocate a working set member with this id on construction of the stage. It gets
+        // used for all fetch requests, changing the DiskLoc as appropriate.
+        const WorkingSetID _wsidForFetch;
     };
 
 } // namespace mongo

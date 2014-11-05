@@ -31,14 +31,16 @@
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
 
 #include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
 
 #include <boost/filesystem/operations.hpp>
 
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/file.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -104,7 +106,7 @@ namespace mongo {
 
     boost::filesystem::path NamespaceIndex::path() const {
         boost::filesystem::path ret( _dir );
-        if (storageGlobalParams.directoryperdb)
+        if (mmapv1GlobalOptions.directoryperdb)
             ret /= _database;
         ret /= ( _database + ".ns" );
         return ret;
@@ -125,7 +127,7 @@ namespace mongo {
     }
 
     void NamespaceIndex::maybeMkdir() const {
-        if (!storageGlobalParams.directoryperdb)
+        if (!mmapv1GlobalOptions.directoryperdb)
             return;
         boost::filesystem::path dir( _dir );
         dir /= _database;
@@ -134,20 +136,7 @@ namespace mongo {
     }
 
     NOINLINE_DECL void NamespaceIndex::_init( OperationContext* txn ) {
-        verify( !_ht.get() );
-
-        txn->lockState()->assertWriteLocked(_database);
-
-        /* if someone manually deleted the datafiles for a database,
-           we need to be sure to clear any cached info for the database in
-           local.*.
-        */
-        /*
-        if ( "local" != _database ) {
-            DBInfo i(_database.c_str());
-            i.dbDropped();
-        }
-        */
+        invariant(!_ht.get());
 
         unsigned long long len = 0;
         boost::filesystem::path nsPath = path();
@@ -164,11 +153,40 @@ namespace mongo {
             }
         }
         else {
-            // use storageGlobalParams.lenForNewNsFiles, we are making a new database
-            massert(10343, "bad storageGlobalParams.lenForNewNsFiles",
-                    storageGlobalParams.lenForNewNsFiles >= 1024*1024);
+            // use mmapv1GlobalOptions.lenForNewNsFiles, we are making a new database
+            massert(10343, "bad mmapv1GlobalOptions.lenForNewNsFiles",
+                    mmapv1GlobalOptions.lenForNewNsFiles >= 1024*1024);
             maybeMkdir();
-            unsigned long long l = storageGlobalParams.lenForNewNsFiles;
+            unsigned long long l = mmapv1GlobalOptions.lenForNewNsFiles;
+            log() << "allocating new ns file " << pathString << ", filling with zeroes..." << endl;
+
+            {
+                // Due to SERVER-15369 we need to explicitly write zero-bytes to the NS file.
+                const unsigned long long kBlockSize = 1024*1024;
+                invariant(l % kBlockSize == 0); // ns files can only be multiples of 1MB
+                const std::vector<char> zeros(kBlockSize, 0);
+
+                File file;
+                file.open(pathString.c_str());
+                massert(18825, str::stream() << "couldn't create file " << pathString, file.is_open());
+                for (fileofs ofs = 0; ofs < l && !file.bad(); ofs += kBlockSize ) {
+                    file.write(ofs, &zeros[0], kBlockSize);
+                }
+                if (file.bad()) {
+                    try {
+                        boost::filesystem::remove(pathString);
+                    } catch (const std::exception& e) {
+                        StringBuilder ss;
+                        ss << "error removing file: " << e.what();
+                        massert(18909, ss.str(), 0);
+                    }
+                }
+                else {
+                    file.fsync();
+                }
+                massert(18826, str::stream() << "failure writing file " << pathString, !file.bad() );
+            }
+
             if ( _f.create(pathString, l, true) ) {
                 // The writes done in this function must not be rolled back. If the containing
                 // UnitOfWork rolls back it should roll back to the state *after* these writes. This
@@ -177,7 +195,7 @@ namespace mongo {
                 // OperationContext.
                 getDur().createdFile(pathString, l); // always a new file
                 len = l;
-                verify(len == storageGlobalParams.lenForNewNsFiles);
+                verify(len == mmapv1GlobalOptions.lenForNewNsFiles);
                 p = _f.getView();
 
                 if ( p ) {

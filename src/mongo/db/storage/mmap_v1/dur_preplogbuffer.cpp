@@ -36,6 +36,8 @@
      @see https://docs.google.com/drawings/edit?id=1TklsmZzm7ohIZkwgeK6rMvsdaR13KjtJYMsfLr175Zc
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/pch.h"
 
 #include "mongo/db/storage/mmap_v1/dur.h"
@@ -43,6 +45,7 @@
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
 #include "mongo/db/storage/mmap_v1/dur_journalimpl.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/server.h"
 #include "mongo/util/alignedbuilder.h"
 #include "mongo/util/log.h"
@@ -76,7 +79,7 @@ namespace mongo {
             size_t ofs = 1;
             DurableMappedFile *mmf = findMMF_inlock(i->start(), /*out*/ofs);
 
-            if( unlikely(!mmf->willNeedRemap()) ) {
+            if( MONGO_unlikely(!mmf->willNeedRemap()) ) {
                 // tag this mmf as needed a remap of its private view later.
                 // usually it will already be dirty/already set, so we do the if above first
                 // to avoid possibility of cpu cache line contention
@@ -113,7 +116,7 @@ namespace mongo {
 #endif
             bb.appendBuf(i->start(), e.len);
 
-            if (unlikely(e.len != (unsigned)i->length())) {
+            if (MONGO_unlikely(e.len != (unsigned)i->length())) {
                 log() << "journal info splitting prepBasicWrite at boundary" << endl;
 
                 // This only happens if we write to the last byte in a file and

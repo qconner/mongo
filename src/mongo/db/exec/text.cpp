@@ -30,6 +30,7 @@
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/working_set_computed_data.h"
@@ -97,6 +98,9 @@ namespace mongo {
         case PlanStage::NEED_TIME:
             ++_commonStats.needTime;
             break;
+        case PlanStage::NEED_FETCH:
+            ++_commonStats.needFetch;
+            break;
         default:
             break;
         }
@@ -113,6 +117,7 @@ namespace mongo {
     }
 
     void TextStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
 
         for (size_t i = 0; i < _scanners.size(); ++i) {

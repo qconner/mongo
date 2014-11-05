@@ -232,19 +232,7 @@ namespace mongo {
     }
 
     bool providesSort(const CanonicalQuery& query, const BSONObj& kp) {
-        BSONObjIterator sortIt(query.getParsed().getSort());
-        BSONObjIterator kpIt(kp);
-
-        while (sortIt.more() && kpIt.more()) {
-            // We want the field name to be the same as well (so we pass true).
-            // TODO: see if we can pull a reverse sort out...
-            if (0 != sortIt.next().woCompare(kpIt.next(), true)) {
-                return false;
-            }
-        }
-
-        // every elt in sort matched kp
-        return !sortIt.more();
+        return query.getParsed().getSort().isPrefixOf(kp);
     }
 
     // static
@@ -486,7 +474,7 @@ namespace mongo {
         // tailable set on the collscan.  TODO: This is a policy departure.  Previously I think you
         // could ask for a tailable cursor and it just tried to give you one.  Now, we fail if we
         // can't provide one.  Is this what we want?
-        if (query.getParsed().hasOption(QueryOption_CursorTailable)) {
+        if (query.getParsed().getOptions().tailable) {
             if (!QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)
                 && canTableScan) {
                 QuerySolution* soln = buildCollscanSoln(query, true, params);
@@ -654,7 +642,7 @@ namespace mongo {
 
                         // Now we have the final min and max. This index is only relevant for
                         // the min/max query if min < max.
-                        if (0 > finishedMinObj.woCompare(finishedMaxObj, kp, false)) {
+                        if (0 >= finishedMinObj.woCompare(finishedMaxObj, kp, false)) {
                             // Found a relevant index.
                             idxNo = i;
                             break;
@@ -877,7 +865,7 @@ namespace mongo {
                     //   2dsphereIndexVersion=2) should be able to provide a sort for
                     //   find({b: GEO}).sort({a:1}).  SERVER-10801.
 
-                    const BSONObj kp = LiteParsedQuery::normalizeSortOrder(index.keyPattern);
+                    const BSONObj kp = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
                     if (providesSort(query, kp)) {
                         QLOG() << "Planner: outputting soln that uses index to provide sort."
                                << endl;

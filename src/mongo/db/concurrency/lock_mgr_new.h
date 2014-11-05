@@ -28,147 +28,22 @@
 
 #pragma once
 
+#include <deque>
 #include <boost/thread/condition_variable.hpp>
 #include <boost/thread/mutex.hpp>
-#include <map>
-#include <string>
 
+#include "mongo/db/concurrency/lock_mgr_defs.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/platform/cstdint.h"
-#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/platform/unordered_map.h"
+#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/timer.h"
 
-
-/**
- * Event-driven LockManager implementation.
- */
-
 namespace mongo {
-namespace newlm {
 
     class Locker;
-
-    /**
-     * Lock modes. Refer to the compatiblity matrix in the source file for information on how
-     * these conflict.
-     */
-    enum LockMode {
-        MODE_NONE       = 0,
-        MODE_IS         = 1,
-        MODE_IX         = 2,
-        MODE_S          = 3,
-        MODE_X          = 4,
-
-        MODE_COUNT
-    };
-
-
-    /**
-     * Return values for the locking functions of the lock manager.
-     */
-    enum LockResult {
-
-        /**
-         * The lock request was granted and is now on the granted list for the specified resource.
-         */
-        LOCK_OK,
-
-        /**
-         * The lock request was not granted because of conflict. If this value is returned, the
-         * request was placed on the conflict queue of the specified resource and a call to the
-         * LockGrantNotification::notify callback should be expected with the resource whose lock
-         * was requested.
-         */
-        LOCK_WAITING,
-
-        /**
-         * The lock request was not granted because it would result in a deadlock. No changes to
-         * the state of the Locker would be made if this value is returned (i.e., it will not be
-         * killed due to deadlock). It is up to the caller to decide how to recover from this
-         * return value - could be either release some locks and try again, or just bail with an
-         * error and have some upper code handle it.
-         */
-        LOCK_DEADLOCK,
-
-        /**
-         * This is used as an initialiser value. Should never be returned.
-         */
-        LOCK_INVALID
-    };
-
-
-    /**
-     * Hierarchy of resource types. The lock manager knows nothing about this hierarchy, it is
-     * purely logical. I.e., acquiring a RESOURCE_GLOBAL and then a RESOURCE_DATABASE won't block
-     * at the level of the lock manager.
-     */
-    enum ResourceType {
-        // Special (singleton) resources
-        RESOURCE_INVALID = 0,
-        RESOURCE_GLOBAL,
-        RESOURCE_POLICY,
-
-        // Generic resources
-        RESOURCE_DATABASE,
-        RESOURCE_COLLECTION,
-
-        // Must bound the max resource id
-        RESOURCE_LAST
-    };
-
-    // We only use 3 bits for the resource type in the ResourceId hash
-    BOOST_STATIC_ASSERT(RESOURCE_LAST < 8);
-
-
-    /**
-     * Uniquely identifies a lockable resource.
-     */
-    class ResourceId {
-    public:
-        ResourceId() : _fullHash(0) { }
-        ResourceId(ResourceType type, const StringData& ns);
-        ResourceId(ResourceType type, const std::string& ns);
-        ResourceId(ResourceType type, uint64_t hashId);
-
-        operator uint64_t() const {
-            return _fullHash;
-        }
-
-        ResourceType getType() const {
-            return static_cast<ResourceType>(_type);
-        }
-
-        uint64_t getHashId() const {
-            return _hashId;
-        }
-
-        std::string toString() const;
-
-    private:
-
-        /**
-         * 64-bit hash of the resource
-         */
-        union {
-            struct {
-                uint64_t     _type   : 3;
-                uint64_t     _hashId : 61;
-            };
-
-            uint64_t _fullHash;
-        };
-
-        // Keep the complete namespace name for debugging purposes (TODO: this will be removed once
-        // we are confident in the robustness of the lock manager).
-        std::string _nsCopy;
-    };
-
-    // Treat the resource ids as 64-bit integers. Commented out for now - we will keep the full
-    // resource content in there for debugging purposes.
-    //
-    // BOOST_STATIC_ASSERT(sizeof(ResourceId) == sizeof(uint64_t));
-
+    struct LockHead;
 
     /**
      * Interface on which granted lock requests will be notified. See the contract for the notify
@@ -221,17 +96,11 @@ namespace newlm {
         /**
          * Used for initialization of a LockRequest, which might have been retrieved from cache.
          */
-        void initNew(const ResourceId& resourceId, Locker* locker, LockGrantNotification* notify);
+        void initNew(Locker* locker, LockGrantNotification* notify);
 
         //
         // These fields are maintained by the Locker class
         //
-
-        // Id of the resource for which this request applies. The only reason it is here is we can
-        // locate the lock object during unlock. This can be solved either by having a pointer to
-        // the LockHead (which should be alive as long as there are LockRequests on it, or by
-        // requiring resource id to be passed on unlock, along with the lock request).
-        ResourceId resourceId;
 
         // This is the Locker, which created this LockRequest. Pointer is not owned, just
         // referenced. Must outlive the LockRequest.
@@ -246,6 +115,11 @@ namespace newlm {
         //
         // These fields are owned and maintained by the LockManager class
         //
+
+        // Pointer to the lock to which this request belongs, or null if this request has not yet
+        // been assigned to a lock. The LockHead should be alive as long as there are LockRequests
+        // on it, so it is safe to have this pointer hanging around.
+        LockHead* lock;
 
         // The reason intrusive linked list is used instead of the std::list class is to allow
         // for entries to be removed from the middle of the list in O(1) time, if they are known
@@ -272,31 +146,6 @@ namespace newlm {
 
 
     /**
-     * There is one of these objects per each resource which has a lock on it.
-     *
-     * Not thread-safe and should only be accessed under the LockManager's bucket lock.
-     */
-    struct LockHead {
-        LockHead(const ResourceId& resId);
-        ~LockHead();
-
-        const ResourceId resourceId;
-
-        // The head of the doubly-linked list of granted or converting requests
-        LockRequest* grantedQueue;
-
-        // Bit-mask of the maximum of the granted + converting modes on the granted queue.
-        uint32_t grantedModes;
-
-        // Doubly-linked list of requests, which have not been granted yet because they conflict
-        // with the set of granted modes. The reason to have both begin and end pointers is to make
-        // the FIFO scheduling easier (queue at begin and take from the end).
-        LockRequest* conflictQueueBegin;
-        LockRequest* conflictQueueEnd;
-    };
-
-
-    /**
      * Entry point for the lock manager scheduling functionality. Don't use it directly, but
      * instead go through the Locker interface.
      */
@@ -306,26 +155,100 @@ namespace newlm {
         LockManager();
         ~LockManager();
 
+        /**
+          * Acquires lock on the specified resource in the specified mode and returns the outcome
+          * of the operation. See the details for LockResult for more information on what the
+          * different results mean.
+          *
+          * Locking the same resource twice increments the reference count of the lock so each call
+          * to lock must be matched with a call to unlock with the same resource.
+          *
+          * @param resId Id of the resource to be locked.
+          * @param request LockRequest structure on which the state of the request will be tracked.
+          *                 This value cannot be NULL and the notify value must be set. If the
+          *                 return value is not LOCK_WAITING, this pointer can be freed and will
+          *                 not be used any more.
+          *
+          *                 If the return value is LOCK_WAITING, the notification method will be
+          *                 called at some point into the future, when the lock either becomes
+          *                 granted or a deadlock is discovered. If unlock is called before the
+          *                 lock becomes granted, the notification will not be invoked.
+          *
+          *                 If the return value is LOCK_WAITING, the notification object *must*
+          *                 live at least until the notfy method has been invoked or unlock has
+          *                 been called for the resource it was assigned to. Failure to do so will
+          *                 cause the lock manager to call into an invalid memory location.
+          * @param mode Mode in which the resource should be locked. Lock upgrades are allowed.
+          *
+          * @return See comments for LockResult.
+          */
         LockResult lock(const ResourceId& resId, LockRequest* request, LockMode mode);
-        void unlock(LockRequest* request);
 
+        /**
+         * Decrements the reference count of a previously locked request and if the reference count
+         * becomes zero, removes the request and proceeds to granting any conflicts.
+         *
+         * This method always succeeds and never blocks.
+         *
+         * @param request A previously locked request. Calling unlock more times than lock was
+         *                  called for the same LockRequest is an error.
+         *
+         * @return true if this is the last reference for the request; false otherwise
+         */
+        bool unlock(LockRequest* request);
+
+        /**
+         * Downgrades the mode in which an already granted request is held, without changing the
+         * reference count of the lock request. This call never blocks, will always succeed and may
+         * potentially allow other blocked lock requests to proceed.
+         * 
+         * @param request Request, already in granted mode through a previous call to lock.
+         * @param newMode Mode, which is less-restrictive than the mode in which the request is
+         *                  already held. I.e., the conflict set of newMode must be a sub-set of
+         *                  the conflict set of the request's current mode.
+         */
+        void downgrade(LockRequest* request, LockMode newMode);
+
+        /**
+         * Iterates through all buckets and deletes all locks, which have no requests on them. This
+         * call is kind of expensive and should only be used for reducing the memory footprint of
+         * the lock manager.
+         */
+        void cleanupUnusedLocks();
+
+        /**
+         * Dumps the contents of all locks to the log.
+         */
         void dump() const;
+
+
+        //
+        // Test-only methods
+        //
+
+        void setNoCheckForLeakedLocksTestOnly(bool newValue);
 
     private:
 
-        typedef std::map<const ResourceId, LockHead*> LockHeadMap;
+        // The deadlock detector needs to access the buckets and locks directly
+        friend class DeadlockDetector;
+
+        // These types describe the locks hash table
+        typedef unordered_map<ResourceId, LockHead*> LockHeadMap;
         typedef LockHeadMap::value_type LockHeadPair;
 
         struct LockBucket {
-            SpinLock mutex;
+            LockBucket() : mutex("LockManager") { }
+            SimpleMutex mutex;
             LockHeadMap data;
         };
 
+
         /**
-         * Retrieves a LockHead for the particular resource. The particular bucket must have been
-         * locked before calling this function.
+         * Retrieves the bucket in which the particular resource must reside. There is no need to
+         * hold a lock when calling this function.
          */
-        LockBucket* _getBucket(const ResourceId& resId);
+        LockBucket* _getBucket(const ResourceId& resId) const;
 
         /**
          * Prints the contents of a bucket to the log.
@@ -333,23 +256,123 @@ namespace newlm {
         void _dumpBucket(const LockBucket* bucket) const;
 
         /**
-         * Should be invoked when the state of a lock changes (in particular during downgrades) in
-         * order to grant whatever locks could possibly be granted.
+         * Should be invoked when the state of a lock changes in a way, which could potentially
+         * allow other blocked requests to proceed.
          *
          * MUST be called under the lock bucket's spin lock.
          *
-         * @param lock Lock whose grant state should be recalculated
-         * @param requestUnlocked Which request on the lock state was just unlocked
-         * @param requestChanged Which request on the lock state caused the recalculation
-         *
-         * Only one of requestUnlocked or requestChanged can be non-NULL.
-         *
+         * @param lock Lock whose grant state should be recalculated.
+         * @param checkConflictQueue Whether to go through the conflict queue. This is an
+         *          optimisation in that we only need to check the conflict queue if one of the
+         *          granted modes, which was conflicting before became zero.
          */
-        void _recalcAndGrant(LockHead* lock, LockRequest* unlocked, LockRequest* changed);
+        void _onLockModeChanged(LockHead* lock, bool checkConflictQueue);
+
 
         unsigned _numLockBuckets;
         LockBucket* _lockBuckets;
     };
 
-} // namespace newlm
+
+    /**
+     * Iteratively builds the wait-for graph, starting from a given blocked Locker and stops either
+     * when all reachable nodes have been checked or if a cycle is detected. This class is
+     * thread-safe. Because locks may come and go in parallel with deadlock detection, it may
+     * report false positives, but if there is a stable cycle it will be discovered.
+     *
+     * Implemented as a separate class in order to facilitate diagnostics and also unit-testing for
+     * cases where locks come and go in parallel with deadlock detection.
+     */
+    class DeadlockDetector {
+    public:
+
+        /**
+         * Initializes the wait-for graph builder with the LM to operate on and a locker object
+         * from which to start the search. Deadlock will only be reported if there is a wait cycle
+         * in which the initial locker participates.
+         */
+        DeadlockDetector(const LockManager& lockMgr, const Locker* initialLocker);
+
+        DeadlockDetector& check() {
+            while (next()) {
+
+            }
+
+            return *this;
+        }
+
+        /**
+         * Processes the next wait for node and queues up its set of owners to the unprocessed
+         * queue.
+         *
+         * @return true if there are more unprocessed nodes and no cycle has been discovered yet;
+         *          false if either all reachable nodes have been processed or 
+         */
+        bool next();
+
+        /**
+         * Checks whether a cycle exists in the wait-for graph, which has been built so far. It's
+         * only useful to call this after next() has returned false.
+         */
+        bool hasCycle() const;
+
+        /**
+         * Produces a string containing the wait-for graph that has been built so far.
+         */
+        std::string toString() const;
+
+    private:
+
+        // An entry in the owners list below means that some locker L is blocked on some resource
+        // resId, which is currently held by the given set of owners. The reason to store it in
+        // such form is in order to avoid storing pointers to the lockers or to have to look them
+        // up by id, both of which require some form of synchronization other than locking the
+        // bucket for the resource. Instead, given the resId, we can lock the bucket for the lock
+        // and find the respective LockRequests and continue our scan forward.
+        typedef std::vector<LockerId> ConflictingOwnersList;
+
+        struct Edges {
+            Edges(const ResourceId& resId) : resId(resId) { }
+
+            // Resource id indicating the lock node
+            ResourceId resId;
+
+            // List of lock owners/pariticipants with which the initial locker conflicts for
+            // obtaining the lock
+            ConflictingOwnersList owners;
+        };
+
+        typedef std::map<LockerId, Edges> WaitForGraph;
+        typedef WaitForGraph::value_type WaitForGraphPair;
+
+
+        // We don't want to hold locks between iteration cycles, so just store the resourceId and
+        // the lockerId so we can directly find them from the lock manager.
+        struct UnprocessedNode {
+            UnprocessedNode(LockerId lockerId, ResourceId resId)
+                : lockerId(lockerId),
+                  resId(resId) {
+
+            }
+
+            LockerId lockerId;
+            ResourceId resId;
+        };
+
+        typedef std::deque<UnprocessedNode> UnprocessedNodesQueue;
+
+
+        void _processNextNode(const UnprocessedNode& node);
+
+
+        // Not owned. Lifetime must be longer than that of the graph builder.
+        const LockManager& _lockMgr;
+        const LockerId _initialLockerId;
+
+        UnprocessedNodesQueue _queue;
+        WaitForGraph _graph;
+
+        bool _foundCycle;
+    };
+
 } // namespace mongo

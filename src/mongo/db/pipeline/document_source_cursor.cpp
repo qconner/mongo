@@ -26,10 +26,11 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
 
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
@@ -37,7 +38,7 @@
 #include "mongo/db/query/find_constants.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/s/d_state.h"
-#include "mongo/s/stale_exception.h" // for SendStaleConfigException
+
 
 namespace mongo {
 
@@ -79,8 +80,8 @@ namespace mongo {
 
         // We have already validated the sharding version when we constructed the PlanExecutor
         // so we shouldn't check it again.
-        Lock::DBRead lk(pExpCtx->opCtx->lockState(), _ns);
-        Client::Context ctx(pExpCtx->opCtx, _ns, /*doVersion=*/false);
+        const NamespaceString nss(_ns);
+        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
 
         _exec->restoreState(pExpCtx->opCtx);
 
@@ -157,16 +158,14 @@ namespace mongo {
 
         // Get planner-level explain info from the underlying PlanExecutor.
         BSONObjBuilder explainBuilder;
-        Status explainStatus(ErrorCodes::InternalError, "");
         {
-            Lock::DBRead lk(pExpCtx->opCtx->lockState(), _ns);
-            Client::Context ctx(pExpCtx->opCtx, _ns, /*doVersion=*/ false);
+            const NamespaceString nss(_ns);
+            AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
 
             massert(17392, "No _exec. Were we disposed before explained?", _exec);
 
             _exec->restoreState(pExpCtx->opCtx);
-            explainStatus = Explain::explainStages(_exec.get(), Explain::QUERY_PLANNER,
-                                                   &explainBuilder);
+            Explain::explainStages(_exec.get(), ExplainCommon::QUERY_PLANNER, &explainBuilder);
             _exec->saveState();
         }
 
@@ -183,14 +182,9 @@ namespace mongo {
             out["fields"] = Value(_projection);
 
         // Add explain results from the query system into the agg explain output.
-        if (explainStatus.isOK()) {
-            BSONObj explainObj = explainBuilder.obj();
-            invariant(explainObj.hasField("queryPlanner"));
-            out["queryPlanner"] = Value(explainObj["queryPlanner"]);
-        }
-        else {
-            out["planError"] = Value(explainStatus.toString());
-        }
+        BSONObj explainObj = explainBuilder.obj();
+        invariant(explainObj.hasField("queryPlanner"));
+        out["queryPlanner"] = Value(explainObj["queryPlanner"]);
 
         return Value(DOC(getSourceName() << out.freezeToValue()));
     }

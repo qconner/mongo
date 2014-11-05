@@ -36,10 +36,13 @@
 
 #pragma once
 
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/paths.h"
 
@@ -50,12 +53,103 @@ namespace mongo {
     class Database;
     class CurOp;
     class Client;
+    class Collection;
     class AbstractMessagingPort;
-
 
     TSP_DECLARE(Client, currentClient)
 
     typedef long long ConnectionId;
+
+    /**
+     * RAII-style class, which acquires a lock on the specified database in the requested mode and
+     * obtains a reference to the database. Used as a shortcut for calls to dbHolder().get().
+     *
+     * It is guaranteed that locks will be released when this object goes out of scope, therefore
+     * the database reference returned by this class should not be retained.
+     *
+     * TODO: This should be moved outside of client.h (maybe dbhelpers.h)
+     */
+    class AutoGetDb {
+        MONGO_DISALLOW_COPYING(AutoGetDb);
+    public:
+        AutoGetDb(OperationContext* txn, const StringData& ns, LockMode mode);
+
+        Database* getDb() const {
+            return _db;
+        }
+    private:
+        const Lock::DBLock _dbLock;
+        Database* const _db;
+    };
+
+    /**
+     * RAII-style class, which acquires a lock on the specified database in the requested mode and
+     * obtains a reference to the database, creating it was non-existing. Used as a shortcut for
+     * calls to dbHolder().openDb(), taking care of locking details. The requested mode must be
+     * MODE_IX or MODE_X. If the database needs to be created, the lock will automatically be
+     * reacquired as MODE_X.
+     *
+     * It is guaranteed that locks will be released when this object goes out of scope, therefore
+     * the database reference returned by this class should not be retained.
+     *
+     * TODO: This should be moved outside of client.h (maybe dbhelpers.h)
+     */
+    class AutoGetOrCreateDb {
+        MONGO_DISALLOW_COPYING(AutoGetOrCreateDb);
+    public:
+        AutoGetOrCreateDb(OperationContext* txn, const StringData& ns, LockMode mode);
+
+        Database* getDb() {
+            return _db;
+        }
+
+        bool justCreated() {
+            return _justCreated;
+        }
+
+        Lock::DBLock& lock() { return _dbLock; }
+
+    private:
+        Lock::DBLock _dbLock; // not const, as we may need to relock for implicit create
+        Database* _db;
+        bool _justCreated;
+    };
+
+    /**
+     * RAII-style class, which would acquire the appropritate hierarchy of locks for obtaining
+     * a particular collection and would retrieve a reference to the collection.
+     *
+     * It is guaranteed that locks will be released when this object goes out of scope, therefore
+     * database and collection references returned by this class should not be retained.
+     *
+     * TODO: This should be moved outside of client.h (maybe dbhelpers.h)
+     */
+    class AutoGetCollectionForRead {
+        MONGO_DISALLOW_COPYING(AutoGetCollectionForRead);
+    public:
+        AutoGetCollectionForRead(OperationContext* txn, const std::string& ns);
+        AutoGetCollectionForRead(OperationContext* txn, const NamespaceString& nss);
+        ~AutoGetCollectionForRead();
+
+        Database* getDb() const {
+            return _db.getDb();
+        }
+
+        Collection* getCollection() const {
+            return _coll;
+        }
+
+    private:
+        void _init();
+
+        const Timer _timer;
+        OperationContext* const _txn;
+        const NamespaceString _nss;
+        const AutoGetDb _db;
+        const Lock::CollectionLock _collLock;
+
+        Collection* _coll;
+    };
 
     /** the database's concept of an outside "client" */
     class Client : public ClientBasic {
@@ -71,10 +165,23 @@ namespace mongo {
         */
         static void initThread(const char *desc, AbstractMessagingPort *mp = 0);
 
+        /**
+         * Inits a thread if that thread has not already been init'd, setting the thread name to
+         * "desc".
+         */
         static void initThreadIfNotAlready(const char *desc) { 
-            if( currentClient.get() )
+            if (currentClient.get())
                 return;
             initThread(desc);
+        }
+
+        /**
+         * Inits a thread if that thread has not already been init'd, using the existing thread name
+         */
+        static void initThreadIfNotAlready() {
+            if (currentClient.get())
+                return;
+            initThread(getThreadName().c_str());
         }
 
         /** this has to be called as the client goes away, but before thread termination
@@ -96,8 +203,8 @@ namespace mongo {
         bool isGod() const { return _god; } /* this is for map/reduce writes */
         bool setGod(bool newVal) { const bool prev = _god; _god = newVal; return prev; }
 
-        void setRemoteID(const OID& rid) { _remoteId = rid;  }
-        OID getRemoteID() const { return _remoteId; }
+        void setRemoteID(const OID& rid) { _remoteId = rid;  } // Only used for master/slave
+        OID getRemoteID() const { return _remoteId; } // Only used for master/slave
         ConnectionId getConnectionId() const { return _connectionId; }
         const std::string& getThreadId() const { return _threadId; }
 
@@ -128,22 +235,6 @@ namespace mongo {
         
     public:
 
-        class Context;
-
-        /** "read lock, and set my context, all in one operation" 
-         *  This handles (if not recursively locked) opening an unopened database.
-         */
-        class ReadContext : boost::noncopyable { 
-        public:
-            ReadContext(OperationContext* txn,
-                        const std::string& ns,
-                        bool doVersion = true);
-            Context& ctx() { return *_c.get(); }
-        private:
-            scoped_ptr<Lock::DBRead> _lk;
-            scoped_ptr<Context> _c;
-        };
-
         /* Set database we want to use, then, restores when we finish (are out of scope)
            Note this is also helpful if an exception happens as the state if fixed up.
         */
@@ -153,14 +244,21 @@ namespace mongo {
             /** this is probably what you want */
             Context(OperationContext* txn, const std::string& ns, bool doVersion = true);
 
-            /** note: this does not call finishInit -- i.e., does not call 
-                      shardVersionOk() for example. 
-                see also: reset().
-            */
-            Context(OperationContext* txn, const std::string& ns, Database * db);
+            /**
+             * Below still calls _finishInit, but assumes database has already been acquired
+             * or just created.
+             */
+            Context(OperationContext* txn,
+                    const std::string& ns,
+                    Database* db,
+                    bool justCreated);
 
-            // used by ReadContext
-            Context(OperationContext* txn, const std::string& ns, Database *db, bool doVersion);
+            /**
+             * note: this does not call _finishInit -- i.e., does not call
+             * ensureShardVersionOKOrThrow for example.
+             * see also: reset().
+             */
+            Context(OperationContext* txn, const std::string& ns, Database * db);
 
             ~Context();
             Client* getClient() const { return _client; }
@@ -194,24 +292,28 @@ namespace mongo {
             Timer _timer;
         }; // class Client::Context
 
+
         class WriteContext : boost::noncopyable {
         public:
-            WriteContext(OperationContext* opCtx, const std::string& ns, bool doVersion = true);
+            WriteContext(OperationContext* opCtx, const std::string& ns);
 
-            /** Commit any writes done so far in this context. */
-            void commit();
+            Database* db() const { return _c.db(); }
+
+            Collection* getCollection() const {
+                return _c.db()->getCollection(_txn, _nss.ns());
+            }
 
             Context& ctx() { return _c; }
 
         private:
-            Lock::DBWrite _lk;
-            WriteUnitOfWork _wunit;
+            OperationContext* _txn;
+            NamespaceString _nss;
+            AutoGetOrCreateDb _autodb;
+            Lock::CollectionLock _collk;
             Context _c;
+            Collection* _collection;
         };
-
-
     }; // class Client
-
 
     /** get the Client object for this thread. */
     inline Client& cc() {
