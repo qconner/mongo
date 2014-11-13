@@ -43,7 +43,7 @@ assert.throws(function(c){
 goodCRS= {
     type: 'name',
     properties: {
-        name: 'urn:mongodb:strictwindingcrs:EPSG:4326'
+        name: 'urn:x-mongodb:crs:strictwinding:EPSG:4326'
     }
 };
 
@@ -291,26 +291,3 @@ assert.eq(curs.count(), 0);
 curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
 assert.eq(curs.count(), 3);
 
-poly = {
-    type: 'Polygon',
-    coordinates: [ nGon(6000, 89.99) ],
-    crs: goodCRS
-};
-// within
-curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
-assert.eq(curs.count(), 0);
-// intersection
-curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
-assert.eq(curs.count(), 3);
-
-poly = {
-    type: 'Polygon',
-    coordinates: [ nGon(6200, 89.99) ],
-    crs: goodCRS
-};
-// within
-curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
-assert.eq(curs.count(), 0);
-// intersection
-curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
-assert.eq(curs.count(), 3);
