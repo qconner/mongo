@@ -41,9 +41,8 @@ var CRS = {};
 CRS.type = 'name';
 CRS.properties = {};
 
-// this CRS string no good but referenced at
-// https://wiki.mongodb.com/display/10GEN/Multi-hemisphere+%28BigPolygon%29+queries
-CRS.properties.name = 'urn:mongodb:crs:strictwinding:EPSG:4326';
+// this CRS string is no good
+CRS.properties.name = 'urn:z-mongodb:crs:strictwinding:EPSG:4326';
 
 shenzhenPoly.crs = CRS;
 curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
@@ -53,7 +52,8 @@ assert.throws(function(c){
 
 
 // this CRS string works for a Big Polygon geo query
-CRS.properties.name = 'urn:mongodb:strictwindingcrs:EPSG:4326';
+CRS.properties.name = 'urn:x-mongodb:crs:strictwinding:EPSG:4326';
+
 shenzhenPoly.crs = CRS;
 curs = coll.find({geo: {$geoWithin: {$geometry: shenzhenPoly}}});
 assert.eq(1, curs.count(), 'expected only doc within Big Poly shenzhen triangle');
