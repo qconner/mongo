@@ -13,12 +13,11 @@ coll.getMongo().getDB("admin").runCommand({ setParameter : 1, logLevel: 1})
 
 
 // 4.2.1.1.1 wrong CRS
-// this CRS string no good but referenced at
-// https://wiki.mongodb.com/display/10GEN/Multi-hemisphere+%28BigPolygon%29+queries
+// this CRS string is no good
 var badCRS = {
     type: 'name',
     properties: {
-        name: 'urn:mongodb:crs:strictwinding:EPSG:4326'
+        name: 'urn:x-mongodb:crs:strictwinding:EPSG:4326'
     }
 };
 var poly = {
