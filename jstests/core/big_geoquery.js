@@ -5,10 +5,11 @@
 //  and:  https://jira.mongodb.org/browse/SERVER-14510
 //
 
-//coll.getMongo().getDB("admin").runCommand({ setParameter : 1, help: true})
+var coll = db.big_geodata;
+
+coll.getMongo().getDB("admin").runCommand({ setParameter : 1, help: true})
 coll.getMongo().getDB("admin").runCommand({ setParameter : 1, logLevel: 1})
 
-var coll = db.big_geodata;
 
 
 // Triangle around Shenzhen, China

@@ -8,7 +8,7 @@
 //
 
 var coll = db.big_geodata;
-//coll.getMongo().getDB("admin").runCommand({ setParameter : 1, help: true})
+coll.getMongo().getDB("admin").runCommand({ setParameter : 1, help: true})
 coll.getMongo().getDB("admin").runCommand({ setParameter : 1, logLevel: 1})
 
 
@@ -223,71 +223,106 @@ polys.forEach(
 
 
 
-// 4.2.1.1.8 closed polygon (101, 1001, 25000-sided)
-// helper function
-function nGon(N, D){
-    // compute N+1 points on a circle centered at 0,0
+// 4.2.1.1.8 closed big polygon generator
+function nGonBig(N, D){
+    // compute N points on a circle centered at 0,0
     // with diameter = D
     // and lat*lat + lon*lon = (D/2)*(D/2)
     // lat range is -10 to +10
     // lon = sqrt( (D/2)*(D/2) - lat*lat )
-    // and N = number of sides = number of vertices
-    var eps = D / Math.ceil((N+1)/2)
-    print("generating a", N, "-sided polygon");
+    // N = number of edges
+    // N must be even!
+    if (N % 2 == 1)
+        N++;
+    var eps = D / (Math.ceil(N/2) + 1);
+    print("generating a", N, "-sided big polygon");
     var lat=0;
     var lon=0;
     var pts = [];
     var i = 0;
-    var j = N+1;
+    var j = N;
     // produce longitude values in pairs
-    // and toss out last point if an odd number requested
-    for (lat=-(D/2); lat < (D/2); lat+=eps) {
+    // traverse with left foot outside the circle (clockwise) to define the big polygon
+    for (lat = (D/2); lat >= (-D/2); lat -= eps) {
         lon = Math.sqrt( (D/2)*(D/2) - lat*lat );
-        pts[i++] = [lon, lat];
-        pts[--j] = [-lon, lat];
+        //print("lat=",lat,"  lon=",lon);
+        //print("i=",i,"  j=",j);
+        pts[i] = [lon, lat];
+        if (i < j)
+            pts[j] = [-lon, lat];
+        i++;
+        j--;
     }
     // ensure we connect the dots
     assert(tojson(pts[0]) == tojson(pts[N]));
     return pts
 }
 
+
 poly = {
     type: 'Polygon',
     coordinates: [
-        nGon(101, 20)
+        nGonBig(101, 20)
     ],
     crs: goodCRS
 }
 // within
 curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
-assert.eq(curs.count(), 0);
+assert.eq(24, curs.count(), 'expected 24 fully outside big polygon');
 // intersection
 curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
-assert.eq(curs.count(), 3);
+assert.eq(27, curs.count(), 'expected 27 intersect outside big polygon');
+
+
 
 poly = {
     type: 'Polygon',
-    coordinates: [ nGon(1001, 20) ],
+    coordinates: [ nGonBig(1001, 20) ],
     crs: goodCRS
 }
 // within
 curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
-assert.eq(curs.count(), 0);
+assert.eq(24, curs.count(), 'expected 24 fully outside big polygon');
 // intersection
 curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
-assert.eq(curs.count(), 3);
+assert.eq(27, curs.count(), 'expected 27 intersect outside big polygon');
 
 
-//debugger;
 poly = {
     type: 'Polygon',
-    coordinates: [ nGon(5000, 89) ],
+    coordinates: [ nGonBig(5000, 89) ],
     crs: goodCRS
 };
 // within
 curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
-assert.eq(curs.count(), 0);
+assert.eq(24, curs.count(), 'expected 24 fully outside big polygon');
 // intersection
 curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
-assert.eq(curs.count(), 3);
+assert.eq(27, curs.count(), 'expected 27 intersect outside big polygon');
+
+
+poly = {
+    type: 'Polygon',
+    coordinates: [ nGonBig(10000, 89) ],
+    crs: goodCRS
+};
+// within
+curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
+assert.eq(24, curs.count(), 'expected 24 fully outside big polygon');
+// intersection
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
+assert.eq(27, curs.count(), 'expected 27 intersect outside big polygon');
+
+poly = {
+    type: 'Polygon',
+    coordinates: [ nGonBig(25000, 89) ],
+    crs: goodCRS
+};
+// within
+curs = coll.find({geo: {$geoWithin: {$geometry: poly}}});
+assert.eq(24, curs.count(), 'expected 24 fully outside big polygon');
+// intersection
+curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
+assert.eq(27, curs.count(), 'expected 27 intersect outside big polygon');
+
 
