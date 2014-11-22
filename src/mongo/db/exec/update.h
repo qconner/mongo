@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/ops/update_driver.h"
@@ -76,9 +76,10 @@ namespace mongo {
     class UpdateStage : public PlanStage {
         MONGO_DISALLOW_COPYING(UpdateStage);
     public:
-        UpdateStage(const UpdateStageParams& params,
+        UpdateStage(OperationContext* txn,
+                    const UpdateStageParams& params,
                     WorkingSet* ws,
-                    Database* db,
+                    Collection* collection,
                     PlanStage* child);
 
         virtual bool isEOF();
@@ -86,7 +87,7 @@ namespace mongo {
 
         virtual void saveState();
         virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const DiskLoc& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -130,13 +131,15 @@ namespace mongo {
          */
         Status restoreUpdateState(OperationContext* opCtx);
 
+        // Transactional context.  Not owned by us.
+        OperationContext* _txn;
+
         UpdateStageParams _params;
 
         // Not owned by us.
         WorkingSet* _ws;
 
-        // Not owned by us.
-        Database* _db;
+        // Not owned by us. May be NULL.
         Collection* _collection;
 
         // Owned by us.

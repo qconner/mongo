@@ -29,7 +29,7 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "mongo/bson/mutable/document.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -259,6 +260,15 @@ namespace mongo {
     }
 
     void Command::redactForLogging(mutablebson::Document* cmdObj) {}
+
+    BSONObj Command::getRedactedCopyForLogging(const BSONObj& cmdObj) {
+        namespace mmb = mutablebson;
+        mmb::Document cmdToLog(cmdObj, mmb::Document::kInPlaceDisabled);
+        redactForLogging(&cmdToLog);
+        BSONObjBuilder bob;
+        cmdToLog.writeTo(&bob);
+        return bob.obj();
+    }
 
     void Command::logIfSlow( const Timer& timer, const string& msg ) {
         int ms = timer.millis();

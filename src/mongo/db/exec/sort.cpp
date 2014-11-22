@@ -38,13 +38,12 @@
 #include "mongo/db/index/btree_key_generator.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 
 namespace mongo {
 
     using std::vector;
-
-    const size_t kMaxBytes = 32 * 1024 * 1024;
 
     // static
     const char* SortStage::kStageType = "SORT";
@@ -281,12 +280,10 @@ namespace mongo {
         return lhs.loc < rhs.loc;
     }
 
-    SortStage::SortStage(OperationContext* txn,
-                         const SortStageParams& params,
+    SortStage::SortStage(const SortStageParams& params,
                          WorkingSet* ws,
                          PlanStage* child)
-        : _txn(txn),
-          _collection(params.collection),
+        : _collection(params.collection),
           _ws(ws),
           _child(child),
           _pattern(params.pattern),
@@ -325,10 +322,11 @@ namespace mongo {
             return PlanStage::NEED_TIME;
         }
 
-        if (_memUsage > kMaxBytes) {
+        const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes);
+        if (_memUsage > maxBytes) {
             mongoutils::str::stream ss;
             ss << "sort stage buffered data usage of " << _memUsage
-               << " bytes exceeds internal limit of " << kMaxBytes << " bytes";
+               << " bytes exceeds internal limit of " << maxBytes << " bytes";
             Status status(ErrorCodes::Overflow, ss);
             *out = WorkingSetCommon::allocateStatusMember( _ws, status);
             return PlanStage::FAILURE;
@@ -429,14 +427,13 @@ namespace mongo {
     }
 
     void SortStage::restoreState(OperationContext* opCtx) {
-        _txn = opCtx;
         ++_commonStats.unyields;
         _child->restoreState(opCtx);
     }
 
-    void SortStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void SortStage::invalidate(OperationContext* txn, const DiskLoc& dl, InvalidationType type) {
         ++_commonStats.invalidates;
-        _child->invalidate(dl, type);
+        _child->invalidate(txn, dl, type);
 
         // If we have a deletion, we can fetch and carry on.
         // If we have a mutation, it's easier to fetch and use the previous document.
@@ -453,7 +450,7 @@ namespace mongo {
             WorkingSetMember* member = _ws->get(it->second);
             verify(member->loc == dl);
 
-            WorkingSetCommon::fetchAndInvalidateLoc(_txn, member, _collection);
+            WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
 
             // Remove the DiskLoc from our set of active DLs.
             _wsidByDiskLoc.erase(it);
@@ -469,7 +466,8 @@ namespace mongo {
 
     PlanStageStats* SortStage::getStats() {
         _commonStats.isEOF = isEOF();
-        _specificStats.memLimit = kMaxBytes;
+        const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes);
+        _specificStats.memLimit = maxBytes;
         _specificStats.memUsage = _memUsage;
         _specificStats.limit = _limit;
         _specificStats.sortPattern = _pattern.getOwned();

@@ -68,7 +68,12 @@ namespace mongo {
           _commonStats(kStageType) {
         _iam = _params.descriptor->getIndexCatalog()->getIndex(_params.descriptor);
         _keyPattern = _params.descriptor->keyPattern().getOwned();
+
+        // We can't always access the descriptor in the call to getStats() so we pull
+        // any info we need for stats reporting out here.
         _specificStats.keyPattern = _keyPattern;
+        _specificStats.indexName = _params.descriptor->indexName();
+        _specificStats.isMultiKey = _params.descriptor->isMultikey(_txn);
     }
 
     void IndexScan::initIndexScan() {
@@ -83,11 +88,6 @@ namespace mongo {
         else {
             _shouldDedup = _params.descriptor->isMultikey(_txn);
         }
-
-        // We can't always access the descriptor in the call to getStats() so we pull
-        // the status-only information we need out here.
-        _specificStats.indexName = _params.descriptor->indexName();
-        _specificStats.isMultiKey = _params.descriptor->isMultikey(_txn);
 
         // Set up the index cursor.
         CursorOptions cursorOptions;
@@ -242,6 +242,7 @@ namespace mongo {
     }
 
     void IndexScan::saveState() {
+        _txn = NULL;
         ++_commonStats.yields;
 
         if (HIT_END == _scanState || INITIALIZING == _scanState) { return; }
@@ -253,6 +254,7 @@ namespace mongo {
     }
 
     void IndexScan::restoreState(OperationContext* opCtx) {
+        invariant(_txn == NULL);
         _txn = opCtx;
         ++_commonStats.unyields;
 
@@ -276,7 +278,7 @@ namespace mongo {
         }
     }
 
-    void IndexScan::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void IndexScan::invalidate(OperationContext* txn, const DiskLoc& dl, InvalidationType type) {
         ++_commonStats.invalidates;
 
         // The only state we're responsible for holding is what DiskLocs to drop.  If a document

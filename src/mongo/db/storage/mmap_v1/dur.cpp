@@ -69,7 +69,7 @@
    @see https://docs.google.com/drawings/edit?id=1TklsmZzm7ohIZkwgeK6rMvsdaR13KjtJYMsfLr175Zc
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kJournaling
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kJournal
 
 #include "mongo/platform/basic.h"
 
@@ -206,12 +206,10 @@ namespace mongo {
         }
 
         bool NonDurableImpl::commitNow(OperationContext* txn) {
-            cc().checkpointHappened();   // XXX: remove when all dur goes through DurRecoveryUnit
             return false;
         }
 
         bool NonDurableImpl::commitIfNeeded(OperationContext* txn) {
-            cc().checkpointHappened();   // XXX: remove when all dur goes through DurRecoveryUnit
             return false;
         }
 
@@ -238,7 +236,6 @@ namespace mongo {
             flushRequested.notify_one();
             commitJob._notify.waitFor(when);
 
-            cc().checkpointHappened();
             return true;
         }
 
@@ -285,10 +282,6 @@ namespace mongo {
         }
 
         bool DurableImpl::commitIfNeeded(OperationContext* txn) {
-            // this is safe since since conceptually if you call commitIfNeeded, we're at a valid
-            // spot in an operation to be terminated.
-            cc().checkpointHappened();
-
             if (MONGO_likely(commitJob.bytes() < UncommittedBytesLimit)) {
                 return false;
             }

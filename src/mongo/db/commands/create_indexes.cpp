@@ -40,6 +40,7 @@
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
@@ -135,6 +136,7 @@ namespace mongo {
 
             // now we know we have to create index(es)
             // Note: createIndexes command does not currently respect shard versioning.
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbLock(txn->lockState(), ns.db(), MODE_X);
             Database* db = dbHolder().get(txn, ns.db());
             if (!db) {

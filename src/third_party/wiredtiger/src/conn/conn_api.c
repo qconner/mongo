@@ -35,8 +35,9 @@ ext_collate(WT_EXTENSION_API *wt_api, WT_SESSION *wt_session,
  */
 static int
 ext_collator_config(WT_EXTENSION_API *wt_api, WT_SESSION *wt_session,
-    WT_CONFIG_ARG *cfg_arg, WT_COLLATOR **collatorp, int *ownp)
+    const char *uri, WT_CONFIG_ARG *cfg_arg, WT_COLLATOR **collatorp, int *ownp)
 {
+	WT_CONFIG_ITEM cval, metadata;
 	WT_CONNECTION_IMPL *conn;
 	WT_SESSION_IMPL *session;
 	const char **cfg;
@@ -49,20 +50,29 @@ ext_collator_config(WT_EXTENSION_API *wt_api, WT_SESSION *wt_session,
 	if ((cfg = (const char **)cfg_arg) == NULL)
 		return (0);
 
-	return (__wt_collator_config(session, cfg, collatorp, ownp));
+	WT_CLEAR(cval);
+	WT_RET_NOTFOUND_OK(__wt_config_gets(session, cfg, "collator", &cval));
+	if (cval.len == 0)
+		return (0);
+
+	WT_CLEAR(metadata);
+	WT_RET_NOTFOUND_OK(
+	    __wt_config_gets(session, cfg, "app_metadata", &metadata));
+	return (__wt_collator_config(
+	    session, uri, &cval, &metadata, collatorp, ownp));
 }
 
 /*
  * __wt_collator_config --
- *	Given a configuration, configure the collator.
+ *	Configure a custom collator.
  */
 int
-__wt_collator_config(WT_SESSION_IMPL *session, const char **cfg,
+__wt_collator_config(WT_SESSION_IMPL *session, const char *uri,
+    WT_CONFIG_ITEM *cname, WT_CONFIG_ITEM *metadata,
     WT_COLLATOR **collatorp, int *ownp)
 {
+	WT_COLLATOR *collator;
 	WT_CONNECTION_IMPL *conn;
-	WT_CONFIG_ITEM cval;
-	WT_DECL_RET;
 	WT_NAMED_COLLATOR *ncoll;
 
 	*collatorp = NULL;
@@ -70,30 +80,23 @@ __wt_collator_config(WT_SESSION_IMPL *session, const char **cfg,
 
 	conn = S2C(session);
 
-	if ((ret = __wt_config_gets(session, cfg, "collator", &cval)) != 0)
-		return (ret == WT_NOTFOUND ? 0 : ret);
+	TAILQ_FOREACH(ncoll, &conn->collqh, q)
+		if (WT_STRING_MATCH(ncoll->name, cname->str, cname->len))
+			break;
 
-	if (cval.len > 0) {
-		TAILQ_FOREACH(ncoll, &conn->collqh, q)
-			if (WT_STRING_MATCH(ncoll->name, cval.str, cval.len))
-				break;
+	if (ncoll == NULL)
+		WT_RET_MSG(session, EINVAL,
+		    "unknown collator '%.*s'", (int)cname->len, cname->str);
 
-		if (ncoll == NULL)
-			WT_RET_MSG(session, EINVAL,
-			    "unknown collator '%.*s'", (int)cval.len, cval.str);
+	collator = ncoll->collator;
+	if (collator->customize != NULL)
+		WT_RET(collator->customize(collator,
+		    &session->iface, uri, metadata, collatorp));
 
-		if (ncoll->collator->customize != NULL) {
-			WT_RET(__wt_config_gets(session,
-			    session->dhandle->cfg, "app_metadata", &cval));
-			WT_RET(ncoll->collator->customize(
-			    ncoll->collator, &session->iface,
-			    session->dhandle->name, &cval, collatorp));
-		}
-		if (*collatorp == NULL)
-			*collatorp = ncoll->collator;
-		else
-			*ownp = 1;
-	}
+	if (*collatorp == NULL)
+		*collatorp = collator;
+	else
+		*ownp = 1;
 
 	return (0);
 }
@@ -472,17 +475,109 @@ __conn_add_extractor(WT_CONNECTION *wt_conn,
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
+	WT_NAMED_EXTRACTOR *nextractor;
 	WT_SESSION_IMPL *session;
 
-	WT_UNUSED(name);
-	WT_UNUSED(extractor);
-	ret = ENOTSUP;
+	nextractor = NULL;
 
 	conn = (WT_CONNECTION_IMPL *)wt_conn;
 	CONNECTION_API_CALL(conn, session, add_extractor, config, cfg);
 	WT_UNUSED(cfg);
 
-err:	API_END_RET_NOTFOUND_MAP(session, ret);
+	WT_ERR(__wt_calloc_def(session, 1, &nextractor));
+	WT_ERR(__wt_strdup(session, name, &nextractor->name));
+	nextractor->extractor = extractor;
+
+	__wt_spin_lock(session, &conn->api_lock);
+	TAILQ_INSERT_TAIL(&conn->extractorqh, nextractor, q);
+	nextractor = NULL;
+	__wt_spin_unlock(session, &conn->api_lock);
+
+err:	if (nextractor != NULL) {
+		__wt_free(session, nextractor->name);
+		__wt_free(session, nextractor);
+	}
+
+	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __wt_extractor_config --
+ *	Given a configuration, configure the extractor.
+ */
+int
+__wt_extractor_config(WT_SESSION_IMPL *session, const char *config,
+    WT_EXTRACTOR **extractorp, int *ownp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_CONFIG_ITEM cval;
+	WT_DECL_RET;
+	WT_NAMED_EXTRACTOR *nextractor;
+
+	*extractorp = NULL;
+	*ownp = 0;
+
+	conn = S2C(session);
+
+	if ((ret =
+	    __wt_config_getones(session, config, "extractor", &cval)) != 0)
+		return (ret == WT_NOTFOUND ? 0 : ret);
+
+	if (cval.len > 0) {
+		TAILQ_FOREACH(nextractor, &conn->extractorqh, q)
+			if (WT_STRING_MATCH(
+			    nextractor->name, cval.str, cval.len))
+				break;
+
+		if (nextractor == NULL)
+			WT_RET_MSG(session, EINVAL,
+			    "unknown extractor '%.*s'",
+			    (int)cval.len, cval.str);
+
+		if (nextractor->extractor->customize != NULL) {
+			WT_RET(__wt_config_getones(session,
+			    config, "app_metadata", &cval));
+			WT_RET(nextractor->extractor->customize(
+			    nextractor->extractor, &session->iface,
+			    session->dhandle->name, &cval, extractorp));
+		}
+
+		if (*extractorp == NULL)
+			*extractorp = nextractor->extractor;
+		else
+			*ownp = 1;
+	}
+
+	return (0);
+}
+
+/*
+ * __wt_conn_remove_extractor --
+ *	Remove extractor added by WT_CONNECTION->add_extractor, only used
+ * internally.
+ */
+int
+__wt_conn_remove_extractor(WT_SESSION_IMPL *session)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_EXTRACTOR *nextractor;
+
+	conn = S2C(session);
+
+	while ((nextractor = TAILQ_FIRST(&conn->extractorqh)) != NULL) {
+		/* Call any termination method. */
+		if (nextractor->extractor->terminate != NULL)
+			WT_TRET(nextractor->extractor->terminate(
+			    nextractor->extractor, (WT_SESSION *)session));
+
+		/* Remove from the connection's list, free memory. */
+		TAILQ_REMOVE(&conn->extractorqh, nextractor, q);
+		__wt_free(session, nextractor->name);
+		__wt_free(session, nextractor);
+	}
+
+	return (ret);
 }
 
 /*

@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -36,11 +36,13 @@
 
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/head_manager.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -117,12 +119,38 @@ namespace mongo {
         _isReady = newIsReady;
     }
 
+    class IndexCatalogEntry::SetHeadChange : public RecoveryUnit::Change {
+    public:
+        SetHeadChange(IndexCatalogEntry* ice, DiskLoc oldHead) :_ice(ice), _oldHead(oldHead) {
+        }
+
+        virtual void commit() {}
+        virtual void rollback() { _ice->_head = _oldHead; }
+
+        IndexCatalogEntry* _ice;
+        const DiskLoc _oldHead;
+    };
+
     void IndexCatalogEntry::setHead( OperationContext* txn, DiskLoc newHead ) {
         _collection->setIndexHead( txn,
                                    _descriptor->indexName(),
                                    newHead );
+
+        txn->recoveryUnit()->registerChange(new SetHeadChange(this, _head));
         _head = newHead;
     }
+
+    class IndexCatalogEntry::SetMultikeyChange : public RecoveryUnit::Change {
+    public:
+        SetMultikeyChange(IndexCatalogEntry* ice) :_ice(ice) {
+            invariant(!_ice->_isMultikey);
+        }
+
+        virtual void commit() {}
+        virtual void rollback() { _ice->_isMultikey = false; }
+
+        IndexCatalogEntry* _ice;
+    };
 
     void IndexCatalogEntry::setMultikey( OperationContext* txn ) {
         if ( isMultikey( txn ) )
@@ -136,6 +164,14 @@ namespace mongo {
             return;
         }
 
+        const ResourceId collRes = ResourceId(RESOURCE_COLLECTION, _ns);
+        LockResult res = txn->lockState()->lock(collRes, MODE_X, UINT_MAX, true);
+        if (res == LOCK_DEADLOCK) throw WriteConflictException();
+        invariant(res == LOCK_OK);
+
+        // Lock will be held until end of WUOW to ensure rollback safety.
+        ON_BLOCK_EXIT(&Locker::unlock, txn->lockState(), collRes);
+
         if ( _collection->setIndexIsMultikey( txn,
                                               _descriptor->indexName(),
                                               true ) ) {
@@ -146,6 +182,7 @@ namespace mongo {
             }
         }
 
+        txn->recoveryUnit()->registerChange(new SetMultikeyChange(this));
         _isMultikey = true;
     }
 

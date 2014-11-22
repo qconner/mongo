@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrites
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/lasterror.h"
@@ -50,6 +51,7 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/update_executor.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -527,7 +529,7 @@ namespace mongo {
         currentOp->ensureStarted();
         currentOp->setNS( currWrite.getRequest()->getNS() );
 
-        currentOp->debug().ns = currentOp->getNS().c_str();
+        currentOp->debug().ns = currentOp->getNS();
         currentOp->debug().op = currentOp->getOp();
 
         if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert ) {
@@ -657,7 +659,6 @@ namespace mongo {
 
     static void singleCreateIndex( OperationContext* txn,
                                    const BSONObj& indexDesc,
-                                   Collection* collection,
                                    WriteOpResult* result );
 
     static void multiUpdate( OperationContext* txn,
@@ -735,6 +736,7 @@ namespace mongo {
     private:
         bool _lockAndCheckImpl(WriteOpResult* result, bool intentLock=true);
 
+        ScopedTransaction _transaction;
         // Guard object for the write lock on the target database.
         scoped_ptr<Lock::DBLock> _writeLock;
         scoped_ptr<Lock::CollectionLock> _collLock;
@@ -844,14 +846,25 @@ namespace mongo {
         ExecInsertsState state(_txn, &request);
         normalizeInserts(request, &state.normalizedInserts);
 
-        ElapsedTracker elapsedTracker(128, 10); // 128 hits or 10 ms, matching RunnerYieldPolicy's
+        // Yield frequency is based on the same constants used by PlanYieldPolicy.
+        ElapsedTracker elapsedTracker(internalQueryExecYieldIterations,
+                                      internalQueryExecYieldPeriodMS);
 
         for (state.currIndex = 0;
              state.currIndex < state.request->sizeWriteOps();
              ++state.currIndex) {
 
             if (elapsedTracker.intervalHasElapsed()) {
-                // Consider yielding between inserts.
+                // Consider yielding between inserts. We never yield for storage engines that
+                // support document-level locking. TODO: as an optimization, this should only
+                // yield if another thread is waiting for our lock.
+                if (!supportsDocLocking() && state.hasLock()) {
+                    // Release our locks. They get reacquired when insertOne() calls
+                    // ExecInsertsState::lockAndCheck(). Since the lock manager guarantees FIFO
+                    // queues waiting on locks, there is no need to explicitly sleep or give up
+                    // control of the processor here.
+                    state.unlock();
+                }
 
                 _txn->checkForInterrupt();
                 elapsedTracker.resetLastTime();
@@ -887,6 +900,9 @@ namespace mongo {
         incWriteStats( updateItem, result.getStats(), result.getError(), currentOp.get() );
         finishCurrentOp( _txn, currentOp.get(), result.getError() );
 
+        // End current transaction and release snapshot.
+        _txn->recoveryUnit()->commitAndRestart();
+
         if ( result.getError() ) {
             result.getError()->setIndex( updateItem.getItemIndex() );
             *error = result.releaseError();
@@ -910,6 +926,9 @@ namespace mongo {
         incWriteStats( removeItem, result.getStats(), result.getError(), currentOp.get() );
         finishCurrentOp( _txn, currentOp.get(), result.getError() );
 
+        // End current transaction and release snapshot.
+        _txn->recoveryUnit()->commitAndRestart();
+
         if ( result.getError() ) {
             result.getError()->setIndex( removeItem.getItemIndex() );
             *error = result.releaseError();
@@ -925,6 +944,7 @@ namespace mongo {
         txn(txn),
         request(aRequest),
         currIndex(0),
+        _transaction(txn, MODE_IX),
         _collection(NULL) {
     }
 
@@ -1028,13 +1048,13 @@ namespace mongo {
             normalizedInsert.getValue();
 
         try {
-            if (state->lockAndCheck(result)) {
-                if (!state->request->isInsertIndexRequest()) {
+            if (!state->request->isInsertIndexRequest()) {
+                if (state->lockAndCheck(result)) {
                     singleInsert(state->txn, insertDoc, state->getCollection(), result);
                 }
-                else {
-                    singleCreateIndex(state->txn, insertDoc, state->getCollection(), result);
-                }
+            }
+            else {
+                singleCreateIndex(state->txn, insertDoc, result);
             }
         }
         catch (const DBException& ex) {
@@ -1045,8 +1065,10 @@ namespace mongo {
         }
 
         // Errors release the write lock, as a matter of policy.
-        if (result->getError())
+        if (result->getError()) {
+            state->txn->recoveryUnit()->commitAndRestart();
             state->unlock();
+        }
     }
 
     void WriteBatchExecutor::execOneInsert(ExecInsertsState* state, WriteErrorDetail** error) {
@@ -1056,16 +1078,6 @@ namespace mongo {
 
         WriteOpResult result;
         insertOne(state, &result);
-
-        if (state->hasLock()) {
-            // Normally, unlocking records lock time stats on the active CurOp.  However,
-            // insertOne() may not release the lock. In that case, record time by hand.
-            state->getLock().recordTime();
-            // If we deschedule here, there could be substantial unaccounted locked time.
-            // Any time from here will be attributed to the next insert in the batch, or
-            // not attributed to any operation if this is the last op in the batch.
-            state->getLock().resetTime();
-        }
 
         incWriteStats(currInsertItem,
                       result.getStats(),
@@ -1107,45 +1119,57 @@ namespace mongo {
     }
 
     /**
-     * Perform a single index insert into a collection.  Requires the index descriptor be
-     * preprocessed and the collection already has been created.
+     * Perform a single index creation on a collection.  Requires the index descriptor be
+     * preprocessed.
      *
      * Might fault or error, otherwise populates the result.
      */
-    static void singleCreateIndex( OperationContext* txn,
-                                   const BSONObj& indexDesc,
-                                   Collection* collection,
-                                   WriteOpResult* result ) {
+    static void singleCreateIndex(OperationContext* txn,
+                                  const BSONObj& indexDesc,
+                                  WriteOpResult* result) {
 
-        const string indexNS = collection->ns().getSystemIndexesCollection();
-
-        txn->lockState()->assertWriteLocked( indexNS );
-
-        MultiIndexBlock indexer(txn, collection);
-        indexer.allowBackgroundBuilding();
-        indexer.allowInterruption();
-
-        Status status = indexer.init(indexDesc);
-        if ( status.code() == ErrorCodes::IndexAlreadyExists ) {
+        BSONElement nsElement = indexDesc["ns"];
+        uassert(ErrorCodes::NoSuchKey,
+                "Missing \"ns\" field in index description",
+                !nsElement.eoo());
+        uassert(ErrorCodes::TypeMismatch,
+                str::stream() << "Expected \"ns\" field of index description to be a " "string, "
+                "but found a " << typeName(nsElement.type()),
+                nsElement.type() == String);
+        const NamespaceString ns(nsElement.valueStringData());
+        BSONObjBuilder cmdBuilder;
+        cmdBuilder << "createIndexes" << ns.coll();
+        cmdBuilder << "indexes" << BSON_ARRAY(indexDesc);
+        BSONObj cmd = cmdBuilder.done();
+        Command* createIndexesCmd = Command::findCommand("createIndexes");
+        invariant(createIndexesCmd);
+        std::string errmsg;
+        BSONObjBuilder resultBuilder;
+        const bool success = createIndexesCmd->run(
+                txn,
+                ns.db().toString(),
+                cmd,
+                0,
+                errmsg,
+                resultBuilder,
+                false /* fromrepl */);
+        Command::appendCommandStatus(resultBuilder, success, errmsg);
+        BSONObj cmdResult = resultBuilder.done();
+        uassertStatusOK(Command::getStatusFromCommandResult(cmdResult));
+        const long long numIndexesBefore = cmdResult["numIndexesBefore"].safeNumberLong();
+        const long long numIndexesAfter = cmdResult["numIndexesAfter"].safeNumberLong();
+        if (numIndexesAfter - numIndexesBefore == 1) {
+            result->getStats().n = 1;
+        }
+        else if (numIndexesAfter != 0 && numIndexesAfter != numIndexesBefore) {
+            severe() <<
+                "Created multiple indexes while attempting to create only 1; numIndexesBefore = " <<
+                numIndexesBefore << "; numIndexesAfter = " << numIndexesAfter;
+            fassertFailed(28547);
+        }
+        else {
             result->getStats().n = 0;
-            return; // inserting an existing index is a no-op.
         }
-        if (!status.isOK()) {
-            result->setError(toWriteError(status));
-            return;
-        }
-
-        status = indexer.insertAllDocumentsInCollection();
-        if (!status.isOK()) {
-            result->setError(toWriteError(status));
-            return;
-        }
-
-        WriteUnitOfWork wunit(txn);
-        indexer.commit();
-        repl::logOp( txn, "i", indexNS.c_str(), indexDesc );
-        result->getStats().n = 1;
-        wunit.commit();
     }
 
     static void multiUpdate( OperationContext* txn,
@@ -1154,7 +1178,7 @@ namespace mongo {
 
         const NamespaceString nsString(updateItem.getRequest()->getNS());
         const bool isMulti = updateItem.getUpdate()->getMulti();
-        UpdateRequest request(txn, nsString);
+        UpdateRequest request(nsString);
         request.setQuery(updateItem.getUpdate()->getQuery());
         request.setUpdates(updateItem.getUpdate()->getUpdateExpr());
         request.setMulti(isMulti);
@@ -1166,11 +1190,11 @@ namespace mongo {
         // Updates from the write commands path can yield.
         request.setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-        int attempt = 1;
+        int attempt = 0;
         bool createCollection = false;
         for ( int fakeLoop = 0; fakeLoop < 1; fakeLoop++ ) {
 
-            UpdateExecutor executor(&request, &txn->getCurOp()->debug());
+            UpdateExecutor executor(txn, &request, &txn->getCurOp()->debug());
             Status status = executor.prepare();
             if (!status.isOK()) {
                 result->setError(toWriteError(status));
@@ -1178,6 +1202,7 @@ namespace mongo {
             }
 
             if ( createCollection ) {
+                ScopedTransaction transaction(txn, MODE_IX);
                 Lock::DBLock lk(txn->lockState(), nsString.db(), MODE_X);
                 Client::Context ctx(txn, nsString.ns(), false /* don't check version */);
                 Database* db = ctx.db();
@@ -1194,6 +1219,7 @@ namespace mongo {
             }
 
             ///////////////////////////////////////////
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbLock(txn->lockState(), nsString.db(), MODE_IX);
             Lock::CollectionLock colLock(txn->lockState(),
                                          nsString.ns(),
@@ -1269,12 +1295,13 @@ namespace mongo {
                     log() << "Had WriteConflict during multi update, aborting";
                     throw;
                 }
-                else if ( attempt++ > 1 ) {
-                    log() << "Had WriteConflict doing update on " << nsString
-                          << ", attempt: " << attempt << " retrying";
-                    createCollection = false;
-                    fakeLoop = -1;
-                }
+
+                WriteConflictException::logAndBackoff( attempt++, "update", nsString.ns() );
+
+                createCollection = false;
+                // RESTART LOOP
+                fakeLoop = -1;
+                txn->recoveryUnit()->commitAndRestart();
             }
             catch (const DBException& ex) {
                 Status status = ex.toStatus();
@@ -1297,7 +1324,7 @@ namespace mongo {
                              WriteOpResult* result ) {
 
         const NamespaceString nss( removeItem.getRequest()->getNS() );
-        DeleteRequest request(txn, nss);
+        DeleteRequest request(nss);
         request.setQuery( removeItem.getDelete()->getQuery() );
         request.setMulti( removeItem.getDelete()->getLimit() != 1 );
         request.setUpdateOpLog(true);
@@ -1310,7 +1337,7 @@ namespace mongo {
         while ( 1 ) {
             try {
 
-                DeleteExecutor executor( &request );
+                DeleteExecutor executor( txn, &request );
                 Status status = executor.prepare();
                 if ( !status.isOK() ) {
                     result->setError(toWriteError(status));
@@ -1338,10 +1365,7 @@ namespace mongo {
                 break;
             }
             catch ( const WriteConflictException& dle ) {
-                if ( attempt++ > 1 ) {
-                    log() << "Had WriteConflict doing delete on " << nss
-                          << ", attempt: " << attempt << " retrying";
-                }
+                WriteConflictException::logAndBackoff( attempt++, "delete", nss.ns() );
             }
             catch ( const DBException& ex ) {
                 Status status = ex.toStatus();

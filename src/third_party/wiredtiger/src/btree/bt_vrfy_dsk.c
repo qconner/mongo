@@ -42,7 +42,7 @@ static int __verify_dsk_row(
  */
 int
 __wt_verify_dsk_image(WT_SESSION_IMPL *session,
-    const char *addr, const WT_PAGE_HEADER *dsk, size_t size)
+    const char *addr, const WT_PAGE_HEADER *dsk, size_t size, int empty_page_ok)
 {
 	const uint8_t *p, *end;
 	u_int i;
@@ -129,7 +129,24 @@ __wt_verify_dsk_image(WT_SESSION_IMPL *session,
 				    __wt_page_type_string(dsk->type), addr);
 	}
 
-	/* Verify the items on the page. */
+	/* Check for empty pages, then verify the items on the page. */
+	switch (dsk->type) {
+	case WT_PAGE_COL_INT:
+	case WT_PAGE_COL_FIX:
+	case WT_PAGE_COL_VAR:
+	case WT_PAGE_ROW_INT:
+	case WT_PAGE_ROW_LEAF:
+		if (!empty_page_ok && dsk->u.entries == 0)
+			WT_RET_VRFY(session, "%s page at %s has no entries",
+			    __wt_page_type_string(dsk->type), addr);
+		break;
+	case WT_PAGE_BLOCK_MANAGER:
+	case WT_PAGE_OVFL:
+		if (dsk->u.datalen == 0)
+			WT_RET_VRFY(session, "%s page at %s has no data",
+			    __wt_page_type_string(dsk->type), addr);
+		break;
+	}
 	switch (dsk->type) {
 	case WT_PAGE_COL_INT:
 		return (__verify_dsk_col_int(session, addr, dsk));
@@ -155,7 +172,7 @@ __wt_verify_dsk_image(WT_SESSION_IMPL *session,
 int
 __wt_verify_dsk(WT_SESSION_IMPL *session, const char *addr, WT_ITEM *buf)
 {
-	return (__wt_verify_dsk_image(session, addr, buf->data, buf->size));
+	return (__wt_verify_dsk_image(session, addr, buf->data, buf->size, 0));
 }
 
 /*
@@ -629,14 +646,8 @@ __verify_dsk_chunk(WT_SESSION_IMPL *session,
 
 	/*
 	 * Fixed-length column-store and overflow pages are simple chunks of
-	 * data.
+	 * data. Verify the data doesn't overflow the end of the page.
 	 */
-	if (datalen == 0)
-		WT_RET_VRFY(session,
-		    "%s page at %s has no data",
-		    __wt_page_type_string(dsk->type), addr);
-
-	/* Verify the data doesn't overflow the end of the page. */
 	p = WT_PAGE_HEADER_BYTE(btree, dsk);
 	if (p + datalen > end)
 		WT_RET_VRFY(session,

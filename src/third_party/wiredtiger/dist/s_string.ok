@@ -38,6 +38,7 @@ BUFs
 BUILTIN
 BZ
 BZIP
+Barack
 Bitfield
 Bitwise
 Bsearch
@@ -91,6 +92,7 @@ EMSG
 EMail
 ENOENT
 ENOMEM
+ENOSYS
 ENOTSUP
 ENV
 EOF
@@ -117,6 +119,7 @@ FOREACH
 FREAD
 FREELIST
 FTRUNCATE
+FULLFSYNC
 Fasttrack
 Filesystems
 FindFirstFile
@@ -142,6 +145,7 @@ GetModuleHandleEx
 GetProcAddress
 Givargis
 Google
+HFS
 HHHH
 HHHHLL
 HHHLL
@@ -153,6 +157,7 @@ IFF
 IKEY
 IMPL
 IMPL's
+INCR
 INDX
 INIT
 INITIALIZER
@@ -218,6 +223,7 @@ Marsaglia's
 Mellor
 Metadata
 Mewhort
+Mitzenmacher
 MoveFile
 Multi
 Multithreaded
@@ -242,6 +248,7 @@ ONPAGE
 OPTYPE
 OUTBUFF
 OVFL
+Obama
 PADDR
 PAGE's
 PARAM
@@ -266,6 +273,7 @@ REF's
 REFs
 REQ
 RET
+RHEL
 RLE
 RNG
 ROCKSDB
@@ -289,6 +297,7 @@ SPARC
 SPINLOCK
 SQL
 SSD
+SSHH
 SSq
 STAILQ
 STRTOUQ
@@ -324,6 +333,7 @@ Timespec
 Timestamp
 TryCV
 TxnID
+UDF
 UID
 UIDs
 UINT
@@ -410,6 +420,7 @@ bitstring
 bitwise
 bm
 bnd
+bool
 boolean
 br
 breakpoint
@@ -491,6 +502,7 @@ curbtree
 curbulk
 curconfig
 curdump
+curextract
 curfile
 curindex
 curlog
@@ -597,6 +609,7 @@ fileop
 fileops
 filesize
 filesystem
+filesystems
 fillms
 firstfit
 fixup
@@ -652,6 +665,7 @@ hval
 hw
 iS
 iSh
+ibackup
 icount
 idx
 ifdef's
@@ -775,6 +789,7 @@ minprefix
 mkdir
 mmap
 mnt
+msecs
 msg
 msgv
 msvc

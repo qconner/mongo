@@ -33,6 +33,7 @@
 #include "mongo/db/repl/bgsync.h"
 
 #include "mongo/base/counter.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -41,7 +42,6 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_coordinator_impl.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/rslog.h"
@@ -140,7 +140,7 @@ namespace {
 
     void BackgroundSync::producerThread() {
         Client::initThread("rsBackgroundSync");
-        replLocalAuth();
+        cc().getAuthorizationSession()->grantInternalAuthorization();
 
         while (!inShutdown()) {
             try {
@@ -521,6 +521,7 @@ namespace {
     long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
         BSONObj oplogEntry;
         try {
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), "local", MODE_X);
             bool success = Helpers::getLast(txn, rsoplog, oplogEntry);
             if (!success) {

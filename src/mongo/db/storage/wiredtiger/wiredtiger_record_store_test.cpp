@@ -89,16 +89,19 @@ namespace mongo {
             return new WiredTigerRecordStore( &txn, ns, uri );
         }
 
-        virtual RecordStore* newCappedRecordStore( int64_t cappedMaxSize,
+        virtual RecordStore* newCappedRecordStore( const std::string& ns,
+                                                   int64_t cappedMaxSize,
                                                    int64_t cappedMaxDocs ) {
-            std::string ns = "a.b";
 
             WiredTigerRecoveryUnit* ru = new WiredTigerRecoveryUnit( _sessionCache );
             OperationContextNoop txn( ru );
             string uri = "table:a.b";
 
+            CollectionOptions options;
+            options.capped = true;
+
             StatusWith<std::string> result =
-                WiredTigerRecordStore::generateCreateString("", CollectionOptions(), "");
+                WiredTigerRecordStore::generateCreateString(ns, options, "");
             ASSERT_TRUE(result.isOK());
             std::string config = result.getValue();
 
@@ -127,7 +130,7 @@ namespace mongo {
 
     TEST(WiredTigerRecordStoreTest, GenerateCreateStringUnknownField) {
         CollectionOptions options;
-        options.storageEngine = fromjson("{wiredtiger: {unknownField: 1}}");
+        options.storageEngine = fromjson("{wiredTiger: {unknownField: 1}}");
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString("", options, "");
         const Status& status = result.getStatus();
         ASSERT_NOT_OK(status);
@@ -136,7 +139,7 @@ namespace mongo {
 
     TEST(WiredTigerRecordStoreTest, GenerateCreateStringNonStringConfig) {
         CollectionOptions options;
-        options.storageEngine = fromjson("{wiredtiger: {configString: 12345}}");
+        options.storageEngine = fromjson("{wiredTiger: {configString: 12345}}");
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString("", options, "");
         const Status& status = result.getStatus();
         ASSERT_NOT_OK(status);
@@ -329,82 +332,281 @@ namespace mongo {
         rs.reset( NULL ); // this has to be deleted before ss
     }
 
-    StatusWith<DiskLoc> insertBSON(ptr<OperationContext> opCtx, ptr<RecordStore> rs,
-                                   const BSONObj& obj) {
-        WriteUnitOfWork wuow(opCtx);
-        StatusWith<DiskLoc> status = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), false);
-        if (status.isOK())
+    StatusWith<DiskLoc> insertBSON(scoped_ptr<OperationContext>& opCtx,
+                                   scoped_ptr<RecordStore>& rs,
+                                   const OpTime& opTime) {
+        BSONObj obj = BSON( "ts" << opTime );
+        WriteUnitOfWork wuow(opCtx.get());
+        WiredTigerRecordStore* wrs = dynamic_cast<WiredTigerRecordStore*>(rs.get());
+        invariant( wrs );
+        Status status = wrs->oplogDiskLocRegister( opCtx.get(), opTime );
+        if (!status.isOK())
+            return StatusWith<DiskLoc>( status );
+        StatusWith<DiskLoc> res = rs->insertRecord(opCtx.get(),
+                                                   obj.objdata(),
+                                                   obj.objsize(),
+                                                   false);
+        if (res.isOK())
             wuow.commit();
-        return status;
+        return res;
     }
 
     // TODO make generic
     TEST(WiredTigerRecordStoreTest, OplogHack) {
         WiredTigerHarnessHelper harnessHelper;
         scoped_ptr<RecordStore> rs(harnessHelper.newNonCappedRecordStore("local.oplog.foo"));
-        scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
 
-        // always illegal
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(2,-1))).getStatus(),
+            // always illegal
+            ASSERT_EQ(insertBSON(opCtx, rs, OpTime(2,-1)).getStatus(),
                   ErrorCodes::BadValue);
 
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("not_ts" << OpTime(2,1))).getStatus(),
-                  ErrorCodes::BadValue);
+            {
+                BSONObj obj = BSON("not_ts" << OpTime(2,1));
+                ASSERT_EQ(rs->insertRecord(opCtx.get(), obj.objdata(), obj.objsize(),
+                                           false ).getStatus(),
+                          ErrorCodes::BadValue);
 
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << "not an OpTime")).getStatus(),
-                  ErrorCodes::BadValue);
+                obj = BSON( "ts" << "not an OpTime" );
+                ASSERT_EQ(rs->insertRecord(opCtx.get(), obj.objdata(), obj.objsize(),
+                                           false ).getStatus(),
+                          ErrorCodes::BadValue);
+            }
 
-        // currently dasserts
-        // ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(-2,1))).getStatus(),
-                  // ErrorCodes::BadValue);
+            // currently dasserts
+            // ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(-2,1))).getStatus(),
+            // ErrorCodes::BadValue);
 
-        // success cases
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(1,1))).getValue(),
-                                                    DiskLoc(1,1));
+            // success cases
+            ASSERT_EQ(insertBSON(opCtx, rs, OpTime(1,1)).getValue(),
+                      DiskLoc(1,1));
 
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(1,2))).getValue(),
-                                                    DiskLoc(1,2));
+            ASSERT_EQ(insertBSON(opCtx, rs, OpTime(1,2)).getValue(),
+                      DiskLoc(1,2));
 
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(2,2))).getValue(),
-                                                    DiskLoc(2,2));
-
-        // fails because <= highest
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(2,1))).getStatus(),
-                  ErrorCodes::BadValue);
-
-        ASSERT_EQ(insertBSON(opCtx, rs, BSON("ts" << OpTime(2,2))).getStatus(),
-                  ErrorCodes::BadValue);
-
-
-        // find start
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(0,1)), DiskLoc()); // nothing <=
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,1)), DiskLoc(1,2)); // between
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,2)), DiskLoc(2,2)); // ==
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(2,2)); // > highest
-
-        rs->temp_cappedTruncateAfter(opCtx.get(), DiskLoc(2,2),  false); // no-op
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(2,2));
-
-        rs->temp_cappedTruncateAfter(opCtx.get(), DiskLoc(1,2),  false); // deletes 2,2
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(1,2));
-
-        rs->temp_cappedTruncateAfter(opCtx.get(), DiskLoc(1,2),  true); // deletes 1,2
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(1,1));
+            ASSERT_EQ(insertBSON(opCtx, rs, OpTime(2,2)).getValue(),
+                      DiskLoc(2,2));
+        }
 
         {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            // find start
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(0,1)), DiskLoc()); // nothing <=
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,1)), DiskLoc(1,2)); // between
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,2)), DiskLoc(2,2)); // ==
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(2,2)); // > highest
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            rs->temp_cappedTruncateAfter(opCtx.get(), DiskLoc(2,2),  false); // no-op
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(2,2));
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            rs->temp_cappedTruncateAfter(opCtx.get(), DiskLoc(1,2),  false); // deletes 2,2
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(1,2));
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            rs->temp_cappedTruncateAfter(opCtx.get(), DiskLoc(1,2),  true); // deletes 1,2
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc(1,1));
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
             WriteUnitOfWork wuow(opCtx.get());
             ASSERT_OK(rs->truncate(opCtx.get())); // deletes 1,1 and leaves collection empty
             wuow.commit();
         }
-        ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc());
+
+        {
+            scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+            ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(2,3)), DiskLoc());
+        }
     }
 
     TEST(WiredTigerRecordStoreTest, OplogHackOnNonOplog) {
         WiredTigerHarnessHelper harnessHelper;
         scoped_ptr<RecordStore> rs(harnessHelper.newNonCappedRecordStore("local.NOT_oplog.foo"));
+
         scoped_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
 
-        ASSERT_OK(insertBSON(opCtx, rs, BSON("ts" << OpTime(2,-1))).getStatus());
+        BSONObj obj = BSON( "ts" << OpTime(2,-1) );
+        {
+            WriteUnitOfWork wuow( opCtx.get() );
+            ASSERT_OK(rs->insertRecord(opCtx.get(), obj.objdata(),
+                                       obj.objsize(), false ).getStatus());
+            wuow.commit();
+        }
         ASSERT_EQ(rs->oplogStartHack(opCtx.get(), DiskLoc(0,1)), DiskLoc().setInvalid());
     }
+
+    TEST(WiredTigerRecordStoreTest, CappedOrder) {
+        scoped_ptr<WiredTigerHarnessHelper> harnessHelper( new WiredTigerHarnessHelper() );
+        scoped_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("a.b", 100000,10000));
+
+        DiskLoc loc1;
+
+        { // first insert a document
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            {
+                WriteUnitOfWork uow( opCtx.get() );
+                StatusWith<DiskLoc> res = rs->insertRecord( opCtx.get(), "a", 2, false );
+                ASSERT_OK( res.getStatus() );
+                loc1 = res.getValue();
+                uow.commit();
+            }
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            scoped_ptr<RecordIterator> it( rs->getIterator( opCtx.get(), loc1 ) );
+            ASSERT( !it->isEOF() );
+            ASSERT_EQ( loc1, it->getNext() );
+            ASSERT( it->isEOF() );
+        }
+
+        {
+            // now we insert 2 docs, but commit the 2nd one fiirst
+            // we make sure we can't find the 2nd until the first is commited
+            scoped_ptr<OperationContext> t1( harnessHelper->newOperationContext() );
+            scoped_ptr<WriteUnitOfWork> w1( new WriteUnitOfWork( t1.get() ) );
+            rs->insertRecord( t1.get(), "b", 2, false );
+            // do not commit yet
+
+            { // create 2nd doc
+                scoped_ptr<OperationContext> t2( harnessHelper->newOperationContext() );
+                {
+                    WriteUnitOfWork w2( t2.get() );
+                    rs->insertRecord( t2.get(), "c", 2, false );
+                    w2.commit();
+                }
+            }
+
+            { // state should be the same
+                scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+                scoped_ptr<RecordIterator> it( rs->getIterator( opCtx.get(), loc1 ) );
+                ASSERT( !it->isEOF() );
+                ASSERT_EQ( loc1, it->getNext() );
+                ASSERT( it->isEOF() );
+            }
+
+            w1->commit();
+        }
+
+        { // now all 3 docs should be visible
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            scoped_ptr<RecordIterator> it( rs->getIterator( opCtx.get(), loc1 ) );
+            ASSERT( !it->isEOF() );
+            ASSERT_EQ( loc1, it->getNext() );
+            ASSERT( !it->isEOF() );
+            it->getNext();
+            ASSERT( !it->isEOF() );
+            it->getNext();
+            ASSERT( it->isEOF() );
+        }
+    }
+
+    DiskLoc _oplogOrderInsertOplog( OperationContext* txn,
+                                    scoped_ptr<RecordStore>& rs,
+                                    int inc ) {
+        OpTime opTime = OpTime(5,inc);
+        WiredTigerRecordStore* wrs = dynamic_cast<WiredTigerRecordStore*>(rs.get());
+        Status status = wrs->oplogDiskLocRegister( txn, opTime );
+        ASSERT_OK( status );
+        BSONObj obj = BSON( "ts" << opTime );
+        StatusWith<DiskLoc> res = rs->insertRecord( txn, obj.objdata(), obj.objsize(), false );
+        ASSERT_OK( res.getStatus() );
+        return res.getValue();
+    }
+
+    TEST(WiredTigerRecordStoreTest, OplogOrder) {
+        scoped_ptr<WiredTigerHarnessHelper> harnessHelper( new WiredTigerHarnessHelper() );
+        scoped_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("local.oplog.foo",
+                                                                       100000,
+                                                                       10000));
+
+        {
+            const WiredTigerRecordStore* wrs = dynamic_cast<WiredTigerRecordStore*>(rs.get());
+            ASSERT( wrs->isOplog() );
+            ASSERT( wrs->usingOplogHack() );
+        }
+
+        DiskLoc loc1;
+
+        { // first insert a document
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            {
+                WriteUnitOfWork uow( opCtx.get() );
+                loc1 = _oplogOrderInsertOplog( opCtx.get(), rs, 1 );
+                uow.commit();
+            }
+        }
+
+        {
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            scoped_ptr<RecordIterator> it( rs->getIterator( opCtx.get(), loc1 ) );
+            ASSERT( !it->isEOF() );
+            ASSERT_EQ( loc1, it->getNext() );
+            ASSERT( it->isEOF() );
+        }
+
+        {
+            // now we insert 2 docs, but commit the 2nd one fiirst
+            // we make sure we can't find the 2nd until the first is commited
+            scoped_ptr<OperationContext> t1( harnessHelper->newOperationContext() );
+            scoped_ptr<WriteUnitOfWork> w1( new WriteUnitOfWork( t1.get() ) );
+            _oplogOrderInsertOplog( t1.get(), rs, 2 );
+            // do not commit yet
+
+            { // create 2nd doc
+                scoped_ptr<OperationContext> t2( harnessHelper->newOperationContext() );
+                {
+                    WriteUnitOfWork w2( t2.get() );
+                    _oplogOrderInsertOplog( t2.get(), rs, 3 );
+                    w2.commit();
+                }
+            }
+
+            { // state should be the same
+                scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+                scoped_ptr<RecordIterator> it( rs->getIterator( opCtx.get(), loc1 ) );
+                ASSERT( !it->isEOF() );
+                ASSERT_EQ( loc1, it->getNext() );
+                ASSERT( it->isEOF() );
+            }
+
+            w1->commit();
+        }
+
+        { // now all 3 docs should be visible
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            scoped_ptr<RecordIterator> it( rs->getIterator( opCtx.get(), loc1 ) );
+            ASSERT( !it->isEOF() );
+            ASSERT_EQ( loc1, it->getNext() );
+            ASSERT( !it->isEOF() );
+            it->getNext();
+            ASSERT( !it->isEOF() );
+            it->getNext();
+            ASSERT( it->isEOF() );
+        }
+    }
+
+
 }

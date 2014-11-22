@@ -38,93 +38,175 @@
 #include "mongo/util/stringutils.h"
 #include "mongo/util/timer.h"
 
-
 namespace mongo {
+namespace {
 
-    namespace {
+    /**
+     * Map of conflicts. 'LockConflictsTable[newMode] & existingMode != 0' means that a new request
+     * with the given 'newMode' conflicts with an existing request with mode 'existingMode'.
+     */
+    static const int LockConflictsTable[] = {
+        // MODE_NONE
+        0,
 
-        /**
-         * Map of conflicts. 'LockConflictsTable[newMode] & existingMode != 0' means that a new
-         * request with the given 'newMode' conflicts with an existing request with mode
-         * 'existingMode'.
-         */
-        static const int LockConflictsTable[] = {
-            // MODE_NONE
-            0,
+        // MODE_IS
+        (1 << MODE_X),
 
-            // MODE_IS
-            (1 << MODE_X),
+        // MODE_IX
+        (1 << MODE_S) | (1 << MODE_X),
 
-            // MODE_IX
-            (1 << MODE_S) | (1 << MODE_X),
+        // MODE_S
+        (1 << MODE_IX) | (1 << MODE_X),
 
-            // MODE_S
-            (1 << MODE_IX) | (1 << MODE_X),
+        // MODE_X
+        (1 << MODE_S) | (1 << MODE_X) | (1 << MODE_IS) | (1 << MODE_IX),
+    };
 
-            // MODE_X
-            (1 << MODE_S) | (1 << MODE_X) | (1 << MODE_IS) | (1 << MODE_IX),
-        };
-
-        // Ensure we do not add new modes without updating the conflicts table
-        BOOST_STATIC_ASSERT(
-            (sizeof(LockConflictsTable) / sizeof(LockConflictsTable[0])) == LockModesCount);
+    // Ensure we do not add new modes without updating the conflicts table
+    BOOST_STATIC_ASSERT(
+        (sizeof(LockConflictsTable) / sizeof(LockConflictsTable[0])) == LockModesCount);
 
 
-        /**
-         * Maps the mode id to a string.
-         */
-        static const char* LockModeNames[] = {
-            "NONE", "IS", "IX", "S", "X"
-        };
+    /**
+     * Maps the mode id to a string.
+     */
+    static const char* LockModeNames[] = {
+        "NONE", "IS", "IX", "S", "X"
+    };
 
-        static const char* LegacyLockModeNames[] = {
-            "", "r", "w", "R", "W"
-        };
+    static const char* LegacyLockModeNames[] = {
+        "", "r", "w", "R", "W"
+    };
 
-        // Ensure we do not add new modes without updating the names array
-        BOOST_STATIC_ASSERT((sizeof(LockModeNames) / sizeof(LockModeNames[0])) == LockModesCount);
-        BOOST_STATIC_ASSERT(
-            (sizeof(LegacyLockModeNames) / sizeof(LegacyLockModeNames[0])) == LockModesCount);
-
-
-        // Helper functions for the lock modes
-        inline bool conflicts(LockMode newMode, uint32_t existingModesMask) {
-            return (LockConflictsTable[newMode] & existingModesMask) != 0;
-        }
-
-        inline uint32_t modeMask(LockMode mode) {
-            return 1 << mode;
-        }
+    // Ensure we do not add new modes without updating the names array
+    BOOST_STATIC_ASSERT((sizeof(LockModeNames) / sizeof(LockModeNames[0])) == LockModesCount);
+    BOOST_STATIC_ASSERT(
+        (sizeof(LegacyLockModeNames) / sizeof(LegacyLockModeNames[0])) == LockModesCount);
 
 
-        /**
-         * Maps the resource id to a human-readable string.
-         */
-        static const char* ResourceTypeNames[] = {
-            "Invalid",
-            "Global",
-            "MMAPV1Flush",
-            "Database",
-            "Collection",
-            "Document",
-            "MMAPV1ExtentManager"
-        };
+    // Helper functions for the lock modes
+    bool conflicts(LockMode newMode, uint32_t existingModesMask) {
+        return (LockConflictsTable[newMode] & existingModesMask) != 0;
+    }
 
-        // Ensure we do not add new types without updating the names array
-        BOOST_STATIC_ASSERT(
-            (sizeof(ResourceTypeNames) / sizeof(ResourceTypeNames[0])) == ResourceTypesCount);
-
+    uint32_t modeMask(LockMode mode) {
+        return 1 << mode;
     }
 
 
     /**
-     * There is one of these objects per each resource which has a lock on it.
+     * Maps the resource id to a human-readable string.
+     */
+    static const char* ResourceTypeNames[] = {
+        "Invalid",
+        "Global",
+        "MMAPV1Flush",
+        "Database",
+        "Collection",
+        "Document",
+        "MMAPV1ExtentManager"
+    };
+
+    // Ensure we do not add new types without updating the names array
+    BOOST_STATIC_ASSERT(
+        (sizeof(ResourceTypeNames) / sizeof(ResourceTypeNames[0])) == ResourceTypesCount);
+
+
+    /**
+     * Simple intrusive list implementation for the lock's granted and conflicting lists. Does not
+     * own its contents, just uses the intrusive pointers on the LockRequest structure to link them
+     * together. Therefore requests must outlive this list.
+     *
+     * Intentionally implemented as a POD in order to avoid constructor/destructor invocations.
+     *
+     * NOTE: This class should not be used for generic purposes and should not be moved outside of
+     * this file.
+     */
+    class LockRequestList {
+    public:
+
+        void push_front(LockRequest* request) {
+            // Sanity check that we do not reuse entries without cleaning them up
+            invariant(request->next == NULL);
+            invariant(request->prev == NULL);
+
+            if (_front == NULL) {
+                _front = _back = request;
+            }
+            else {
+                request->next = _front;
+
+                _front->prev = request;
+                _front = request;
+            }
+        }
+
+        void push_back(LockRequest* request) {
+            // Sanity check that we do not reuse entries without cleaning them up
+            invariant(request->next == NULL);
+            invariant(request->prev == NULL);
+
+            if (_front == NULL) {
+                _front = _back = request;
+            }
+            else {
+                request->prev = _back;
+
+                _back->next = request;
+                _back = request;
+            }
+        }
+
+        void remove(LockRequest* request) {
+            if (request->prev != NULL) {
+                request->prev->next = request->next;
+            }
+            else {
+                _front = request->next;
+            }
+
+            if (request->next != NULL) {
+                request->next->prev = request->prev;
+            }
+            else {
+                _back = request->prev;
+            }
+
+            request->prev = NULL;
+            request->next = NULL;
+        }
+
+        void reset() {
+            _front = _back = NULL;
+        }
+
+        bool empty() const {
+            return _front == NULL;
+        }
+
+        // Pointers to the beginning and the end of the list
+        LockRequest* _front;
+        LockRequest* _back;
+    };
+
+} // namespace
+
+
+    /**
+     * There is one of these objects per each resource which has a lock on it. Empty objects (i.e.
+     * LockHead with no requests) are allowed to exist on the lock manager's hash table.
+     *
+     * The memory and lifetime is controlled entirely by the LockManager class.
      *
      * Not thread-safe and should only be accessed under the LockManager's bucket lock.
      */
     struct LockHead {
 
-        LockHead(const ResourceId& resId);
+        /**
+         * Used for initialization of a LockHead, which might have been retrieved from cache and
+         * also in order to keep the LockHead structure a POD.
+         */
+        void initNew(const ResourceId& resId);
 
         /**
          * Locates the request corresponding to the particular locker or returns NULL. Must be
@@ -140,18 +222,13 @@ namespace mongo {
 
         // Methods to maintain the granted queue
         void changeGrantedModeCount(LockMode mode, ChangeModeCountAction action);
-        void addToGrantedQueue(LockRequest* request);
-        void removeFromGrantedQueue(LockRequest* request);
 
         // Methods to maintain the conflict queue
         void changeConflictModeCount(LockMode mode, ChangeModeCountAction count);
-        void addToConflictQueue(LockRequest* request);
-        void removeFromConflictQueue(LockRequest* request);
 
 
         // Id of the resource which this lock protects
-        const ResourceId resourceId;
-
+        ResourceId resourceId;
 
         //
         // Granted queue
@@ -159,8 +236,7 @@ namespace mongo {
 
         // Doubly-linked list of requests, which have been granted. Newly granted requests go to
         // the end of the queue. Conversion requests are granted from the beginning forward.
-        LockRequest* grantedQueueBegin;
-        LockRequest* grantedQueueEnd;
+        LockRequestList grantedList;
 
         // Counts the grants and coversion counts for each of the supported lock modes. These
         // counts should exactly match the aggregated modes on the granted list.
@@ -179,8 +255,7 @@ namespace mongo {
         // with the set of granted modes. Requests are queued at the end of the queue and are
         // granted from the beginning forward, which gives these locks FIFO ordering. Exceptions
         // are high-priorty locks, such as the MMAP V1 flush lock.
-        LockRequest* conflictQueueBegin;
-        LockRequest* conflictQueueEnd;
+        LockRequestList conflictList;
 
         // Counts the conflicting requests for each of the lock modes. These counts should exactly
         // match the aggregated modes on the conflicts list.
@@ -201,16 +276,96 @@ namespace mongo {
         // check the granted queue for requests in STATUS_CONVERTING if this count is zero. This
         // saves cycles in the regular case and only burdens the less-frequent lock upgrade case.
         uint32_t conversionsCount;
+
+        // Counts the number of requests on the granted queue, which have requested that the policy
+        // be switched to compatible-first. As long as this value is > 0, the policy will stay
+        // compatible-first.
+        uint32_t compatibleFirstCount;
     };
+
+
+    //
+    // LockHead
+    //
+
+    void LockHead::initNew(const ResourceId& resId) {
+        resourceId = resId;
+
+        grantedList.reset();
+        memset(grantedCounts, 0, sizeof(grantedCounts));
+        grantedModes = 0;
+
+        conflictList.reset();
+        memset(conflictCounts, 0, sizeof(conflictCounts));
+        conflictModes = 0;
+
+        conversionsCount = 0;
+        compatibleFirstCount = 0;
+    }
+
+    LockRequest* LockHead::findRequest(LockerId lockerId) const {
+        // Check the granted queue first
+        for (LockRequest* it = grantedList._front; it != NULL; it = it->next) {
+            if (it->locker->getId() == lockerId) {
+                return it;
+            }
+        }
+
+        // Check the conflict queue second
+        for (LockRequest* it = conflictList._front; it != NULL; it = it->next) {
+            if (it->locker->getId() == lockerId) {
+                return it;
+            }
+        }
+
+        return NULL;
+    }
+
+    void LockHead::changeGrantedModeCount(LockMode mode, ChangeModeCountAction action) {
+        if (action == Increment) {
+            invariant(grantedCounts[mode] >= 0);
+            if (++grantedCounts[mode] == 1) {
+                invariant((grantedModes & modeMask(mode)) == 0);
+                grantedModes |= modeMask(mode);
+            }
+        }
+        else {
+            invariant(action == Decrement);
+            invariant(grantedCounts[mode] >= 1);
+            if (--grantedCounts[mode] == 0) {
+                invariant((grantedModes & modeMask(mode)) == modeMask(mode));
+                grantedModes &= ~modeMask(mode);
+            }
+        }
+    }
+
+    void LockHead::changeConflictModeCount(LockMode mode, ChangeModeCountAction action) {
+        if (action == Increment) {
+            invariant(conflictCounts[mode] >= 0);
+            if (++conflictCounts[mode] == 1) {
+                invariant((conflictModes & modeMask(mode)) == 0);
+                conflictModes |= modeMask(mode);
+            }
+        }
+        else {
+            invariant(action == Decrement);
+            invariant(conflictCounts[mode] >= 1);
+            if (--conflictCounts[mode] == 0) {
+                invariant((conflictModes & modeMask(mode)) == modeMask(mode));
+                conflictModes &= ~modeMask(mode);
+            }
+        }
+    }
 
 
     //
     // LockManager
     //
 
+    //  Have more buckets than CPUs to reduce contention on lock and caches
+    const unsigned LockManager::_numLockBuckets(128);
+
     LockManager::LockManager() {
-        //  Have more buckets than CPUs to reduce contention on lock and caches
-        _numLockBuckets = 128;
         _lockBuckets = new LockBucket[_numLockBuckets];
     }
 
@@ -227,24 +382,9 @@ namespace mongo {
         delete[] _lockBuckets;
     }
 
-    LockResult LockManager::lock(const ResourceId& resId, LockRequest* request, LockMode mode) {
-        dassert(mode > MODE_NONE);
-
-        // Fast path for acquiring the same lock multiple times in modes, which are already covered
-        // by the current mode. It is safe to do this without locking, because 1) all calls for the
-        // same lock request must be done on the same thread and 2) if there are lock requests
-        // hanging off a given LockHead, then this lock will never disappear.
-        if ((LockConflictsTable[request->mode] | LockConflictsTable[mode]) == 
-                LockConflictsTable[request->mode]) {
-            request->recursiveCount++;
-            return LOCK_OK;
-        }
-
-        // TODO: For the time being we do not need conversions between unrelated lock modes (i.e.,
-        // modes which both add and remove to the conflicts set), so these are not implemented yet
-        // (e.g., S -> IX).
-        invariant((LockConflictsTable[request->mode] | LockConflictsTable[mode]) == 
-                LockConflictsTable[mode]);
+    LockResult LockManager::lock(ResourceId resId, LockRequest* request, LockMode mode) {
+        // Sanity check that requests are not being reused without proper cleanup
+        invariant(request->status == LockRequest::STATUS_NEW);
 
         LockBucket* bucket = _getBucket(resId);
         SimpleMutex::scoped_lock scopedLock(bucket->mutex);
@@ -253,98 +393,123 @@ namespace mongo {
 
         LockHeadMap::iterator it = bucket->data.find(resId);
         if (it == bucket->data.end()) {
-            // Lock is free (not on the map)
-            invariant(request->status == LockRequest::STATUS_NEW);
+            lock = new LockHead();
+            lock->initNew(resId);
 
-            lock = new LockHead(resId);
             bucket->data.insert(LockHeadPair(resId, lock));
         }
         else {
-            // Lock is not free
             lock = it->second;
         }
 
-        // Sanity check if requests are being reused
-        invariant(request->lock == NULL || request->lock == lock);
-
         request->lock = lock;
-        request->recursiveCount++;
+        request->recursiveCount = 1;
 
-        if (request->status == LockRequest::STATUS_NEW) {
-            invariant(request->recursiveCount == 1);
+        // New lock request. Queue after all granted modes and after any already requested
+        // conflicting modes.
+        if (conflicts(mode, lock->grantedModes) ||
+                (!lock->compatibleFirstCount && conflicts(mode, lock->conflictModes))) {
 
-            // New lock request. Queue after all granted modes and after any already requested
-            // conflicting modes.
-            if (conflicts(mode, lock->grantedModes) || conflicts(mode, lock->conflictModes)) {
-                request->status = LockRequest::STATUS_WAITING;
-                request->mode = mode;
-                request->convertMode = MODE_NONE;
+            request->status = LockRequest::STATUS_WAITING;
+            request->mode = mode;
 
-                // Put it on the conflict queue. This is the place where various policies could be
-                // applied for where in the wait queue does a request go.
-                lock->addToConflictQueue(request);
-                lock->changeConflictModeCount(mode, LockHead::Increment);
-
-                return LOCK_WAITING;
+            // Put it on the conflict queue. Conflicts are granted front to back.
+            if (request->enqueueAtFront) {
+                lock->conflictList.push_front(request);
             }
-            else {  // No conflict, new request
-                request->status = LockRequest::STATUS_GRANTED;
-                request->mode = mode;
-                request->convertMode = MODE_NONE;
-
-                lock->addToGrantedQueue(request);
-                lock->changeGrantedModeCount(mode, LockHead::Increment);
-
-                return LOCK_OK;
+            else {
+                lock->conflictList.push_back(request);
             }
+
+            lock->changeConflictModeCount(mode, LockHead::Increment);
+
+            return LOCK_WAITING;
         }
         else {
-            // If we are here, we already hold the lock in some mode. In order to keep it simple,
-            // we do not allow requesting a conversion while a lock is already waiting or pending
-            // conversion, hence the assertion below.
-            invariant(request->status == LockRequest::STATUS_GRANTED);
-            invariant(request->recursiveCount > 1);
-            invariant(request->mode != mode);
+            // No conflict, new request
+            request->status = LockRequest::STATUS_GRANTED;
+            request->mode = mode;
 
-            // Construct granted mask without our current mode, so that it is not counted as
-            // conflicting
-            uint32_t grantedModesWithoutCurrentRequest = 0;
+            lock->grantedList.push_back(request);
+            lock->changeGrantedModeCount(mode, LockHead::Increment);
 
-            // We start the counting at 1 below, because LockModesCount also includes MODE_NONE
-            // at position 0, which can never be acquired/granted.
-            for (uint32_t i = 1; i < LockModesCount; i++) {
-                const uint32_t currentRequestHolds =
-                                    (request->mode == static_cast<LockMode>(i) ? 1 : 0);
-
-                if (lock->grantedCounts[i] > currentRequestHolds) {
-                    grantedModesWithoutCurrentRequest |= modeMask(static_cast<LockMode>(i));
-                }
+            if (request->compatibleFirst) {
+                lock->compatibleFirstCount++;
             }
 
-            // This check favours conversion requests over pending requests. For example:
-            //
-            // T1 requests lock L in IS
-            // T2 requests lock L in X
-            // T1 then upgrades L from IS -> S
-            //
-            // Because the check does not look into the conflict modes bitmap, it will grant L to
-            // T1 in S mode, instead of block, which would otherwise cause deadlock.
-            if (conflicts(mode, grantedModesWithoutCurrentRequest)) {
-                request->status = LockRequest::STATUS_CONVERTING;
-                request->convertMode = mode;
+            return LOCK_OK;
+        }
+    }
 
-                lock->conversionsCount++;
-                lock->changeGrantedModeCount(request->convertMode, LockHead::Increment);
+    LockResult LockManager::convert(ResourceId resId, LockRequest* request, LockMode newMode) {
+        // If we are here, we already hold the lock in some mode. In order to keep it simple, we do
+        // not allow requesting a conversion while a lock is already waiting or pending conversion.
+        invariant(request->status == LockRequest::STATUS_GRANTED);
+        invariant(request->recursiveCount > 0);
 
-                return LOCK_WAITING;
+        request->recursiveCount++;
+
+        // Fast path for acquiring the same lock multiple times in modes, which are already covered
+        // by the current mode. It is safe to do this without locking, because 1) all calls for the
+        // same lock request must be done on the same thread and 2) if there are lock requests
+        // hanging off a given LockHead, then this lock will never disappear.
+        if ((LockConflictsTable[request->mode] | LockConflictsTable[newMode]) ==
+                                                        LockConflictsTable[request->mode]) {
+            return LOCK_OK;
+        }
+
+        // TODO: For the time being we do not need conversions between unrelated lock modes (i.e.,
+        // modes which both add and remove to the conflicts set), so these are not implemented yet
+        // (e.g., S -> IX).
+        invariant((LockConflictsTable[request->mode] | LockConflictsTable[newMode]) ==
+                                                        LockConflictsTable[newMode]);
+
+        LockBucket* bucket = _getBucket(resId);
+        SimpleMutex::scoped_lock scopedLock(bucket->mutex);
+
+        LockHeadMap::iterator it = bucket->data.find(resId);
+        invariant(it != bucket->data.end());
+
+        LockHead* const lock = it->second;
+
+        // Construct granted mask without our current mode, so that it is not counted as
+        // conflicting
+        uint32_t grantedModesWithoutCurrentRequest = 0;
+
+        // We start the counting at 1 below, because LockModesCount also includes MODE_NONE
+        // at position 0, which can never be acquired/granted.
+        for (uint32_t i = 1; i < LockModesCount; i++) {
+            const uint32_t currentRequestHolds =
+                (request->mode == static_cast<LockMode>(i) ? 1 : 0);
+
+            if (lock->grantedCounts[i] > currentRequestHolds) {
+                grantedModesWithoutCurrentRequest |= modeMask(static_cast<LockMode>(i));
             }
-            else {  // No conflict, existing request
-                lock->changeGrantedModeCount(mode, LockHead::Increment);
-                lock->changeGrantedModeCount(request->mode, LockHead::Decrement);
-                request->mode = mode;
+        }
 
-                return LOCK_OK;
-            }
+        // This check favours conversion requests over pending requests. For example:
+        //
+        // T1 requests lock L in IS
+        // T2 requests lock L in X
+        // T1 then upgrades L from IS -> S
+        //
+        // Because the check does not look into the conflict modes bitmap, it will grant L to
+        // T1 in S mode, instead of block, which would otherwise cause deadlock.
+        if (conflicts(newMode, grantedModesWithoutCurrentRequest)) {
+            request->status = LockRequest::STATUS_CONVERTING;
+            request->convertMode = newMode;
+
+            lock->conversionsCount++;
+            lock->changeGrantedModeCount(request->convertMode, LockHead::Increment);
+
+            return LOCK_WAITING;
+        }
+        else {  // No conflict, existing request
+            lock->changeGrantedModeCount(newMode, LockHead::Increment);
+            lock->changeGrantedModeCount(request->mode, LockHead::Decrement);
+            request->mode = newMode;
+
+            return LOCK_OK;
         }
     }
 
@@ -365,15 +530,11 @@ namespace mongo {
         LockBucket* bucket = _getBucket(lock->resourceId);
         SimpleMutex::scoped_lock scopedLock(bucket->mutex);
 
-        invariant(lock->grantedQueueBegin != NULL);
-        invariant(lock->grantedQueueEnd != NULL);
-        invariant(lock->grantedModes != 0);
-
         if (request->status == LockRequest::STATUS_WAITING) {
             // This cancels a pending lock request
             invariant(request->recursiveCount == 0);
 
-            lock->removeFromConflictQueue(request);
+            lock->conflictList.remove(request);
             lock->changeConflictModeCount(request->mode, LockHead::Decrement);
         }
         else if (request->status == LockRequest::STATUS_CONVERTING) {
@@ -397,8 +558,12 @@ namespace mongo {
             invariant(request->recursiveCount == 0);
 
             // Remove from the granted list
-            lock->removeFromGrantedQueue(request);
+            lock->grantedList.remove(request);
             lock->changeGrantedModeCount(request->mode, LockHead::Decrement);
+
+            if (request->compatibleFirst) {
+                lock->compatibleFirstCount--;
+            }
 
             _onLockModeChanged(lock, lock->grantedCounts[request->mode] == 0);
         }
@@ -425,10 +590,6 @@ namespace mongo {
         LockBucket* bucket = _getBucket(lock->resourceId);
         SimpleMutex::scoped_lock scopedLock(bucket->mutex);
 
-        invariant(lock->grantedQueueBegin != NULL);
-        invariant(lock->grantedQueueEnd != NULL);
-        invariant(lock->grantedModes != 0);
-
         lock->changeGrantedModeCount(newMode, LockHead::Increment);
         lock->changeGrantedModeCount(request->mode, LockHead::Decrement);
         request->mode = newMode;
@@ -446,12 +607,13 @@ namespace mongo {
                 LockHead* lock = it->second;
                 if (lock->grantedModes == 0) {
                     invariant(lock->grantedModes == 0);
-                    invariant(lock->grantedQueueBegin == NULL);
-                    invariant(lock->grantedQueueEnd == NULL);
+                    invariant(lock->grantedList._front == NULL);
+                    invariant(lock->grantedList._back == NULL);
                     invariant(lock->conflictModes == 0);
-                    invariant(lock->conflictQueueBegin == NULL);
-                    invariant(lock->conflictQueueEnd == NULL);
+                    invariant(lock->conflictList._front == NULL);
+                    invariant(lock->conflictList._back == NULL);
                     invariant(lock->conversionsCount == 0);
+                    invariant(lock->compatibleFirstCount == 0);
 
                     bucket->data.erase(it++);
                     delete lock;
@@ -466,7 +628,7 @@ namespace mongo {
     void LockManager::_onLockModeChanged(LockHead* lock, bool checkConflictQueue) {
         // Unblock any converting requests (because conversions are still counted as granted and
         // are on the granted queue).
-        for (LockRequest* iter = lock->grantedQueueBegin;
+        for (LockRequest* iter = lock->grantedList._front;
             (iter != NULL) && (lock->conversionsCount > 0);
             iter = iter->next) {
 
@@ -510,7 +672,7 @@ namespace mongo {
         // Grant any conflicting requests, which might now be unblocked
         LockRequest* iterNext = NULL;
 
-        for (LockRequest* iter = lock->conflictQueueBegin;
+        for (LockRequest* iter = lock->conflictList._front;
              (iter != NULL) && checkConflictQueue;
              iter = iterNext) {
 
@@ -524,22 +686,26 @@ namespace mongo {
 
             iter->status = LockRequest::STATUS_GRANTED;
 
-            lock->removeFromConflictQueue(iter);
-            lock->addToGrantedQueue(iter);
+            lock->conflictList.remove(iter);
+            lock->grantedList.push_back(iter);
 
             lock->changeGrantedModeCount(iter->mode, LockHead::Increment);
             lock->changeConflictModeCount(iter->mode, LockHead::Decrement);
+
+            if (iter->compatibleFirst) {
+                lock->compatibleFirstCount++;
+            }
 
             iter->notify->notify(lock->resourceId, LOCK_OK);
         }
 
         // This is a convenient place to check that the state of the two request queues is in sync
         // with the bitmask on the modes.
-        invariant((lock->grantedModes == 0) ^ (lock->grantedQueueBegin != NULL));
-        invariant((lock->conflictModes == 0) ^ (lock->conflictQueueBegin != NULL));
+        invariant((lock->grantedModes == 0) ^ (lock->grantedList._front != NULL));
+        invariant((lock->conflictModes == 0) ^ (lock->conflictList._front != NULL));
     }
 
-    LockManager::LockBucket* LockManager::_getBucket(const ResourceId& resId) const {
+    LockManager::LockBucket* LockManager::_getBucket(ResourceId resId) const {
         return &_lockBuckets[resId % _numLockBuckets];
     }
 
@@ -557,15 +723,22 @@ namespace mongo {
     }
 
     void LockManager::_dumpBucket(const LockBucket* bucket) const {
-        StringBuilder sb;
+        for (LockHeadMap::const_iterator it = bucket->data.begin();
+             it != bucket->data.end();
+             it++) {
 
-        LockHeadMap::const_iterator it = bucket->data.begin();
-        while (it != bucket->data.end()) {
             const LockHead* lock = it->second;
+
+            if (lock->grantedList.empty()) {
+                // If there are no granted requests, this lock is empty, so no need to print it
+                continue;
+            }
+
+            StringBuilder sb;
             sb << "Lock @ " << lock << ": " << lock->resourceId.toString() << '\n';
 
             sb << "GRANTED:\n";
-            for (const LockRequest* iter = lock->grantedQueueBegin;
+            for (const LockRequest* iter = lock->grantedList._front;
                  iter != NULL;
                  iter = iter->next) {
 
@@ -573,13 +746,15 @@ namespace mongo {
                     << "LockRequest " << iter->locker->getId() << " @ " << iter->locker << ": "
                     << "Mode = " << modeName(iter->mode) << "; "
                     << "ConvertMode = " << modeName(iter->convertMode) << "; "
+                    << "EnqueueAtFront = " << iter->enqueueAtFront << "; "
+                    << "CompatibleFirst = " << iter->compatibleFirst << "; "
                     << '\n';
             }
 
             sb << '\n';
 
             sb << "PENDING:\n";
-            for (const LockRequest* iter = lock->conflictQueueBegin;
+            for (const LockRequest* iter = lock->conflictList._front;
                  iter != NULL;
                  iter = iter->next) {
 
@@ -587,15 +762,13 @@ namespace mongo {
                     << "LockRequest " << iter->locker->getId() << " @ " << iter->locker << ": "
                     << "Mode = " << modeName(iter->mode) << "; "
                     << "ConvertMode = " << modeName(iter->convertMode) << "; "
+                    << "EnqueueAtFront = " << iter->enqueueAtFront << "; "
+                    << "CompatibleFirst = " << iter->compatibleFirst << "; "
                     << '\n';
             }
 
-            sb << '\n';
-
-            it++;
+            log() << sb.str();
         }
-
-        log() << sb.str();
     }
 
 
@@ -688,7 +861,7 @@ namespace mongo {
         Edges& edges = val.first->second;
 
         bool seen = false;
-        for (LockRequest* it = lock->grantedQueueEnd; it != NULL; it = it->prev) {
+        for (LockRequest* it = lock->grantedList._back; it != NULL; it = it->prev) {
             // We can't conflict with ourselves
             if (it == request) {
                 seen = true;
@@ -757,33 +930,32 @@ namespace mongo {
 
     static const StringData::Hasher stringDataHashFunction = StringData::Hasher();
 
-    ResourceId::ResourceId(ResourceType type, const StringData& ns) {
-        _type = type;
-        _hashId = stringDataHashFunction(ns) % 0x1fffffffffffffffULL;
+    uint64_t ResourceId::fullHash(ResourceType type, uint64_t hashId) {
+        return (static_cast<uint64_t>(type) << (64 - resourceTypeBits))
+                + (hashId & (std::numeric_limits<uint64_t>::max() >> resourceTypeBits));
+    }
 
+    ResourceId::ResourceId(ResourceType type, const StringData& ns)
+        : _fullHash(fullHash(type, stringDataHashFunction(ns))) {
 #ifdef _DEBUG
         _nsCopy = ns.toString();
 #endif
     }
 
-    ResourceId::ResourceId(ResourceType type, const string& ns) {
-        _type = type;
-        _hashId = stringDataHashFunction(ns) % 0x1fffffffffffffffULL;
-
+    ResourceId::ResourceId(ResourceType type, const string& ns)
+        : _fullHash(fullHash(type, stringDataHashFunction(ns))) {
 #ifdef _DEBUG
         _nsCopy = ns;
 #endif
     }
 
-    ResourceId::ResourceId(ResourceType type, uint64_t hashId) {
-        _type = type;
-        _hashId = hashId;
-    }
+    ResourceId::ResourceId(ResourceType type, uint64_t hashId)
+        : _fullHash(fullHash(type, hashId)) { }
 
     string ResourceId::toString() const {
         StringBuilder ss;
-        ss << "{" << _fullHash << ": " << resourceTypeName(static_cast<ResourceType>(_type))
-           << ", " << _hashId;
+        ss << "{" << _fullHash << ": " << resourceTypeName(getType())
+           << ", " << getHashId();
 
 #ifdef _DEBUG
         ss << ", " << _nsCopy;
@@ -796,164 +968,6 @@ namespace mongo {
 
 
     //
-    // LockHead
-    //
-
-    LockHead::LockHead(const ResourceId& resId)
-        : resourceId(resId),
-          grantedQueueBegin(NULL),
-          grantedQueueEnd(NULL),
-          grantedModes(0),
-          conflictQueueBegin(NULL),
-          conflictQueueEnd(NULL),
-          conflictModes(0),
-          conversionsCount(0) {
-
-        memset(grantedCounts, 0, sizeof(grantedCounts));
-        memset(conflictCounts, 0, sizeof(conflictCounts));
-    }
-
-    LockRequest* LockHead::findRequest(LockerId lockerId) const {
-        // Check the granted queue first
-        for (LockRequest* it = grantedQueueBegin; it != NULL; it = it->next) {
-            if (it->locker->getId() == lockerId) {
-                return it;
-            }
-        }
-
-        // Check the conflict queue second
-        for (LockRequest* it = conflictQueueBegin; it != NULL; it = it->next) {
-            if (it->locker->getId() == lockerId) {
-                return it;
-            }
-        }
-
-        return NULL;
-    }
-
-    void LockHead::changeGrantedModeCount(LockMode mode, ChangeModeCountAction action) {
-        if (action == Increment) {
-            invariant(grantedCounts[mode] >= 0);
-            if (++grantedCounts[mode] == 1) {
-                invariant((grantedModes & modeMask(mode)) == 0);
-                grantedModes |= modeMask(mode);
-            }
-        }
-        else {
-            invariant(action == Decrement);
-            invariant(grantedCounts[mode] >= 1);
-            if (--grantedCounts[mode] == 0) {
-                invariant((grantedModes & modeMask(mode)) == modeMask(mode));
-                grantedModes &= ~modeMask(mode);
-            }
-        }
-    }
-
-    void LockHead::changeConflictModeCount(LockMode mode, ChangeModeCountAction action) {
-        if (action == Increment) {
-            invariant(conflictCounts[mode] >= 0);
-            if (++conflictCounts[mode] == 1) {
-                invariant((conflictModes & modeMask(mode)) == 0);
-                conflictModes |= modeMask(mode);
-            }
-        }
-        else {
-            invariant(action == Decrement);
-            invariant(conflictCounts[mode] >= 1);
-            if (--conflictCounts[mode] == 0) {
-                invariant((conflictModes & modeMask(mode)) == modeMask(mode));
-                conflictModes &= ~modeMask(mode);
-            }
-        }
-    }
-
-    void LockHead::addToGrantedQueue(LockRequest* request) {
-        invariant(request->next == NULL);
-        invariant(request->prev == NULL);
-        if (grantedQueueBegin == NULL) {
-            invariant(grantedQueueEnd == NULL);
-
-            request->prev = NULL;
-            request->next = NULL;
-
-            grantedQueueBegin = request;
-            grantedQueueEnd = request;
-        }
-        else {
-            invariant(grantedQueueEnd != NULL);
-
-            request->prev = grantedQueueEnd;
-            request->next = NULL;
-
-            grantedQueueEnd->next = request;
-            grantedQueueEnd = request;
-        }
-    }
-
-    void LockHead::removeFromGrantedQueue(LockRequest* request) {
-        if (request->prev != NULL) {
-            request->prev->next = request->next;
-        }
-        else {
-            grantedQueueBegin = request->next;
-        }
-
-        if (request->next != NULL) {
-            request->next->prev = request->prev;
-        }
-        else {
-            grantedQueueEnd = request->prev;
-        }
-
-        request->prev = NULL;
-        request->next = NULL;
-    }
-
-    void LockHead::addToConflictQueue(LockRequest* request) {
-        invariant(request->next == NULL);
-        invariant(request->prev == NULL);
-
-        if (conflictQueueBegin == NULL) {
-            invariant(conflictQueueEnd == NULL);
-
-            request->prev = NULL;
-            request->next = NULL;
-
-            conflictQueueBegin = request;
-            conflictQueueEnd = request;
-        }
-        else {
-            invariant(conflictQueueEnd != NULL);
-
-            request->prev = conflictQueueEnd;
-            request->next = NULL;
-
-            conflictQueueEnd->next = request;
-            conflictQueueEnd = request;
-        }
-    }
-
-    void LockHead::removeFromConflictQueue(LockRequest* request) {
-        if (request->prev != NULL) {
-            request->prev->next = request->next;
-        }
-        else {
-            conflictQueueBegin = request->next;
-        }
-
-        if (request->next != NULL) {
-            request->next->prev = request->prev;
-        }
-        else {
-            conflictQueueEnd = request->prev;
-        }
-
-        request->prev = NULL;
-        request->next = NULL;
-    }
-
-
-    //
     // LockRequest
     //
 
@@ -961,13 +975,16 @@ namespace mongo {
         this->locker = locker;
         this->notify = notify;
 
+        enqueueAtFront = false;
+        compatibleFirst = false;
+        recursiveCount = 0;
+
         lock = NULL;
         prev = NULL;
         next = NULL;
         status = STATUS_NEW;
         mode = MODE_NONE;
         convertMode = MODE_NONE;
-        recursiveCount = 0;
     }
 
 

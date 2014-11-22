@@ -265,7 +265,7 @@ namespace mongo {
 
         std::string getSetName() const { return _setName; }
 
-        std::vector<HostAndPort> getServers() const { return _servers; }
+        const std::vector<HostAndPort>& getServers() const { return _servers; }
 
         ConnectionType type() const { return _type; }
 
@@ -986,7 +986,7 @@ namespace mongo {
 
         virtual void reIndex( const std::string& ns );
 
-        std::string genIndexName( const BSONObj& keys );
+        static std::string genIndexName( const BSONObj& keys );
 
         /** Erase / drop an entire database */
         virtual bool dropDatabase(const std::string &dbname, BSONObj *info = 0) {

@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -141,8 +141,9 @@ namespace mongo {
         }
 
         while (i->more()) {
-            if (mayInterrupt)
-                _txn->checkForInterrupt(/*heedMutex*/ false);
+            if (mayInterrupt) {
+                _txn->checkForInterrupt();
+            }
 
             WriteUnitOfWork wunit(_txn);
 

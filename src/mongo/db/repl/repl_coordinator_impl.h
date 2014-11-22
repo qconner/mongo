@@ -43,6 +43,7 @@
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/update_position_args.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/unordered_map.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/net/hostandport.h"
@@ -456,8 +457,10 @@ namespace repl {
         /**
          * Triggers all callbacks that are blocked waiting for new heartbeat data
          * to decide whether or not to finish a step down.
+         * Should only be called from executor callbacks.
          */
-        void _signalStepDownWaiters(const ReplicationExecutor::CallbackData& cbData);
+        void _signalStepDownWaitersFromCallback(const ReplicationExecutor::CallbackData& cbData);
+        void _signalStepDownWaiters();
 
         /**
          * Helper for stepDown run within a ReplicationExecutor callback.  This method assumes
@@ -466,6 +469,7 @@ namespace repl {
          */
         void _stepDownContinue(const ReplicationExecutor::CallbackData& cbData,
                                const ReplicationExecutor::EventHandle finishedEvent,
+                               OperationContext* txn,
                                Date_t waitUntil,
                                Date_t stepdownUntil,
                                bool force,
@@ -741,6 +745,9 @@ namespace repl {
         // (X)  Reads and writes must be performed in a callback in _replExecutor
         // (MX) Must hold _mutex and be in a callback in _replExecutor to write; must either hold
         //      _mutex or be in a callback in _replExecutor to read.
+        // (GX) Readable under a global intent lock.  Must either hold global lock in exclusive
+        //      mode (MODE_X) or both hold global lock in shared mode (MODE_S) and be in executor
+        //      context to write.
         // (I)  Independently synchronized, see member variable comment.
 
         // Protects member data of this ReplicationCoordinator.
@@ -794,7 +801,7 @@ namespace repl {
         bool _inShutdown;                                                                 // (M)
 
         // Election ID of the last election that resulted in this node becoming primary.
-        OID _electionID;                                                                  // (M)
+        OID _electionId;                                                                  // (M)
 
         // Vector containing known information about each member (such as replication
         // progress and member ID) in our replica set or each member replicating from
@@ -843,6 +850,18 @@ namespace repl {
 
         // Whether we slept last time we attempted an election but possibly tied with other nodes.
         bool _sleptLastElection;                                                          // (X)
+
+        // Flag that indicates whether writes to databases other than "local" are allowed.  Used to
+        // answer the canAcceptWritesForDatabase() question.  Always true for standalone nodes and
+        // masters in master-slave relationships.
+        bool _canAcceptNonLocalWrites;                                                    // (GX)
+
+        // Flag that indicates whether reads from databases other than "local" are allowed.  Unlike
+        // _canAcceptNonLocalWrites, above, this question is about admission control on secondaries,
+        // and we do not require that its observers be strongly synchronized.  Accidentally
+        // providing the prior value for a limited period of time is acceptable.  Also unlike
+        // _canAcceptNonLocalWrites, its value is only meaningful on replica set secondaries.
+        AtomicUInt32 _canServeNonLocalReads;                                              // (S)
     };
 
 } // namespace repl

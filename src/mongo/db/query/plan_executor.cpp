@@ -251,8 +251,8 @@ namespace mongo {
         return !_killed;
     }
 
-    void PlanExecutor::invalidate(const DiskLoc& dl, InvalidationType type) {
-        if (!_killed) { _root->invalidate(dl, type); }
+    void PlanExecutor::invalidate(OperationContext* txn, const DiskLoc& dl, InvalidationType type) {
+        if (!_killed) { _root->invalidate(txn, dl, type); }
     }
 
     PlanExecutor::ExecState PlanExecutor::getNext(BSONObj* objOut, DiskLoc* dlOut) {
@@ -275,14 +275,14 @@ namespace mongo {
                 // Here's where we yield.
                 _yieldPolicy->yield(fetcher.get());
 
-                // We're done using the fetcher, so it should be freed. We don't want to
-                // use the same RecordFetcher twice.
-                fetcher.reset();
-
                 if (_killed) {
                     return PlanExecutor::DEAD;
                 }
             }
+
+            // We're done using the fetcher, so it should be freed. We don't want to
+            // use the same RecordFetcher twice.
+            fetcher.reset();
 
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState code = _root->work(&id);

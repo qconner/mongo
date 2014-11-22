@@ -31,7 +31,10 @@
 
 #pragma once
 
+#include <set>
 #include <string>
+
+#include <boost/thread/mutex.hpp>
 
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/storage/record_store.h"
@@ -45,6 +48,8 @@ namespace mongo {
     class WiredTigerRecoveryUnit;
     class WiredTigerSizeStorer;
 
+    extern const std::string kWiredTigerEngineName;
+
     class WiredTigerRecordStore : public RecordStore {
     public:
 
@@ -52,7 +57,7 @@ namespace mongo {
          * Creates a configuration string suitable for 'config' parameter in WT_SESSION::create().
          * Configuration string is constructed from:
          *     built-in defaults
-         *     storageEngine.wiredtiger.configString in 'options'
+         *     storageEngine.wiredTiger.configString in 'options'
          *     'extraStrings'
          * Performs simple validation on the supplied parameters.
          * Returns error status if validation fails.
@@ -75,7 +80,7 @@ namespace mongo {
         virtual ~WiredTigerRecordStore();
 
         // name of the RecordStore implementation
-        virtual const char* name() const { return "wiredtiger"; }
+        virtual const char* name() const;
 
         virtual long long dataSize( OperationContext *txn ) const;
 
@@ -122,8 +127,6 @@ namespace mongo {
                                              const CollectionScanParams::Direction& dir =
                                              CollectionScanParams::FORWARD ) const;
 
-        virtual RecordIterator* getIteratorForRepair( OperationContext* txn ) const;
-
         virtual std::vector<RecordIterator*> getManyIterators( OperationContext* txn ) const;
 
         virtual Status truncate( OperationContext* txn );
@@ -157,6 +160,12 @@ namespace mongo {
         virtual DiskLoc oplogStartHack(OperationContext* txn,
                                        const DiskLoc& startingPosition) const;
 
+        virtual Status oplogDiskLocRegister( OperationContext* txn,
+                                             const OpTime& opTime );
+
+        bool isOplog() const { return _isOplog; }
+        bool usingOplogHack() const { return _useOplogHack; }
+
         void setCappedDeleteCallback(CappedDocumentDeleteCallback* cb) {
             _cappedDeleteCallback = cb;
         }
@@ -167,6 +176,9 @@ namespace mongo {
         uint64_t instanceId() const { return _instanceId; }
 
         void setSizeStorer( WiredTigerSizeStorer* ss ) { _sizeStorer = ss; }
+
+        void dealtWithCappedLoc( const DiskLoc& loc );
+        bool isCappedHidden( const DiskLoc& loc ) const;
 
     private:
 
@@ -189,20 +201,20 @@ namespace mongo {
             virtual RecordData dataFor( const DiskLoc& loc ) const;
 
         private:
-            bool _forward() const;
             void _getNext();
             void _locate( const DiskLoc &loc, bool exact );
-            void _checkStatus();
             DiskLoc _curr() const; // const version of public curr method
 
             const WiredTigerRecordStore& _rs;
             OperationContext* _txn;
             RecoveryUnit* _savedRecoveryUnit; // only used to sanity check between save/restore
-            CollectionScanParams::Direction _dir;
+            const bool _forward;
             bool _forParallelCollectionScan;
             scoped_ptr<WiredTigerCursor> _cursor;
             bool _eof;
+            const DiskLoc _readUntilForOplog;
 
+            DiskLoc _loc; // Cached key of _cursor. Update any time _cursor is moved.
             DiskLoc _lastLoc; // the last thing returned from getNext()
         };
 
@@ -214,14 +226,17 @@ namespace mongo {
         static uint64_t _makeKey(const DiskLoc &loc);
         static DiskLoc _fromKey(uint64_t k);
 
+        void _addUncommitedDiskLoc_inlock( OperationContext* txn, const DiskLoc& loc );
+
         DiskLoc _nextId();
         void _setId(DiskLoc loc);
-        bool cappedAndNeedDelete(OperationContext* txn) const;
-        void cappedDeleteAsNeeded(OperationContext* txn);
+        bool cappedAndNeedDelete() const;
+        void cappedDeleteAsNeeded(OperationContext* txn, const DiskLoc& justInserted );
         void _changeNumRecords(OperationContext* txn, bool insert);
         void _increaseDataSize(OperationContext* txn, int amount);
         RecordData _getData( const WiredTigerCursor& cursor) const;
         StatusWith<DiskLoc> extractAndCheckLocForOplog(const char* data, int len);
+        void _oplogSetStartHack( WiredTigerRecoveryUnit* wru ) const;
 
         const std::string _uri;
         const uint64_t _instanceId; // not persisted
@@ -232,9 +247,15 @@ namespace mongo {
         const int64_t _cappedMaxSize;
         const int64_t _cappedMaxDocs;
         CappedDocumentDeleteCallback* _cappedDeleteCallback;
+        boost::mutex _cappedDeleterMutex; // see commend in ::cappedDeleteAsNeeded
 
         const bool _useOplogHack;
-        DiskLoc _highestLocForOplogHack;
+
+        typedef std::vector<DiskLoc> SortedDiskLocs;
+        SortedDiskLocs _uncommittedDiskLocs;
+        DiskLoc _oplog_visibleTo;
+        DiskLoc _oplog_highestSeen;
+        mutable boost::mutex _uncommittedDiskLocsMutex;
 
         AtomicUInt64 _nextIdNum;
         AtomicInt64 _dataSize;

@@ -37,6 +37,7 @@
 #include "third_party/murmurhash3/MurmurHash3.h"
 
 #include "mongo/base/counter.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status.h"
@@ -44,12 +45,10 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/member.h"
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_initialsync.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/repl/sync_tail.h"
@@ -66,7 +65,7 @@ namespace repl {
 
     void runSyncThread() {
         Client::initThread("rsSync");
-        replLocalAuth();
+        cc().getAuthorizationSession()->grantInternalAuthorization();
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
 
         // Set initial indexPrefetch setting
@@ -99,8 +98,16 @@ namespace repl {
             }
 
             const MemberState memberState = replCoord->getCurrentMemberState();
-            if (replCoord->getCurrentMemberState().arbiter()) {
+
+            // An arbiter can never transition to any other state, and doesn't replicate, ever
+            if (memberState.arbiter()) {
                 break;
+            }
+
+            // If we are removed then we don't belong to the set anymore
+            if (memberState.removed()) {
+                sleepsecs(5);
+                continue;
             }
 
             try {

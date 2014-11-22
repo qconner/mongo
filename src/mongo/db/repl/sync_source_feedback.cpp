@@ -42,7 +42,6 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/member.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/operation_context.h"
@@ -78,6 +77,7 @@ namespace repl {
     void SyncSourceFeedback::ensureMe(OperationContext* txn) {
         string myname = getHostName();
         {
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dlk(txn->lockState(), "local", MODE_X);
             Client::Context ctx(txn, "local");
 

@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -377,14 +377,14 @@ namespace {
         invariant( descriptor );
         invariant( entry == _entries.find( descriptor ) );
 
-        status = entry->accessMethod()->initializeAsEmpty(txn);
-        if (!status.isOK())
-            return status;
-
         txn->recoveryUnit()->registerChange(new IndexCleanupOnRollback(txn,
                                                                        _collection,
                                                                        &_entries,
                                                                        entry->descriptor()));
+
+        status = entry->accessMethod()->initializeAsEmpty(txn);
+        if (!status.isOK())
+            return status;
         indexBuildBlock.success();
 
         // sanity check
@@ -498,7 +498,7 @@ namespace {
         fassert( 17331, entry && entry == _entry );
 
         if ( entry->wantToSetIsMultikey() ) {
-            _catalog->_collection->getCatalogEntry()->setIndexIsMultikey( _txn, _indexName, true );
+            entry->setMultikey(_txn);
         }
 
         entry->setIsReady( true );

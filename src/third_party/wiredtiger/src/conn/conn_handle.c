@@ -25,6 +25,7 @@ __wt_connection_init(WT_CONNECTION_IMPL *conn)
 	TAILQ_INIT(&conn->fhqh);		/* File list */
 	TAILQ_INIT(&conn->collqh);		/* Collator list */
 	TAILQ_INIT(&conn->compqh);		/* Compressor list */
+	TAILQ_INIT(&conn->extractorqh);		/* Extractor list */
 
 	TAILQ_INIT(&conn->lsmqh);		/* WT_LSM_TREE list */
 
@@ -47,6 +48,7 @@ __wt_connection_init(WT_CONNECTION_IMPL *conn)
 	WT_RET(__wt_spin_init(session, &conn->hot_backup_lock, "hot backup"));
 	WT_RET(__wt_spin_init(session, &conn->reconfig_lock, "reconfigure"));
 	WT_RET(__wt_spin_init(session, &conn->schema_lock, "schema"));
+	WT_RET(__wt_spin_init(session, &conn->table_lock, "table creation"));
 	WT_RET(__wt_calloc_def(session, WT_PAGE_LOCKS(conn), &conn->page_lock));
 	for (i = 0; i < WT_PAGE_LOCKS(conn); ++i)
 		WT_RET(
@@ -127,6 +129,7 @@ __wt_connection_destroy(WT_CONNECTION_IMPL *conn)
 	__wt_spin_destroy(session, &conn->hot_backup_lock);
 	__wt_spin_destroy(session, &conn->reconfig_lock);
 	__wt_spin_destroy(session, &conn->schema_lock);
+	__wt_spin_destroy(session, &conn->table_lock);
 	for (i = 0; i < WT_PAGE_LOCKS(conn); ++i)
 		__wt_spin_destroy(session, &conn->page_lock[i]);
 	__wt_free(session, conn->page_lock);

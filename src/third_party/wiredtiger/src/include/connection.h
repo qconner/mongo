@@ -54,10 +54,29 @@ struct __wt_named_data_source {
 };
 
 /*
+ * WT_NAMED_EXTRACTOR --
+ *	An extractor list entry
+ */
+struct __wt_named_extractor {
+	const char *name;		/* Name of extractor */
+	WT_EXTRACTOR *extractor;		/* User supplied object */
+	TAILQ_ENTRY(__wt_named_extractor) q;	/* Linked list of extractors */
+};
+
+/*
  * Allocate some additional slots for internal sessions.  There is a default
  * session for each connection, plus a session for each server thread.
  */
 #define	WT_NUM_INTERNAL_SESSIONS	10
+
+/*
+ * WT_CONN_CHECK_PANIC --
+ *	Check if we've panicked and return the appropriate error.
+ */
+#define	WT_CONN_CHECK_PANIC(conn)					\
+	(F_ISSET(conn, WT_CONN_PANIC) ? WT_PANIC : 0)
+#define	WT_SESSION_CHECK_PANIC(session)					\
+	WT_CONN_CHECK_PANIC(S2C(session))
 
 /*
  * WT_CONNECTION_IMPL --
@@ -74,9 +93,11 @@ struct __wt_connection_impl {
 
 	WT_SPINLOCK api_lock;		/* Connection API spinlock */
 	WT_SPINLOCK checkpoint_lock;	/* Checkpoint spinlock */
+	WT_SPINLOCK dhandle_lock;	/* Data handle list spinlock */
 	WT_SPINLOCK fh_lock;		/* File handle queue spinlock */
 	WT_SPINLOCK reconfig_lock;	/* Single thread reconfigure */
 	WT_SPINLOCK schema_lock;	/* Schema operation spinlock */
+	WT_SPINLOCK table_lock;		/* Table creation spinlock */
 
 	/*
 	 * We distribute the btree page locks across a set of spin locks; it
@@ -111,7 +132,6 @@ struct __wt_connection_impl {
 
 	uint64_t  split_gen;		/* Generation number for splits */
 
-	WT_SPINLOCK dhandle_lock;	/* Locked: dhandle sweep */
 					/* Locked: data handle list */
 	SLIST_HEAD(__wt_dhandle_lh, __wt_data_handle) dhlh;
 					/* Locked: LSM handle list. */
@@ -162,8 +182,8 @@ struct __wt_connection_impl {
 	WT_CONDVAR	*ckpt_cond;	/* Checkpoint wait mutex */
 	const char	*ckpt_config;	/* Checkpoint configuration */
 #define	WT_CKPT_LOGSIZE(conn)	((conn)->ckpt_logsize != 0)
-	wt_off_t		 ckpt_logsize;	/* Checkpoint log size period */
-	uint32_t	 ckpt_signalled; /* Checkpoint signalled */
+	wt_off_t	 ckpt_logsize;	/* Checkpoint log size period */
+	uint32_t	 ckpt_signalled;/* Checkpoint signalled */
 	long		 ckpt_usecs;	/* Checkpoint period */
 
 	int compact_in_memory_pass;	/* Compaction serialization */
@@ -251,6 +271,9 @@ struct __wt_connection_impl {
 
 					/* Locked: data source list */
 	TAILQ_HEAD(__wt_dsrc_qh, __wt_named_data_source) dsrcqh;
+
+					/* Locked: extractor list */
+	TAILQ_HEAD(__wt_extractor_qh, __wt_named_extractor) extractorqh;
 
 	void	*lang_private;		/* Language specific private storage */
 

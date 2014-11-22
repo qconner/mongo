@@ -36,7 +36,9 @@
 #include <boost/thread.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/global_optime.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/elect_cmd_runner.h"
@@ -50,7 +52,6 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replica_set_config_checks.h"
 #include "mongo/db/repl/replication_executor.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
@@ -147,7 +148,9 @@ namespace {
         _isWaitingForDrainToComplete(false),
         _rsConfigState(kConfigPreStart),
         _thisMembersConfigIndex(-1),
-        _sleptLastElection(false) {
+        _sleptLastElection(false),
+        _canAcceptNonLocalWrites(!(settings.usingReplSets() || settings.slave)),
+        _canServeNonLocalReads(0U) {
 
         if (!isReplEnabled()) {
             return;
@@ -265,6 +268,7 @@ namespace {
             lk.unlock();
         }
         _performPostMemberStateUpdateAction(action);
+        _externalState->startThreads();
     }
 
     void ReplicationCoordinatorImpl::startReplication(OperationContext* txn) {
@@ -287,14 +291,12 @@ namespace {
         if (!_settings.usingReplSets()) {
             // Must be Master/Slave
             invariant(_settings.master || _settings.slave);
-            _externalState->startMasterSlave();
+            _externalState->startMasterSlave(txn);
             return;
         }
 
         _topCoordDriverThread.reset(new boost::thread(stdx::bind(&ReplicationExecutor::run,
                                                                  &_replExecutor)));
-
-        _externalState->startThreads();
 
         bool doneLoadingConfig = _startLoadLocalConfig(txn);
         if (doneLoadingConfig) {
@@ -507,9 +509,10 @@ namespace {
         // 1.) Check to see if we're waiting for this signal.  If not, return early.
         // 2.) Otherwise, release the mutex while acquiring the global exclusive lock,
         //     since that might take a while (NB there's a deadlock cycle otherwise, too).
-        // 3.) Re-check to see if we've somehow left drain mode.  If we are, clear
-        //     _isWaitingForDrainToComplete and drop the mutex.  At this point, no writes
-        //     can occur from other threads, due to the global exclusive lock.
+        // 3.) Re-check to see if we've somehow left drain mode.  If we have not, clear
+        //     _isWaitingForDrainToComplete, set the flag allowing non-local database writes and
+        //     drop the mutex.  At this point, no writes can occur from other threads, due to the
+        //     global exclusive lock.
         // 4.) Drop all temp collections.
         // 5.) Drop the global exclusive lock.
         //
@@ -526,12 +529,14 @@ namespace {
         }
         lk.unlock();
         boost::scoped_ptr<OperationContext> txn(_externalState->createOperationContext("rsDrain"));
+        ScopedTransaction transaction(txn.get(), MODE_X);
         Lock::GlobalWrite globalWriteLock(txn->lockState());
         lk.lock();
         if (!_isWaitingForDrainToComplete) {
             return;
         }
         _isWaitingForDrainToComplete = false;
+        _canAcceptNonLocalWrites = true;
         lk.unlock();
         _externalState->dropAllTempCollections(txn.get());
         log() << "transition to primary complete; database writes are now permitted";
@@ -792,6 +797,11 @@ namespace {
                 return;
             }
         }
+
+        _replExecutor.scheduleWork(
+                stdx::bind(&ReplicationCoordinatorImpl::_signalStepDownWaitersFromCallback,
+                           this,
+                           stdx::placeholders::_1));
     }
 
     void ReplicationCoordinatorImpl::interruptAll() {
@@ -801,6 +811,11 @@ namespace {
             WaiterInfo* info = *it;
             info->condVar->notify_all();
         }
+
+        _replExecutor.scheduleWork(
+                stdx::bind(&ReplicationCoordinatorImpl::_signalStepDownWaitersFromCallback,
+                           this,
+                           stdx::placeholders::_1));
     }
 
     bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
@@ -951,10 +966,9 @@ namespace {
         while (!_doneWaitingForReplication_inlock(opTime, writeConcern)) {
             const int elapsed = timer->millis();
 
-            try {
-                txn->checkForInterrupt();
-            } catch (const DBException& e) {
-                return StatusAndDuration(e.toStatus(), Milliseconds(elapsed));
+            Status interruptedStatus = txn->checkForInterruptNoAssert();
+            if (!interruptedStatus.isOK()) {
+                return StatusAndDuration(interruptedStatus, Milliseconds(elapsed));
             }
 
             if (!waitInfo.master) {
@@ -1004,13 +1018,20 @@ namespace {
         const Date_t stepDownUntil(startTime.millis + stepdownTime.total_milliseconds());
         const Date_t waitUntil(startTime.millis + waitTime.total_milliseconds());
 
-        ReplicationCoordinatorExternalState::ScopedLocker lk(
-                txn, _externalState->getGlobalSharedLockAcquirer(), stepdownTime);
-        if (!lk.gotLock()) {
-            return Status(ErrorCodes::ExceededTimeLimit,
-                          "Could not acquire the global shared lock within the amount of time "
-                                  "specified that we should step down for");
+        LockResult lockState = txn->lockState()->lockGlobalBegin(MODE_S);
+        // TODO(spencer): SERVER-15310 Kill all operations here.
+
+        if (lockState == LOCK_WAITING) {
+            lockState = txn->lockState()->lockGlobalComplete(stepdownTime.total_milliseconds());
+            if (lockState == LOCK_TIMEOUT) {
+                return Status(ErrorCodes::ExceededTimeLimit,
+                              "Could not acquire the global shared lock within the amount of time "
+                                      "specified that we should step down for");
+            }
         }
+        invariant(lockState == LOCK_OK);
+        ON_BLOCK_EXIT(&Locker::unlockAll, txn->lockState());
+        // From this point onward we are guaranteed to be holding the global shared lock.
 
         boost::unique_lock<boost::mutex> lock(_mutex);
         if (!_getCurrentMemberState_inlock().primary()) {
@@ -1028,6 +1049,7 @@ namespace {
                        this,
                        stdx::placeholders::_1,
                        finishedEvent.getValue(),
+                       txn,
                        waitUntil,
                        stepDownUntil,
                        force,
@@ -1038,7 +1060,7 @@ namespace {
         fassert(18809, cbh.getStatus());
         cbh = _replExecutor.scheduleWorkAt(
                 waitUntil,
-                stdx::bind(&ReplicationCoordinatorImpl::_signalStepDownWaiters,
+                stdx::bind(&ReplicationCoordinatorImpl::_signalStepDownWaitersFromCallback,
                            this,
                            stdx::placeholders::_1));
         if (cbh.getStatus() == ErrorCodes::ShutdownInProgress) {
@@ -1050,11 +1072,16 @@ namespace {
         return result;
     }
 
-    void ReplicationCoordinatorImpl::_signalStepDownWaiters(
+    void ReplicationCoordinatorImpl::_signalStepDownWaitersFromCallback(
             const ReplicationExecutor::CallbackData& cbData) {
         if (!cbData.status.isOK()) {
             return;
         }
+
+        _signalStepDownWaiters();
+    }
+
+    void ReplicationCoordinatorImpl::_signalStepDownWaiters() {
         std::for_each(_stepDownWaiters.begin(),
                       _stepDownWaiters.end(),
                       stdx::bind(&ReplicationExecutor::signalEvent,
@@ -1066,6 +1093,7 @@ namespace {
     void ReplicationCoordinatorImpl::_stepDownContinue(
             const ReplicationExecutor::CallbackData& cbData,
             const ReplicationExecutor::EventHandle finishedEvent,
+            OperationContext* txn,
             const Date_t waitUntil,
             const Date_t stepDownUntil,
             bool force,
@@ -1082,6 +1110,13 @@ namespace {
             *result = cbData.status;
             return;
         }
+
+        Status interruptedStatus = txn->checkForInterruptNoAssert();
+        if (!interruptedStatus.isOK()) {
+            *result = interruptedStatus;
+            return;
+        }
+
         if (_topCoord->getRole() != TopologyCoordinator::Role::leader) {
             *result = Status(ErrorCodes::NotMaster,
                              "Already stepped down from primary while processing step down "
@@ -1095,7 +1130,8 @@ namespace {
                              "time we were supposed to step down until");
             return;
         }
-        if (_topCoord->stepDown(stepDownUntil, force, getMyLastOptime())) {
+        bool forceNow = now >= waitUntil ? force : false;
+        if (_topCoord->stepDown(stepDownUntil, forceNow, getMyLastOptime())) {
             // Schedule work to (potentially) step back up once the stepdown period has ended.
             _replExecutor.scheduleWorkAt(stepDownUntil,
                                          stdx::bind(&ReplicationCoordinatorImpl::_handleTimePassing,
@@ -1118,6 +1154,7 @@ namespace {
                              dateToISOStringLocal(now));
             return;
         }
+
         if (_stepDownWaiters.empty()) {
             StatusWith<ReplicationExecutor::EventHandle> reschedEvent =
                 _replExecutor.makeEvent();
@@ -1133,6 +1170,7 @@ namespace {
                            this,
                            stdx::placeholders::_1,
                            finishedEvent,
+                           txn,
                            waitUntil,
                            stepDownUntil,
                            force,
@@ -1190,32 +1228,20 @@ namespace {
     }
 
     bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase(const StringData& dbName) {
-        // we must check _settings since getReplicationMode() isn't aware of modeReplSet
-        // until a valid replica set config has been loaded
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        if (_settings.usingReplSets()) {
-            if (_getReplicationMode_inlock() == modeReplSet &&
-                    _getCurrentMemberState_inlock().primary() &&
-                    !_isWaitingForDrainToComplete) {
-                return true;
-            }
-            return dbName == "local";
-        }
-
-        if (!_settings.slave)
-            return true;
-
-        // TODO(dannenberg) replAllDead is bad and should be removed when master slave is removed
-        if (replAllDead) {
-            return dbName == "local";
-        }
-
-        if (_settings.master) {
-            // if running with --master --slave, allow.
+        // _canAcceptNonLocalWrites is always true for standalone nodes, always false for nodes
+        // started with --slave, and adjusted based on primary+drain state in replica sets.
+        //
+        // That is, stand-alone nodes, non-slave nodes and drained replica set primaries can always
+        // accept writes.  Similarly, writes are always permitted to the "local" database.  Finally,
+        // in the event that a node is started with --slave and --master, we allow writes unless the
+        // master/slave system has set the replAllDead flag.
+        if (_canAcceptNonLocalWrites) {
             return true;
         }
-
-        return dbName == "local";
+        if (dbName == "local") {
+            return true;
+        }
+        return !replAllDead && _settings.master;
     }
 
     Status ReplicationCoordinatorImpl::checkCanServeReadsFor(OperationContext* txn,
@@ -1227,23 +1253,18 @@ namespace {
         if (canAcceptWritesForDatabase(ns.db())) {
             return Status::OK();
         }
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        Mode replMode = _getReplicationMode_inlock();
-        if (replMode == modeMasterSlave && _settings.slave == SimpleSlave) {
+        if (_settings.slave || _settings.master) {
             return Status::OK();
         }
         if (slaveOk) {
-            if (replMode == modeMasterSlave || replMode == modeNone) {
+            if (_canServeNonLocalReads.loadRelaxed()) {
                 return Status::OK();
             }
-            if (_getCurrentMemberState_inlock().secondary()) {
-                return Status::OK();
-            }
-            return Status(ErrorCodes::NotMasterOrSecondaryCode,
-                         "not master or secondary; cannot currently read from this replSet member");
+            return Status(
+                    ErrorCodes::NotMasterOrSecondaryCode,
+                    "not master or secondary; cannot currently read from this replSet member");
         }
-        return Status(ErrorCodes::NotMasterNoSlaveOkCode,
-                      "not master and slaveOk=false");
+        return Status(ErrorCodes::NotMasterNoSlaveOkCode, "not master and slaveOk=false");
     }
 
     bool ReplicationCoordinatorImpl::shouldIgnoreUniqueIndex(const IndexDescriptor* idx) {
@@ -1254,24 +1275,30 @@ namespace {
         if (idx->isIdIndex()) {
             return false;
         }
+        if (nsToDatabaseSubstring(idx->parentNS()) == "local" ) {
+            // always enforce on local
+            return false;
+        }
         boost::lock_guard<boost::mutex> lock(_mutex);
         if (_getReplicationMode_inlock() != modeReplSet) {
             return false;
         }
         // see SERVER-6671
         MemberState ms = _getCurrentMemberState_inlock();
-        if (! ((ms == MemberState::RS_STARTUP2) ||
-               (ms == MemberState::RS_RECOVERING) ||
-               (ms == MemberState::RS_ROLLBACK))) {
+        switch ( ms.s ) {
+        case MemberState::RS_SECONDARY:
+        case MemberState::RS_RECOVERING:
+        case MemberState::RS_ROLLBACK:
+        case MemberState::RS_STARTUP2:
+            return true;
+        default:
             return false;
         }
-
-        return true;
     }
 
     OID ReplicationCoordinatorImpl::getElectionId() {
         boost::lock_guard<boost::mutex> lock(_mutex);
-        return _electionID;
+        return _electionId;
     }
 
     OID ReplicationCoordinatorImpl::getMyRID() const {
@@ -1848,6 +1875,12 @@ namespace {
         configStateGuard.Dismiss();
         fassert(18654, cbh.getStatus());
         _replExecutor.wait(cbh.getValue());
+
+        if (status.isOK()) {
+            // Create the oplog with the first entry, and start repl threads.
+            _externalState->initiateOplog(txn);
+            _externalState->startThreads();
+        }
         return status;
     }
 
@@ -1887,9 +1920,18 @@ namespace {
                 info->condVar->notify_all();
             }
             _isWaitingForDrainToComplete = false;
+            _canAcceptNonLocalWrites = false;
             result = kActionCloseAllConnections;
         }
         else {
+            if (_currentState.secondary() && !newState.primary()) {
+                // Switching out of SECONDARY, but not to PRIMARY.
+                _canServeNonLocalReads.store(0U);
+            }
+            else if (newState.secondary()) {
+                // Switching into SECONDARY, but not from PRIMARY.
+                _canServeNonLocalReads.store(1U);
+            }
             result = kActionChooseNewSyncSource;
         }
         _currentState = newState;

@@ -67,12 +67,16 @@ namespace mongo {
         MONGO_DISALLOW_COPYING(MmapV1RecordFetcher);
     public:
         explicit MmapV1RecordFetcher(const Record* record)
-            : _record(record),
-              _filesLock(new LockMongoFilesShared()) { }
+            : _record(record) { }
+
+        virtual void setup() {
+            invariant(!_filesLock.get());
+            _filesLock.reset(new LockMongoFilesShared());
+        }
 
         virtual void fetch() {
             // It's only legal to touch the record while we're holding a lock on the data files.
-            invariant(_filesLock);
+            invariant(_filesLock.get());
 
             const char* recordChar = reinterpret_cast<const char*>(_record);
 
@@ -188,10 +192,6 @@ namespace mongo {
         invariant(txn->lockState()->isWriteLocked(_dbname));
 
         const int allocFileId = _files.size();
-        if (allocFileId == 0) {
-            // TODO: Does this auditing have to be done here?
-            audit::logCreateDatabase(currentClient.get(), _dbname);
-        }
 
         int minSize = 0;
         if (allocFileId > 0) {
@@ -308,12 +308,6 @@ namespace mongo {
 
         if ( fileNo < mmapv1GlobalOptions.quotaFiles )
             return;
-
-        // exceeded!
-        if ( cc().hasWrittenSinceCheckpoint() ) {
-            warning() << "quota exceeded, but can't assert" << endl;
-            return;
-        }
 
         uasserted(12501, "quota exceeded");
     }

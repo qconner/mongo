@@ -28,7 +28,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -250,7 +250,7 @@ namespace mongo {
         Config::Config( const string& _dbname , const BSONObj& cmdObj )
         {
             dbname = _dbname;
-            ns = dbname + "." + cmdObj.firstElement().valuestr();
+            ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
 
             verbose = cmdObj["verbose"].trueValue();
             jsMode = cmdObj["jsMode"].trueValue();
@@ -334,6 +334,7 @@ namespace mongo {
             if (_useIncremental) {
                 // We don't want to log the deletion of incLong as it isn't replicated. While
                 // harmless, this would lead to a scary looking warning on the secondaries.
+                ScopedTransaction(_txn, MODE_IX);
                 Lock::DBLock lk(_txn->lockState(),
                                 nsToDatabaseSubstring(_config.incLong),
                                 MODE_X);
@@ -538,6 +539,7 @@ namespace mongo {
 
             invariant( !txn->lockState()->isLocked() );
 
+            ScopedTransaction transaction(txn, MODE_X);
             Lock::GlobalWrite lock(txn->lockState()); // TODO(erh): this is how it was, but seems it doesn't need to be global
             return postProcessCollectionNonAtomic(txn, op, pm);
         }
@@ -576,6 +578,7 @@ namespace mongo {
             if (_config.outputOptions.outType == Config::REPLACE ||
                     _safeCount(_db, _config.outputOptions.finalNamespace) == 0) {
 
+                ScopedTransaction transaction(txn, MODE_X);
                 Lock::GlobalWrite lock(txn->lockState()); // TODO(erh): why global???
                 // replace: just rename from temp to final collection name, dropping previous collection
                 _db.dropCollection( _config.outputOptions.finalNamespace );
@@ -598,6 +601,7 @@ namespace mongo {
                                _safeCount(_db, _config.tempNamespace, BSONObj()));
                 auto_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace , BSONObj());
                 while (cursor->more()) {
+                    ScopedTransaction(_txn, MODE_IX);
                     Lock::DBLock lock(_txn->lockState(),
                                       nsToDatabaseSubstring(_config.outputOptions.finalNamespace),
                                       MODE_X);
@@ -617,6 +621,7 @@ namespace mongo {
                                _safeCount(_db, _config.tempNamespace, BSONObj()));
                 auto_ptr<DBClientCursor> cursor = _db.query( _config.tempNamespace , BSONObj() );
                 while ( cursor->more() ) {
+                    ScopedTransaction transaction(txn, MODE_X);
                     Lock::GlobalWrite lock(txn->lockState()); // TODO(erh) why global?
                     BSONObj temp = cursor->nextSafe();
                     BSONObj old;
@@ -1001,18 +1006,22 @@ namespace mongo {
             const NamespaceString nss(_config.incLong);
             const WhereCallbackReal whereCallback(_txn, nss.db());
 
-            CanonicalQuery* cq;
+            CanonicalQuery* cqRaw;
             verify(CanonicalQuery::canonicalize(_config.incLong,
                                                 BSONObj(),
                                                 sortKey,
                                                 BSONObj(),
-                                                &cq,
+                                                &cqRaw,
                                                 whereCallback).isOK());
+            std::auto_ptr<CanonicalQuery> cq(cqRaw);
+
+            Collection* coll = getCollectionOrUassert(ctx->getDb(), _config.incLong);
+            invariant(coll);
 
             PlanExecutor* rawExec;
             verify(getExecutor(_txn,
-                               getCollectionOrUassert(ctx->getDb(), _config.incLong),
-                               cq,
+                               coll,
+                               cq.release(),
                                PlanExecutor::YIELD_AUTO,
                                &rawExec,
                                QueryPlannerParams::NO_TABLE_SCAN).isOK());
@@ -1338,27 +1347,26 @@ namespace mongo {
 
                         const WhereCallbackReal whereCallback(txn, nss.db());
 
-                        CanonicalQuery* cq;
+                        CanonicalQuery* cqRaw;
                         if (!CanonicalQuery::canonicalize(config.ns,
                                                           config.filter,
                                                           config.sort,
                                                           BSONObj(),
-                                                          &cq,
+                                                          &cqRaw,
                                                           whereCallback).isOK()) {
                             uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                             return 0;
                         }
+                        std::auto_ptr<CanonicalQuery> cq(cqRaw);
 
                         Database* db = dbHolder().get(txn, nss.db());
-                        if (!db) {
-                            errmsg = "ns doesn't exist";
-                            return false;
-                        }
+                        Collection* coll = state.getCollectionOrUassert(db, config.ns);
+                        invariant(coll);
 
                         PlanExecutor* rawExec;
                         if (!getExecutor(txn,
-                                         state.getCollectionOrUassert(db, config.ns),
-                                         cq,
+                                         coll,
+                                         cq.release(),
                                          PlanExecutor::YIELD_AUTO,
                                          &rawExec).isOK()) {
                             uasserted(17239, "Can't get executor for query "

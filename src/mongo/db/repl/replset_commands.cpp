@@ -26,19 +26,19 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/pch.h"
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
@@ -47,10 +47,9 @@
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_set_seed_list.h"
 #include "mongo/db/repl/replset_commands.h"
-#include "mongo/db/repl/rs_config.h"
 #include "mongo/db/repl/rslog.h"
+#include "mongo/db/repl/scoped_conn.h"
 #include "mongo/db/repl/update_position_args.h"
-#include "mongo/db/repl/write_concern.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -280,10 +279,6 @@ namespace {
             Status status = getGlobalReplicationCoordinator()->processReplSetInitiate(txn,
                                                                                       configObj,
                                                                                       &result);
-            if (status.isOK()) {
-                createOplog(txn);
-                logOpInitiate(txn, BSON("msg" << "initiating set"));
-            }
             return appendCommandStatus(result, status);
         }
     } cmdReplSetInitiate;
@@ -390,16 +385,52 @@ namespace {
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 
-            bool force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
-            int secs = (int) cmdObj.firstElement().numberInt();
-            if( secs == 0 )
-                secs = 60;
+            const bool force = cmdObj["force"].trueValue();
+
+            long long stepDownForSecs = cmdObj.firstElement().numberLong();
+            if (stepDownForSecs == 0) {
+                stepDownForSecs = 60;
+            }
+            else if (stepDownForSecs < 0) {
+                status = Status(ErrorCodes::BadValue,
+                                "stepdown period must be a positive integer");
+                return appendCommandStatus(result, status);
+            }
+
+            long long secondaryCatchUpPeriodSecs;
+            status = bsonExtractIntegerField(cmdObj,
+                                             "secondaryCatchUpPeriodSecs",
+                                             &secondaryCatchUpPeriodSecs);
+            if (status.code() == ErrorCodes::NoSuchKey) {
+                // if field is absent, default values
+                if (force) {
+                    secondaryCatchUpPeriodSecs = 0;
+                }
+                else {
+                    secondaryCatchUpPeriodSecs = 10;
+                }
+            }
+            else if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
+            if (secondaryCatchUpPeriodSecs < 0) {
+                status = Status(ErrorCodes::BadValue,
+                                "secondaryCatchUpPeriodSecs period must be a positive or absent");
+                return appendCommandStatus(result, status);
+            }
+
+            if (stepDownForSecs < secondaryCatchUpPeriodSecs) {
+                status = Status(ErrorCodes::BadValue,
+                                "stepdown period must be longer than secondaryCatchUpPeriodSecs");
+                return appendCommandStatus(result, status);
+            }
 
             status = getGlobalReplicationCoordinator()->stepDown(
                     txn,
                     force,
-                    ReplicationCoordinator::Milliseconds(1000),
-                    ReplicationCoordinator::Milliseconds(secs * 1000));
+                    ReplicationCoordinator::Milliseconds(secondaryCatchUpPeriodSecs * 1000),
+                    ReplicationCoordinator::Milliseconds(stepDownForSecs * 1000));
             return appendCommandStatus(result, status);
         }
     } cmdReplSetStepDown;

@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -87,6 +87,21 @@ namespace mongo {
     }
 
     template <class BtreeLayout>
+    class BtreeLogic<BtreeLayout>::Builder::SetRightLeafLocChange : public RecoveryUnit::Change {
+    public:
+        SetRightLeafLocChange(Builder* builder, DiskLoc oldLoc)
+            : _builder(builder)
+            , _oldLoc(oldLoc)
+        {}
+
+        virtual void commit() {}
+        virtual void rollback() { _builder->_rightLeafLoc = _oldLoc; }
+
+        Builder* _builder;
+        const DiskLoc _oldLoc;
+    };
+
+    template <class BtreeLayout>
     Status BtreeLogic<BtreeLayout>::Builder::addKey(const BSONObj& keyObj, const DiskLoc& loc) {
         auto_ptr<KeyDataOwnedType> key(new KeyDataOwnedType(keyObj));
 
@@ -116,6 +131,7 @@ namespace mongo {
         BucketType* rightLeaf = _getModifiableBucket(_rightLeafLoc);
         if (!_logic->pushBack(rightLeaf, loc, *key, DiskLoc())) {
             // bucket was full, so split and try with the new node.
+            _txn->recoveryUnit()->registerChange(new SetRightLeafLocChange(this, _rightLeafLoc));
             _rightLeafLoc = newBucket(rightLeaf, _rightLeafLoc);
             rightLeaf = _getModifiableBucket(_rightLeafLoc);
             invariant(_logic->pushBack(rightLeaf, loc, *key, DiskLoc()));

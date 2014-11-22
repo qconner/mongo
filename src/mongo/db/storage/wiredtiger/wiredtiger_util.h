@@ -50,7 +50,7 @@ namespace mongo {
     /**
      * converts wiredtiger return codes to mongodb statuses.
      */
-    inline Status wtRCToStatus(int retCode) {
+    inline Status wtRCToStatus(int retCode, const char* prefix = NULL ) {
         if (MONGO_likely(retCode == 0))
             return Status::OK();
 
@@ -60,18 +60,28 @@ namespace mongo {
             throw WriteConflictException();
         }
 
+        fassert( 28559, retCode != WT_PANIC );
+
+        str::stream s;
+        if ( prefix )
+            s << prefix << " ";
+        s << retCode << ": " << wiredtiger_strerror(retCode);
+
+        if (retCode == EINVAL) {
+            return Status(ErrorCodes::BadValue, s);
+        }
+
         // TODO convert specific codes rather than just using UNKNOWN_ERROR for everything.
-        return Status(ErrorCodes::UnknownError,
-                      str::stream() << retCode << ": " << wiredtiger_strerror(retCode));
-
+        return Status(ErrorCodes::UnknownError, s);
     }
 
-    inline void invariantWTOK(int retCode) {
-        if (MONGO_likely(retCode == 0))
-            return;
-
-        fassertFailedWithStatus(28519, wtRCToStatus(retCode));
-    }
+#define invariantWTOK(expression) do { \
+        int _invariantWTOK_retCode = expression; \
+        if (MONGO_unlikely(_invariantWTOK_retCode != 0)) { \
+            invariantOKFailed(#expression, wtRCToStatus(_invariantWTOK_retCode), \
+                              __FILE__, __LINE__); \
+        } \
+    } while (false)
 
     struct WiredTigerItem : public WT_ITEM {
         WiredTigerItem(const void *d, size_t s) {
@@ -124,11 +134,11 @@ namespace mongo {
             invariantWTOK(_parser->close(_parser));
         }
 
-	int next(WT_CONFIG_ITEM* key, WT_CONFIG_ITEM* value) {
+        int next(WT_CONFIG_ITEM* key, WT_CONFIG_ITEM* value) {
             return _parser->next(_parser, key, value);
         }
 
-	int get(const char* key, WT_CONFIG_ITEM* value) {
+        int get(const char* key, WT_CONFIG_ITEM* value) {
             return _parser->get(_parser, key, value);
         }
 
