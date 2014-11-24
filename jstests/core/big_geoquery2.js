@@ -223,52 +223,39 @@ polys.forEach(
 
 // 4.2.1.1.8 closed big polygon generator
 function nGonGenerator(N, D, LAT, LON) {
-    // compute N points on a circle centered at 0,0
+    // compute N points on a circle centered at LAT,LON
     // with diameter = D
     // and lat*lat + lon*lon = (D/2)*(D/2)
     // lat range is -10 to +10
     // lon = sqrt( (D/2)*(D/2) - lat*lat )
     // N = number of edges
     // N must be even!
+    // edge lengths will be uneven with this quick & dirty approach
     if (N % 2 == 1) {
         N++;
         print("N is now", N);
     }
-    //var eps = D / (Math.ceil(N/2) + 1);
     var eps = 2 * D / N;
     print("generating a", N, "-sided big polygon");
-    print("with epsilon =", eps);
     var lat=0;
     var lon=0;
     var pts = [];
     var i = 0;
-    var j = N;
     // produce longitude values in pairs
     // traverse with left foot outside the circle (clockwise) to define the big polygon
-    lat = D/2;
-    //for (lat = (D/2); lat >= (-D/2); lat -= eps) {
-    while (lat >= (-D/2) && i <= j) {
+    for (i = 0, lat = D/2; i <= N/2; ++i, lat -= eps) {
+        if ( lat < (-D/2) ) {
+            print("fixing lat.  was", lat, " now", (-D/2));
+            lat = (-D/2);
+        }
         lon = Math.sqrt( (D/2)*(D/2) - lat*lat );
-        print("i=", i, "  j=", j);
-        print("zlat=", lat,"  zlon=", lon);
-
         newlat = lat + LAT;
         newlon = lon + LON;
         conjugateLon = LON - lon;
-        print("newlat=", newlat, "  newlon=", newlon, "  conjugateLon=", conjugateLon);
-
         pts[i] = [ newlon, newlat ];
-
-        if (i < j)
-            pts[j] = [ conjugateLon, newlat ];
-
-        i++;
-        j--;
-        lat -= eps;
+        pts[N-i] = [ conjugateLon, newlat ];
     }
-    // ensure we connect the dots
-    print(tojson(pts[0]));
-    print(tojson(pts[N]));
+    // ensure we connected the dots
     assert(tojson(pts[0]) == tojson(pts[N]));
     return pts;
 }
@@ -306,7 +293,7 @@ curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
 assert.eq(27, curs.count(), 'expected 27 intersect outside big polygon');
 
 
-/*
+
 poly = {
     type: 'Polygon',
     coordinates: [ nGonBig(1001, 20) ],
@@ -357,5 +344,3 @@ assert.eq(24, curs.count(), 'expected 24 fully outside big polygon');
 curs = coll.find({geo: {$geoIntersects: {$geometry: poly}}});
 assert.eq(27, curs.count(), 'expected 27 intersect outside big polygon');
 
-
-*/
