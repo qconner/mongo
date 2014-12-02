@@ -763,6 +763,13 @@ namespace mongo {
         virtual const char *getOpName() const;
     };
 
+    class ExpressionROT13 : public ExpressionFixedArity<ExpressionROT13, 1> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(Variables* vars) const;
+        virtual const char *getOpName() const;
+    };
+
 
     class ExpressionObject : public Expression {
     public:
