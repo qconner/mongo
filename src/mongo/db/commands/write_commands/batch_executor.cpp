@@ -99,7 +99,7 @@ namespace mongo {
     using mongoutils::str::stream;
 
     WriteBatchExecutor::WriteBatchExecutor( OperationContext* txn,
-                                            const BSONObj& wc,
+                                            const WriteConcernOptions& wc,
                                             OpCounters* opCounters,
                                             LastError* le ) :
         _txn(txn),
@@ -199,10 +199,7 @@ namespace mongo {
 
             // The default write concern if empty is w : 1
             // Specifying w : 0 is/was allowed, but is interpreted identically to w : 1
-
-            wcStatus = writeConcern.parse(
-                _defaultWriteConcern.isEmpty() ?
-                    WriteConcernOptions::Acknowledged : _defaultWriteConcern );
+            writeConcern = _defaultWriteConcern;
 
             if ( writeConcern.wNumNodes == 0 && writeConcern.wMode.empty() ) {
                 writeConcern.wNumNodes = 1;
@@ -1106,7 +1103,7 @@ namespace mongo {
         txn->lockState()->assertWriteLocked( insertNS );
 
         WriteUnitOfWork wunit(txn);
-        StatusWith<DiskLoc> status = collection->insertDocument( txn, docToInsert, true );
+        StatusWith<RecordId> status = collection->insertDocument( txn, docToInsert, true );
 
         if ( !status.isOK() ) {
             result->setError(toWriteError(status.getStatus()));

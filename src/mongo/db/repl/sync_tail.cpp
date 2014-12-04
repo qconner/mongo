@@ -51,7 +51,6 @@
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rslog.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/util/exit.h"
@@ -230,7 +229,7 @@ namespace repl {
             // this is often a no-op
             // but can't be 100% sure
             if( *op.getStringField("op") != 'n' ) {
-                error() << "replSet skipping bad op in oplog: " << op.toString() << rsLog;
+                error() << "replSet skipping bad op in oplog: " << op.toString();
             }
             return true;
         }
@@ -346,7 +345,7 @@ namespace repl {
     }
 
     // Doles out all the work to the writer pool threads and waits for them to complete
-    OpTime SyncTail::multiApply( std::deque<BSONObj>& ops) {
+    OpTime SyncTail::multiApply(OperationContext* txn, std::deque<BSONObj>& ops) {
 
         if (getGlobalEnvironment()->getGlobalStorageEngine()->isMmapV1()) {
             // Use a ThreadPool to prefetch all the operations in a batch.
@@ -373,7 +372,7 @@ namespace repl {
         }
 
         applyOps(writerVectors);
-        return applyOpsToOplog(&ops);
+        return applyOpsToOplog(txn, &ops);
     }
 
 
@@ -422,9 +421,8 @@ namespace repl {
         unsigned long long entriesApplied = 0;
         while (true) {
             OpQueue ops;
-            OperationContextImpl ctx;
 
-            while (!tryPopAndWaitForMore(&ops, getGlobalReplicationCoordinator())) {
+            while (!tryPopAndWaitForMore(txn, &ops, getGlobalReplicationCoordinator())) {
                 // nothing came back last time, so go again
                 if (ops.empty()) continue;
 
@@ -438,7 +436,7 @@ namespace repl {
                 }
                 else if (currentOpTime > endOpTime) {
                     severe() << "Applied past expected end " << endOpTime << " to " << currentOpTime
-                            << " without seeing it. Rollback?" << rsLog;
+                            << " without seeing it. Rollback?";
                     fassertFailedNoTrace(18693);
                 }
 
@@ -460,7 +458,7 @@ namespace repl {
             bytesApplied += ops.getSize();
             entriesApplied += ops.getDeque().size();
 
-            const OpTime lastOpTime = multiApply(ops.getDeque());
+            const OpTime lastOpTime = multiApply(txn, ops.getDeque());
 
             // if the last op applied was our end, return
             if (lastOpTime == endOpTime) {
@@ -552,8 +550,9 @@ namespace {
                     }
                 }
                 // keep fetching more ops as long as we haven't filled up a full batch yet
-            } while (!tryPopAndWaitForMore(&ops, replCoord) && // tryPopAndWaitForMore returns true 
-                                                               // when we need to end a batch early
+            } while (!tryPopAndWaitForMore(&txn, &ops, replCoord) && // tryPopAndWaitForMore returns
+                                                                     // true when we need to end a
+                                                                     // batch early
                    (ops.getSize() < replBatchLimitBytes) &&
                    !inShutdown());
 
@@ -574,7 +573,7 @@ namespace {
             // if we should crash and restart before updating the oplog
             OpTime minValid = lastOp["ts"]._opTime();
             setMinValid(&txn, minValid);
-            multiApply(ops.getDeque());
+            multiApply(&txn, ops.getDeque());
         }
     }
 
@@ -585,7 +584,9 @@ namespace {
     // This function also blocks 1 second waiting for new ops to appear in the bgsync
     // queue.  We can't block forever because there are maintenance things we need
     // to periodically check in the loop.
-    bool SyncTail::tryPopAndWaitForMore(SyncTail::OpQueue* ops, ReplicationCoordinator* replCoord) {
+    bool SyncTail::tryPopAndWaitForMore(OperationContext* txn,
+                                        SyncTail::OpQueue* ops,
+                                        ReplicationCoordinator* replCoord) {
         BSONObj op;
         // Check to see if there are ops waiting in the bgsync queue
         bool peek_success = peek(&op);
@@ -593,7 +594,7 @@ namespace {
         if (!peek_success) {
             // if we don't have anything in the queue, wait a bit for something to appear
             if (ops->empty()) {
-                replCoord->signalDrainComplete();
+                replCoord->signalDrainComplete(txn);
                 // block up to 1 second
                 _networkQueue->waitForMore();
                 return false;
@@ -644,25 +645,28 @@ namespace {
         return false;
     }
 
-    OpTime SyncTail::applyOpsToOplog(std::deque<BSONObj>* ops) {
+    OpTime SyncTail::applyOpsToOplog(OperationContext* txn, std::deque<BSONObj>* ops) {
         OpTime lastOpTime;
         {
-            OperationContextImpl txn; // XXX?
-            ScopedTransaction transaction(&txn, MODE_IX);
-            Lock::DBLock lk(txn.lockState(), "local", MODE_X);
-            WriteUnitOfWork wunit(&txn);
+            ScopedTransaction transaction(txn, MODE_IX);
+            Lock::DBLock lk(txn->lockState(), "local", MODE_X);
+            WriteUnitOfWork wunit(txn);
 
             while (!ops->empty()) {
                 const BSONObj& op = ops->front();
                 // this updates lastOpTimeApplied
-                lastOpTime = _logOpObjRS(&txn, op);
+                lastOpTime = _logOpObjRS(txn, op);
                 ops->pop_front();
              }
             wunit.commit();
         }
 
-        // Update write concern on primary
-        BackgroundSync::get()->notify();
+        // This call may result in us assuming PRIMARY role if we'd been waiting for our sync
+        // buffer to drain and it's now empty.  This will acquire a global lock to drop all
+        // temp collections, so we must release the above lock on the local database before
+        // doing so.
+        BackgroundSync::get()->notify(txn);
+
         return lastOpTime;
     }
 
@@ -686,7 +690,7 @@ namespace {
                 }
                 else {
                     warning() << "replSet slavedelay causing a long sleep of " << sleeptime
-                              << " seconds" << rsLog;
+                              << " seconds";
                     // sleep(hours) would prevent reconfigs from taking effect & such!
                     long long waitUntil = b + sleeptime;
                     while(time(0) < waitUntil) {

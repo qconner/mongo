@@ -52,30 +52,44 @@ namespace {
 
     const std::string kMetadataBasename = "storage.bson";
 
+    /**
+     * Returns true if local.ns is found in 'directory' or 'directory'/local/.
+     */
+    bool containsMMapV1LocalNsFile(const std::string& directory) {
+        boost::filesystem::path directoryPath(directory);
+        return boost::filesystem::exists(directoryPath / "local.ns") ||
+            boost::filesystem::exists((directoryPath / "local") / "local.ns");
+    }
+
 }  // namespace
 
     // static
     void StorageEngineMetadata::validate(const std::string& dbpath,
                                          const std::string& storageEngine) {
-        if (boost::filesystem::is_empty(dbpath)) {
+        std::string previousStorageEngine;
+        if (boost::filesystem::exists(boost::filesystem::path(dbpath) / kMetadataBasename)) {
+            StorageEngineMetadata metadata(dbpath);
+            Status status = metadata.read();
+            if (status.isOK()) {
+                previousStorageEngine = metadata.getStorageEngine();
+            }
+            else {
+                // The storage metadata file is present but there was an issue
+                // reading its contents.
+                severe() << "Unable to verify the storage engine";
+                uassertStatusOK(status);
+            }
+        }
+        else if (containsMMapV1LocalNsFile(dbpath)) {
+            previousStorageEngine = "mmapv1";
+
+        }
+        else {
+            // Directory contains neither metadata nor mmapv1 files.
+            // Allow validation to succeed.
             return;
         }
 
-        StorageEngineMetadata metadata(dbpath);
-        Status status = metadata.read();
-        std::string previousStorageEngine;
-        if (status.isOK()) {
-            previousStorageEngine = metadata.getStorageEngine();
-        }
-        else if (status.code() == ErrorCodes::NonExistentPath) {
-            previousStorageEngine = "mmapv1";
-        }
-        else {
-            // The storage metadata file is present but there was an issue
-            // reading its contents.
-            severe() << "Unable to verify the storage engine";
-            uassertStatusOK(status);
-        }
         uassert(28574, str::stream()
             << "Cannot start server. Detected data files in " << dbpath
             << " created by storage engine '" << previousStorageEngine
@@ -199,10 +213,10 @@ namespace {
                           "Cannot write empty storage engine name to metadata file.");
         }
 
-        boost::filesystem::path metadataPath =
-            boost::filesystem::path(_dbpath) / kMetadataBasename;
-        std::string filenameTemp = metadataPath.string() + ".tmp";
-        try {
+        boost::filesystem::path metadataTempPath =
+            boost::filesystem::path(_dbpath) / (kMetadataBasename + ".tmp");
+        {
+            std::string filenameTemp = metadataTempPath.string();
             std::ofstream ofs(filenameTemp.c_str(), std::ios_base::out | std::ios_base::binary);
             if (!ofs) {
                 return Status(ErrorCodes::FileNotOpen, str::stream()
@@ -215,22 +229,19 @@ namespace {
                 return Status(ErrorCodes::InternalError, str::stream()
                     << "Failed to write BSON data to " << filenameTemp);
             }
-            ofs.flush();
-        }
-        catch (const std::exception& ex) {
-            return Status(ErrorCodes::InternalError, str::stream()
-                << "Unexpected error while writing metadata to " << filenameTemp
-                << ": " << ex.what());
         }
 
-        // Rename temp file to actual metadata file.
-        // Removing original metafile first
-        std::string filename = metadataPath.string();
-        ::remove(filename.c_str());
-        if (::rename(filenameTemp.c_str(), filename.c_str())) {
+        // Rename temporary file to actual metadata file.
+        boost::filesystem::path metadataPath =
+            boost::filesystem::path(_dbpath) / kMetadataBasename;
+        try {
+            boost::filesystem::rename(metadataTempPath, metadataPath);
+        }
+        catch (const std::exception& ex) {
             return Status(ErrorCodes::FileRenameFailed, str::stream()
-                << "Failed to rename " << filename << " to " << filenameTemp
-                << ": " << errnoWithDescription());
+                << "Unexpected error while renaming temporary metadata file "
+                << metadataTempPath.string() << " to " << metadataPath.string()
+                << ": " << ex.what());
         }
 
         return Status::OK();
