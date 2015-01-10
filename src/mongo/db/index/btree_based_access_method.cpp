@@ -49,13 +49,6 @@ namespace mongo {
 
     MONGO_EXPORT_SERVER_PARAMETER(failIndexKeyTooLong, bool, true);
 
-    void BtreeBasedAccessMethod::InvalidateCursorsNotification::aboutToDeleteBucket(
-            const RecordId& bucket) {
-        BtreeIndexCursor::aboutToDeleteBucket(bucket);
-    }
-
-    BtreeBasedAccessMethod::InvalidateCursorsNotification BtreeBasedAccessMethod::invalidateCursors;
-
     BtreeBasedAccessMethod::BtreeBasedAccessMethod(IndexCatalogEntry* btreeState,
                                                    SortedDataInterface* btree)
         : _btreeState(btreeState),
@@ -229,6 +222,12 @@ namespace mongo {
         _newInterface->fullValidate(txn, full, &keys, output);
         *numKeys = keys;
         return Status::OK();
+    }
+
+    bool BtreeBasedAccessMethod::appendCustomStats(OperationContext* txn,
+                                                   BSONObjBuilder* output,
+                                                   double scale) const {
+        return _newInterface->appendCustomStats(txn, output, scale);
     }
 
     long long BtreeBasedAccessMethod::getSpaceUsedBytes( OperationContext* txn ) const {

@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -12,12 +13,13 @@
  *	Callback function from log_scan to get a log record.
  */
 static int
-__curlog_logrec(
-    WT_SESSION_IMPL *session, WT_ITEM *logrec, WT_LSN *lsnp, void *cookie)
+__curlog_logrec(WT_SESSION_IMPL *session,
+    WT_ITEM *logrec, WT_LSN *lsnp, void *cookie, int firstrecord)
 {
 	WT_CURSOR_LOG *cl;
 
 	cl = cookie;
+	WT_UNUSED(firstrecord);
 
 	/* Set up the LSNs and take a copy of the log record for the cursor. */
 	*cl->cur_lsn = *lsnp;
@@ -263,8 +265,8 @@ __curlog_reset(WT_CURSOR *cursor)
 	cl = (WT_CURSOR_LOG *)cursor;
 	cl->stepp = cl->stepp_end = NULL;
 	cl->step_count = 0;
-	INIT_LSN(cl->cur_lsn);
-	INIT_LSN(cl->next_lsn);
+	WT_INIT_LSN(cl->cur_lsn);
+	WT_INIT_LSN(cl->next_lsn);
 	return (0);
 }
 
@@ -290,9 +292,9 @@ __curlog_close(WT_CURSOR *cursor)
 	WT_TRET(__curlog_reset(cursor));
 	__wt_free(session, cl->cur_lsn);
 	__wt_free(session, cl->next_lsn);
-	__wt_scr_free(&cl->logrec);
-	__wt_scr_free(&cl->opkey);
-	__wt_scr_free(&cl->opvalue);
+	__wt_scr_free(session, &cl->logrec);
+	__wt_scr_free(session, &cl->opkey);
+	__wt_scr_free(session, &cl->opvalue);
 	WT_TRET(__wt_cursor_close(cursor));
 
 err:	API_END_RET(session, ret);
@@ -347,8 +349,8 @@ __wt_curlog_open(WT_SESSION_IMPL *session,
 	cursor->key_format = LOGC_KEY_FORMAT;
 	cursor->value_format = LOGC_VALUE_FORMAT;
 
-	INIT_LSN(cl->cur_lsn);
-	INIT_LSN(cl->next_lsn);
+	WT_INIT_LSN(cl->cur_lsn);
+	WT_INIT_LSN(cl->next_lsn);
 
 	WT_ERR(__wt_cursor_init(cursor, uri, NULL, cfg, cursorp));
 
@@ -361,9 +363,9 @@ err:		if (F_ISSET(cursor, WT_CURSTD_OPEN))
 		else {
 			__wt_free(session, cl->cur_lsn);
 			__wt_free(session, cl->next_lsn);
-			__wt_scr_free(&cl->logrec);
-			__wt_scr_free(&cl->opkey);
-			__wt_scr_free(&cl->opvalue);
+			__wt_scr_free(session, &cl->logrec);
+			__wt_scr_free(session, &cl->opkey);
+			__wt_scr_free(session, &cl->opvalue);
 			/*
 			 * NOTE:  We cannot get on the error path with the
 			 * readlock held.  No need to unlock it unless that

@@ -32,6 +32,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/base/init.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
@@ -69,6 +72,10 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
 
     namespace dbgrid_pub_cmds {
 
@@ -2703,7 +2710,21 @@ namespace mongo {
                     return false;
                 }
 
-                return passthrough( conf, cmdObj, result );
+                bool retval = passthrough( conf, cmdObj, result );
+
+                BSONObj peekResultObj = result.asTempObj();
+
+                if (peekResultObj["ok"].trueValue() && peekResultObj.hasField("cursor")) {
+                    long long cursorId = peekResultObj["cursor"]["id"].Long();
+                    if (cursorId) {
+                        const string cursorNs = peekResultObj["cursor"]["ns"].String();
+                        cursorCache.storeRef(conf->getPrimary().getConnString(),
+                                             cursorId,
+                                             cursorNs);
+                    }
+                }
+
+                return retval;
             }
         } cmdListCollections;
 
@@ -2731,7 +2752,21 @@ namespace mongo {
                     return false;
                 }
 
-                return passthrough( conf, cmdObj, result );
+                bool retval = passthrough( conf, cmdObj, result );
+
+                BSONObj peekResultObj = result.asTempObj();
+
+                if (peekResultObj["ok"].trueValue() && peekResultObj.hasField("cursor")) {
+                    long long cursorId = peekResultObj["cursor"]["id"].Long();
+                    if (cursorId) {
+                        const string cursorNs = peekResultObj["cursor"]["ns"].String();
+                        cursorCache.storeRef(conf->getPrimary().getConnString(),
+                                             cursorId,
+                                             cursorNs);
+                    }
+                }
+
+                return retval;
             }
         } cmdListIndexes;
 

@@ -30,6 +30,14 @@
 
 #pragma once
 
+#define MONGO_PCH_WHITELISTED
+#include "mongo/platform/basic.h"
+#include "mongo/pch.h"
+#undef MONGO_PCH_WHITELISTED
+
+#include <boost/noncopyable.hpp>
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/durop.h"
 #include "mongo/util/alignedbuilder.h"
@@ -106,7 +114,7 @@ namespace mongo {
         public:
             std::vector<WriteIntent> _intents;
             Already<127> _alreadyNoted;
-            std::vector< shared_ptr<DurOp> > _durOps; // all the ops other than basic writes
+            std::vector< boost::shared_ptr<DurOp> > _durOps; // all the ops other than basic writes
 
             /** reset the IntentsAndDurOps structure (empties all the above) */
             void clear();
@@ -127,7 +135,6 @@ namespace mongo {
                          other uses are in a read lock from a single thread (durThread)
         */
         class CommitJob : boost::noncopyable {
-            void _committingReset();
             ~CommitJob(){ verify(!"shouldn't destroy CommitJob!"); }
 
         public:
@@ -135,13 +142,12 @@ namespace mongo {
             CommitJob();
 
             /** note an operation other than a "basic write". threadsafe (locks in the impl) */
-            void noteOp(shared_ptr<DurOp> p);
+            void noteOp(boost::shared_ptr<DurOp> p);
 
             /** record/note an intent to write */
             void note(void* p, int len);
 
-            std::vector< shared_ptr<DurOp> >& ops() {
-                groupCommitMutex.dassertLocked(); // this is what really makes the below safe
+            const std::vector<boost::shared_ptr<DurOp> >& ops() const {
                 return _intentsAndDurOps._durOps;                
             }
 
@@ -155,14 +161,11 @@ namespace mongo {
             void commitingBegin();
             /** the commit code calls this when data reaches the journal (on disk) */
             void committingNotifyCommitted() { 
-                groupCommitMutex.dassertLocked();
                 _notify.notifyAll(_commitNumber); 
             }
+
             /** we use the commitjob object over and over, calling reset() rather than reconstructing */
-            void committingReset() {
-                groupCommitMutex.dassertLocked();
-                _committingReset();
-            }
+            void committingReset();
 
         public:
             /** we check how much written and if it is getting to be a lot, we commit sooner. */
@@ -172,7 +175,6 @@ namespace mongo {
              * can be merged.  we sort here so the caller receives something they must 
              * keep const from their pov. */
             const std::vector<WriteIntent>& getIntentsSorted() {
-                groupCommitMutex.dassertLocked();
                 sort(_intentsAndDurOps._intents.begin(), _intentsAndDurOps._intents.end());
                 return _intentsAndDurOps._intents;
             }

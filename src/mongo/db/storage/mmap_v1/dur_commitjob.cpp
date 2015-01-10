@@ -30,9 +30,15 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
+#define MONGO_PCH_WHITELISTED
+#include "mongo/platform/basic.h"
 #include "mongo/pch.h"
+#undef MONGO_PCH_WHITELISTED
 
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
+
+#include <boost/shared_ptr.hpp>
+#include <iostream>
 
 #include "mongo/db/client.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
@@ -42,6 +48,8 @@
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
 
     namespace dur {
 
@@ -76,7 +84,6 @@ namespace mongo {
         }
 
         void IntentsAndDurOps::clear() {
-            commitJob.groupCommitMutex.dassertLocked();
             _alreadyNoted.clear();
             _intents.clear();
             _durOps.clear();
@@ -105,17 +112,14 @@ namespace mongo {
             _intentsAndDurOps._durOps.push_back(p);
         }
 
-        size_t privateMapBytes = 0; // used by _REMAPPRIVATEVIEW to track how much / how fast to remap
-
         void CommitJob::commitingBegin() {
             _commitNumber = _notify.now();
             stats.curr->_commits++;
         }
 
-        void CommitJob::_committingReset() {
+        void CommitJob::committingReset() {
             _hasWritten = false;
             _intentsAndDurOps.clear();
-            privateMapBytes += _bytes;
             _bytes = 0;
         }
 

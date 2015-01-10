@@ -37,6 +37,7 @@
 #include <algorithm>
 
 #include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include <rocksdb/comparator.h>
 #include <rocksdb/db.h>
@@ -54,6 +55,8 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
 
     namespace {
 
@@ -419,6 +422,10 @@ namespace mongo {
         return StatusWith<RecordId>( loc );
     }
 
+    bool RocksRecordStore::updateWithDamagesSupported() const {
+        return true;
+    }
+
     Status RocksRecordStore::updateWithDamages( OperationContext* txn,
                                                 const RecordId& loc,
                                                 const RecordData& oldRec,
@@ -509,7 +516,7 @@ namespace mongo {
                                        bool scanData,
                                        ValidateAdaptor* adaptor,
                                        ValidateResults* results,
-                                       BSONObjBuilder* output ) const {
+                                       BSONObjBuilder* output ) {
         // TODO validate that _numRecords and _dataSize are correct in scanData mode
         if ( scanData ) {
             bool invalidObject = false;
@@ -547,7 +554,7 @@ namespace mongo {
         result->appendBool("capped", _isCapped);
         if (_isCapped) {
             result->appendIntOrLL("max", _cappedMaxDocs);
-            result->appendIntOrLL("maxSize", _cappedMaxSize);
+            result->appendIntOrLL("maxSize", _cappedMaxSize / scale);
         }
         bool valid = _db->GetProperty(_columnFamily.get(), "rocksdb.stats", &statsString);
         invariant( valid );

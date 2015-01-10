@@ -34,6 +34,8 @@
 
 #include "mongo/db/catalog/collection.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/counter.h"
 #include "mongo/base/owned_pointer_map.h"
 #include "mongo/db/clientcursor.h"
@@ -53,6 +55,7 @@
 
 namespace mongo {
 
+    using boost::scoped_ptr;
     using logger::LogComponent;
 
     std::string CompactOptions::toString() const {
@@ -87,11 +90,12 @@ namespace mongo {
           _database( database ),
           _infoCache( this ),
           _indexCatalog( this ),
-          _cursorCache( fullNS ) {
+          _cursorManager( fullNS ) {
         _magic = 1357924;
         _indexCatalog.init(txn);
         if ( isCapped() )
             _recordStore->setCappedDeleteCallback( this );
+        _infoCache.reset(txn);
     }
 
     Collection::~Collection() {
@@ -184,6 +188,9 @@ namespace mongo {
     StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
                                                     const BSONObj& docToInsert,
                                                     bool enforceQuota ) {
+
+        uint64_t txnId = txn->recoveryUnit()->getMyTransactionCount();
+
         if ( _indexCatalog.findIdIndex( txn ) ) {
             if ( docToInsert["_id"].eoo() ) {
                 return StatusWith<RecordId>( ErrorCodes::InternalError,
@@ -192,7 +199,9 @@ namespace mongo {
             }
         }
 
-        return _insertDocument( txn, docToInsert, enforceQuota );
+        StatusWith<RecordId> res = _insertDocument( txn, docToInsert, enforceQuota );
+        invariant( txnId == txn->recoveryUnit()->getMyTransactionCount() );
+        return res;
     }
 
     StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
@@ -252,7 +261,7 @@ namespace mongo {
         BSONObj doc = docFor( txn, loc );
 
         /* check if any cursors point to us.  if so, advance them. */
-        _cursorCache.invalidateDocument(txn, loc, INVALIDATION_DELETION);
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_DELETION);
 
         _indexCatalog.unindexRecord(txn, doc, loc, false);
 
@@ -280,7 +289,7 @@ namespace mongo {
         }
 
         /* check if any cursors point to us.  if so, advance them. */
-        _cursorCache.invalidateDocument(txn, loc, INVALIDATION_DELETION);
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_DELETION);
 
         _indexCatalog.unindexRecord(txn, doc, loc, noWarn);
 
@@ -293,21 +302,20 @@ namespace mongo {
     ServerStatusMetricField<Counter64> moveCounterDisplay( "record.moves", &moveCounter );
 
     StatusWith<RecordId> Collection::updateDocument( OperationContext* txn,
-                                                    const RecordId& oldLocation,
-                                                    const BSONObj& objNew,
-                                                    bool enforceQuota,
-                                                    OpDebug* debug ) {
+                                                     const RecordId& oldLocation,
+                                                     const BSONObj& objOld,
+                                                     const BSONObj& objNew,
+                                                     bool enforceQuota,
+                                                     bool indexesAffected,
+                                                     OpDebug* debug ) {
 
-        BSONObj objOld = _recordStore->dataFor( txn, oldLocation ).releaseToBson();
+        uint64_t txnId = txn->recoveryUnit()->getMyTransactionCount();
 
-        if ( objOld.hasElement( "_id" ) ) {
-            BSONElement oldId = objOld["_id"];
-            BSONElement newId = objNew["_id"];
-            if ( oldId != newId )
-                return StatusWith<RecordId>( ErrorCodes::InternalError,
-                                            "in Collection::updateDocument _id mismatch",
-                                            13596 );
-        }
+        BSONElement oldId = objOld["_id"];
+        if ( !oldId.eoo() && ( oldId != objNew["_id"] ) )
+            return StatusWith<RecordId>( ErrorCodes::InternalError,
+                                         "in Collection::updateDocument _id mismatch",
+                                         13596 );
 
         /* duplicate key check. we descend the btree twice - once for this check, and once for the actual inserts, further
            below.  that is suboptimal, but it's pretty complicated to do it the other way without rollbacks...
@@ -317,21 +325,24 @@ namespace mongo {
         // represent the index updates needed to be done, based on the changes between objOld and
         // objNew.
         OwnedPointerMap<IndexDescriptor*,UpdateTicket> updateTickets;
-        IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
-        while ( ii.more() ) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
+        if ( indexesAffected ) {
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
+            while ( ii.more() ) {
+                IndexDescriptor* descriptor = ii.next();
+                IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
 
-            InsertDeleteOptions options;
-            options.logIfError = false;
-            options.dupsAllowed =
-                !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique())
-                || repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor);
-            UpdateTicket* updateTicket = new UpdateTicket();
-            updateTickets.mutableMap()[descriptor] = updateTicket;
-            Status ret = iam->validateUpdate(txn, objOld, objNew, oldLocation, options, updateTicket );
-            if ( !ret.isOK() ) {
-                return StatusWith<RecordId>( ret );
+                InsertDeleteOptions options;
+                options.logIfError = false;
+                options.dupsAllowed =
+                    !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique())
+                    || repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor);
+                UpdateTicket* updateTicket = new UpdateTicket();
+                updateTickets.mutableMap()[descriptor] = updateTicket;
+                Status ret = iam->validateUpdate(
+                    txn, objOld, objNew, oldLocation, options, updateTicket );
+                if ( !ret.isOK() ) {
+                    return StatusWith<RecordId>( ret );
+                }
             }
         }
 
@@ -366,7 +377,7 @@ namespace mongo {
             Status s = _indexCatalog.indexRecord(txn, objNew, newLocation.getValue());
             if (!s.isOK())
                 return StatusWith<RecordId>(s);
-
+            invariant( txnId == txn->recoveryUnit()->getMyTransactionCount() );
             return newLocation;
         }
 
@@ -375,22 +386,25 @@ namespace mongo {
         if ( debug )
             debug->keyUpdates = 0;
 
-        ii = _indexCatalog.getIndexIterator( txn, true );
-        while ( ii.more() ) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
+        if ( indexesAffected ) {
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
+            while ( ii.more() ) {
+                IndexDescriptor* descriptor = ii.next();
+                IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
 
-            int64_t updatedKeys;
-            Status ret = iam->update(txn, *updateTickets.mutableMap()[descriptor], &updatedKeys);
-            if ( !ret.isOK() )
-                return StatusWith<RecordId>( ret );
-            if ( debug )
-                debug->keyUpdates += updatedKeys;
+                int64_t updatedKeys;
+                Status ret = iam->update(
+                    txn, *updateTickets.mutableMap()[descriptor], &updatedKeys);
+                if ( !ret.isOK() )
+                    return StatusWith<RecordId>( ret );
+                if ( debug )
+                    debug->keyUpdates += updatedKeys;
+            }
         }
 
         // Broadcast the mutation so that query results stay correct.
-        _cursorCache.invalidateDocument(txn, oldLocation, INVALIDATION_MUTATION);
-
+        _cursorManager.invalidateDocument(txn, oldLocation, INVALIDATION_MUTATION);
+        invariant( txnId == txn->recoveryUnit()->getMyTransactionCount() );
         return newLocation;
     }
 
@@ -399,7 +413,7 @@ namespace mongo {
                                                const char* oldBuffer,
                                                size_t oldSize ) {
         moveCounter.increment();
-        _cursorCache.invalidateDocument(txn, oldLocation, INVALIDATION_DELETION);
+        _cursorManager.invalidateDocument(txn, oldLocation, INVALIDATION_DELETION);
         _indexCatalog.unindexRecord(txn, BSONObj(oldBuffer), oldLocation, true);
         return Status::OK();
     }
@@ -412,7 +426,7 @@ namespace mongo {
                                                   const mutablebson::DamageVector& damages ) {
 
         // Broadcast the mutation so that query results stay correct.
-        _cursorCache.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
 
         return _recordStore->updateWithDamages( txn, loc, oldRec, damageSource, damages );
     }
@@ -494,7 +508,7 @@ namespace mongo {
         Status status = _indexCatalog.dropAllIndexes(txn, true);
         if ( !status.isOK() )
             return status;
-        _cursorCache.invalidateAll( false );
+        _cursorManager.invalidateAll( false );
         _infoCache.reset( txn );
 
         // 3) truncate record store

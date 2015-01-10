@@ -35,7 +35,9 @@
 #include <boost/thread/thread.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
+#include <iostream>
 #include <limits>
+#include <signal.h>
 #include <string>
 
 #include "mongo/base/init.h"
@@ -258,12 +260,12 @@ namespace mongo {
         AutoGetOrCreateDb autoDb(&txn, "local", mongo::MODE_X);
         Database* db = autoDb.getDb();
         const std::string ns = "local.startup_log";
-        Collection* collection = db->getCollection(&txn, ns);
+        Collection* collection = db->getCollection(ns);
         WriteUnitOfWork wunit(&txn);
         if (!collection) {
             BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
             uassertStatusOK(userCreateNS(&txn, db, ns, options, true));
-            collection = db->getCollection(&txn, ns);
+            collection = db->getCollection(ns);
         }
         invariant(collection);
         uassertStatusOK(collection->insertDocument(&txn, o, false).getStatus());
@@ -286,7 +288,7 @@ namespace mongo {
             if ( ns.isSystem() )
                 continue;
 
-            Collection* coll = db->getCollection( txn, collectionName );
+            Collection* coll = db->getCollection( collectionName );
             if ( !coll )
                 continue;
 
@@ -374,7 +376,7 @@ namespace mongo {
             // Major versions match, check indexes
             const string systemIndexes = db->name() + ".system.indexes";
 
-            Collection* coll = db->getCollection( &txn, systemIndexes );
+            Collection* coll = db->getCollection( systemIndexes );
             auto_ptr<PlanExecutor> exec(
                 InternalPlanner::collectionScan(&txn, systemIndexes, coll));
 

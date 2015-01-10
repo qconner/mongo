@@ -26,6 +26,7 @@
 *    it in the license file.
 */
 
+#include <boost/scoped_ptr.hpp>
 #include <set>
 #include <vector>
 
@@ -86,6 +87,11 @@ namespace mongo {
 
         virtual Status validate(OperationContext* txn, bool full, int64_t* numKeys, BSONObjBuilder* output) {
             return _notAllowed();
+        }
+
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const {
+            return false;
         }
 
         virtual Status remove(OperationContext* txn,

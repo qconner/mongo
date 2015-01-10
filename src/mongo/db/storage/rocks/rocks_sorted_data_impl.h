@@ -31,6 +31,7 @@
 #include "mongo/db/storage/sorted_data_interface.h"
 
 #include <atomic>
+#include <boost/shared_ptr.hpp>
 #include <string>
 
 #include <rocksdb/db.h>
@@ -82,6 +83,11 @@ namespace mongo {
 
         virtual void fullValidate(OperationContext* txn, bool full, long long* numKeysOut,
                                   BSONObjBuilder* output) const;
+
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const {
+            return false;
+        }
 
         virtual bool isEmpty(OperationContext* txn);
 

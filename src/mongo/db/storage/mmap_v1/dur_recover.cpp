@@ -35,8 +35,11 @@
 #include "mongo/db/storage/mmap_v1/dur_recover.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/noncopyable.hpp>
+#include <boost/shared_ptr.hpp>
 #include <fcntl.h>
 #include <iomanip>
+#include <iostream>
 #include <sys/stat.h>
 
 #include "mongo/db/curop.h"
@@ -57,6 +60,8 @@
 #include "mongo/util/bufreader.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/startup_test.h"
@@ -64,6 +69,8 @@
 using namespace mongoutils;
 
 namespace mongo {
+
+    using boost::shared_ptr;
 
     /**
      * Thrown when a journal section is corrupt. This is considered OK as long as it occurs while
@@ -186,8 +193,7 @@ namespace mongo {
 
                     case JEntry::OpCode_DbContext: {
                         _lastDbName = (const char*) _entries->pos();
-                        const unsigned limit = std::min((unsigned)Namespace::MaxNsLenWithNUL,
-                                                        _entries->remaining());
+                        const unsigned limit = _entries->remaining();
                         const unsigned len = strnlen(_lastDbName, limit);
                         if (_lastDbName[len] != '\0') {
                             log() << "problem processing journal file during recovery";
@@ -290,7 +296,6 @@ namespace mongo {
             //TODO(mathias): look into making some of these dasserts
             verify(entry.e);
             verify(entry.dbName);
-            verify(strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
 
             DurableMappedFile *mmf = last.newEntry(entry, *this);
 
@@ -340,7 +345,6 @@ namespace mongo {
 
         DurableMappedFile* RecoveryJob::getDurableMappedFile(const ParsedJournalEntry& entry) {
             verify(entry.dbName);
-            verify(strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
 
             const string fn = fileName(entry.dbName, entry.e->getFileNo());
             MongoFile* file;

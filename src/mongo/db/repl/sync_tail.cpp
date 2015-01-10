@@ -128,17 +128,19 @@ namespace repl {
                 break;
 
             case mongo::Timestamp:
+                boost::hash_combine(hash, elem._opTime().asDate());
+                break;
+
             case mongo::Date:
-                // Need to treat these the same until SERVER-3304 is resolved.
                 boost::hash_combine(hash, elem.date().asInt64());
                 break;
 
             case mongo::NumberDouble:
             case mongo::NumberLong:
             case mongo::NumberInt: {
-                // This converts all numbers to doubles for compatibility with woCompare.
-                // This ignores // the low-order bits of NumberLongs > 2**53, but that is required
-                // until SERVER-3719 is resolved.
+                // This converts all numbers to doubles, which ignores the low-order bits of
+                // NumberLongs > 2**53, but that is ok since the hash will still be the same for
+                // equal numbers and is still likely to be different for different numbers.
                 const double dbl = elem.numberDouble();
                 if (isNaN(dbl)) {
                     boost::hash_combine(hash, numeric_limits<double>::quiet_NaN());
@@ -177,12 +179,10 @@ namespace repl {
                 break;
 
             case mongo::CodeWScope: {
-                // SERVER-7804
-                // Intentionally not using codeWScopeCodeLen for compatibility with
-                // compareElementValues. Using codeWScopeScopeDataUnsafe (as a string!) for the same
-                // reason.
-                boost::hash_combine(hash, StringData::Hasher()(elem.codeWScopeCode()));
-                boost::hash_combine(hash, StringData::Hasher()(elem.codeWScopeScopeDataUnsafe()));
+                boost::hash_combine(hash, StringData::Hasher()(
+                                            StringData(elem.codeWScopeCode(),
+                                                       elem.codeWScopeCodeLen())));
+                boost::hash_combine(hash, hashBSONObj(elem.codeWScopeObject()));
                 break;
             }
             }
@@ -275,7 +275,7 @@ namespace repl {
                 if ( createCollection == 0 &&
                      !isIndexBuild &&
                      isCrudOpType(opType) &&
-                     ctx.db()->getCollection(txn,ns) == NULL ) {
+                     ctx.db()->getCollection(ns) == NULL ) {
                     // uh, oh, we need to create collection
                     // try again
                     continue;
@@ -473,6 +473,10 @@ namespace repl {
 
 namespace {
     void tryToGoLiveAsASecondary(OperationContext* txn, ReplicationCoordinator* replCoord) {
+        if (replCoord->isInPrimaryOrSecondaryState()) {
+            return;
+        }
+
         ScopedTransaction transaction(txn, MODE_S);
         Lock::GlobalRead readLock(txn->lockState());
 

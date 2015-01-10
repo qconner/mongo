@@ -33,6 +33,8 @@
 
 #include "mongo/db/repl/rs_rollback.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/client.h"
@@ -93,6 +95,9 @@
  */
 
 namespace mongo {
+
+    using boost::shared_ptr;
+
 namespace repl {
 namespace {
 
@@ -252,7 +257,7 @@ namespace {
         boost::scoped_ptr<PlanExecutor> exec(
                 InternalPlanner::collectionScan(txn,
                                                 rsoplog,
-                                                ctx.db()->getCollection(txn, rsoplog),
+                                                ctx.db()->getCollection(rsoplog),
                                                 InternalPlanner::BACKWARD));
 
         BSONObj ourObj;
@@ -528,7 +533,7 @@ namespace {
 
         log() << "rollback 4.7";
         Client::Context ctx(txn, rsoplog);
-        Collection* oplogCollection = ctx.db()->getCollection(txn, rsoplog);
+        Collection* oplogCollection = ctx.db()->getCollection(rsoplog);
         uassert(13423,
                 str::stream() << "replSet error in rollback can't find " << rsoplog,
                 oplogCollection);
@@ -567,7 +572,7 @@ namespace {
 
                 // Add the doc to our rollback file
                 BSONObj obj;
-                bool found = Helpers::findOne(txn, ctx.db()->getCollection(txn, doc.ns), pattern, obj, false);
+                bool found = Helpers::findOne(txn, ctx.db()->getCollection(doc.ns), pattern, obj, false);
                 if (found) {
                     removeSaver->goingToDelete(obj);
                 }
@@ -580,7 +585,7 @@ namespace {
                     // TODO 1.6 : can't delete from a capped collection.  need to handle that here.
                     deletes++;
 
-                    Collection* collection = ctx.db()->getCollection(txn, doc.ns);
+                    Collection* collection = ctx.db()->getCollection(doc.ns);
                     if (collection) {
                         if (collection->isCapped()) {
                             // can't delete from a capped collection - so we truncate instead. if

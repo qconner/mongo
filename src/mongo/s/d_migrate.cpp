@@ -39,6 +39,7 @@
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/thread.hpp>
 #include <map>
 #include <string>
@@ -93,6 +94,7 @@
 using namespace std;
 
 namespace {
+    using boost::scoped_ptr;
     using mongo::WriteConcernOptions;
     using mongo::repl::ReplicationCoordinator;
 
@@ -1902,14 +1904,20 @@ namespace mongo {
                 Client::WriteContext ctx(txn,  ns );
                 // Only copy if ns doesn't already exist
                 Database* db = ctx.ctx().db();
-                Collection* collection = db->getCollection( txn, ns );
+                Collection* collection = db->getCollection( ns );
 
                 if ( !collection ) {
-                    string system_namespaces = nsToDatabase(ns) + ".system.namespaces";
-                    BSONObj entry = conn->findOne( system_namespaces, BSON( "name" << ns ) );
+                    list<BSONObj> infos =
+                            conn->getCollectionInfos(nsToDatabase(ns),
+                                                     BSON("name" << nsToCollectionSubstring(ns)));
+
                     BSONObj options;
-                    if ( entry["options"].isABSONObj() )
-                        options = entry["options"].Obj();
+                    if (infos.size() > 0) {
+                        BSONObj entry = infos.front();
+                        if (entry["options"].isABSONObj()) {
+                            options = entry["options"].Obj();
+                        }
+                    }
 
                     WriteUnitOfWork wuow(txn);
                     Status status = userCreateNS( txn, db, ns, options, true, false );
@@ -1934,7 +1942,7 @@ namespace mongo {
                 Lock::DBLock lk(txn->lockState(),  nsToDatabaseSubstring(ns), MODE_X);
                 Client::Context ctx(txn,  ns);
                 Database* db = ctx.db();
-                Collection* collection = db->getCollection( txn, ns );
+                Collection* collection = db->getCollection( ns );
                 if ( !collection ) {
                     errmsg = str::stream() << "collection dropped during migration: " << ns;
                     warning() << errmsg;

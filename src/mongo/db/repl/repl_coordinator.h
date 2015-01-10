@@ -134,6 +134,17 @@ namespace repl {
         virtual MemberState getCurrentMemberState() const = 0;
 
         /**
+         * Returns true if this node is in state PRIMARY or SECONDARY.
+         *
+         * It is invalid to call this unless getReplicationMode() == modeReplSet.
+         *
+         * This method may be optimized to reduce synchronization overhead compared to
+         * reading the current member state with getCurrentMemberState().
+         */
+        virtual bool isInPrimaryOrSecondaryState() const = 0;
+
+
+        /**
          * Returns how slave delayed this node is configured to be.
          *
          * Raises a DBException if this node is not a member of the current replica set
@@ -216,7 +227,7 @@ namespace repl {
         virtual Status checkIfWriteConcernCanBeSatisfied(
                 const WriteConcernOptions& writeConcern) const = 0;
 
-        /*
+        /**
          * Returns Status::OK() if it is valid for this node to serve reads on the given collection
          * and an errorcode indicating why the node cannot if it cannot.
          */
@@ -238,6 +249,11 @@ namespace repl {
 
         /**
          * Updates our internal tracking of the last OpTime applied to this node.
+         *
+         * The new value of "ts" must be no less than any prior value passed to this method, and it
+         * is the caller's job to properly synchronize this behavior.  The exception to this rule is
+         * that after calls to resetLastOpTimeFromOplog(), the minimum acceptable value for "ts" is
+         * reset based on the contents of the oplog, and may go backwards due to rollback.
          */
         virtual void setMyLastOptime(const OpTime& ts) = 0;
 

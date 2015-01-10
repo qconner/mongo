@@ -45,39 +45,12 @@ namespace mongo {
 
         void debugValidateAllMapsMatch();
 
-        static void WRITETODATAFILES_Impl1(const JSectHeader& h, AlignedBuilder& uncompressed) {
+        static void WRITETODATAFILES_Impl1(const JSectHeader& h,
+                                           const AlignedBuilder& uncompressed) {
             LOG(3) << "journal WRITETODATAFILES 1" << endl;
             RecoveryJob::get().processSection(&h, uncompressed.buf(), uncompressed.len(), 0);
             LOG(3) << "journal WRITETODATAFILES 2" << endl;
         }
-
-#if 0
-        // the old implementation.  doesn't work with groupCommitWithLimitedLocks()
-        void WRITETODATAFILES_Impl2() {
-            /* we go backwards as what is at the end is most likely in the cpu cache.  it won't be much, but we'll take it. */
-            for( set<WriteIntent>::const_iterator it(commitJob.writes().begin()), end(commitJob.writes().end()); it != end; ++it ) {
-                const WriteIntent& intent = *it;
-                stats.curr->_writeToDataFilesBytes += intent.length();
-                dassert(intent.w_ptr);
-                memcpy(intent.w_ptr, intent.start(), intent.length());
-            }
-        }
-#endif
-
-#if defined(_EXPERIMENTAL)
-        // doesn't work with groupCommitWithLimitedLocks()
-        void WRITETODATAFILES_Impl3() {
-            /* we go backwards as what is at the end is most likely in the cpu cache.  it won't be much, but we'll take it. */
-            for( set<WriteIntent>::const_iterator it(commitJob.writes().begin()), end(commitJob.writes().end()); it != end; ++it ) {
-                const WriteIntent& intent = *it;
-                stats.curr->_writeToDataFilesBytes += intent.length();
-                dassert(intent.w_ptr);
-                memcpy(intent.w_ptr,
-                       commitJob._ab.atOfs(intent.ofsInJournalBuffer),
-                       intent.length());
-            }
-        }
-#endif
 
         /** apply the writes back to the non-private MMF after they are for certain in redo log
 
@@ -99,7 +72,7 @@ namespace mongo {
             @see https://docs.google.com/drawings/edit?id=1TklsmZzm7ohIZkwgeK6rMvsdaR13KjtJYMsfLr175Zc&hl=en
         */
 
-        void WRITETODATAFILES(const JSectHeader& h, AlignedBuilder& uncompressed) {
+        void WRITETODATAFILES(const JSectHeader& h, const AlignedBuilder& uncompressed) {
             Timer t;
             WRITETODATAFILES_Impl1(h, uncompressed);
             long long m = t.micros();

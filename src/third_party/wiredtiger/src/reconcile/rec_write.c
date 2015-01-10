@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -397,13 +398,15 @@ __wt_reconcile(WT_SESSION_IMPL *session,
 			ret = __rec_col_fix(session, r, page);
 		break;
 	case WT_PAGE_COL_INT:
-		ret = __rec_col_int(session, r, page);
+		WT_WITH_PAGE_INDEX(session,
+		    ret = __rec_col_int(session, r, page));
 		break;
 	case WT_PAGE_COL_VAR:
 		ret = __rec_col_var(session, r, page, salvage);
 		break;
 	case WT_PAGE_ROW_INT:
-		ret = __rec_row_int(session, r, page);
+		WT_WITH_PAGE_INDEX(session,
+		    ret = __rec_row_int(session, r, page));
 		break;
 	case WT_PAGE_ROW_LEAF:
 		ret = __rec_row_leaf(session, r, page, salvage);
@@ -1877,7 +1880,7 @@ __rec_split_row_promote(
 		}
 	ret = __wt_buf_set(session, key, r->cur->data, size);
 
-err:	__wt_scr_free(&update);
+err:	__wt_scr_free(session, &update);
 	return (ret);
 }
 
@@ -2500,7 +2503,7 @@ __rec_raw_decompress(
 	WT_ASSERT(session, __wt_verify_dsk_image(
 	    session, "[raw evict split]", tmp->data, dsk->mem_size, 0) == 0);
 
-err:	__wt_scr_free(&tmp);
+err:	__wt_scr_free(session, &tmp);
 	return (ret);
 }
 
@@ -2670,7 +2673,7 @@ __rec_split_fixup(WT_SESSION_IMPL *session, WT_RECONCILE *r)
 	r->space_avail =
 	    r->split_size - (WT_PAGE_HEADER_BYTE_SIZE(btree) + len);
 
-err:	__wt_scr_free(&tmp);
+err:	__wt_scr_free(session, &tmp);
 	return (ret);
 }
 
@@ -2859,7 +2862,7 @@ skip_check_complete:
 	bnd->addr.size = (uint8_t)addr_size;
 
 done:
-err:	__wt_scr_free(&key);
+err:	__wt_scr_free(session, &key);
 	return (ret);
 }
 
@@ -3913,7 +3916,7 @@ compare:		/*
 	/* Write the remnant page. */
 	ret = __rec_split_finish(session, r);
 
-err:	__wt_scr_free(&orig);
+err:	__wt_scr_free(session, &orig);
 	return (ret);
 }
 
@@ -4562,8 +4565,8 @@ leaf_insert:	/* Write any K/V pairs inserted into the page after this key. */
 	/* Write the remnant page. */
 	ret = __rec_split_finish(session, r);
 
-err:	__wt_scr_free(&tmpkey);
-	__wt_scr_free(&tmpval);
+err:	__wt_scr_free(session, &tmpkey);
+	__wt_scr_free(session, &tmpval);
 	return (ret);
 }
 
@@ -4917,7 +4920,7 @@ __rec_write_wrapup(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_PAGE *page)
 					break;
 				WT_ILLEGAL_VALUE_ERR(session);
 				}
-err:			__wt_scr_free(&tkey);
+err:			__wt_scr_free(session, &tkey);
 			WT_RET(ret);
 		}
 		if (r->bnd_next > r->bnd_next_max) {
@@ -5400,7 +5403,7 @@ __rec_cell_build_ovfl(WT_SESSION_IMPL *session,
 	kv->cell_len = __wt_cell_pack_ovfl(&kv->cell, type, rle, kv->buf.size);
 	kv->len = kv->cell_len + kv->buf.size;
 
-err:	__wt_scr_free(&tmp);
+err:	__wt_scr_free(session, &tmp);
 	return (ret);
 }
 

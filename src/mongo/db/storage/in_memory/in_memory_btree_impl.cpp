@@ -32,6 +32,8 @@
 
 #include "mongo/db/storage/in_memory/in_memory_btree_impl.h"
 
+#include <boost/make_shared.hpp>
+#include <boost/shared_ptr.hpp>
 #include <set>
 
 #include "mongo/db/catalog/index_catalog_entry.h"
@@ -40,6 +42,9 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
+
 namespace {
 
     const int TempKeyMaxSize = 1024; // this goes away with SERVER-3372
@@ -192,6 +197,11 @@ namespace {
             *numKeysOut = _data->size();
         }
 
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const {
+            return false;
+        }
+
         virtual long long getSpaceUsedBytes( OperationContext* txn ) const {
             return _currentKeySize + ( sizeof(IndexKeyEntry) * _data->size() );
         }
@@ -230,10 +240,6 @@ namespace {
                 const ForwardCursor& other = static_cast<const ForwardCursor&>(otherBase);
                 invariant(&_data == &other._data); // iterators over same index
                 return _it == other._it;
-            }
-
-            virtual void aboutToDeleteBucket(const RecordId& bucket) {
-                invariant(!"aboutToDeleteBucket should not be called");
             }
 
             virtual bool locate(const BSONObj& keyRaw, const RecordId& loc) {
@@ -340,10 +346,6 @@ namespace {
                 const ReverseCursor& other = static_cast<const ReverseCursor&>(otherBase);
                 invariant(&_data == &other._data); // iterators over same index
                 return _it == other._it;
-            }
-
-            virtual void aboutToDeleteBucket(const RecordId& bucket) {
-                invariant(!"aboutToDeleteBucket should not be called");
             }
 
             virtual bool locate(const BSONObj& keyRaw, const RecordId& loc) {

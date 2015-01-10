@@ -32,6 +32,8 @@
 
 #include "mongo/db/query/find.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -59,6 +61,8 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+
+using boost::scoped_ptr;
 
 namespace mongo {
     // The .h for this in find_constants.h.
@@ -192,9 +196,19 @@ namespace mongo {
 
         // This is a read lock.
         const NamespaceString nss(ns);
-        scoped_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(txn, nss));
-        Collection* collection = ctx->getCollection();
-        uassert( 17356, "collection dropped between getMore calls", collection );
+        boost::scoped_ptr<AutoGetCollectionForRead> ctx;
+
+        CursorManager* cursorManager;
+        CursorManager* globalCursorManager = CursorManager::getGlobalCursorManager();
+        if (globalCursorManager->ownsCursorId(cursorid)) {
+            cursorManager = globalCursorManager;
+        }
+        else {
+            ctx.reset(new AutoGetCollectionForRead(txn, nss));
+            Collection* collection = ctx->getCollection();
+            uassert( 17356, "collection dropped between getMore calls", collection );
+            cursorManager = collection->cursorManager();
+        }
 
         QLOG() << "Running getMore, cursorid: " << cursorid << endl;
 
@@ -211,7 +225,7 @@ namespace mongo {
         // A pin performs a CC lookup and if there is a CC, increments the CC's pin value so it
         // doesn't time out.  Also informs ClientCursor that there is somebody actively holding the
         // CC, so don't delete it.
-        ClientCursorPin ccPin(collection, cursorid);
+        ClientCursorPin ccPin(cursorManager, cursorid);
         ClientCursor* cc = ccPin.c();
 
         // If we're not being called from DBDirectClient we want to associate the RecoveryUnit
@@ -240,9 +254,14 @@ namespace mongo {
             resultFlags = ResultFlag_CursorNotFound;
         }
         else {
-            // Quote: check for spoofing of the ns such that it does not match the one originally
-            // there for the cursor
-            uassert(17011, "auth error", str::equals(ns, cc->ns().c_str()));
+            // Check for spoofing of the ns such that it does not match the one originally
+            // there for the cursor.
+            if (globalCursorManager->ownsCursorId(cursorid)) {
+                // TODO Implement auth check for global cursors.  SERVER-16657.
+            }
+            else {
+                uassert(17011, "auth error", str::equals(ns, cc->ns().c_str()));
+            }
             *isCursorAuthorized = true;
 
             // Restore the RecoveryUnit if we need to.
@@ -644,7 +663,6 @@ namespace mongo {
             BSONObj explainObj = explainBob.obj();
             bb.appendBuf((void*)explainObj.objdata(), explainObj.objsize());
 
-            curop.debug().iscommand = true;
             // TODO: Does this get overwritten/do we really need to set this twice?
             curop.debug().query = q.query;
 
@@ -824,7 +842,7 @@ namespace mongo {
 
             // Allocate a new ClientCursor.  We don't have to worry about leaking it as it's
             // inserted into a global map by its ctor.
-            ClientCursor* cc = new ClientCursor(collection, exec.get(),
+            ClientCursor* cc = new ClientCursor(collection->cursorManager(), exec.get(),
                                                 pq.getOptions().toInt(),
                                                 pq.getFilter());
             ccId = cc->cursorid();

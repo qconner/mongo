@@ -39,8 +39,11 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
+#include <boost/version.hpp>
 #include <iomanip>
+#include <iostream>
 #include <fstream>
 
 #include "mongo/db/db.h"
@@ -70,6 +73,8 @@
 #endif
 
 namespace PerfTests {
+
+    using boost::shared_ptr;
 
     const bool profiling = false;
 

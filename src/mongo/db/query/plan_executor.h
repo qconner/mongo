@@ -270,7 +270,7 @@ namespace mongo {
         //
 
         /**
-         * Register this plan executor with the collection cursor cache so that it
+         * Register this plan executor with the collection cursor manager so that it
          * receives notifications for events that happen while yielding any locks.
          *
          * Deregistration happens automatically when this plan executor is destroyed.
@@ -367,8 +367,7 @@ namespace mongo {
          * If the tree contains plan selection stages, such as MultiPlanStage or SubplanStage,
          * this calls into their underlying plan selection facilities. Otherwise, does nothing.
          *
-         * If a YIELD_AUTO policy is set (and document-level locking is not supported), then
-         * locks are yielded during plan selection.
+         * If a YIELD_AUTO policy is set then locks are yielded during plan selection.
          */
         Status pickBestPlan(YieldPolicy policy);
 

@@ -138,6 +138,7 @@ GETTIMEOFDAY
 GIDs
 Gcc
 Geoff
+GetEnvironmentVariableA
 GetFileAttributesEx
 GetFileSizeEx
 GetLastError
@@ -224,6 +225,7 @@ Mellor
 Metadata
 Mewhort
 Mitzenmacher
+MongoDB
 MoveFile
 Multi
 Multithreaded
@@ -639,6 +641,7 @@ func
 funcs
 gcc
 gdb
+getenv
 getfiles
 getid
 getline

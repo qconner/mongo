@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -667,7 +668,8 @@ __conn_dhandle_remove(WT_SESSION_IMPL *session, int final)
 	WT_ASSERT(session, F_ISSET(session, WT_SESSION_HANDLE_LIST_LOCKED));
 
 	/* Check if the handle was reacquired by a session while we waited. */
-	if (!final && dhandle->session_ref != 0)
+	if (!final &&
+	    (dhandle->session_inuse != 0 || dhandle->session_ref != 0))
 		return (EBUSY);
 
 	WT_CONN_DHANDLE_REMOVE(conn, dhandle, bucket);
@@ -715,7 +717,7 @@ __wt_conn_dhandle_discard_single(WT_SESSION_IMPL *session, int final)
 		__wt_spin_destroy(session, &dhandle->close_lock);
 		__wt_overwrite_and_free(session, dhandle);
 
-		WT_CLEAR_BTREE_IN_SESSION(session);
+		session->dhandle = NULL;
 	}
 
 	return (ret);

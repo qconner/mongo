@@ -88,6 +88,8 @@ namespace repl {
 
         virtual MemberState getCurrentMemberState() const;
 
+        virtual bool isInPrimaryOrSecondaryState() const;
+
         virtual Seconds getSlaveDelaySecs() const;
 
         virtual void clearSyncSourceBlacklist();
@@ -278,7 +280,8 @@ namespace repl {
         enum PostMemberStateUpdateAction {
             kActionNone,
             kActionCloseAllConnections,  // Also indicates that we should clear sharding state.
-            kActionChooseNewSyncSource
+            kActionChooseNewSyncSource,
+            kActionWinElection
         };
 
         // Struct that holds information about clients waiting for replication.
@@ -497,8 +500,13 @@ namespace repl {
          * Helper method for setMyLastOptime that takes in a unique lock on
          * _mutex.  The passed in lock must already be locked.  It is unspecified what state the
          * lock will be in after this method finishes.
+         *
+         * This function has the same rules for "ts" as setMyLastOptime(), unless
+         * "isRollbackAllowed" is true.
          */
-        void _setMyLastOptime_inlock(boost::unique_lock<boost::mutex>* lock, const OpTime& ts);
+        void _setMyLastOptime_inlock(boost::unique_lock<boost::mutex>* lock,
+                                     const OpTime& ts,
+                                     bool isRollbackAllowed);
 
         /**
          * Schedules a heartbeat to be sent to "target" at "when". "targetIndex" is the index

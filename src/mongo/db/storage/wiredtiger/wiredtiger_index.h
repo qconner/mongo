@@ -78,7 +78,9 @@ namespace mongo {
          * @param unique - If this is a unique index.
          *                 Note: even if unique, it may be allowed ot be non-unique at times.
          */
-        WiredTigerIndex(const std::string& uri, const IndexDescriptor* desc);
+        WiredTigerIndex(OperationContext* ctx,
+                        const std::string& uri,
+                        const IndexDescriptor* desc);
 
         virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* txn, bool dupsAllowed);
 
@@ -94,7 +96,8 @@ namespace mongo {
 
         virtual void fullValidate(OperationContext* txn, bool full, long long *numKeysOut,
                                   BSONObjBuilder* output) const;
-
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const;
         virtual Status dupKeyCheck(OperationContext* txn, const BSONObj& key, const RecordId& loc);
 
         virtual bool isEmpty(OperationContext* txn);
@@ -144,8 +147,6 @@ namespace mongo {
 
             virtual bool pointsToSamePlaceAs(const SortedDataInterface::Cursor &genother) const;
 
-            virtual void aboutToDeleteBucket(const RecordId& bucket);
-
             virtual bool locate(const BSONObj &key, const RecordId& loc);
 
             virtual void customLocate(const BSONObj& keyBegin,
@@ -179,7 +180,7 @@ namespace mongo {
             bool _forward;
             bool _eof;
 
-            mutable int _uniquePos;
+            mutable int _uniquePos; // byte offset of start of current RecordId
             mutable int _uniqueLen;
 
             // For save/restorePosition check
@@ -196,7 +197,9 @@ namespace mongo {
 
     class WiredTigerIndexUnique : public WiredTigerIndex {
     public:
-        WiredTigerIndexUnique( const std::string& uri, const IndexDescriptor* desc );
+        WiredTigerIndexUnique( OperationContext* ctx,
+                               const std::string& uri,
+                               const IndexDescriptor* desc );
 
         virtual bool unique() const { return true; }
 
@@ -213,7 +216,9 @@ namespace mongo {
 
     class WiredTigerIndexStandard : public WiredTigerIndex {
     public:
-        WiredTigerIndexStandard( const std::string& uri, const IndexDescriptor* desc );
+        WiredTigerIndexStandard( OperationContext* ctx,
+                                 const std::string& uri,
+                                 const IndexDescriptor* desc );
 
         virtual bool unique() const { return false; }
 

@@ -46,10 +46,10 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/random.h"
-#include "mongo/server.h"
 #include "mongo/util/alignedbuilder.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/file.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
@@ -723,7 +723,7 @@ namespace mongo {
             @param uncompressed - a buffer that will be written to the journal after compression
             will not return until on disk
         */
-        void WRITETOJOURNAL(JSectHeader h, AlignedBuilder& uncompressed) {
+        void WRITETOJOURNAL(const JSectHeader& h, const AlignedBuilder& uncompressed) {
             Timer t;
             j.journal(h, uncompressed);
             stats.curr->_writeToJournalMicros += t.micros();

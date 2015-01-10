@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -141,8 +142,10 @@ __lsm_worker(void *arg)
 				ret = 0;
 			} else if (ret == EBUSY)
 				ret = 0;
-			/* Clear any state */
-			WT_CLEAR_BTREE_IN_SESSION(session);
+
+			/* Paranoia: clear session state. */
+			session->dhandle = NULL;
+
 			__wt_lsm_manager_free_work_unit(session, entry);
 			entry = NULL;
 			progress = 1;

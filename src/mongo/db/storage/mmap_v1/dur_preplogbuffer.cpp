@@ -38,7 +38,9 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
@@ -46,16 +48,14 @@
 #include "mongo/db/storage/mmap_v1/dur_journalimpl.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage_options.h"
-#include "mongo/server.h"
 #include "mongo/util/alignedbuilder.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/timer.h"
 
-using namespace mongoutils;
-
 namespace mongo {
+
     namespace dur {
 
         extern Journal j;
@@ -101,6 +101,7 @@ namespace mongo {
             verify( ofs <= 0x80000000 );
             e.ofs = (unsigned) ofs;
             e.setFileNo( mmf->fileSuffixNo() );
+
             if( mmf->relativePath() == local ) {
                 e.setLocalDbContextBit();
             }
@@ -110,10 +111,8 @@ namespace mongo {
                 bb.appendStruct(c);
                 bb.appendStr(lastDbPath.toString());
             }
+
             bb.appendStruct(e);
-#if defined(_EXPERIMENTAL)
-            i->ofsInJournalBuffer = bb.len();
-#endif
             bb.appendBuf(i->start(), e.len);
 
             if (MONGO_unlikely(e.len != (unsigned)i->length())) {
@@ -133,34 +132,34 @@ namespace mongo {
             two writes to the same location during the group commit interval, it is likely
             (although not assured) that it is journaled here once.
         */
-        static void prepBasicWrites(AlignedBuilder& bb) {
+        static void prepBasicWrites(AlignedBuilder& bb, const std::vector<WriteIntent>& intents) {
             scoped_lock lk(privateViews._mutex());
 
-            // each time events switch to a different database we journal a JDbContext
-            // switches will be rare as we sort by memory location first and we batch commit.
+            // Each time write intents switch to a different database we journal a JDbContext.
+            // Switches will be rare as we sort by memory location first and we batch commit.
             RelativePath lastDbPath;
 
-            const vector<WriteIntent>& _intents = commitJob.getIntentsSorted();
-
-            // right now the durability code assumes there is at least one write intent
-            // this does not have to be true in theory as i could just add or delete a file
-            // callers have to ensure they do at least something for now even though its ugly
-            // until this can be addressed
-            fassert( 17388, !_intents.empty() );
+            invariant(!intents.empty());
 
             WriteIntent last;
-            for( vector<WriteIntent>::const_iterator i = _intents.begin(); i != _intents.end(); i++ ) { 
+            for (std::vector<WriteIntent>::const_iterator i = intents.begin();
+                 i != intents.end();
+                 i++) {
+
                 if( i->start() < last.end() ) { 
                     // overlaps
                     last.absorb(*i);
                 }
                 else { 
                     // discontinuous
-                    if( i != _intents.begin() )
+                    if (i != intents.begin()) {
                         prepBasicWrite_inlock(bb, &last, lastDbPath);
+                    }
+
                     last = *i;
                 }
             }
+
             prepBasicWrite_inlock(bb, &last, lastDbPath);
         }
 
@@ -183,22 +182,26 @@ namespace mongo {
             resetLogBuffer(h, bb); // adds JSectHeader
 
             // ops other than basic writes (DurOp's)
-            {
-                for( vector< shared_ptr<DurOp> >::iterator i = commitJob.ops().begin(); i != commitJob.ops().end(); ++i ) {
-                    (*i)->serialize(bb);
-                }
+            const std::vector<boost::shared_ptr<DurOp> >& durOps = commitJob.ops();
+            for (std::vector<boost::shared_ptr<DurOp> >::const_iterator i = durOps.begin();
+                 i != durOps.end();
+                 i++) {
+
+                (*i)->serialize(bb);
             }
 
-            prepBasicWrites(bb);
-
-            return;
+            // Write intents
+            const std::vector<WriteIntent>& intents = commitJob.getIntentsSorted();
+            if (!intents.empty()) {
+                prepBasicWrites(bb, intents);
+            }
         }
-        void PREPLOGBUFFER(/*out*/ JSectHeader& h, AlignedBuilder& ab) {
+
+        void PREPLOGBUFFER(/*out*/ JSectHeader& outHeader, AlignedBuilder& outBuffer) {
             Timer t;
             j.assureLogFileOpen(); // so fileId is set
-            _PREPLOGBUFFER(h, ab);
+            _PREPLOGBUFFER(outHeader, outBuffer);
             stats.curr->_prepLogBufferMicros += t.micros();
         }
-
     }
 }

@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -106,7 +107,9 @@ __wt_btree_open(WT_SESSION_IMPL *session, const char *op_cfg[])
 			    session, root_addr, root_addr_size));
 
 			/* Warm the cache, if possible. */
-			WT_ERR(__btree_preload(session));
+			WT_WITH_PAGE_INDEX(session,
+			    ret = __btree_preload(session));
+			WT_ERR(ret);
 
 			/* Get the last record number in a column-store file. */
 			if (btree->type != BTREE_ROW)

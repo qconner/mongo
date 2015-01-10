@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -122,7 +123,8 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
 				    __wt_page_type_string(
 				    btree->root.page->type)));
 #endif
-			ret = __verify_tree(session, &btree->root, vs);
+			WT_WITH_PAGE_INDEX(session,
+			    ret = __verify_tree(session, &btree->root, vs));
 
 			WT_TRET(__wt_cache_op(session, NULL, WT_SYNC_DISCARD));
 		}
@@ -145,10 +147,10 @@ err:	/* Inform the underlying block manager we're done. */
 	WT_TRET(__wt_progress(session, NULL, vs->fcnt));
 
 	/* Free allocated memory. */
-	__wt_scr_free(&vs->max_key);
-	__wt_scr_free(&vs->max_addr);
-	__wt_scr_free(&vs->tmp1);
-	__wt_scr_free(&vs->tmp2);
+	__wt_scr_free(session, &vs->max_key);
+	__wt_scr_free(session, &vs->max_addr);
+	__wt_scr_free(session, &vs->tmp1);
+	__wt_scr_free(session, &vs->tmp2);
 
 	return (ret);
 }

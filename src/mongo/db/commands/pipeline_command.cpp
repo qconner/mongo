@@ -28,7 +28,8 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/smart_ptr.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 #include <vector>
 
 #include "mongo/db/auth/action_set.h"
@@ -52,6 +53,10 @@
 #include "mongo/db/storage_options.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
 
     static bool isCursorCommand(BSONObj cmdObj) {
         BSONElement cursorElem = cmdObj["cursor"];
@@ -275,9 +280,10 @@ namespace mongo {
                 if (collection) {
                     // XXX
                     const bool isAggCursor = true; // enable special locking behavior
-                    ClientCursor* cursor = new ClientCursor(collection, execHolder.release(), 0,
-                                                            BSONObj(), isAggCursor);
-                    pin.reset(new ClientCursorPin(collection, cursor->cursorid()));
+                    ClientCursor* cursor = new ClientCursor(collection->cursorManager(),
+                                                            execHolder.release(), 0, BSONObj(),
+                                                            isAggCursor);
+                    pin.reset(new ClientCursorPin(collection->cursorManager(), cursor->cursorid()));
                     // Don't add any code between here and the start of the try block.
                 }
             }
