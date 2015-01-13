@@ -30,16 +30,16 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/repl/repl_coordinator_test_fixture.h"
+#include "mongo/db/repl/replication_coordinator_test_fixture.h"
 
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/operation_context_repl_mock.h"
-#include "mongo/db/repl/repl_coordinator_external_state_mock.h"
-#include "mongo/db/repl/repl_coordinator_impl.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
+#include "mongo/db/repl/replication_coordinator_external_state_mock.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/unittest/unittest.h"
@@ -155,7 +155,7 @@ namespace {
             const BSONObj& configDoc,
             const HostAndPort& selfHost) {
         start(configDoc, selfHost);
-        ASSERT_NE(MemberState::RS_STARTUP, getReplCoord()->getCurrentMemberState().s);
+        ASSERT_NE(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
     }
 
     ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc, Milliseconds millis) {
@@ -168,10 +168,10 @@ namespace {
         ReplicationCoordinatorImpl* replCoord = getReplCoord();
         NetworkInterfaceMock* net = getNet();
         ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
-        ASSERT(replCoord->getCurrentMemberState().secondary()) <<
-            replCoord->getCurrentMemberState().toString();
-        while (!replCoord->getCurrentMemberState().primary()) {
-            log() << "Waiting on network in state " << replCoord->getCurrentMemberState();
+        ASSERT(replCoord->getMemberState().secondary()) <<
+            replCoord->getMemberState().toString();
+        while (!replCoord->getMemberState().primary()) {
+            log() << "Waiting on network in state " << replCoord->getMemberState();
             getNet()->enterNetwork();
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
             const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
@@ -209,8 +209,8 @@ namespace {
             getNet()->exitNetwork();
         }
         ASSERT(replCoord->isWaitingForApplierToDrain());
-        ASSERT(replCoord->getCurrentMemberState().primary()) <<
-            replCoord->getCurrentMemberState().toString();
+        ASSERT(replCoord->getMemberState().primary()) <<
+            replCoord->getMemberState().toString();
 
         IsMasterResponse imResponse;
         replCoord->fillIsMasterForReplSet(&imResponse);
@@ -221,18 +221,18 @@ namespace {
         ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
         ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 
-        ASSERT(replCoord->getCurrentMemberState().primary()) <<
-            replCoord->getCurrentMemberState().toString();
+        ASSERT(replCoord->getMemberState().primary()) <<
+            replCoord->getMemberState().toString();
     }
 
     void ReplCoordTest::simulateStepDownOnIsolation() {
         ReplicationCoordinatorImpl* replCoord = getReplCoord();
         NetworkInterfaceMock* net = getNet();
         ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
-        ASSERT(replCoord->getCurrentMemberState().primary()) <<
-            replCoord->getCurrentMemberState().toString();
-        while (replCoord->getCurrentMemberState().primary()) {
-            log() << "Waiting on network in state " << replCoord->getCurrentMemberState();
+        ASSERT(replCoord->getMemberState().primary()) <<
+            replCoord->getMemberState().toString();
+        while (replCoord->getMemberState().primary()) {
+            log() << "Waiting on network in state " << replCoord->getMemberState();
             getNet()->enterNetwork();
             net->runUntil(net->now() + 10000);
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();

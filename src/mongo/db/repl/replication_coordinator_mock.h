@@ -29,7 +29,7 @@
 #pragma once
 
 #include "mongo/base/status.h"
-#include "mongo/db/repl/repl_coordinator.h"
+#include "mongo/db/repl/replication_coordinator.h"
 
 namespace mongo {
 namespace repl {
@@ -56,7 +56,7 @@ namespace repl {
 
         virtual Mode getReplicationMode() const;
 
-        virtual MemberState getCurrentMemberState() const;
+        virtual MemberState getMemberState() const;
 
         virtual bool isInPrimaryOrSecondaryState() const;
 

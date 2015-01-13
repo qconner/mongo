@@ -45,7 +45,7 @@
 #include "mongo/db/index_builder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -87,7 +87,7 @@ namespace mongo {
             const std::string nsToCompact = parseNsCollectionRequired(db, cmdObj);
 
             repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
-            if (replCoord->getCurrentMemberState().primary() && !cmdObj["force"].trueValue()) {
+            if (replCoord->getMemberState().primary() && !cmdObj["force"].trueValue()) {
                 errmsg = "will not run compact on an active replica set primary as this is a slow blocking operation. use force:true to force";
                 return false;
             }

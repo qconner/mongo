@@ -70,8 +70,8 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repair_database.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
@@ -1412,7 +1412,7 @@ namespace mongo {
         if (!c->maintenanceOk()
                 && replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet
                 && !replCoord->canAcceptWritesForDatabase(dbname)
-                && !replCoord->getCurrentMemberState().secondary()) {
+                && !replCoord->getMemberState().secondary()) {
             result.append( "note" , "from execCommand" );
             appendCommandStatus(result, false, "node is recovering");
             return;

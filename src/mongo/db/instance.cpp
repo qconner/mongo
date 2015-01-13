@@ -77,7 +77,7 @@
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/atomic_word.h"
@@ -209,7 +209,7 @@ namespace mongo {
                 audit::logQueryAuthzCheck(client, ns, q.query, status.code());
                 uassertStatusOK(status);
             }
-            dbresponse.exhaustNS = runQuery(txn, m, q, op, *resp, fromDBDirectClient);
+            dbresponse.exhaustNS = runQuery(txn, m, q, ns, op, *resp, fromDBDirectClient);
             verify( !resp->empty() );
         }
         catch ( SendStaleConfigException& e ){
@@ -749,14 +749,8 @@ namespace mongo {
                 const NamespaceString nsString( ns );
                 uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
 
-                Status status = Status::OK();
-                if (CursorManager::getGlobalCursorManager()->ownsCursorId(cursorid)) {
-                    // TODO Implement auth check for global cursors.  SERVER-16657.
-                }
-                else {
-                    status = txn->getClient()->getAuthorizationSession()->checkAuthForGetMore(
-                            nsString, cursorid);
-                }
+                Status status = txn->getClient()->getAuthorizationSession()->checkAuthForGetMore(
+                    nsString, cursorid);
                 audit::logGetMoreAuthzCheck(txn->getClient(), nsString, cursorid, status.code());
                 uassertStatusOK(status);
 

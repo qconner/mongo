@@ -55,7 +55,7 @@
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
@@ -233,7 +233,7 @@ namespace {
         }
 
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        if (ns && ns[0] && !replCoord->canAcceptWritesForDatabase(nsToDatabaseSubstring(ns))) {
+        if (ns[0] && !replCoord->canAcceptWritesForDatabase(nsToDatabaseSubstring(ns))) {
             severe() << "replSet error : logOp() but can't accept write to collection " << ns;
             fassertFailed(17405);
         }

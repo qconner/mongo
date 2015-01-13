@@ -35,12 +35,12 @@
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/operation_context_repl_mock.h"
-#include "mongo/db/repl/repl_coordinator_external_state_mock.h"
-#include "mongo/db/repl/repl_coordinator_impl.h"
-#include "mongo/db/repl/repl_coordinator_test_fixture.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/replication_coordinator_external_state_mock.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 
@@ -140,8 +140,8 @@ namespace {
 
         getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY);
 
-        ASSERT(getReplCoord()->getCurrentMemberState().primary()) <<
-            getReplCoord()->getCurrentMemberState().toString();
+        ASSERT(getReplCoord()->getMemberState().primary()) <<
+            getReplCoord()->getMemberState().toString();
         ASSERT(getReplCoord()->isWaitingForApplierToDrain());
 
         // Since we're still in drain mode, expect that we report ismaster: false, issecondary:true.

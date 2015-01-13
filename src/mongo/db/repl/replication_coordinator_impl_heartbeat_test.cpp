@@ -33,12 +33,12 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/network_interface_mock.h"
-#include "mongo/db/repl/repl_coordinator_external_state_mock.h"
-#include "mongo/db/repl/repl_coordinator_impl.h"
-#include "mongo/db/repl/repl_coordinator_test_fixture.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/replication_coordinator_external_state_mock.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
@@ -57,7 +57,7 @@ namespace {
     };
 
     void ReplCoordHBTest::assertMemberState(const MemberState expected, std::string msg) {
-        const MemberState actual = getReplCoord()->getCurrentMemberState();
+        const MemberState actual = getReplCoord()->getMemberState();
         ASSERT(expected == actual) << "Expected coordinator to report state " <<
             expected.toString() << " but found " << actual.toString() << " - " << msg;
     }
