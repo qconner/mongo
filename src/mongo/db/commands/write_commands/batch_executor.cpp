@@ -75,6 +75,10 @@
 namespace mongo {
 
     using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     namespace {
 
@@ -641,8 +645,8 @@ namespace mongo {
             LOG(0) << currentOp->debug().report( *currentOp ) << endl;
         }
 
-        if ( currentOp->shouldDBProfile( executionTime ) ) {
-            profile( txn, *txn->getClient(), currentOp->getOp(), *currentOp );
+        if (currentOp->shouldDBProfile(executionTime)) {
+            profile(txn, txn->getCurOp()->getOp());
         }
     }
 

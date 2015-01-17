@@ -41,6 +41,9 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using std::string;
+
 namespace {
 
     /**
@@ -105,7 +108,7 @@ namespace {
     static const char* ResourceTypeNames[] = {
         "Invalid",
         "Global",
-        "MMAPV1Flush",
+        "MMAPV1Journal",
         "Database",
         "Collection",
         "Metadata",

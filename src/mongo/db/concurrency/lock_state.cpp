@@ -32,9 +32,10 @@
 
 #include "mongo/db/concurrency/lock_state.h"
 
-#include "mongo/db/concurrency/lock_stats.h"
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -65,28 +66,41 @@ namespace {
             stats.recordWaitTime(resId, mode, waitMicros);
         }
 
+        void recordDeadlock(ResourceId resId, LockMode mode) {
+            LockStats& stats = _get(resId);
+            stats.recordDeadlock(resId, mode);
+        }
+
         void report(LockStats* outStats) const {
             for (int i = 0; i < NumPartitions; i++) {
-                outStats->append(_partitions[i]);
+                outStats->append(_partitions[i].stats);
             }
         }
 
         void reset() {
             for (int i = 0; i < NumPartitions; i++) {
-                _partitions[i].reset();
+                _partitions[i].stats.reset();
             }
         }
 
     private:
 
+        // This alignment is a best effort approach to ensure that each partition falls on a
+        // separate page/cache line in order to avoid false sharing. The 4096-byte alignment is
+        // in an effort to play nicely with NUMA.
+        struct MONGO_COMPILER_ALIGN_TYPE(4096) AlignedLockStats {
+            LockStats stats;
+        };
+
         enum { NumPartitions = 8 };
 
+
         LockStats& _get(LockerId id) {
-            return _partitions[id % NumPartitions];
+            return _partitions[id % NumPartitions].stats;
         }
 
 
-        LockStats _partitions[NumPartitions];
+        AlignedLockStats _partitions[NumPartitions];
     };
 
 
@@ -320,6 +334,8 @@ namespace {
         if (globalLockRequest->recursiveCount == 1) {
             invariant(LOCK_OK == lock(resourceIdMMAPV1Flush, _getModeForMMAPV1FlushLock()));
         }
+
+        dassert(getLockMode(resourceIdMMAPV1Flush) == _getModeForMMAPV1FlushLock());
     }
 
     template<bool IsForMMAPV1>
@@ -355,6 +371,10 @@ namespace {
 
     template<bool IsForMMAPV1>
     void LockerImpl<IsForMMAPV1>::beginWriteUnitOfWork() {
+        // Sanity check that write transactions under MMAP V1 have acquired the flush lock, so we
+        // don't allow partial changes to be written.
+        dassert(!IsForMMAPV1 || isLockHeldForMode(resourceIdMMAPV1Flush, MODE_IX));
+
         _wuowNestingLevel++;
     }
 
@@ -499,6 +519,7 @@ namespace {
         // Zero-out the contents
         lockerInfo->locks.clear();
         lockerInfo->waitingResource = ResourceId();
+        lockerInfo->stats.reset();
 
         if (!isLocked()) return;
 
@@ -517,6 +538,7 @@ namespace {
         std::sort(lockerInfo->locks.begin(), lockerInfo->locks.end(), SortByGranularity());
 
         lockerInfo->waitingResource = getWaitingResource();
+        lockerInfo->stats.append(_stats);
     }
 
     template<bool IsForMMAPV1>
@@ -615,6 +637,7 @@ namespace {
 
         // Making this call here will record lock re-acquisitions and conversions as well.
         globalStats.recordAcquisition(_id, resId, mode);
+        _stats.recordAcquisition(resId, mode);
 
         // Give priority to the full modes for global and flush lock so we don't stall global
         // operations such as shutdown or flush.
@@ -625,8 +648,17 @@ namespace {
             }
         }
         else {
-            // The global lock must always be acquired first
-            invariant(getLockMode(resourceIdGlobal) != MODE_NONE);
+            // This is all sanity checks that the global and flush locks are always be acquired
+            // before any other lock has been acquired and they must be in sync with the nesting.
+            DEV {
+                const LockRequestsMap::Iterator itGlobal = _requests.find(resourceIdGlobal);
+                invariant(itGlobal->recursiveCount > 0);
+                invariant(itGlobal->mode != MODE_NONE);
+
+                // Check the MMAP V1 flush lock is held in the appropriate mode
+                invariant(!IsForMMAPV1 || isLockHeldForMode(resourceIdMMAPV1Flush,
+                                                            _getModeForMMAPV1FlushLock()));
+            };
         }
 
         // The notification object must be cleared before we invoke the lock manager, because
@@ -640,6 +672,7 @@ namespace {
             // Start counting the wait time so that lockComplete can update that metric
             _requestStartTime = curTimeMicros64();
             globalStats.recordWait(_id, resId, mode);
+            _stats.recordWait(resId, mode);
         }
 
         return result;
@@ -668,11 +701,14 @@ namespace {
         // deadlock detection.
         unsigned waitTimeMs = std::min(timeoutMs, DeadlockTimeoutMs);
         while (true) {
+            // It is OK if this call wakes up spuriously, because we re-evaluate the remaining
+            // wait time anyways.
             result = _notify.wait(waitTimeMs);
 
             // Account for the time spent waiting on the notification object
             const uint64_t elapsedTimeMicros = curTimeMicros64() - _requestStartTime;
             globalStats.recordWaitTime(_id, resId, mode, elapsedTimeMicros);
+            _stats.recordWaitTime(resId, mode, elapsedTimeMicros);
 
             if (result == LOCK_OK) break;
 
@@ -681,10 +717,16 @@ namespace {
                 if (wfg.check().hasCycle()) {
                     warning() << "Deadlock found: " << wfg.toString();
 
+                    globalStats.recordDeadlock(resId, mode);
+                    _stats.recordDeadlock(resId, mode);
+
                     result = LOCK_DEADLOCK;
                     break;
                 }
             }
+
+            // If infinite timeout was requested, just keep waiting
+            if (timeoutMs == UINT_MAX) continue;
 
             const unsigned elapsedTimeMs = elapsedTimeMicros / 1000;
             waitTimeMs = (elapsedTimeMs < timeoutMs) ?

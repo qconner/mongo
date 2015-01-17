@@ -1,5 +1,3 @@
-// rocks_engine.h
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -97,6 +95,10 @@ namespace mongo {
 
         virtual bool supportsDocLocking() const override {
             return true;
+        }
+
+        virtual bool supportsDirectoryPerDB() const override {
+            return false;
         }
 
         virtual bool isDurable() const override { return _durable; }

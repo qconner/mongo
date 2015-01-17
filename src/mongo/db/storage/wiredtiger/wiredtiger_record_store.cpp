@@ -59,6 +59,7 @@
 namespace mongo {
 
     using boost::scoped_ptr;
+    using std::string;
 
 namespace {
     static const int kMinimumRecordStoreVersion = 1;
@@ -91,7 +92,12 @@ namespace {
         // override values in the prefix, but not values in the suffix.
         str::stream ss;
         ss << "type=file,";
-        ss << "memory_page_max=100m,";
+        // Setting this larger than 10m can hurt latencies and throughput degradation if this
+        // is the oplog.  See SERVER-16247
+        ss << "memory_page_max=10m,";
+        // Choose a higher split percent, since most usage is append only. Allow some space
+        // for workloads where updates increase the size of documents.
+        ss << "split_pct=90,";
         ss << "leaf_value_max=1MB,";
         if (wiredTigerGlobalOptions.useCollectionPrefixCompression) {
             ss << "prefix_compression,";
@@ -397,6 +403,7 @@ namespace {
             RecordId oldest;
             int ret = 0;
             while (( sizeSaved < sizeOverCap || docsRemoved < docsOverCap ) &&
+                   docsRemoved < 250 &&
                    (ret = c->next(c)) == 0 ) {
                 int64_t key;
                 ret = c->get_key(c, &key);
@@ -763,14 +770,6 @@ namespace {
 
     }
 
-    Status WiredTigerRecordStore::touch( OperationContext* txn, BSONObjBuilder* output ) const {
-        if (output) {
-            output->append("numRanges", 1);
-            output->append("millis", 0);
-        }
-        return Status::OK();
-    }
-
     Status WiredTigerRecordStore::setCustomOption( OperationContext* txn,
                                                    const BSONElement& option,
                                                    BSONObjBuilder* info ) {
@@ -856,6 +855,14 @@ namespace {
         ret = c->get_key(c, &key);
         invariantWTOK(ret);
         return _fromKey(key);
+    }
+
+    void WiredTigerRecordStore::updateStatsAfterRepair(OperationContext* txn,
+                                                       long long numRecords,
+                                                       long long dataSize) {
+        _numRecords.store(numRecords);
+        _dataSize.store(dataSize);
+        _sizeStorer->store(_uri, numRecords, dataSize);
     }
 
     RecordId WiredTigerRecordStore::_nextId() {
@@ -1117,6 +1124,9 @@ namespace {
 
         invariant( _savedRecoveryUnit == txn->recoveryUnit() );
         if ( needRestore || !wt_keeptxnopen() ) {
+            // This will ensure an active session exists, so any restored cursors will bind to it
+            invariant(WiredTigerRecoveryUnit::get(txn)->getSession() == _cursor->getSession());
+
             RecordId saved = _lastLoc;
             _locate(_lastLoc, false);
             RS_ITERATOR_TRACE( "isEOF check " << _eof );
