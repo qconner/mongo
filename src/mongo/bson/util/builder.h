@@ -184,13 +184,7 @@ namespace mongo {
         }
 
         // Bool does not have a well defined encoding.
-#if __cplusplus >= 201103L
         void appendNum(bool j) = delete;
-#else
-        void appendNum(bool j) {
-            invariant(false);
-        }
-#endif
 
         void appendNum(double j) {
             BOOST_STATIC_ASSERT(sizeof(double) == 8);
@@ -213,7 +207,7 @@ namespace mongo {
             appendBuf(&s, sizeof(T));
         }
 
-        void appendStr(const StringData &str , bool includeEndingNull = true ) {
+        void appendStr(StringData str , bool includeEndingNull = true ) {
             const int len = str.size() + ( includeEndingNull ? 1 : 0 );
             str.copyTo( grow(len), includeEndingNull );
         }
@@ -343,7 +337,7 @@ namespace mongo {
         StringBuilderImpl& operator<<(const char* str) {
             return *this << StringData(str);
         }
-        StringBuilderImpl& operator<<(const StringData& str) {
+        StringBuilderImpl& operator<<(StringData str) {
             append(str);
             return *this;
         }
@@ -363,7 +357,7 @@ namespace mongo {
 
         void write( const char* buf, int len) { memcpy( _buf.grow( len ) , buf , len ); }
 
-        void append( const StringData& str ) { str.copyTo( _buf.grow( str.size() ), false ); }
+        void append( StringData str ) { str.copyTo( _buf.grow( str.size() ), false ); }
 
         void reset( int maxSize = 0 ) { _buf.reset( maxSize ); }
 

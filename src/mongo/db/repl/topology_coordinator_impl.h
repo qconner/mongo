@@ -129,8 +129,9 @@ namespace repl {
         virtual HostAndPort chooseNewSyncSource(Date_t now, 
                                                 const OpTime& lastOpApplied);
         virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
+        virtual void unblacklistSyncSource(const HostAndPort& host, Date_t now);
         virtual void clearSyncSourceBlacklist();
-        virtual bool shouldChangeSyncSource(const HostAndPort& currentSource) const;
+        virtual bool shouldChangeSyncSource(const HostAndPort& currentSource, Date_t now) const;
         virtual bool becomeCandidateIfStepdownPeriodOverAndSingleNodeSet(Date_t now);
         virtual void setElectionSleepUntil(Date_t newTime);
         virtual void setFollowerMode(MemberState::MS newMode);
@@ -250,7 +251,8 @@ namespace repl {
         // Sees if a majority number of votes are held by members who are currently "up"
         bool _aMajoritySeemsToBeUp() const;
 
-        // Is otherOpTime close enough to the latest known optime to qualify for an election
+        // Is otherOpTime close enough (within 10 seconds) to the latest known optime to qualify
+        // for an election
         bool _isOpTimeCloseEnoughToLatestToElect(const OpTime& otherOpTime,
                                                  const OpTime& ourLastOpApplied) const;
 
@@ -290,6 +292,7 @@ namespace repl {
          */
         HeartbeatResponseAction _updateHeartbeatDataImpl(
                 int updatedConfigIndex,
+                const MemberState& originalState,
                 Date_t now,
                 const OpTime& lastOpApplied);
 
@@ -310,10 +313,10 @@ namespace repl {
         /**
          * Looks up the provided member in the blacklist and returns true if the member's blacklist
          * expire time is after 'now'.  If the member is found but the expire time is before 'now',
-         * the member is removed from _syncSourceBlacklist and the function returns false.
-         * If the member is not found in the blacklist, the function simply returns false.
+         * the function returns false.  If the member is not found in the blacklist, the function
+         * returns false.
          **/
-        bool _memberIsBlacklisted(const MemberConfig& memberConfig, Date_t now);
+        bool _memberIsBlacklisted(const MemberConfig& memberConfig, Date_t now) const;
 
         // This node's role in the replication protocol.
         Role _role;

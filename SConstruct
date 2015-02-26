@@ -19,6 +19,7 @@ import datetime
 import imp
 import os
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -213,8 +214,8 @@ add_option( "cc", "compiler to use for c" , 1 , True )
 add_option( "cc-use-shell-environment", "use $CC from shell for C compiler" , 0 , False )
 add_option( "cxx-use-shell-environment", "use $CXX from shell for C++ compiler" , 0 , False )
 add_option( "ld", "linker to use" , 1 , True )
-add_option( "c++11", "enable c++11 support (experimental)", "?", True,
-            type="choice", choices=["on", "off", "auto"], const="on", default="auto" )
+add_option( "c++11", "enable c++11 support", "?", True,
+            type="choice", choices=["on", "off", "auto"], const="on", default="on" )
 add_option( "disable-minimum-compiler-version-enforcement",
             "allow use of unsupported older compilers (NEVER for production builds)",
             0, False )
@@ -238,6 +239,8 @@ add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
 js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
 add_option( "js-engine", "JavaScript scripting engine implementation", 1, False,
            type='choice', default=js_engine_choices[0], choices=js_engine_choices)
+add_option( "server-js", "Build mongod without JavaScript support", 1, False,
+           type='choice', choices=["on", "off"], const="on", default="on")
 add_option( "libc++", "use libc++ (experimental, requires clang)", 0, True )
 
 add_option( "use-glibcxx-debug",
@@ -267,7 +270,6 @@ add_option( "llvm-symbolizer", "name of (or path to) the LLVM symbolizer", 1, Fa
 add_option( "durableDefaultOn" , "have durable default to on" , 0 , True )
 add_option( "durableDefaultOff" , "have durable default to off" , 0 , True )
 
-add_option( "pch" , "use precompiled headers to speed up the build (experimental)" , 0 , True , "usePCH" )
 add_option( "distcc" , "use distcc for distributing builds" , 0 , False )
 
 # debugging/profiling help
@@ -295,7 +297,11 @@ add_option( "use-system-wiredtiger", "use system version of wiredtiger library",
 # library choices
 boost_choices = ['1.49', '1.56']
 add_option( "internal-boost", "Specify internal boost version to use", 1, True,
-           type='choice', default=boost_choices[0], choices=boost_choices)
+           type='choice', default=boost_choices[1], choices=boost_choices)
+
+add_option( "system-boost-lib-search-suffixes",
+            "Comma delimited sequence of boost library suffixes to search",
+            1, False )
 
 add_option( "use-system-boost", "use system version of boost libraries", 0, True )
 
@@ -327,10 +333,11 @@ add_option('propagate-shell-environment',
            "Pass shell environment to sub-processes (NEVER for production builds)",
            0, False)
 
+add_option('variables-help',
+           "Print the help text for SCons variables", 0, False)
+
 if darwin:
-    osx_version_choices = ['10.7', '10.8', '10.9', '10.10']
-    add_option("osx-version-min", "minimum OS X version to support", 1, True,
-               type = 'choice', default = osx_version_choices[0], choices = osx_version_choices)
+    add_option("osx-version-min", "minimum OS X version to support", 1, True)
 
 elif windows:
     win_version_min_choices = {
@@ -367,11 +374,73 @@ add_option('cache-dir',
            "Specify the directory to use for caching objects if --cache is in use",
            1, False, default="$BUILD_ROOT/scons/cache")
 
+# Setup the command-line variables
+def variable_shlex_converter(val):
+    return shlex.split(val)
+
+env_vars = Variables()
+
+env_vars.Add('ARFLAGS',
+    help='Sets flags for the archiver',
+    converter=variable_shlex_converter)
+
+env_vars.Add('CCFLAGS',
+    help='Sets flags for the C and C++ compiler',
+    converter=variable_shlex_converter)
+
+env_vars.Add('CFLAGS',
+    help='Sets flags for the C compiler',
+    converter=variable_shlex_converter)
+
+env_vars.Add('CPPDEFINES',
+    help='Sets pre-processor definitions for C and C++',
+    converter=variable_shlex_converter)
+
+env_vars.Add('CPPPATH',
+    help='Adds paths to the preprocessor search path',
+    converter=variable_shlex_converter)
+
+env_vars.Add('CXXFLAGS',
+    help='Sets flags for the C++ compiler',
+    converter=variable_shlex_converter)
+
+env_vars.Add('LIBPATH',
+    help='Adds paths to the linker search path',
+    converter=variable_shlex_converter)
+
+env_vars.Add('LIBS',
+    help='Adds extra libraries to link against',
+    converter=variable_shlex_converter)
+
+env_vars.Add('LINKFLAGS',
+    help='Sets flags for the linker',
+    converter=variable_shlex_converter)
+
+env_vars.Add('SHCCFLAGS',
+    help='Sets flags for the C and C++ compiler when building shared libraries',
+    converter=variable_shlex_converter)
+
+env_vars.Add('SHCFLAGS',
+    help='Sets flags for the C compiler when building shared libraries',
+    converter=variable_shlex_converter)
+
+env_vars.Add('SHCXXFLAGS',
+    help='Sets flags for the C++ compiler when building shared libraries',
+    converter=variable_shlex_converter)
+
+env_vars.Add('SHLINKFLAGS',
+    help='Sets flags for the linker when building shared libraries',
+    converter=variable_shlex_converter)
+
 # don't run configure if user calls --help
 if GetOption('help'):
     Return()
 
 # --- environment setup ---
+
+if get_option("c++11") != "on":
+    print("MongoDB requires C++11 to build")
+    Exit(1)
 
 # If the user isn't using the # to indicate top-of-tree or $ to expand a variable, forbid
 # relative paths. Relative paths don't really work as expected, because they end up relative to
@@ -451,12 +520,15 @@ noshell = has_option( "noshell" )
 
 jsEngine = get_option( "js-engine")
 
+serverJs = get_option( "server-js" ) == "on"
+
 usev8 = (jsEngine != 'none')
 
 v8version = jsEngine[3:] if jsEngine.startswith('v8-') else 'none'
 v8suffix = '' if v8version == '3.12' else '-' + v8version
 
-usePCH = has_option( "usePCH" )
+if not serverJs and not usev8:
+    print("Warning: --server-js=off is not needed with --js-engine=none")
 
 # The Scons 'default' tool enables a lot of tools that we don't actually need to enable.
 # On platforms like Solaris, it actually does the wrong thing by enabling the sunstudio
@@ -477,7 +549,7 @@ def decide_platform_tools():
     else:
         return ["default"]
 
-tools = decide_platform_tools() + ["gch", "jsheader", "mergelib", "mongo_unittest", "textfile"]
+tools = decide_platform_tools() + ["jsheader", "mergelib", "mongo_unittest", "textfile"]
 
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
@@ -541,8 +613,37 @@ if windows:
             msvc_script = None
         envDict['MSVC_USE_SCRIPT'] = msvc_script
 
-env = Environment(**envDict)
+env = Environment(variables=env_vars, **envDict)
 del envDict
+
+if has_option('variables-help'):
+    print env_vars.GenerateHelpText(env)
+    Exit(0)
+
+unknown_vars = env_vars.UnknownVariables()
+if unknown_vars:
+    print "Unknown variables specified: {0}".format(", ".join(unknown_vars.keys()))
+    Exit(1)
+
+
+# Add any scons options that conflict with scons variables here.
+# The first item in each tuple is the option name and the second
+# is the variable name
+variable_conflicts = [
+    ('libpath', 'LIBPATH'),
+    ('cpppath', 'CPPPATH'),
+    ('extrapath', 'CPPPATH'),
+    ('extrapathdyn', 'CPPPATH'),
+    ('extrapath', 'LIBPATH'),
+    ('extrapathdyn', 'LIBPATH'),
+    ('extralib', 'LIBS')
+]
+
+for (opt_name, var_name) in variable_conflicts:
+    if has_option(opt_name) and var_name in env:
+        print("Both option \"--{0}\" and variable {1} were specified".
+            format(opt_name, var_name))
+        Exit(1)
 
 if has_option("cache"):
     EnsureSConsVersion( 2, 3, 0 )
@@ -663,8 +764,6 @@ elif env['PYSYSPLATFORM'].startswith('sunos'):
     env['RELOBJ_LIBDEPS_START'] = '-z allextract'
     env['RELOBJ_LIBDEPS_END'] = '-z defaultextract'
     env['RELOBJ_LIBDEPS_ITEM'] = ''
-
-env["LIBPATH"] = []
 
 if has_option( "libpath" ):
     env["LIBPATH"] = [get_option( "libpath" )]
@@ -1015,6 +1114,21 @@ if not windows:
         keyfile = "jstests/libs/key%s" % keysuffix
         os.chmod( keyfile , stat.S_IWUSR|stat.S_IRUSR )
 
+# boostSuffixList is used when using system boost to select a search sequence
+# for boost libraries.
+boostSuffixList = ["-mt", ""]
+if get_option("system-boost-lib-search-suffixes") is not None:
+    if not use_system_version_of_library("boost"):
+        print("The --system-boost-lib-search-suffixes option is only valid with --use-system-boost")
+        Exit(1)
+    boostSuffixList = get_option("system-boost-lib-search-suffixes")
+    if boostSuffixList == "":
+        boostSuffixList = []
+    else:
+        boostSuffixList = boostSuffixList.split(',')
+
+# boostSuffix is used when using internal boost to select which version
+# of boost is in play.
 boostSuffix = "";
 if not use_system_version_of_library("boost"):
     if get_option( "internal-boost") != "1.49":
@@ -1303,22 +1417,6 @@ def doConfigure(myenv):
             wiredtiger = False
     conf.Finish()
 
-    # Enable PCH if we are on using gcc or clang and the 'Gch' tool is enabled. Otherwise,
-    # remove any pre-compiled header since the compiler may try to use it if it exists.
-    if usePCH and (using_gcc() or using_clang()):
-        if 'Gch' in dir( myenv ):
-            if using_clang():
-                # clang++ uses pch.h.pch rather than pch.h.gch
-                myenv['GCHSUFFIX'] = '.pch'
-                # clang++ only uses pch from command line
-                myenv.Prepend( CXXFLAGS=['-include pch.h'] )
-            myenv['Gch'] = myenv.Gch( "$BUILD_DIR/mongo/pch.h$GCHSUFFIX",
-                                        "src/mongo/pch.h" )[0]
-            myenv['GchSh'] = myenv[ 'Gch' ]
-    elif os.path.exists( myenv.File("$BUILD_DIR/mongo/pch.h$GCHSUFFIX").abspath ):
-        print( "removing precompiled headers" )
-        os.unlink( myenv.File("$BUILD_DIR/mongo/pch.h.$GCHSUFFIX").abspath )
-
     def AddFlagIfSupported(env, tool, extension, flag, **mutation):
         def CheckFlagTest(context, tool, extension, flag):
             test_body = ""
@@ -1476,26 +1574,65 @@ def doConfigure(myenv):
         usingLibStdCxx = conf.CheckLibStdCxx()
         conf.Finish()
 
-    # Check to see if we are trying to use an elderly libstdc++, which we arbitrarily define as
-    # 4.6.0. This is primarly to help people using clang in C++11 mode on OS X but forgetting
-    # to use --libc++. We also use it to decide if we trust the libstdc++ debug mode. We would,
-    # ideally, check the __GLIBCXX__ version, but for various reasons this is not
-    # workable. Instead, we switch on the fact that _GLIBCXX_BEGIN_NAMESPACE_VERSION wasn't
-    # introduced until libstdc++ 4.6.0.
+    if not using_msvc():
+        if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
+            print( 'Compiler does not honor -std=c++11' )
+            Exit(1)
+        if not AddToCFLAGSIfSupported(myenv, '-std=c99'):
+            print( "C++11 mode selected for C++ files, but can't enable C99 for C files" )
+            Exit(1)
 
-    haveGoodLibStdCxx = False
+    if using_system_version_of_cxx_libraries():
+        print( 'WARNING: System versions of C++ libraries must be compiled with C++11 support' )
+
+    # We appear to have C++11, or at least a flag to enable it. Check that the declared C++
+    # language level is not less than C++11, and that we can at least compile an 'auto'
+    # expression. We don't check the __cplusplus macro when using MSVC because as of our
+    # current required MS compiler version (MSVS 2013 Update 2), they don't set it. If
+    # MSFT ever decides (in MSVS 2015?) to define __cplusplus >= 201103L, remove the exception
+    # here for _MSC_VER
+    def CheckCxx11(context):
+        test_body = """
+        #ifndef _MSC_VER
+        #if __cplusplus < 201103L
+        #error
+        #endif
+        #endif
+        auto not_an_empty_file = 0;
+        """
+
+        context.Message('Checking for C++11... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+        context.Result(ret)
+        return ret
+
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckCxx11' : CheckCxx11,
+    })
+
+    if not conf.CheckCxx11():
+        print( 'C++11 support is required to build MongoDB')
+        Exit(1)
+
+    conf.Finish()
+
+    # If we are using libstdc++, check to see if we are using a libstdc++ that is older than
+    # our GCC minimum of 4.8.2. This is primarly to help people using clang on OS X but
+    # forgetting to use --libc++ (or set the target OS X version high enough to get it as the
+    # default). We would, ideally, check the __GLIBCXX__ version, but for various reasons this
+    # is not workable. Instead, we switch on the fact that _GLIBCXX_PROFILE_UNORDERED wasn't
+    # introduced until libstdc++ 4.8.2. Yes, this is a terrible hack.
     if usingLibStdCxx:
-
         def CheckModernLibStdCxx(context):
-
             test_body = """
-            #include <vector>
-            #if !defined(_GLIBCXX_BEGIN_NAMESPACE_VERSION)
-            #error libstdcxx older than 4.6.0
+            #define _GLIBCXX_PROFILE
+            #include <unordered_map>
+            #if !defined(_GLIBCXX_PROFILE_UNORDERED)
+            #error libstdc++ older than 4.8.2
             #endif
             """
 
-            context.Message('Checking for libstdc++ 4.6.0 or better... ')
+            context.Message('Checking for libstdc++ 4.8.2 or better... ')
             ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
             context.Result(ret)
             return ret
@@ -1503,111 +1640,23 @@ def doConfigure(myenv):
         conf = Configure(myenv, help=False, custom_tests = {
             'CheckModernLibStdCxx' : CheckModernLibStdCxx,
         })
-        haveGoodLibStdCxx = conf.CheckModernLibStdCxx()
+
+        if not conf.CheckModernLibStdCxx():
+            print("When using libstdc++, MongoDB requires libstdc++ 4.8.2 or newer")
+            Exit(1)
+
         conf.Finish()
-
-    # Sort out whether we can and should use C++11:
-    cxx11_mode = get_option("c++11")
-
-    if using_msvc():
-        if cxx11_mode == "off":
-            print( 'WARNING: Cannot disable C++11 features when using MSVC' )
-    else:
-
-        # In C++11 'auto' mode, don't use C++11 if we are linking against any system C++ libs.
-        if cxx11_mode == "auto" and using_system_version_of_cxx_libraries():
-            cxx11_mode = "off"
-
-        # If we are using libstdc++, only allow C++11 mode with our line-in-the-sand good
-        # libstdc++. As always, if in auto mode fall back to disabling if we don't have a good
-        # libstdc++, otherwise fail the build because we can't honor the explicit request.
-        if cxx11_mode != "off" and usingLibStdCxx:
-            if not haveGoodLibStdCxx:
-                if cxx11_mode == "auto":
-                    cxx11_mode = "off"
-                else:
-                    print( 'Detected libstdc++ is too old to support C++11 mode' )
-                    if darwin:
-                        print( 'Try building with --libc++ and --osx-version-min=10.7 or higher' )
-                    Exit(1)
-
-        # We are going to be adding flags to the environment, but we don't want to persist
-        # those changes unless we pass all the below checks. Make a copy of the environment
-        # that we will modify, we will only "commit" the changes to the env if we pass all the
-        # checks.
-        cxx11Env = myenv.Clone()
-
-        # For our other compilers (gcc and clang) we need to pass -std=c++0x or -std=c++11,
-        # but we prefer the latter. Try that first, and fall back to c++0x if we don't
-        # detect that --std=c++11 works. If we can't find a flag and C++11 was explicitly
-        # requested, error out, otherwise turn off C++11 support in auto mode.
-        if cxx11_mode != "off":
-            if not AddToCXXFLAGSIfSupported(cxx11Env, '-std=c++11'):
-                if not AddToCXXFLAGSIfSupported(cxx11Env, '-std=c++0x'):
-                    if cxx11_mode == "auto":
-                        cxx11_mode = "off"
-                    else:
-                        print( 'C++11 mode requested, but cannot find a flag to enable it' )
-                        Exit(1)
-
-        # We appear to have C++11, or at least a flag to enable it, which is now set in the
-        # environment. If we are in auto mode, check if the compiler claims that it strictly
-        # supports C++11, and disable C++11 if not. If the user has explicitly requested C++11,
-        # we don't care about what the compiler claims to support, trust the user.
-        if cxx11_mode == "auto":
-            def CheckCxx11Official(context):
-                test_body = """
-                #if __cplusplus < 201103L
-                #error
-                #endif
-                const int not_an_empty_file = 0;
-                """
-
-                context.Message('Checking if __cplusplus >= 201103L to auto-enable C++11... ')
-                ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
-                context.Result(ret)
-                return ret
-
-            conf = Configure(cxx11Env, help=False, custom_tests = {
-                'CheckCxx11Official' : CheckCxx11Official,
-            })
-
-            if cxx11_mode == "auto" and not conf.CheckCxx11Official():
-                cxx11_mode = "off"
-
-            conf.Finish()
-
-        # We require c99 mode for C files when C++11 is enabled, so perform the same dance
-        # as above: if C++11 mode is not off, try the flag, if we are in auto mode and we fail
-        # then turn off C++11, otherwise C++11 was explicitly requested and we should error out.
-        if cxx11_mode != "off":
-            if not AddToCFLAGSIfSupported(cxx11Env, '-std=c99'):
-                if cxx11_mode == "auto":
-                    cxx11_mode = "off"
-                else:
-                    print( "C++11 mode selected for C++ files, but can't enable C99 for C files" )
-                    Exit(1)
-
-        # If we got here and cxx11_mode hasn't become false, then its true, so swap in the
-        # modified environment.
-        if cxx11_mode != "off":
-            cxx11_mode = "on"
-            myenv = cxx11Env
-
-    # rocksdb requires C++11 mode
-    if has_option("rocksdb") and cxx11_mode == "off":
-        print("--rocksdb requires C++11 mode to be enabled");
-        Exit(1)
 
     if has_option("use-glibcxx-debug"):
         # If we are using a modern libstdc++ and this is a debug build and we control all C++
         # dependencies, then turn on the debugging features in libstdc++.
+        # TODO: Need a new check here.
         if not debugBuild:
             print("--use-glibcxx-debug requires --dbg=on")
             Exit(1)
-        if not usingLibStdCxx or not haveGoodLibStdCxx:
+        if not usingLibStdCxx:
             print("--use-glibcxx-debug is only compatible with the GNU implementation of the "
-                  "C++ standard libary, and requires minimum version 4.6")
+                  "C++ standard libary")
             Exit(1)
         if using_system_version_of_cxx_libraries():
             print("--use-glibcxx-debug not compatible with system versions of C++ libraries.")
@@ -1848,61 +1897,6 @@ def doConfigure(myenv):
         if haveUUThread:
             myenv.Append(CPPDEFINES=['MONGO_HAVE___THREAD'])
 
-    def CheckCXX11Atomics(context):
-        test_body = """
-        #include <atomic>
-        int main(int argc, char **argv) {
-            std::atomic<int> a(0);
-            return a.fetch_add(1);
-        }
-        """
-        context.Message('Checking for C++11 <atomic> support... ')
-        ret = context.TryLink(textwrap.dedent(test_body), '.cpp')
-        context.Result(ret)
-        return ret;
-
-    def CheckGCCAtomicBuiltins(context):
-        test_body = """
-        int main(int argc, char **argv) {
-            int a = 0;
-            int b = 0;
-            int c = 0;
-
-            __atomic_compare_exchange(&a, &b, &c, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-            return 0;
-        }
-        """
-        context.Message('Checking for gcc __atomic builtins... ')
-        ret = context.TryLink(textwrap.dedent(test_body), '.cpp')
-        context.Result(ret)
-        return ret
-
-    def CheckGCCSyncBuiltins(context):
-        test_body = """
-        int main(int argc, char **argv) {
-            int a = 0;
-            return __sync_fetch_and_add(&a, 1);
-        }
-
-        //
-        // Figure out if we are using gcc older than 4.2 to target 32-bit x86. If so, error out
-        // even if we were able to compile the __sync statement, due to
-        // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=40693
-        //
-        #if defined(__i386__)
-        #if !defined(__clang__)
-        #if defined(__GNUC__) && (__GNUC__ == 4) && (__GNUC_MINOR__ < 2)
-        #error "Refusing to use __sync in 32-bit mode with gcc older than 4.2"
-        #endif
-        #endif
-        #endif
-        """
-
-        context.Message('Checking for useable __sync builtins... ')
-        ret = context.TryLink(textwrap.dedent(test_body), '.cpp')
-        context.Result(ret)
-        return ret
-
     # not all C++11-enabled gcc versions have type properties
     def CheckCXX11IsTriviallyCopyable(context):
         test_body = """
@@ -1934,47 +1928,33 @@ def doConfigure(myenv):
         context.Result(ret)
         return ret
 
+    # Some GCC's don't have std::is_trivially_copyable
     conf = Configure(myenv, help=False, custom_tests = {
-        'CheckCXX11Atomics': CheckCXX11Atomics,
-        'CheckGCCAtomicBuiltins': CheckGCCAtomicBuiltins,
-        'CheckGCCSyncBuiltins': CheckGCCSyncBuiltins,
         'CheckCXX11IsTriviallyCopyable': CheckCXX11IsTriviallyCopyable,
     })
 
-    # Figure out what atomics mode to use by way of the tests defined above.
-    #
-    # Non_windows: <atomic> > __atomic > __sync
-    # Windows: <atomic> > Interlocked functions / intrinsics.
-    #
-    # If we are in C++11 mode, try to use <atomic>. This is unusual for us, as typically we
-    # only use __cplusplus >= 201103L to decide if we want to enable a feature. We make a
-    # special case for the atomics and use them on platforms that offer them even if they don't
-    # advertise full conformance. For MSVC systems, if we don't have <atomic> then no more
-    # checks are required. Otherwise, we are on a GCC/clang system, where we may have __atomic
-    # or __sync, so try those in that order next.
-    #
-    # If we don't end up defining a MONGO_HAVE for the atomics, we will end up falling back to
-    # the Microsoft Interlocked functions/intrinsics when using MSVC, or the gcc_intel
-    # implementation of hand-rolled assembly if using gcc/clang.
-
-    if (using_msvc() or (cxx11_mode == "on")) and conf.CheckCXX11Atomics():
-        conf.env.Append(CPPDEFINES=['MONGO_HAVE_CXX11_ATOMICS'])
-    elif using_gcc() or using_clang():
-        # Prefer the __atomic builtins. If we don't have those, try for __sync. Otherwise
-        # atomic_intrinsics.h will try to fall back to the hand-rolled assembly implementations
-        # in atomic_intrinsics_gcc_intel for x86 platforms.
-        if conf.CheckGCCAtomicBuiltins():
-            conf.env.Append(CPPDEFINES=["MONGO_HAVE_GCC_ATOMIC_BUILTINS"])
-        else:
-            if conf.CheckGCCSyncBuiltins():
-                conf.env.Append(CPPDEFINES=["MONGO_HAVE_GCC_SYNC_BUILTINS"])
-
-    if (cxx11_mode == "on") and conf.CheckCXX11IsTriviallyCopyable():
+    if conf.CheckCXX11IsTriviallyCopyable():
         conf.env.Append(CPPDEFINES=['MONGO_HAVE_STD_IS_TRIVIALLY_COPYABLE'])
 
     myenv = conf.Finish()
 
-    conf = Configure(myenv)
+    def CheckBoostMinVersion(context):
+        compile_test_body = textwrap.dedent("""
+        #include <boost/version.hpp>
+
+        #if BOOST_VERSION < 104900
+        #error
+        #endif
+        """)
+
+        context.Message("Checking if system boost version is 1.49 or newer...")
+        result = context.TryCompile(compile_test_body, ".cpp")
+        context.Result(result)
+        return result
+
+    conf = Configure(myenv, custom_tests = {
+        'CheckBoostMinVersion': CheckBoostMinVersion,
+    })
     libdeps.setup_conftests(conf)
 
     if use_system_version_of_library("pcre"):
@@ -2003,14 +1983,24 @@ def doConfigure(myenv):
         if not conf.CheckCXXHeader( "boost/filesystem/operations.hpp" ):
             print( "can't find boost headers" )
             Exit(1)
+        if not conf.CheckBoostMinVersion():
+            print( "system's version of boost is too old. version 1.49 or better required")
+            Exit(1)
 
         conf.env.Append(CPPDEFINES=[("BOOST_THREAD_VERSION", "2")])
 
-        # Note that on Windows with using-system-boost builds, the following 
+        # Note that on Windows with using-system-boost builds, the following
         # FindSysLibDep calls do nothing useful (but nothing problematic either)
-        for b in boostLibs:
-            boostlib = "boost_" + b
-            conf.FindSysLibDep( boostlib, [ boostlib + "-mt", boostlib ], language='C++' )
+        #
+        # NOTE: Pass --system-boost-lib-search-suffixes= to suppress these checks, which you
+        # might want to do if using autolib linking on Windows, for example.
+        if boostSuffixList:
+            for b in boostLibs:
+                boostlib = "boost_" + b
+                conf.FindSysLibDep(
+                    boostlib,
+                    [boostlib + suffix for suffix in boostSuffixList],
+                    language='C++')
 
     if posix_system:
         conf.env.Append(CPPDEFINES=['MONGO_HAVE_HEADER_UNISTD_H'])
@@ -2292,6 +2282,7 @@ Export("env")
 Export("get_option")
 Export("has_option use_system_version_of_library")
 Export("mongoCodeVersion")
+Export("serverJs")
 Export("usev8")
 Export("v8version v8suffix")
 Export("boostSuffix")

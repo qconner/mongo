@@ -176,9 +176,8 @@ namespace mongo {
                 log() << "Repairing size cache";
                 fassertNoTrace(28577, _salvageIfNeeded(_sizeStorerUri.c_str()));
             }
-            WiredTigerSizeStorer* ss = new WiredTigerSizeStorer();
-            ss->loadFrom( &session, _sizeStorerUri );
-            _sizeStorer.reset( ss );
+            _sizeStorer.reset(new WiredTigerSizeStorer(_conn, _sizeStorerUri));
+            _sizeStorer->fillCache();
         }
     }
 
@@ -188,8 +187,6 @@ namespace mongo {
             cleanShutdown();
         }
 
-        _sizeStorer.reset( NULL );
-
         _sessionCache.reset( NULL );
     }
 
@@ -197,7 +194,8 @@ namespace mongo {
         log() << "WiredTigerKVEngine shutting down";
         syncSizeInfo(true);
         if (_conn) {
-            // this must be the last thing we do before _conn->close();
+            // these must be the last things we do before _conn->close();
+            _sizeStorer.reset( NULL );
             _sessionCache->shuttingDown();
 
 #if !__has_feature(address_sanitizer)
@@ -211,26 +209,26 @@ namespace mongo {
     }
 
     Status WiredTigerKVEngine::okToRename( OperationContext* opCtx,
-                                           const StringData& fromNS,
-                                           const StringData& toNS,
-                                           const StringData& ident,
+                                           StringData fromNS,
+                                           StringData toNS,
+                                           StringData ident,
                                            const RecordStore* originalRecordStore ) const {
-        _sizeStorer->store( _uri( ident ),
-                            originalRecordStore->numRecords( opCtx ),
-                            originalRecordStore->dataSize( opCtx ) );
+        _sizeStorer->storeToCache(_uri( ident ),
+                                  originalRecordStore->numRecords( opCtx ),
+                                  originalRecordStore->dataSize( opCtx ) );
         syncSizeInfo(true);
         return Status::OK();
     }
 
     int64_t WiredTigerKVEngine::getIdentSize( OperationContext* opCtx,
-                                              const StringData& ident ) {
-        WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession();
+                                              StringData ident ) {
+        WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
         return WiredTigerUtil::getIdentSize(session->getSession(), _uri(ident) );
     }
 
     Status WiredTigerKVEngine::repairIdent( OperationContext* opCtx,
-                                            const StringData& ident ) {
-        WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession();
+                                            StringData ident ) {
+        WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
         session->closeAllCursors();
         string uri = _uri(ident);
         return _salvageIfNeeded(uri.c_str());
@@ -276,14 +274,10 @@ namespace mongo {
             return;
 
         try {
-            WiredTigerSession session(_conn);
-            WT_SESSION* s = session.getSession();
-            invariantWTOK( s->begin_transaction( s, sync ? "sync=true" : NULL ) );
-            _sizeStorer->storeInto( &session, _sizeStorerUri );
-            invariantWTOK( s->commit_transaction( s, NULL ) );
+            _sizeStorer->syncCache(sync);
         }
         catch (const WriteConflictException&) {
-            // ignore, it means someone else is doing it
+            // ignore, we'll try again later.
         }
     }
 
@@ -300,8 +294,8 @@ namespace mongo {
     }
 
     Status WiredTigerKVEngine::createRecordStore( OperationContext* opCtx,
-                                                  const StringData& ns,
-                                                  const StringData& ident,
+                                                  StringData ns,
+                                                  StringData ident,
                                                   const CollectionOptions& options ) {
         _checkIdentPath( ident );
         WiredTigerSession session(_conn);
@@ -320,8 +314,8 @@ namespace mongo {
     }
 
     RecordStore* WiredTigerKVEngine::getRecordStore( OperationContext* opCtx,
-                                                     const StringData& ns,
-                                                     const StringData& ident,
+                                                     StringData ns,
+                                                     StringData ident,
                                                      const CollectionOptions& options ) {
 
         if (options.capped) {
@@ -337,12 +331,12 @@ namespace mongo {
         }
     }
 
-    string WiredTigerKVEngine::_uri( const StringData& ident ) const {
+    string WiredTigerKVEngine::_uri( StringData ident ) const {
         return string("table:") + ident.toString();
     }
 
     Status WiredTigerKVEngine::createSortedDataInterface( OperationContext* opCtx,
-                                                          const StringData& ident,
+                                                          StringData ident,
                                                           const IndexDescriptor* desc ) {
         _checkIdentPath( ident );
         StatusWith<std::string> result =
@@ -359,7 +353,7 @@ namespace mongo {
     }
 
     SortedDataInterface* WiredTigerKVEngine::getSortedDataInterface( OperationContext* opCtx,
-                                                                     const StringData& ident,
+                                                                     StringData ident,
                                                                      const IndexDescriptor* desc ) {
         if ( desc->unique() )
             return new WiredTigerIndexUnique( opCtx, _uri( ident ), desc );
@@ -367,12 +361,12 @@ namespace mongo {
     }
 
     Status WiredTigerKVEngine::dropIdent( OperationContext* opCtx,
-                                          const StringData& ident ) {
+                                          StringData ident ) {
         _drop( ident );
         return Status::OK();
     }
 
-    bool WiredTigerKVEngine::_drop( const StringData& ident ) {
+    bool WiredTigerKVEngine::_drop( StringData ident ) {
         string uri = _uri( ident );
 
         WiredTigerSession session(_conn);
@@ -454,8 +448,9 @@ namespace mongo {
         return true;
     }
 
-    bool WiredTigerKVEngine::hasIdent(OperationContext* opCtx, const StringData& ident) const {
-        return _hasUri(WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession(), _uri(ident));
+    bool WiredTigerKVEngine::hasIdent(OperationContext* opCtx, StringData ident) const {
+        return _hasUri(WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx)->getSession(),
+                       _uri(ident));
     }
 
     bool WiredTigerKVEngine::_hasUri(WT_SESSION* session, const std::string& uri) const {
@@ -502,7 +497,7 @@ namespace mongo {
         return _conn->reconfigure(_conn, str);
     }
 
-    void WiredTigerKVEngine::_checkIdentPath( const StringData& ident ) {
+    void WiredTigerKVEngine::_checkIdentPath( StringData ident ) {
         size_t start = 0;
         size_t idx;
         while ( ( idx = ident.find( '/', start ) ) != string::npos ) {

@@ -25,7 +25,7 @@ __wt_connection_open(WT_CONNECTION_IMPL *conn, const char *cfg[])
 	 * Tell internal server threads to run: this must be set before opening
 	 * any sessions.
 	 */
-	F_SET(conn, WT_CONN_SERVER_RUN);
+	F_SET(conn, WT_CONN_SERVER_RUN | WT_CONN_LOG_SERVER_RUN);
 
 	/* WT_SESSION_IMPL array. */
 	WT_RET(__wt_calloc(session,
@@ -130,6 +130,7 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	if (FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))
 		WT_TRET(__wt_txn_checkpoint_log(
 		    session, 1, WT_TXN_LOG_CKPT_STOP, NULL));
+	F_CLR(conn, WT_CONN_LOG_SERVER_RUN);
 	WT_TRET(__wt_logmgr_destroy(session));
 
 	/* Free memory for collators, compressors, data sources. */
@@ -142,14 +143,14 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	 * Complain if files weren't closed, ignoring the lock file, we'll
 	 * close it in a minute.
 	 */
-	TAILQ_FOREACH(fh, &conn->fhqh, q) {
+	SLIST_FOREACH(fh, &conn->fhlh, l) {
 		if (fh == conn->lock_fh)
 			continue;
 
 		__wt_errx(session,
 		    "Connection has open file handles: %s", fh->name);
 		WT_TRET(__wt_close(session, fh));
-		fh = TAILQ_FIRST(&conn->fhqh);
+		fh = SLIST_FIRST(&conn->fhlh);
 	}
 
 	/* Shut down the eviction server thread. */

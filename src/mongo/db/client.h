@@ -36,10 +36,10 @@
 
 #pragma once
 
-#include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/thread.hpp>
 
+#include "mongo/bson/optime.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -47,14 +47,11 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/platform/unordered_set.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/concurrency/threadlocal.h"
-#include "mongo/util/paths.h"
 
 namespace mongo {
 
-    class AuthenticationInfo;
     class CurOp;
     class Collection;
     class AbstractMessagingPort;
@@ -76,7 +73,7 @@ namespace mongo {
     class AutoGetDb {
         MONGO_DISALLOW_COPYING(AutoGetDb);
     public:
-        AutoGetDb(OperationContext* txn, const StringData& ns, LockMode mode);
+        AutoGetDb(OperationContext* txn, StringData ns, LockMode mode);
 
         Database* getDb() const {
             return _db;
@@ -102,13 +99,13 @@ namespace mongo {
     class AutoGetOrCreateDb {
         MONGO_DISALLOW_COPYING(AutoGetOrCreateDb);
     public:
-        AutoGetOrCreateDb(OperationContext* txn, const StringData& ns, LockMode mode);
+        AutoGetOrCreateDb(OperationContext* txn, StringData ns, LockMode mode);
 
-        Database* getDb() {
+        Database* getDb() const {
             return _db;
         }
 
-        bool justCreated() {
+        bool justCreated() const {
             return _justCreated;
         }
 
@@ -147,7 +144,7 @@ namespace mongo {
 
     private:
         void _init(const std::string& ns,
-                   const StringData& coll);
+                   StringData coll);
 
         const Timer _timer;
         OperationContext* const _txn;
@@ -178,7 +175,7 @@ namespace mongo {
          * Inits a thread if that thread has not already been init'd, setting the thread name to
          * "desc".
          */
-        static void initThreadIfNotAlready(const char *desc) { 
+        static void initThreadIfNotAlready(const char* desc) {
             if (currentClient.get())
                 return;
             initThread(desc);
@@ -198,17 +195,17 @@ namespace mongo {
          */
         bool shutdown();
 
-        std::string clientAddress(bool includePort=false) const;
+        std::string clientAddress(bool includePort = false) const;
         CurOp* curop() const { return _curOp; }
         const std::string& desc() const { return _desc; }
-        void setLastOp( OpTime op ) { _lastOp = op; }
+        void setLastOp(OpTime op) { _lastOp = op; }
         OpTime getLastOp() const { return _lastOp; }
 
         // Return a reference to the Locker for this client. Client retains ownership.
-        Locker* getLocker() const { return _locker.get(); }
+        Locker* getLocker();
 
         /* report what the last operation was.  used by getlasterror */
-        void appendLastOp( BSONObjBuilder& b ) const;
+        void appendLastOp(BSONObjBuilder& b) const;
         void reportState(BSONObjBuilder& builder);
 
         // Ensures stability of the client's OperationContext. When the client is locked,
@@ -226,14 +223,18 @@ namespace mongo {
         bool isGod() const { return _god; } /* this is for map/reduce writes */
         bool setGod(bool newVal) { const bool prev = _god; _god = newVal; return prev; }
 
-        void setRemoteID(const OID& rid) { _remoteId = rid;  } // Only used for master/slave
-        OID getRemoteID() const { return _remoteId; } // Only used for master/slave
+        // Only used for master/slave
+        void setRemoteID(const OID& rid) { _remoteId = rid; }
+        OID getRemoteID() const { return _remoteId; }
+
         ConnectionId getConnectionId() const { return _connectionId; }
         bool isFromUserConnection() const { return _connectionId > 0; }
 
     private:
-        Client(const std::string& desc, AbstractMessagingPort *p = 0);
         friend class CurOp;
+
+        Client(const std::string& desc, AbstractMessagingPort *p = 0);
+
 
         // Description for the client (e.g. conn8)
         const std::string _desc;
@@ -256,22 +257,25 @@ namespace mongo {
         // Changes, based on what operation is running. Some of this should be in OperationContext.
         CurOp* _curOp;
 
-        // By having Client, rather than the OperationContext, own the Locker,  setup cost such as
+        // By having Client, rather than the OperationContext, own the Locker, setup cost such as
         // allocating OS resources can be amortized over multiple operations.
-        boost::scoped_ptr<Locker> const _locker;
+        boost::scoped_ptr<Locker> _locker;
 
         // Used by replication
         OpTime _lastOp;
-        OID _remoteId; // Only used by master-slave
+
+        // Only used by master-slave
+        OID _remoteId;
 
         // Tracks if Client::shutdown() gets called (TODO: Is this necessary?)
         bool _shutdown;
 
     public:
 
-        /* Set database we want to use, then, restores when we finish (are out of scope)
-           Note this is also helpful if an exception happens as the state if fixed up.
-        */
+        /**
+         * Opens the database that we want to use and sets the appropriate namespace on the
+         * current operation.
+         */
         class Context {
             MONGO_DISALLOW_COPYING(Context);
         public:
@@ -295,26 +299,18 @@ namespace mongo {
             Context(OperationContext* txn, const std::string& ns, Database * db);
 
             ~Context();
-            Client* getClient() const { return _client; }
+
             Database* db() const { return _db; }
-            const char * ns() const { return _ns.c_str(); }
+            const char* ns() const { return _ns.c_str(); }
 
             /** @return if the db was created by this Context */
             bool justCreated() const { return _justCreated; }
 
-            /** call before unlocking, so clear any non-thread safe state
-             *  _db gets restored on the relock
-             */
-            void unlocked() { _db = 0; }
-
-            /** call after going back into the lock, will re-establish non-thread safe stuff */
-            void relocked() { _finishInit(); }
-
         private:
             friend class CurOp;
             void _finishInit();
-            void checkNotStale() const;
-            Client * const _client;
+            void _checkNotStale() const;
+
             bool _justCreated;
             bool _doVersion;
             const std::string _ns;
@@ -325,7 +321,8 @@ namespace mongo {
         }; // class Client::Context
 
 
-        class WriteContext : boost::noncopyable {
+        class WriteContext {
+            MONGO_DISALLOW_COPYING(WriteContext);
         public:
             WriteContext(OperationContext* opCtx, const std::string& ns);
 
@@ -335,17 +332,17 @@ namespace mongo {
                 return _c.db()->getCollection(_nss.ns());
             }
 
-            Context& ctx() { return _c; }
-
         private:
-            OperationContext* _txn;
-            NamespaceString _nss;
+            OperationContext* const _txn;
+            const NamespaceString _nss;
+
             AutoGetOrCreateDb _autodb;
             Lock::CollectionLock _collk;
             Context _c;
             Collection* _collection;
         };
-    }; // class Client
+
+    };
 
     /** get the Client object for this thread. */
     inline Client& cc() {

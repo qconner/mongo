@@ -37,7 +37,7 @@ namespace mongo {
         invariant(_depth == 0);
     }
 
-    void InMemoryRecoveryUnit::beginUnitOfWork() {
+    void InMemoryRecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
         _depth++;
     }
 
@@ -45,10 +45,15 @@ namespace mongo {
         if ( _depth > 1 )
             return;
 
-        for (Changes::iterator it = _changes.begin(), end = _changes.end(); it != end; ++it) {
-            (*it)->commit();
+        try {
+            for (Changes::iterator it = _changes.begin(), end = _changes.end(); it != end; ++it) {
+                (*it)->commit();
+            }
+            _changes.clear();
         }
-        _changes.clear();
+        catch (...) {
+            std::terminate();
+        }
     }
 
     void InMemoryRecoveryUnit::endUnitOfWork() {
@@ -56,10 +61,15 @@ namespace mongo {
          if (_depth > 0 )
              return;
 
-         for (Changes::reverse_iterator it = _changes.rbegin(), end = _changes.rend();
-                 it != end; ++it) {
-             (*it)->rollback();
-         }
-         _changes.clear();
+         try {
+             for (Changes::reverse_iterator it = _changes.rbegin(), end = _changes.rend();
+                     it != end; ++it) {
+                 (*it)->rollback();
+             }
+             _changes.clear();
+        }
+        catch (...) {
+            std::terminate();
+        }
     }
 }

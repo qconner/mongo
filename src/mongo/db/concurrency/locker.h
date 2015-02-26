@@ -31,7 +31,6 @@
 #include <climits> // For UINT_MAX
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/concurrency/lock_manager.h"
 #include "mongo/db/concurrency/lock_stats.h"
 
@@ -173,8 +172,8 @@ namespace mongo {
         // These are shortcut methods for the above calls. They however check that the entire
         // hierarchy is properly locked and because of this they are very expensive to call.
         // Do not use them in performance critical code paths.
-        virtual bool isDbLockedForMode(const StringData& dbName, LockMode mode) const = 0;
-        virtual bool isCollectionLockedForMode(const StringData& ns, LockMode mode) const = 0;
+        virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const = 0;
+        virtual bool isCollectionLockedForMode(StringData ns, LockMode mode) const = 0;
 
         /**
          * Returns the resource that this locker is waiting/blocked on (if any). If the locker is
@@ -208,7 +207,7 @@ namespace mongo {
             ResourceId waitingResource;
 
             // Lock timing statistics
-            LockStats stats;
+            SingleThreadedLockStats stats;
         };
 
         virtual void getLockerInfo(LockerInfo* lockerInfo) const = 0;
@@ -263,9 +262,12 @@ namespace mongo {
         virtual bool isWriteLocked() const = 0;
         virtual bool isReadLocked() const = 0;
 
-        // This asserts we're not in a WriteUnitOfWork, and there are no requests on the Locker,
-        // so it would be safe to call the destructor or reuse the Locker.
-        virtual void assertEmpty() const = 0;
+        /**
+         * Asserts that the Locker is effectively not in use and resets the locking statistics.
+         * This means, there should be no locks on it, no WUOW, etc, so it would be safe to call
+         * the destructor or reuse the Locker.
+         */
+        virtual void assertEmptyAndReset() = 0;
 
         /**
          * Pending means we are currently trying to get a lock (could be the parallel batch writer
@@ -277,6 +279,12 @@ namespace mongo {
         virtual void setIsBatchWriter(bool newValue) = 0;
         virtual bool isBatchWriter() const = 0;
         virtual void setLockPendingParallelWriter(bool newValue) = 0;
+
+        /**
+         * A string lock is MODE_X or MODE_S.
+         * These are incompatible with other locks and therefore are strong.
+         */
+        virtual bool hasStrongLocks() const = 0;
 
     protected:
         Locker() { }

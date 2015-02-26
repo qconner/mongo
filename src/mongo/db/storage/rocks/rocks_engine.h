@@ -39,6 +39,7 @@
 #include <boost/shared_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 
+#include <rocksdb/cache.h>
 #include <rocksdb/status.h>
 
 #include "mongo/base/disallow_copying.h"
@@ -71,26 +72,25 @@ namespace mongo {
         virtual RecoveryUnit* newRecoveryUnit() override;
 
         virtual Status createRecordStore(OperationContext* opCtx,
-                                         const StringData& ns,
-                                         const StringData& ident,
+                                         StringData ns,
+                                         StringData ident,
                                          const CollectionOptions& options) override;
 
-        virtual RecordStore* getRecordStore(OperationContext* opCtx, const StringData& ns,
-                                            const StringData& ident,
+        virtual RecordStore* getRecordStore(OperationContext* opCtx, StringData ns,
+                                            StringData ident,
                                             const CollectionOptions& options) override;
 
-        virtual Status createSortedDataInterface(OperationContext* opCtx, const StringData& ident,
+        virtual Status createSortedDataInterface(OperationContext* opCtx, StringData ident,
                                                  const IndexDescriptor* desc) override;
 
         virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                            const StringData& ident,
+                                                            StringData ident,
                                                             const IndexDescriptor* desc) override;
 
-        virtual Status dropIdent(OperationContext* opCtx, const StringData& ident) override;
+        virtual Status dropIdent(OperationContext* opCtx, StringData ident) override;
 
-        virtual bool hasIdent(OperationContext* opCtx, const StringData& ident) const {
-            return _identColumnFamilyMap.find(ident) != _identColumnFamilyMap.end();;
-        }
+        virtual bool hasIdent(OperationContext* opCtx, StringData ident) const override;
+
         virtual std::vector<std::string> getAllIdents( OperationContext* opCtx ) const override;
 
         virtual bool supportsDocLocking() const override {
@@ -104,64 +104,55 @@ namespace mongo {
         virtual bool isDurable() const override { return _durable; }
 
         virtual int64_t getIdentSize(OperationContext* opCtx,
-                                      const StringData& ident) {
+                                      StringData ident) {
           // TODO: return correct size.
           return 1;
         }
 
         virtual Status repairIdent(OperationContext* opCtx,
-                                    const StringData& ident) {
+                                    StringData ident) {
             return Status::OK();
         }
 
         virtual void cleanShutdown() {}
+
+        /**
+         * Initializes a background job to remove excess documents in the oplog collections.
+         * This applies to the capped collections in the local.oplog.* namespaces (specifically
+         * local.oplog.rs for replica sets and local.oplog.$main for master/slave replication).
+         * Returns true if a background job is running for the namespace.
+         */
+        static bool initRsOplogBackgroundThread(StringData ns);
 
         // rocks specific api
 
         rocksdb::DB* getDB() { return _db.get(); }
         const rocksdb::DB* getDB() const { return _db.get(); }
 
-        /**
-         * Returns a ReadOptions object that uses the snapshot contained in opCtx
-         */
-        static rocksdb::ReadOptions readOptionsWithSnapshot( OperationContext* opCtx );
-
     private:
-        bool _existsColumnFamily(const StringData& ident);
-        Status _createColumnFamily(const rocksdb::ColumnFamilyOptions& options,
-                                   const StringData& ident);
-        Status _dropColumnFamily(const StringData& ident);
-        boost::shared_ptr<rocksdb::ColumnFamilyHandle> _getColumnFamily(const StringData& ident);
+        Status _createIdentPrefix(StringData ident);
+        std::string _getIdentPrefix(StringData ident);
 
-        std::unordered_map<std::string, Ordering> _loadOrderingMetaData(rocksdb::Iterator* itr);
-        std::set<std::string> _loadCollections(rocksdb::Iterator* itr);
-        std::vector<std::string> _loadColumnFamilies();
-
-        rocksdb::ColumnFamilyOptions _collectionOptions() const;
-        rocksdb::ColumnFamilyOptions _indexOptions(const Ordering& order) const;
-
-        rocksdb::Options _dbOptions() const;
-
-        static rocksdb::ColumnFamilyOptions _defaultCFOptions();
+        rocksdb::Options _options() const;
 
         std::string _path;
         boost::scoped_ptr<rocksdb::DB> _db;
-        boost::scoped_ptr<rocksdb::Comparator> _collectionComparator;
+        std::shared_ptr<rocksdb::Cache> _block_cache;
 
         const bool _durable;
 
-        // Default column family is owned by the rocksdb::DB instance.
-        rocksdb::ColumnFamilyHandle* _defaultHandle;
+        // ident prefix map stores mapping from ident to a prefix (uint32_t)
+        mutable boost::mutex _identPrefixMapMutex;
+        typedef StringMap<uint32_t> IdentPrefixMap;
+        IdentPrefixMap _identPrefixMap;
 
-        mutable boost::mutex _identColumnFamilyMapMutex;
-        typedef StringMap<boost::shared_ptr<rocksdb::ColumnFamilyHandle> > IdentColumnFamilyMap;
-        IdentColumnFamilyMap _identColumnFamilyMap;
+        // protected by _identPrefixMapMutex
+        uint32_t _maxPrefix;
 
         // This is for concurrency control
         RocksTransactionEngine _transactionEngine;
 
-        static const std::string kOrderingPrefix;
-        static const std::string kCollectionPrefix;
+        static const std::string kMetadataPrefix;
     };
 
     Status toMongoStatus( rocksdb::Status s );

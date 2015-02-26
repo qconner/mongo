@@ -42,7 +42,6 @@
 
 #include "mongo/db/repl/master_slave.h"
 
-#include <iostream>
 #include <pcrecpp.h>
 #include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
@@ -58,6 +57,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/sync.h"
@@ -273,11 +273,11 @@ namespace repl {
                 n++;
                 ReplSource tmp(txn, obj);
                 if (tmp.hostName != replSettings.source) {
-                    log() << "repl: --source " << replSettings.source << " != " << tmp.hostName
+                    log() << "--source " << replSettings.source << " != " << tmp.hostName
                           << " from local.sources collection" << endl;
-                    log() << "repl: for instructions on changing this slave's source, see:" << endl;
+                    log() << "for instructions on changing this slave's source, see:" << endl;
                     log() << "http://dochub.mongodb.org/core/masterslave" << endl;
-                    log() << "repl: terminating mongod after 30 seconds" << endl;
+                    log() << "terminating mongod after 30 seconds" << endl;
                     sleepsecs(30);
                     dbexit( EXIT_REPLICATION_ERROR );
                 }
@@ -318,11 +318,9 @@ namespace repl {
             ReplSource tmp(txn, obj);
             if ( tmp.syncedTo.isNull() ) {
                 DBDirectClient c(txn);
-                if ( c.exists( "local.oplog.$main" ) ) {
-                    BSONObj op = c.findOne( "local.oplog.$main", QUERY( "op" << NE << "n" ).sort( BSON( "$natural" << -1 ) ) );
-                    if ( !op.isEmpty() ) {
-                        tmp.syncedTo = op[ "ts" ].date();
-                    }
+                BSONObj op = c.findOne( "local.oplog.$main", QUERY( "op" << NE << "n" ).sort( BSON( "$natural" << -1 ) ) );
+                if ( !op.isEmpty() ) {
+                    tmp.syncedTo = op[ "ts" ].date();
                 }
             }
             addSourceToList(txn, v, tmp, old);
@@ -350,6 +348,43 @@ namespace repl {
         }
         replAllDead = 0;
     }
+
+    class HandshakeCmd : public Command {
+    public:
+        void help(stringstream& h) const { h << "internal"; }
+        HandshakeCmd() : Command("handshake") {}
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool slaveOk() const { return true; }
+        virtual bool adminOnly() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+            const BSONObj& cmdObj,
+            std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::internal);
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        }
+
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int options,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+
+            HandshakeArgs handshake;
+            Status status = handshake.initialize(cmdObj);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
+            txn->getClient()->setRemoteID(handshake.getRid());
+
+            status = getGlobalReplicationCoordinator()->processHandshake(txn, handshake);
+            return appendCommandStatus(result, status);
+        }
+
+    } handshakeCmd;
 
     bool replHandshake(DBClientConnection *conn, const OID& myRID) {
         string myname = getHostName();
@@ -690,7 +725,7 @@ namespace repl {
         // mongos will not send requests there. That's why the last argument is false (do not do
         // version checking).
         Client::Context ctx(txn, ns, false);
-        ctx.getClient()->curop()->reset();
+        txn->getCurOp()->reset();
 
         bool empty = !ctx.db()->getDatabaseCatalogEntry()->hasUserData();
         bool incompleteClone = incompleteCloneDbs.count( clientName ) != 0;
@@ -802,7 +837,7 @@ namespace repl {
     int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
         int okResultCode = 1;
         string ns = string("local.oplog.$") + sourceName();
-        LOG(2) << "repl: sync_pullOpLog " << ns << " syncedTo:" << syncedTo.toStringLong() << '\n';
+        LOG(2) << "sync_pullOpLog " << ns << " syncedTo:" << syncedTo.toStringLong() << '\n';
 
         bool tailing = true;
         oplogReader.tailCheck();
@@ -854,11 +889,11 @@ namespace repl {
             tailing = false;
         }
         else {
-            LOG(2) << "repl: tailing=true\n";
+            LOG(2) << "tailing=true\n";
         }
 
         if( !oplogReader.haveCursor() ) {
-            log() << "repl: dbclient::query returns null (conn closed?)" << endl;
+            log() << "dbclient::query returns null (conn closed?)" << endl;
             oplogReader.resetConnection();
             return -1;
         }
@@ -877,12 +912,12 @@ namespace repl {
 
         if ( !oplogReader.more() ) {
             if ( tailing ) {
-                LOG(2) << "repl: tailing & no new activity\n";
+                LOG(2) << "tailing & no new activity\n";
                 okResultCode = 0; // don't sleep
 
             }
             else {
-                log() << "repl:   " << ns << " oplog is empty" << endl;
+                log() << ns << " oplog is empty" << endl;
             }
             {
                 ScopedTransaction transaction(txn, MODE_X);
@@ -905,26 +940,26 @@ namespace repl {
                         massert( 13344 ,  "trying to slave off of a non-master", false );
                     }
                     else {
-                        log() << "repl: $err reading remote oplog: " + err << '\n';
+                        error() << "$err reading remote oplog: " + err << '\n';
                         massert( 10390 ,  "got $err reading remote oplog", false );
                     }
                 }
                 else {
-                    log() << "repl: bad object read from remote oplog: " << op.toString() << '\n';
-                    massert( 10391 , "repl: bad object read from remote oplog", false);
+                    error() << "bad object read from remote oplog: " << op.toString() << '\n';
+                    massert( 10391 , "bad object read from remote oplog", false);
                 }
             }
 
             nextOpTime = OpTime( ts.date() );
-            LOG(2) << "repl: first op time received: " << nextOpTime.toString() << '\n';
+            LOG(2) << "first op time received: " << nextOpTime.toString() << '\n';
             if ( initial ) {
-                LOG(1) << "repl:   initial run\n";
+                LOG(1) << "initial run\n";
             }
             if( tailing ) {
                 if( !( syncedTo < nextOpTime ) ) {
-                    log() << "repl ASSERTION failed : syncedTo < nextOpTime" << endl;
-                    log() << "repl syncTo:     " << syncedTo.toStringLong() << endl;
-                    log() << "repl nextOpTime: " << nextOpTime.toStringLong() << endl;
+                    warning() << "ASSERTION failed : syncedTo < nextOpTime" << endl;
+                    log() << "syncTo:     " << syncedTo.toStringLong() << endl;
+                    log() << "nextOpTime: " << nextOpTime.toStringLong() << endl;
                     verify(false);
                 }
                 oplogReader.putBack( op ); // op will be processed in the loop below
@@ -932,13 +967,13 @@ namespace repl {
             }
             else if ( nextOpTime != syncedTo ) { // didn't get what we queried for - error
                 log()
-                    << "repl:   nextOpTime " << nextOpTime.toStringLong() << ' '
+                    << "nextOpTime " << nextOpTime.toStringLong() << ' '
                     << ((nextOpTime < syncedTo) ? "<??" : ">")
                     << " syncedTo " << syncedTo.toStringLong() << '\n'
-                    << "repl:   time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs())
+                    << "time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs())
                     << "sec\n"
-                    << "repl:   tailing: " << tailing << '\n'
-                    << "repl:   data too stale, halting replication" << endl;
+                    << "tailing: " << tailing << '\n'
+                    << "data too stale, halting replication" << endl;
                 replInfo = replAllDead = "data too stale halted replication";
                 verify( syncedTo < nextOpTime );
                 throw SyncException();
@@ -967,9 +1002,9 @@ namespace repl {
 
                     syncedTo = nextOpTime;
                     save(txn); // note how far we are synced up to now
-                    log() << "repl:   applied " << n << " operations" << endl;
+                    log() << "applied " << n << " operations" << endl;
                     nApplied = n;
-                    log() << "repl:  end sync_pullOpLog syncedTo: " << syncedTo.toStringLong() << endl;
+                    log() << "end sync_pullOpLog syncedTo: " << syncedTo.toStringLong() << endl;
                     break;
                 }
 
@@ -980,8 +1015,8 @@ namespace repl {
                     syncedTo = nextOpTime;
                     // can't update local log ts since there are pending operations from our peer
                     save(txn);
-                    log() << "repl:   checkpoint applied " << n << " operations" << endl;
-                    log() << "repl:   syncedTo: " << syncedTo.toStringLong() << endl;
+                    log() << "checkpoint applied " << n << " operations" << endl;
+                    log() << "syncedTo: " << syncedTo.toStringLong() << endl;
                     saveLast = time(0);
                     n = 0;
                 }
@@ -1023,8 +1058,8 @@ namespace repl {
                             syncedTo = last;
                             save(txn);
                         }
-                        log() << "repl:   applied " << n << " operations" << endl;
-                        log() << "repl:   syncedTo: " << syncedTo.toStringLong() << endl;
+                        log() << "applied " << n << " operations" << endl;
+                        log() << "syncedTo: " << syncedTo.toStringLong() << endl;
                         log() << "waiting until: " << _sleepAdviceTime << " to continue" << endl;
                         return okResultCode;
                     }
@@ -1057,7 +1092,7 @@ namespace repl {
         ReplInfo r("sync");
         if (!serverGlobalParams.quiet) {
             LogstreamBuilder l = log();
-            l << "repl: syncing from ";
+            l << "syncing from ";
             if( sourceName() != "main" ) {
                 l << "source:" << sourceName() << ' ';
             }
@@ -1068,7 +1103,7 @@ namespace repl {
         // FIXME Handle cases where this db isn't on default port, or default port is spec'd in hostName.
         if ((string("localhost") == hostName || string("127.0.0.1") == hostName) &&
             serverGlobalParams.port == ServerGlobalParams::DefaultDBPort) {
-            log() << "repl:   can't sync from self (localhost). sources configuration may be wrong." << endl;
+            log() << "can't sync from self (localhost). sources configuration may be wrong." << endl;
             sleepsecs(5);
             return -1;
         }
@@ -1076,7 +1111,7 @@ namespace repl {
         if ( !_connect(&oplogReader, 
                        HostAndPort(hostName), 
                        getGlobalReplicationCoordinator()->getMyRID()) ) {
-            LOG(4) << "repl:  can't connect to sync source" << endl;
+            LOG(4) << "can't connect to sync source" << endl;
             return -1;
         }
 
@@ -1145,16 +1180,16 @@ namespace repl {
                     return 60;
                 }
                 else {
-                    log() << "repl: AssertionException " << e.what() << endl;
+                    log() << "AssertionException " << e.what() << endl;
                 }
                 replInfo = "replMain caught AssertionException";
             }
             catch ( const DBException& e ) {
-                log() << "repl: DBException " << e.what() << endl;
+                log() << "DBException " << e.what() << endl;
                 replInfo = "replMain caught DBException";
             }
             catch ( const std::exception &e ) {
-                log() << "repl: std::exception " << e.what() << endl;
+                log() << "std::exception " << e.what() << endl;
                 replInfo = "replMain caught std::exception";
             }
             catch ( ... ) {
@@ -1217,7 +1252,7 @@ namespace repl {
 
             if ( s ) {
                 stringstream ss;
-                ss << "repl: sleep " << s << " sec before next pass";
+                ss << "sleep " << s << " sec before next pass";
                 string msg = ss.str();
                 if (!serverGlobalParams.quiet)
                     log() << msg << endl;
@@ -1232,31 +1267,28 @@ namespace repl {
         Client::initThread("replmaster");
         int toSleep = 10;
         while( 1 ) {
+            sleepsecs(toSleep);
 
-            sleepsecs( toSleep );
-            /* write a keep-alive like entry to the log.  this will make things like
-               printReplicationStatus() and printSlaveReplicationStatus() stay up-to-date
-               even when things are idle.
-            */
-            {
-                OperationContextImpl txn;
-                writelocktry lk(txn.lockState(), 1);
-                if ( lk.got() ) {
-                    toSleep = 10;
+            // Write a keep-alive like entry to the log. This will make things like
+            // printReplicationStatus() and printSlaveReplicationStatus() stay up-to-date even
+            // when things are idle.
+            OperationContextImpl txn;
+            txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
 
-                    txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
+            Lock::GlobalWrite globalWrite(txn.lockState(), 1);
+            if (globalWrite.isLocked()) {
+                toSleep = 10;
 
-                    try {
-                        logKeepalive(&txn);
-                    }
-                    catch(...) {
-                        log() << "caught exception in replMasterThread()" << endl;
-                    }
+                try {
+                    logKeepalive(&txn);
                 }
-                else {
-                    LOG(5) << "couldn't logKeepalive" << endl;
-                    toSleep = 1;
+                catch (...) {
+                    log() << "caught exception in replMasterThread()" << endl;
                 }
+            }
+            else {
+                LOG(5) << "couldn't logKeepalive" << endl;
+                toSleep = 1;
             }
         }
     }

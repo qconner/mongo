@@ -191,7 +191,7 @@ namespace mongo {
 
                     // This is a fetch, but it's OK.  The underlying code won't throw a page fault
                     // exception.
-                    BSONObj obj = collection->docFor(txn, loc);
+                    BSONObj obj = collection->docFor(txn, loc).value();
                     BSONObjIterator j( keyPattern );
                     BSONElement real;
                     for ( int x=0; x <= k; x++ )
@@ -638,7 +638,7 @@ namespace mongo {
                 return false;
             }
 
-            // From mongos >= v2.8.
+            // From mongos >= v3.0.
             BSONElement epochElem(cmdObj["epoch"]);
             if (epochElem.type() == jstOID) {
                 OID cmdEpoch = epochElem.OID();
@@ -847,7 +847,11 @@ namespace mongo {
             {
                 AutoGetCollectionForRead ctx(txn, ns);
                 Collection* collection = ctx.getCollection();
-                invariant(collection);
+                if (!collection) {
+                    warning() << "will not perform top-chunk checking since " << ns
+                              << " does not exist after splitting";
+                    return true;
+                }
 
                 // Allow multiKey based on the invariant that shard keys must be
                 // single-valued. Therefore, any multi-key index prefixed by shard

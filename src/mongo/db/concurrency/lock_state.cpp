@@ -35,6 +35,7 @@
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -52,26 +53,22 @@ namespace {
         PartitionedInstanceWideLockStats() { }
 
         void recordAcquisition(LockerId id, ResourceId resId, LockMode mode) {
-            LockStats& stats = _get(id);
-            stats.recordAcquisition(resId, mode);
+            _get(id).recordAcquisition(resId, mode);
         }
 
         void recordWait(LockerId id, ResourceId resId, LockMode mode) {
-            LockStats& stats = _get(id);
-            stats.recordWait(resId, mode);
+            _get(id).recordWait(resId, mode);
         }
 
         void recordWaitTime(LockerId id, ResourceId resId, LockMode mode, uint64_t waitMicros) {
-            LockStats& stats = _get(id);
-            stats.recordWaitTime(resId, mode, waitMicros);
+            _get(id).recordWaitTime(resId, mode, waitMicros);
         }
 
         void recordDeadlock(ResourceId resId, LockMode mode) {
-            LockStats& stats = _get(resId);
-            stats.recordDeadlock(resId, mode);
+            _get(resId).recordDeadlock(resId, mode);
         }
 
-        void report(LockStats* outStats) const {
+        void report(SingleThreadedLockStats* outStats) const {
             for (int i = 0; i < NumPartitions; i++) {
                 outStats->append(_partitions[i].stats);
             }
@@ -86,16 +83,15 @@ namespace {
     private:
 
         // This alignment is a best effort approach to ensure that each partition falls on a
-        // separate page/cache line in order to avoid false sharing. The 4096-byte alignment is
-        // in an effort to play nicely with NUMA.
-        struct MONGO_COMPILER_ALIGN_TYPE(4096) AlignedLockStats {
-            LockStats stats;
+        // separate page/cache line in order to avoid false sharing.
+        struct MONGO_COMPILER_ALIGN_TYPE(128) AlignedLockStats {
+            AtomicLockStats stats;
         };
 
         enum { NumPartitions = 8 };
 
 
-        LockStats& _get(LockerId id) {
+        AtomicLockStats& _get(LockerId id) {
             return _partitions[id % NumPartitions].stats;
         }
 
@@ -137,13 +133,6 @@ namespace {
     // Partitioned global lock statistics, so we don't hit the same bucket
     PartitionedInstanceWideLockStats globalStats;
 
-
-    /**
-     * Returns whether the passed in mode is S or IS. Used for validation checks.
-     */
-    bool isSharedMode(LockMode mode) {
-        return (mode == MODE_IS || mode == MODE_S);
-    }
 
     /**
      * Whether the particular lock's release should be held until the end of the operation. We
@@ -204,10 +193,13 @@ namespace {
     }
 
     template<bool IsForMMAPV1>
-    void LockerImpl<IsForMMAPV1>::assertEmpty() const {
+    void LockerImpl<IsForMMAPV1>::assertEmptyAndReset() {
         invariant(!inAWriteUnitOfWork());
         invariant(_resourcesToUnlockAtEndOfUnitOfWork.empty());
         invariant(_requests.empty());
+
+        // Reset the locking statistics so the object can be reused
+        _stats.reset();
     }
 
     template<bool IsForMMAPV1>
@@ -228,7 +220,7 @@ namespace {
         _lock.lock();
         LockRequestsMap::ConstIterator it = _requests.begin();
         while (!it.finished()) {
-            ss << " " << it.key().toString();
+            ss << " " << it.key().toString() << " held in " << modeName(it->mode);
             it.next();
         }
         _lock.unlock();
@@ -289,7 +281,7 @@ namespace {
         // Cannot delete the Locker while there are still outstanding requests, because the
         // LockManager may attempt to access deleted memory. Besides it is probably incorrect
         // to delete with unaccounted locks anyways.
-        assertEmpty();
+        assertEmptyAndReset();
     }
 
     template<bool IsForMMAPV1>
@@ -345,6 +337,11 @@ namespace {
         LockRequest* globalLockRequest = _requests.find(resourceIdGlobal).objAddr();
         invariant(globalLockRequest->mode == MODE_X);
         invariant(globalLockRequest->recursiveCount == 1);
+
+        // Making this call here will record lock downgrades as acquisitions, which is acceptable
+        globalStats.recordAcquisition(_id, resourceIdGlobal, MODE_S);
+        _stats.recordAcquisition(resourceIdGlobal, MODE_S);
+
         globalLockManager.downgrade(globalLockRequest, MODE_S);
 
         if (IsForMMAPV1) {
@@ -453,24 +450,24 @@ namespace {
     }
 
     template<bool IsForMMAPV1>
-    bool LockerImpl<IsForMMAPV1>::isDbLockedForMode(const StringData& dbName,
+    bool LockerImpl<IsForMMAPV1>::isDbLockedForMode(StringData dbName,
                                                     LockMode mode) const {
         invariant(nsIsDbOnly(dbName));
 
         if (isW()) return true;
-        if (isR() && isSharedMode(mode)) return true;
+        if (isR() && isSharedLockMode(mode)) return true;
 
         const ResourceId resIdDb(RESOURCE_DATABASE, dbName);
         return isLockHeldForMode(resIdDb, mode);
     }
 
     template<bool IsForMMAPV1>
-    bool LockerImpl<IsForMMAPV1>::isCollectionLockedForMode(const StringData& ns,
+    bool LockerImpl<IsForMMAPV1>::isCollectionLockedForMode(StringData ns,
                                                             LockMode mode) const {
         invariant(nsIsFull(ns));
 
         if (isW()) return true;
-        if (isR() && isSharedMode(mode)) return true;
+        if (isR() && isSharedLockMode(mode)) return true;
 
         const NamespaceString nss(ns);
         const ResourceId resIdDb(RESOURCE_DATABASE, nss.db());
@@ -480,7 +477,7 @@ namespace {
         switch (dbMode) {
         case MODE_NONE: return false;
         case MODE_X: return true;
-        case MODE_S: return isSharedMode(mode);
+        case MODE_S: return isSharedLockMode(mode);
         case MODE_IX:
         case MODE_IS:
             {
@@ -617,7 +614,7 @@ namespace {
 
     template<bool IsForMMAPV1>
     LockResult LockerImpl<IsForMMAPV1>::lockBegin(ResourceId resId, LockMode mode) {
-        invariant(!getWaitingResource().isValid());
+        dassert(!getWaitingResource().isValid());
 
         LockRequest* request;
         bool isNew = true;
@@ -726,7 +723,9 @@ namespace {
             }
 
             // If infinite timeout was requested, just keep waiting
-            if (timeoutMs == UINT_MAX) continue;
+            if (timeoutMs == UINT_MAX) {
+                continue;
+            }
 
             const unsigned elapsedTimeMs = elapsedTimeMicros / 1000;
             waitTimeMs = (elapsedTimeMs < timeoutMs) ?
@@ -790,6 +789,23 @@ namespace {
         }
     }
 
+    template<bool IsForMMAPV1>
+    bool LockerImpl<IsForMMAPV1>::hasStrongLocks() const {
+        if (!isLocked()) return false;
+
+        boost::lock_guard<SpinLock> lk(_lock);
+        LockRequestsMap::ConstIterator it = _requests.begin();
+        while (!it.finished()) {
+            if (it->mode == MODE_X || it->mode == MODE_S) {
+                return true;
+            }
+
+            it.next();
+        }
+
+        return false;
+    }
+
 
     //
     // Auto classes
@@ -850,7 +866,7 @@ namespace {
         return &globalLockManager;
     }
 
-    void reportGlobalLockingStats(LockStats* outStats) {
+    void reportGlobalLockingStats(SingleThreadedLockStats* outStats) {
         globalStats.report(outStats);
     }
 
@@ -868,5 +884,6 @@ namespace {
     const ResourceId resourceIdLocalDB = ResourceId(RESOURCE_DATABASE, StringData("local"));
     const ResourceId resourceIdOplog =
         ResourceId(RESOURCE_COLLECTION, StringData("local.oplog.rs"));
+    const ResourceId resourceIdAdminDB = ResourceId(RESOURCE_DATABASE, StringData("admin"));
 
 } // namespace mongo

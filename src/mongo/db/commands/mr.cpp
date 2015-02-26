@@ -901,7 +901,7 @@ namespace mongo {
             _config.reducer->numReduces = _scope->getNumberInt("_redCt");
         }
 
-        Collection* State::getCollectionOrUassert(Database* db, const StringData& ns) {
+        Collection* State::getCollectionOrUassert(Database* db, StringData ns) {
             Collection* out = db ? db->getCollection(ns) : NULL;
             uassert(18697, "Collection unexpectedly disappeared: " + ns.toString(),
                     out);
@@ -1577,7 +1577,6 @@ namespace mongo {
                     while ( i.more() ) {
                         BSONElement e = i.next();
                         string shard = e.fieldName();
-//                        BSONObj res = e.embeddedObjectUserCheck();
                         servers.insert( shard );
                     }
                 }

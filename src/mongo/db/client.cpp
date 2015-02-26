@@ -32,8 +32,6 @@
    to an open socket (or logical connection if pooling on sockets) from a client.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
@@ -56,9 +54,7 @@
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/s/chunk_version.h"
@@ -68,7 +64,6 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -77,14 +72,31 @@ namespace mongo {
 
     using logger::LogComponent;
 
+namespace {
+
+    /**
+     * Create an appropriate new locker for the storage engine in use. Caller owns the return.
+     */
+    Locker* newLocker() {
+        if (isMMAPV1()) {
+            return new MMAPV1LockerImpl();
+        }
+
+        return new LockerImpl<false>();
+    }
+
+} // namespace
+
+
     boost::mutex Client::clientsMutex;
     ClientSet Client::clients;
 
     TSP_DEFINE(Client, currentClient)
 
-    /* each thread which does db operations has a Client object in TLS.
-       call this when your thread starts.
-    */
+    /**
+     * This must be called whenever a new thread is started, so that active threads can be tracked
+     * so each thread has a Client object in TLS.
+     */
     void Client::initThread(const char *desc, AbstractMessagingPort *mp) {
         invariant(currentClient.get() == 0);
 
@@ -112,17 +124,6 @@ namespace mongo {
         clients.insert(client);
     }
 
-namespace {
-    //  Create an appropriate new locker for the storage engine in use. Caller owns.
-    Locker* newLocker() {
-        if (isMMAPV1()) {
-            return new MMAPV1LockerImpl();
-        }
-
-        return new LockerImpl<false>();
-    }
-}
-
     Client::Client(const string& desc, AbstractMessagingPort *p)
         : ClientBasic(p),
           _desc(desc),
@@ -130,7 +131,6 @@ namespace {
           _connectionId(p ? p->connectionId() : 0),
           _god(0),
           _txn(NULL),
-          _locker(newLocker()),
           _lastOp(0),
           _shutdown(false) {
 
@@ -169,11 +169,9 @@ namespace {
         return false;
     }
 
-    BSONObj CachedBSONObjBase::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
 
     Client::Context::Context(OperationContext* txn, const std::string& ns, Database * db)
-        : _client(currentClient.get()),
-          _justCreated(false),
+        : _justCreated(false),
           _doVersion(true),
           _ns(ns),
           _db(db),
@@ -184,8 +182,7 @@ namespace {
                              const std::string& ns,
                              Database* db,
                              bool justCreated)
-        : _client(currentClient.get()),
-          _justCreated(justCreated),
+        : _justCreated(justCreated),
           _doVersion(true),
           _ns(ns),
           _db(db),
@@ -196,8 +193,7 @@ namespace {
     Client::Context::Context(OperationContext* txn,
                              const string& ns,
                              bool doVersion)
-        : _client(currentClient.get()),
-          _justCreated(false), // set for real in finishInit
+        : _justCreated(false), // set for real in finishInit
           _doVersion(doVersion),
           _ns(ns),
           _db(NULL),
@@ -206,15 +202,51 @@ namespace {
         _finishInit();
     }
 
+    void Client::Context::_finishInit() {
+        _db = dbHolder().get(_txn, _ns);
+        if (_db) {
+            _justCreated = false;
+        }
+        else {
+            invariant(_txn->lockState()->isDbLockedForMode(nsToDatabaseSubstring(_ns), MODE_X));
+            _db = dbHolder().openDb(_txn, _ns, &_justCreated);
+            invariant(_db);
+        }
 
-    AutoGetDb::AutoGetDb(OperationContext* txn, const StringData& ns, LockMode mode)
+        if (_doVersion) {
+            _checkNotStale();
+        }
+
+        _txn->getCurOp()->enter(_ns.c_str(), _db->getProfilingLevel());
+    }
+
+    void Client::Context::_checkNotStale() const {
+        switch (_txn->getCurOp()->getOp()) {
+        case dbGetMore: // getMore is special and should be handled elsewhere.
+        case dbUpdate:  // update & delete check shard version in instance.cpp, so don't check
+        case dbDelete:  // here as well.
+            break;
+        default:
+            ensureShardVersionOKOrThrow(_ns);
+        }
+    }
+
+    Client::Context::~Context() {
+        // Lock must still be held
+        invariant(_txn->lockState()->isLocked());
+
+        _txn->getCurOp()->recordGlobalTime(_txn->lockState()->isWriteLocked(), _timer.micros());
+    }
+
+
+    AutoGetDb::AutoGetDb(OperationContext* txn, StringData ns, LockMode mode)
             : _dbLock(txn->lockState(), ns, mode),
               _db(dbHolder().get(txn, ns)) {
 
     }
 
     AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* txn,
-                                         const StringData& ns,
+                                         StringData ns,
                                          LockMode mode)
             :  _transaction(txn, MODE_IX),
                _dbLock(txn->lockState(), ns, mode),
@@ -253,7 +285,7 @@ namespace {
         _init(nss.toString(), nss.coll());
     }
 
-    void AutoGetCollectionForRead::_init(const std::string& ns, const StringData& coll) {
+    void AutoGetCollectionForRead::_init(const std::string& ns, StringData coll) {
         massert(28535, "need a non-empty collection name", !coll.empty());
 
         // TODO: Client::Context legacy, needs to be removed
@@ -294,41 +326,12 @@ namespace {
         }
     }
 
-    void Client::Context::checkNotStale() const { 
-        switch ( _client->_curOp->getOp() ) {
-        case dbGetMore: // getMore's are special and should be handled else where
-        case dbUpdate: // update & delete check shard version in instance.cpp, so don't check here as well
-        case dbDelete:
-            break;
-        default: {
-            ensureShardVersionOKOrThrow(_ns);
-        }
-        }
-    }
-       
-    void Client::Context::_finishInit() {
-        _db = dbHolder().get(_txn, _ns);
-        if (_db) {
-            _justCreated = false;
-        }
-        else {
-            invariant(_txn->lockState()->isDbLockedForMode(nsToDatabaseSubstring(_ns), MODE_X));
-            _db = dbHolder().openDb(_txn, _ns, &_justCreated);
-            invariant(_db);
+    Locker* Client::getLocker() {
+        if (!_locker) {
+            _locker.reset(newLocker());
         }
 
-        if( _doVersion ) checkNotStale();
-
-        _client->_curOp->enter(_ns.c_str(), _db->getProfilingLevel());
-    }
-    
-    Client::Context::~Context() {
-        DEV verify( _client == currentClient.get() );
-
-        // Lock must still be held
-        invariant(_txn->lockState()->isLocked());
-
-        _client->_curOp->recordGlobalTime(_txn->lockState()->isWriteLocked(), _timer.micros());
+        return _locker.get();
     }
 
     void Client::appendLastOp( BSONObjBuilder& b ) const {
@@ -375,38 +378,6 @@ namespace {
         return currentClient.get();
     }
 
-    class HandshakeCmd : public Command {
-    public:
-        void help(stringstream& h) const { h << "internal"; }
-        HandshakeCmd() : Command( "handshake" ) {}
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return false; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::internal);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            repl::HandshakeArgs handshake;
-            Status status = handshake.initialize(cmdObj);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            // TODO(dannenberg) move this into actual processing for both version
-            txn->getClient()->setRemoteID(handshake.getRid());
-
-            status = repl::getGlobalReplicationCoordinator()->processHandshake(txn,
-                                                                               handshake);
-            return appendCommandStatus(result, status);
-        }
-
-    } handshakeCmd;
-
-
 
     void OpDebug::reset() {
         extra.reset();
@@ -449,7 +420,7 @@ namespace {
 
 #define OPDEBUG_TOSTRING_HELP(x) if( x >= 0 ) s << " " #x ":" << (x)
 #define OPDEBUG_TOSTRING_HELP_BOOL(x) if( x ) s << " " #x ":" << (x)
-    string OpDebug::report( const CurOp& curop ) const {
+    string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const {
         StringBuilder s;
         if ( iscommand )
             s << "command ";
@@ -519,8 +490,16 @@ namespace {
         s << " numYields:" << curop.numYields();
         
         OPDEBUG_TOSTRING_HELP( nreturned );
-        if ( responseLength > 0 )
+        if (responseLength > 0) {
             s << " reslen:" << responseLength;
+        }
+
+        {
+            BSONObjBuilder locks;
+            lockStats.report(&locks);
+            s << " locks:" << locks.obj().toString();
+        }
+
         s << " " << executionTime << "ms";
         
         return s.str();
@@ -531,7 +510,7 @@ namespace {
          * Appends {name: obj} to the provided builder.  If obj is greater than maxSize, appends a
          * string summary of obj instead of the object itself.
          */
-        void appendAsObjOrString(const StringData& name,
+        void appendAsObjOrString(StringData name,
                                  const BSONObj& obj,
                                  size_t maxSize,
                                  BSONObjBuilder* builder) {
@@ -559,11 +538,14 @@ namespace {
                 }
             }
         }
-    }
+    } // namespace
 
 #define OPDEBUG_APPEND_NUMBER(x) if( x != -1 ) b.appendNumber( #x , (x) )
 #define OPDEBUG_APPEND_BOOL(x) if( x ) b.appendBool( #x , (x) )
-    void OpDebug::append(const CurOp& curop, BSONObjBuilder& b) const {
+    void OpDebug::append(const CurOp& curop,
+                         const SingleThreadedLockStats& lockStats,
+                         BSONObjBuilder& b) const {
+
         const size_t maxElementSize = 50 * 1024;
 
         b.append( "op" , iscommand ? "command" : opToString( op ) );
@@ -602,11 +584,16 @@ namespace {
         OPDEBUG_APPEND_BOOL( upsert );
         OPDEBUG_APPEND_NUMBER( keyUpdates );
         OPDEBUG_APPEND_NUMBER( writeConflicts );
-
         b.appendNumber("numYield", curop.numYields());
 
-        if ( ! exceptionInfo.empty() )
-            exceptionInfo.append( b , "exception" , "exceptionCode" );
+        {
+            BSONObjBuilder locks(b.subobjStart("locks"));
+            lockStats.report(&locks);
+        }
+
+        if (!exceptionInfo.empty()) {
+            exceptionInfo.append(b, "exception", "exceptionCode");
+        }
 
         OPDEBUG_APPEND_NUMBER( nreturned );
         OPDEBUG_APPEND_NUMBER( responseLength );
@@ -619,4 +606,4 @@ namespace {
         // This can be called in mongod, which is unfortunate.  To fix this,
         // we can redesign how connection pooling works on mongod for sharded operations.
     }
-}
+} // namespace mongo

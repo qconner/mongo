@@ -32,10 +32,12 @@
 
 namespace mongo {
 
+    class OperationContext;
+
     class RecoveryUnitNoop : public RecoveryUnit {
     public:
         // TODO implement rollback
-        virtual void beginUnitOfWork() {}
+        virtual void beginUnitOfWork(OperationContext* opCtx) {}
         virtual void commitUnitOfWork() {}
         virtual void endUnitOfWork() {}
 
@@ -46,13 +48,21 @@ namespace mongo {
         }
 
         virtual void registerChange(Change* change) {
-            change->commit();
-            delete change;
+            try {
+                change->commit();
+                delete change;
+            }
+            catch (...) {
+                std::terminate();
+            }
         }
 
         virtual void* writingPtr(void* data, size_t len) {
             return data;
         }
+        virtual void setRollbackWritesDisabled() {}
+
+        virtual SnapshotId getSnapshotId() const { return SnapshotId(); }
     };
 
 }  // namespace mongo

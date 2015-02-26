@@ -42,6 +42,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -423,8 +424,8 @@ namespace mongo {
             }
 
             return Status::OK();
-
         }
+
     } // namespace
 
     // static
@@ -440,6 +441,7 @@ namespace mongo {
           _ws(ws),
           _collection(collection),
           _child(child),
+          _idRetrying(WorkingSet::INVALID_ID),
           _commonStats(kStageType),
           _updatedLocs(params.request->isMulti() ? new DiskLocSet() : NULL),
           _doc(params.driver->getDocument()) {
@@ -451,7 +453,7 @@ namespace mongo {
         _specificStats.isDocReplacement = params.driver->isDocReplacement();
     }
 
-    void UpdateStage::transformAndUpdate(BSONObj& oldObj, RecordId& loc) {
+    void UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& loc) {
         const UpdateRequest* request = _params.request;
         UpdateDriver* driver = _params.driver;
         CanonicalQuery* cq = _params.canonicalQuery;
@@ -463,11 +465,10 @@ namespace mongo {
         // is needed to accomodate the new bson layout of the resulting document. In any event,
         // only enable in-place mutations if the underlying storage engine offers support for
         // writing damage events.
-        _doc.reset(
-            oldObj,
-            (_collection->getRecordStore()->updateWithDamagesSupported() ?
-             mutablebson::Document::kInPlaceEnabled :
-             mutablebson::Document::kInPlaceDisabled));
+        _doc.reset(oldObj.value(),
+                   (_collection->getRecordStore()->updateWithDamagesSupported() ?
+                    mutablebson::Document::kInPlaceEnabled :
+                    mutablebson::Document::kInPlaceDisabled));
 
         BSONObj logObj;
 
@@ -485,7 +486,7 @@ namespace mongo {
             matchDetails.requestElemMatchKey();
 
             dassert(cq);
-            verify(cq->root()->matchesBSON(oldObj, &matchDetails));
+            verify(cq->root()->matchesBSON(oldObj.value(), &matchDetails));
 
             string matchedField;
             if (matchDetails.hasElemMatchKey())
@@ -520,6 +521,11 @@ namespace mongo {
             docWasModified = false;
         }
 
+        if (!docWasModified && request->shouldStoreResultDoc()) {
+            // The update is a no-op, so the result doc is the same as the old doc.
+            _specificStats.newObj = oldObj.value().getOwned();
+        }
+
         if (docWasModified) {
 
             // Verify that no immutable fields were changed and data is valid for storage.
@@ -529,7 +535,7 @@ namespace mongo {
                 if (lifecycle)
                     immutableFields = lifecycle->getImmutableFields();
 
-                uassertStatusOK(validate(oldObj,
+                uassertStatusOK(validate(oldObj.value(),
                                          updatedFields,
                                          _doc,
                                          immutableFields,
@@ -541,18 +547,23 @@ namespace mongo {
             BSONObj newObj;
             WriteUnitOfWork wunit(_txn);
 
+            RecordId newLoc;
+
             if (inPlace) {
 
                 // Don't actually do the write if this is an explain.
                 if (!request->isExplain()) {
                     invariant(_collection);
-                    const RecordData oldRec(oldObj.objdata(), oldObj.objsize());
-                    _collection->updateDocumentWithDamages(_txn, loc, oldRec, source, _damages);
+                    const RecordData oldRec(oldObj.value().objdata(), oldObj.value().objsize());
+                    _collection->updateDocumentWithDamages(_txn, loc,
+                                                           Snapshotted<RecordData>(oldObj.snapshotId(),
+                                                                                   oldRec),
+                                                           source, _damages);
                 }
 
-                newObj = oldObj;
+                newObj = oldObj.value();
                 _specificStats.fastmod = true;
-
+                newLoc = loc;
             }
             else {
                 // The updates were not in place. Apply them through the file manager.
@@ -572,17 +583,7 @@ namespace mongo {
                         true, driver->modsAffectIndices(),
                         _params.opDebug);
                     uassertStatusOK(res.getStatus());
-                    RecordId newLoc = res.getValue();
-
-                    // If the document moved, we might see it again in a collection scan (maybe it's
-                    // a document after our current document).
-                    //
-                    // If the document is indexed and the mod changes an indexed value, we might see
-                    // it again.  For an example, see the comment above near declaration of
-                    // updatedLocs.
-                    if (_updatedLocs && (newLoc != loc || driver->modsAffectIndices())) {
-                        _updatedLocs->insert(newLoc);
-                    }
+                    newLoc = res.getValue();
                 }
             }
 
@@ -598,7 +599,25 @@ namespace mongo {
                             request->isFromMigration());
             }
 
+            invariant(oldObj.snapshotId() == _txn->recoveryUnit()->getSnapshotId());
             wunit.commit();
+
+            if (request->shouldStoreResultDoc()) {
+                // We just committed a single update. Hold onto the resulting document.
+                _specificStats.newObj = newObj.getOwned();
+            }
+
+            // If the document moved, we might see it again in a collection scan (maybe it's
+            // a document after our current document).
+            //
+            // If the document is indexed and the mod changes an indexed value, we might see
+            // it again.  For an example, see the comment above near declaration of
+            // updatedLocs.
+            //
+            // This must be done after the wunit commits so we are sure we won't be rolling back.
+            if (_updatedLocs && (newLoc != loc || driver->modsAffectIndices())) {
+                _updatedLocs->insert(newLoc);
+            }
         }
 
         // Only record doc modifications if they wrote (exclude no-ops). Explains get
@@ -608,14 +627,15 @@ namespace mongo {
         }
     }
 
-    void UpdateStage::doInsert() {
-        _specificStats.inserted = true;
-
-        const UpdateRequest* request = _params.request;
-        UpdateDriver* driver = _params.driver;
-        CanonicalQuery* cq = _params.canonicalQuery;
-        UpdateLifecycle* lifecycle = request->getLifecycle();
-
+    // static
+    Status UpdateStage::applyUpdateOpsForInsert(const CanonicalQuery* cq,
+                                                const BSONObj& query,
+                                                UpdateDriver* driver,
+                                                UpdateLifecycle* lifecycle,
+                                                mutablebson::Document* doc,
+                                                bool isInternalRequest,
+                                                UpdateStats* stats,
+                                                BSONObj* out) {
         // Since this is an insert (no docs found and upsert:true), we will be logging it
         // as an insert in the oplog. We don't need the driver's help to build the
         // oplog record, then. We also set the context of the update driver to the INSERT_CONTEXT.
@@ -623,63 +643,93 @@ namespace mongo {
         driver->setLogOp(false);
         driver->setContext(ModifierInterface::ExecInfo::INSERT_CONTEXT);
 
-        // Reset the document we will be writing to
-        _doc.reset();
-
-        // The original document we compare changes to - immutable paths must not change
-        BSONObj original;
-
-        bool isInternalRequest = request->isFromReplication() || request->isFromMigration();
-
         const vector<FieldRef*>* immutablePaths = NULL;
         if (!isInternalRequest && lifecycle)
             immutablePaths = lifecycle->getImmutableFields();
 
-        // Calling populateDocumentWithQueryFields will populate the '_doc' with fields from the
-        // query which creates the base of the update for the inserted doc (because upsert
-        // was true).
+        // The original document we compare changes to - immutable paths must not change
+        BSONObj original;
+
         if (cq) {
-            uassertStatusOK(driver->populateDocumentWithQueryFields(cq, immutablePaths, _doc));
+            Status status = driver->populateDocumentWithQueryFields(cq, immutablePaths, *doc);
+            if (!status.isOK()) {
+                return status;
+            }
+
             if (driver->isDocReplacement())
-                _specificStats.fastmodinsert = true;
-            original = _doc.getObject();
+                stats->fastmodinsert = true;
+            original = doc->getObject();
         }
         else {
-            fassert(17354, CanonicalQuery::isSimpleIdQuery(request->getQuery()));
-            BSONElement idElt = request->getQuery()[idFieldName];
+            fassert(17354, CanonicalQuery::isSimpleIdQuery(query));
+            BSONElement idElt = query[idFieldName];
             original = idElt.wrap();
-            fassert(17352, _doc.root().appendElement(idElt));
+            fassert(17352, doc->root().appendElement(idElt));
         }
 
-        // Apply the update modifications and then log the update as an insert manually.
-        Status status = driver->update(StringData(), &_doc);
-        if (!status.isOK()) {
-            uasserted(16836, status.reason());
+        // Apply the update modifications here.
+        Status updateStatus = driver->update(StringData(), doc);
+        if (!updateStatus.isOK()) {
+            return Status(updateStatus.code(), updateStatus.reason(), 16836);
         }
 
         // Ensure _id exists and is first
-        uassertStatusOK(ensureIdAndFirst(_doc));
+        Status idAndFirstStatus = ensureIdAndFirst(*doc);
+        if (!idAndFirstStatus.isOK()) {
+            return idAndFirstStatus;
+        }
 
         // Validate that the object replacement or modifiers resulted in a document
         // that contains all the immutable keys and can be stored if it isn't coming
         // from a migration or via replication.
-        if (!isInternalRequest){
+        if (!isInternalRequest) {
             FieldRefSet noFields;
             // This will only validate the modified fields if not a replacement.
-            uassertStatusOK(validate(original,
-                                     noFields,
-                                     _doc,
-                                     immutablePaths,
-                                     driver->modOptions()) );
+            Status validateStatus = validate(original,
+                                             noFields,
+                                             *doc,
+                                             immutablePaths,
+                                             driver->modOptions());
+            if (!validateStatus.isOK()) {
+                return validateStatus;
+            }
         }
 
-        // Insert the doc
-        BSONObj newObj = _doc.getObject();
-        uassert(17420,
-                str::stream() << "Document to upsert is larger than " << BSONObjMaxUserSize,
-                newObj.objsize() <= BSONObjMaxUserSize);
+        BSONObj newObj = doc->getObject();
+        if (newObj.objsize() > BSONObjMaxUserSize) {
+            return Status(ErrorCodes::InvalidBSON,
+                          str::stream() << "Document to upsert is larger than "
+                                        << BSONObjMaxUserSize,
+                          17420);
+        }
+
+        *out = newObj;
+        return Status::OK();
+    }
+
+    void UpdateStage::doInsert() {
+        _specificStats.inserted = true;
+
+        const UpdateRequest* request = _params.request;
+        bool isInternalRequest = request->isFromReplication() || request->isFromMigration();
+
+        // Reset the document we will be writing to.
+        _doc.reset();
+
+        BSONObj newObj;
+        uassertStatusOK(applyUpdateOpsForInsert(_params.canonicalQuery,
+                                                request->getQuery(),
+                                                _params.driver,
+                                                request->getLifecycle(),
+                                                &_doc,
+                                                isInternalRequest,
+                                                &_specificStats,
+                                                &newObj));
 
         _specificStats.objInserted = newObj;
+        if (request->shouldStoreResultDoc()) {
+            _specificStats.newObj = newObj;
+        }
 
         // If this is an explain, bail out now without doing the insert.
         if (request->isExplain()) {
@@ -702,13 +752,16 @@ namespace mongo {
                         request->isFromMigration());
         }
 
+        // Technically, we should save/restore state here, but since we are going to return EOF
+        // immediately after, it would just be wasted work.
         wunit.commit();
     }
 
     bool UpdateStage::doneUpdating() {
         // We're done updating if either the child has no more results to give us, or we've
         // already gotten a result back and we're not a multi-update.
-        return _child->isEOF() || (_specificStats.nMatched > 0 && !_params.request->isMulti());
+        return _idRetrying == WorkingSet::INVALID_ID
+            && (_child->isEOF() || (_specificStats.nMatched > 0 && !_params.request->isMulti()));
     }
 
     bool UpdateStage::needInsert() {
@@ -736,6 +789,11 @@ namespace mongo {
         if (doneUpdating()) {
             // Even if we're done updating, we may have some inserting left to do.
             if (needInsert()) {
+                // TODO we may want to handle WriteConflictException here. Currently we bounce it
+                // out to a higher level since if this WCEs it is likely that we raced with another
+                // upsert that may have matched our query, and therefore this may need to perform an
+                // update rather than an insert. Bouncing to the higher level allows restarting the
+                // query in this case.
                 doInsert();
             }
 
@@ -749,22 +807,31 @@ namespace mongo {
         // updates to them. We should only get here if the collection exists.
         invariant(_collection);
 
-        WorkingSetID id = WorkingSet::INVALID_ID;
-        StageState status = _child->work(&id);
+        // Either retry the last WSM we worked on or get a new one from our child.
+        WorkingSetID id;
+        StageState status;
+        if (_idRetrying == WorkingSet::INVALID_ID) {
+            status = _child->work(&id);
+        }
+        else {
+            status = ADVANCED;
+            id = _idRetrying;
+            _idRetrying = WorkingSet::INVALID_ID;
+        }
 
         if (PlanStage::ADVANCED == status) {
             // Need to get these things from the result returned by the child.
             RecordId loc;
-            BSONObj oldObj;
 
             WorkingSetMember* member = _ws->get(id);
+
+            // We want to free this member when we return, unless we need to retry it.
+            ScopeGuard memberFreer = MakeGuard(&WorkingSet::free, _ws, id);
 
             if (!member->hasLoc()) {
                 // We expect to be here because of an invalidation causing a force-fetch, and
                 // doc-locking storage engines do not issue invalidations.
                 dassert(!supportsDocLocking());
-
-                _ws->free(id);
                 ++_specificStats.nInvalidateSkips;
                 ++_commonStats.needTime;
                 return PlanStage::NEED_TIME;
@@ -774,37 +841,6 @@ namespace mongo {
             // Updates can't have projections. This means that covering analysis will always add
             // a fetch. We should always get fetched data, and never just key data.
             invariant(member->hasObj());
-            oldObj = member->obj;
-
-            // If the working set member is in the owned obj with loc state, then 'oldObj' may not
-            // be the latest version in the database. In this case, we must refetch the doc from the
-            // collection. We also must be tolerant of the possibility that the doc at the wsm's
-            // RecordId was deleted or updated after being force-fetched.
-            if (WorkingSetMember::LOC_AND_OWNED_OBJ == member->state) {
-                if (!_collection->findDoc(_txn, loc, &oldObj)) {
-                    // The doc was deleted after the force-fetch, so we just move on.
-                    ++_commonStats.needTime;
-                    return PlanStage::NEED_TIME;
-                }
-
-                // We need to make sure that the doc still matches the predicate, as it may have
-                // been updated since being force-fetched.
-                //
-                // 'cq' may be NULL in the case of idhack updates. In this case, doc-level locking
-                // storage engines will look up the key in the _id index and fetch the keyed
-                // document in a single work() cyle. Since yielding cannot happen between these
-                // two events, the OperationContext protects from the doc changing under our feet.
-                CanonicalQuery* cq = _params.canonicalQuery;
-                if (cq && !cq->root()->matchesBSON(oldObj, NULL)) {
-                    ++_commonStats.needTime;
-                    return PlanStage::NEED_TIME;
-                }
-            }
-
-            // If we're here, then we have retrieved both a RecordId and the corresponding
-            // object from the child stage. Since we have the object and the diskloc,
-            // we can free the WSM.
-            _ws->free(id);
 
             // We fill this with the new locs of moved doc so we don't double-update.
             if (_updatedLocs && _updatedLocs->count(loc) > 0) {
@@ -813,67 +849,65 @@ namespace mongo {
                 return PlanStage::NEED_TIME;
             }
 
-            ++_specificStats.nMatched;
-
-            // Save state before making changes
-            _child->saveState();
-
-            // Do the update and return.
-            BSONObj reFetched;
-            uint64_t attempt = 1;
-
-            while ( attempt++ ) {
-                try {
-                    transformAndUpdate(reFetched.isEmpty() ? oldObj : reFetched , loc);
-                    break;
-                }
-                catch ( const WriteConflictException& de ) {
-                    if ( !_params.request->isMulti() ) {
-                        // We don't handle this here as we handle at the top level.
-                        throw;
-                    }
-
-                    _params.opDebug->writeConflicts++;
-
-                    _txn->recoveryUnit()->commitAndRestart();
-
-                    _txn->checkForInterrupt();
-
-                    WriteConflictException::logAndBackoff( attempt,
-                                                           "multi-update",
-                                                           _collection->ns().ns() );
-
-                    if ( attempt > 2 ) {
-                        // This means someone else is in this same loop trying to update
-                        // the same doc.  Lets make sure we give them a chance to finish.
-#if !defined(_WIN32)
-                        sched_yield();
-#else
-                        SwitchToThread();
-#endif
-                    }
-
-                    if ( !_collection->findDoc( _txn, loc, &reFetched ) ) {
+            try {
+                if (_txn->recoveryUnit()->getSnapshotId() != member->obj.snapshotId()) {
+                    // our snapshot has changed, refetch
+                    if (!WorkingSetCommon::fetch(_txn, member, _collection)) {
                         // document was deleted, we're done here
-                        break;
+                        ++_commonStats.needTime;
+                        return PlanStage::NEED_TIME;
                     }
+
                     // we have to re-match the doc as it might not match anymore
-                    if ( _params.canonicalQuery &&
-                         _params.canonicalQuery->root() &&
-                         !_params.canonicalQuery->root()->matchesBSON( reFetched, NULL ) ) {
-                        // doesn't match!
-                        break;
+                    CanonicalQuery* cq = _params.canonicalQuery;
+                    if (cq && !cq->root()->matchesBSON(member->obj.value(), NULL)) {
+                        // doesn't match predicates anymore!
+                        ++_commonStats.needTime;
+                        return PlanStage::NEED_TIME;
                     }
-                    // now we try again!
                 }
+
+                // Save state before making changes
+                try {
+                    _child->saveState();
+                    if (supportsDocLocking()) {
+                        // Doc-locking engines require this after saveState() since they don't use
+                        // invalidations.
+                        WorkingSetCommon::prepareForSnapshotChange(_ws);
+                    }
+                }
+                catch ( const WriteConflictException& wce ) {
+                    std::terminate();
+                }
+
+                // Do the update
+                transformAndUpdate(member->obj, loc);
             }
+            catch ( const WriteConflictException& wce ) {
+                _idRetrying = id;
+                memberFreer.Dismiss(); // Keep this member around so we can retry updating it.
+                *out = WorkingSet::INVALID_ID;
+                _commonStats.needYield++;
+                return NEED_YIELD;
+            }
+
+            // This should be after transformAndUpdate to make sure we actually updated this doc.
+            ++_specificStats.nMatched;
 
             // Restore state after modification
 
             // As restoreState may restore (recreate) cursors, make sure to restore the
             // state outside of the WritUnitOfWork.
-
-            _child->restoreState(_txn);
+            try {
+                _child->restoreState(_txn);
+            }
+            catch ( const WriteConflictException& wce ) {
+                // Note we don't need to retry anything in this case since the update already
+                // was committed.
+                *out = WorkingSet::INVALID_ID;
+                _commonStats.needYield++;
+                return NEED_YIELD;
+            }
 
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
@@ -899,8 +933,8 @@ namespace mongo {
         else if (PlanStage::NEED_TIME == status) {
             ++_commonStats.needTime;
         }
-        else if (PlanStage::NEED_FETCH == status) {
-            ++_commonStats.needFetch;
+        else if (PlanStage::NEED_YIELD == status) {
+            ++_commonStats.needYield;
             *out = id;
         }
 
@@ -1013,7 +1047,8 @@ namespace mongo {
                             !updateStats->isDocReplacement /* $mod or obj replacement */,
                             opDebug->nModified /* number of modified docs, no no-ops */,
                             opDebug->nMatched /* # of docs matched/updated, even no-ops */,
-                            updateStats->objInserted);
+                            updateStats->objInserted,
+                            updateStats->newObj);
     };
 
 } // namespace mongo

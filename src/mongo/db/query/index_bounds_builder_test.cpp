@@ -387,6 +387,77 @@ namespace {
         ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
     }
 
+    TEST(IndexBoundsBuilderTest, TranslateEqualNan) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: NaN}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 1U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            Interval(fromjson("{'': NaN, '': NaN}"), true, true)));
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
+    TEST(IndexBoundsBuilderTest, TranslateLtNan) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: {$lt: NaN}}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 0U);
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
+    TEST(IndexBoundsBuilderTest, TranslateLteNan) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: {$lte: NaN}}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 1U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            Interval(fromjson("{'': NaN, '': NaN}"), true, true)));
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
+    TEST(IndexBoundsBuilderTest, TranslateGtNan) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: {$gt: NaN}}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 0U);
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
+    TEST(IndexBoundsBuilderTest, TranslateGteNan) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: {$gte: NaN}}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 1U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            Interval(fromjson("{'': NaN, '': NaN}"), true, true)));
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
     TEST(IndexBoundsBuilderTest, TranslateEqual) {
         IndexEntry testIndex = IndexEntry(BSONObj());
         BSONObj obj = BSON("a" << 4);
@@ -841,6 +912,31 @@ namespace {
         ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
     }
 
+    // SERVER-9035
+    TEST(SimpleRegexTest, RootedSingleLineMode) {
+        IndexBoundsBuilder::BoundsTightness tightness;
+        string prefix = IndexBoundsBuilder::simpleRegex("^foo", "s", &tightness);
+        ASSERT_EQUALS(prefix, "foo");
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
+    // SERVER-9035
+    TEST(SimpleRegexTest, NonRootedSingleLineMode) {
+        IndexBoundsBuilder::BoundsTightness tightness;
+        string prefix = IndexBoundsBuilder::simpleRegex("foo", "s", &tightness);
+        ASSERT_EQUALS(prefix, "");
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
+    }
+
+    // SERVER-9035
+    TEST(SimpleRegexTest, RootedComplexSingleLineMode) {
+        IndexBoundsBuilder::BoundsTightness tightness;
+        string prefix = IndexBoundsBuilder::simpleRegex(
+                "\\Af \t\vo\n\ro  \\ \\# #comment", "msx", &tightness);
+        ASSERT_EQUALS(prefix, "foo #");
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
+    }
+
     //
     // Regex bounds
     //
@@ -875,6 +971,22 @@ namespace {
         ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[1].compare(
             Interval(fromjson("{'': /^foo.*|bar/, '': /^foo.*|bar/}"), true, true)));
         ASSERT(tightness == IndexBoundsBuilder::INEXACT_COVERED);
+    }
+
+    TEST(IndexBoundsBuilderTest, SimpleRegexSingleLineMode) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: /^foo/s}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+        ASSERT_EQUALS(oil.intervals.size(), 2U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            Interval(fromjson("{'': 'foo', '': 'fop'}"), true, false)));
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[1].compare(
+            Interval(fromjson("{'': /^foo/s, '': /^foo/s}"), true, true)));
+        ASSERT(tightness == IndexBoundsBuilder::EXACT);
     }
 
     TEST(IndexBoundsBuilderTest, SimplePrefixRegex) {

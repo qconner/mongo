@@ -42,6 +42,7 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
@@ -56,7 +57,7 @@ namespace mongo {
     using std::set;
     using std::string;
 
-    long long Scope::_lastVersion = 1;
+    AtomicInt64 Scope::_lastVersion(1);
 
 namespace {
     // 2 GB is the largest support Javascript file size.
@@ -187,8 +188,16 @@ namespace {
         return exec(code, filename, printResult, reportError, timeoutMs);
     }
 
-    void Scope::storedFuncMod() {
-        _lastVersion++;
+    class Scope::StoredFuncModLogOpHandler : public RecoveryUnit::Change {
+    public:
+        void commit() {
+            _lastVersion.fetchAndAdd(1);
+        }
+        void rollback() { }
+    };
+
+    void Scope::storedFuncMod(OperationContext* txn) {
+        txn->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
     }
 
     void Scope::validateObjectIdString(const string& str) {
@@ -204,10 +213,11 @@ namespace {
             uassert(10208,  "need to have locallyConnected already", _localDBName.size());
         }
 
-        if (_loadedVersion == _lastVersion)
+        int64_t lastVersion = _lastVersion.load();
+        if (_loadedVersion == lastVersion)
             return;
 
-        _loadedVersion = _lastVersion;
+        _loadedVersion = lastVersion;
         string coll = _localDBName + ".system.js";
 
         scoped_ptr<DBClientBase> directDBClient(createDirectClient(txn));
@@ -404,7 +414,7 @@ namespace {
         bool getBoolean(const char* field) { return _real->getBoolean(field); }
         BSONObj getObject(const char* field) { return _real->getObject(field); }
         void setNumber(const char* field, double val) { _real->setNumber(field, val); }
-        void setString(const char* field, const StringData& val) { _real->setString(field, val); }
+        void setString(const char* field, StringData val) { _real->setString(field, val); }
         void setElement(const char* field, const BSONElement& val) {
             _real->setElement(field, val);
         }
@@ -421,7 +431,7 @@ namespace {
             return _real->invoke(func, args, recv, timeoutMs, ignoreReturn,
                                  readOnlyArgs, readOnlyRecv);
         }
-        bool exec(const StringData& code, const string& name, bool printResult, bool reportError,
+        bool exec(StringData code, const string& name, bool printResult, bool reportError,
                   bool assertOnError, int timeoutMs = 0) {
             return _real->exec(code, name, printResult, reportError, assertOnError, timeoutMs);
         }

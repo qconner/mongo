@@ -9,6 +9,7 @@ from buildscripts import utils
 Import("env")
 Import("has_option")
 Import("get_option")
+Import("serverJs")
 Import("usev8")
 Import("v8suffix")
 Import("darwin windows solaris linux nix")
@@ -74,6 +75,7 @@ env.Library('foundation',
               "util/startup_test.cpp",
               ],
             LIBDEPS=['stacktrace',
+                     'synchronization',
                      '$BUILD_DIR/mongo/base/base',
                      '$BUILD_DIR/mongo/logger/logger',
                      '$BUILD_DIR/mongo/platform/platform',
@@ -272,7 +274,8 @@ env.Library('network', [
             "util/net/message.cpp",
             "util/net/message_port.cpp",
             "util/net/listen.cpp" ],
-            LIBDEPS=['$BUILD_DIR/mongo/util/options_parser/options_parser',
+            LIBDEPS=['$BUILD_DIR/mongo/util/concurrency/ticketholder',
+                     '$BUILD_DIR/mongo/util/options_parser/options_parser',
                      'background_job',
                      'fail_point',
                      'foundation',
@@ -546,6 +549,17 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='scripting_none',
+    source=[
+        'scripting/engine_none.cpp',
+    ],
+    LIBDEPS=[
+        'bson_template_evaluator',
+        'scripting_common',
+    ],
+)
+
 env.Library('bson_template_evaluator', ["scripting/bson_template_evaluator.cpp"],
             LIBDEPS=['bson'])
 env.CppUnitTest('bson_template_evaluator_test', ['scripting/bson_template_evaluator_test.cpp'],
@@ -572,11 +586,28 @@ else:
     env.Library(
         target='scripting',
         source=[
-            'scripting/engine_none.cpp',
         ],
         LIBDEPS=[
-            'bson_template_evaluator',
-            'scripting_common',
+            'scripting_none',
+        ],
+    )
+
+if serverJs:
+    env.Library(
+        target='scripting_server',
+        source=[
+        ],
+        LIBDEPS=[
+            'scripting',
+        ],
+    )
+else:
+    env.Library(
+        target='scripting_server',
+        source=[
+        ],
+        LIBDEPS=[
+            'scripting_none',
         ],
     )
 
@@ -772,36 +803,33 @@ env.Library('coreshard', [# This is only here temporarily for auto-split logic i
             LIBDEPS=['s/base',
                      's/cluster_ops_impl']);
 
-mongosLibraryFiles = [
-    "s/strategy.cpp",
-    "s/commands_admin.cpp",
-    "s/commands_public.cpp",
-    "s/commands/auth_schema_upgrade_s.cpp",
-    "s/commands/cluster_explain_cmd.cpp",
-    "s/commands/cluster_find_cmd.cpp",
-    "s/commands/cluster_index_filter_cmd.cpp",
-    "s/commands/cluster_merge_chunks_cmd.cpp",
-    "s/commands/cluster_plan_cache_cmd.cpp",
-    "s/commands/cluster_write_cmd.cpp",
-    "s/request.cpp",
-    "s/client_info.cpp",
-    "s/cursors.cpp",
-    "s/s_only.cpp",
-    "s/balance.cpp",
-    "s/version_manager.cpp",
-    "s/version_mongos.cpp",
-    ]
-
-env.Library( "mongoscore",
-             mongosLibraryFiles,
-             LIBDEPS=['db/auth/authmongos',
-                      'db/fts/ftsmongos',
-                      'db/query/explain_common',
-                      'db/query/lite_parsed_query',
-                      's/cluster_ops',
-                      's/cluster_write_op_conversion',
-                      's/upgrade',
-                     ] )
+env.Library('mongoscore',
+            ['s/strategy.cpp',
+             's/commands_admin.cpp',
+             's/commands_public.cpp',
+             's/commands/auth_schema_upgrade_s.cpp',
+             's/commands/cluster_explain_cmd.cpp',
+             's/commands/cluster_find_cmd.cpp',
+             's/commands/cluster_index_filter_cmd.cpp',
+             's/commands/cluster_merge_chunks_cmd.cpp',
+             's/commands/cluster_plan_cache_cmd.cpp',
+             's/commands/cluster_write_cmd.cpp',
+             's/request.cpp',
+             's/client_info.cpp',
+             's/cursors.cpp',
+             's/s_only.cpp',
+             's/balance.cpp',
+             's/version_manager.cpp',
+             's/version_mongos.cpp',
+            ],
+            LIBDEPS=['db/auth/authmongos',
+                     'db/fts/ftsmongos',
+                     'db/query/explain_common',
+                     'db/query/lite_parsed_query',
+                     's/cluster_ops',
+                     's/cluster_write_op_conversion',
+                     's/upgrade',
+            ])
 
 env.CppUnitTest("shard_key_pattern_test", [ "s/shard_key_pattern_test.cpp" ],
                 LIBDEPS=["mongoscore",
@@ -943,7 +971,7 @@ serveronlyLibdeps = ["coreshard",
                      "global_optime",
                      "index_key_validate",
                      'range_deleter',
-                     'scripting',
+                     'scripting_server',
                      "update_index_data",
                      's/metadata',
                      's/batch_write_types',
@@ -1224,7 +1252,7 @@ coreShellFiles = [ "shell/bench.cpp",
                    "shell/mk_wcwidth.cpp",
                    "shell/shell_options_init.cpp" ]
 
-if not has_option('noshell'):
+if not has_option('noshell') and usev8:
     env.Library("shell_core", coreShellFiles,
                 LIBDEPS=['clientandshell',
                          'db/index/external_key_generator',
@@ -1249,6 +1277,8 @@ if not has_option('noshell'):
                  ])
 
     shellEnv.Install( '#/', mongo_shell )
+else:
+    shellEnv = None
 
 #  ----  INSTALL -------
 

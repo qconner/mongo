@@ -493,8 +493,10 @@ namespace mongo {
         logThreshold += currentOp.getExpectedLatencyMs();
 
         if ( shouldLog || debug.executionTime > logThreshold ) {
-            MONGO_LOG_COMPONENT(0, responseComponent)
-                    << debug.report( currentOp ) << endl;
+            Locker::LockerInfo lockerInfo;
+            txn->lockState()->getLockerInfo(&lockerInfo);
+
+            MONGO_LOG_COMPONENT(0, responseComponent) << debug.report(currentOp, lockerInfo.stats);
         }
 
         if (currentOp.shouldDBProfile(debug.executionTime)) {
@@ -592,7 +594,9 @@ namespace mongo {
                     //  If DB doesn't exist, don't implicitly create it in Client::Context
                     break;
                 }
-                Lock::CollectionLock colLock(txn->lockState(), ns.ns(), MODE_IX);
+                Lock::CollectionLock collLock(txn->lockState(),
+                                              ns.ns(),
+                                              parsedUpdate.isIsolated() ? MODE_X : MODE_IX);
                 Client::Context ctx(txn, ns);
 
                 //  The common case: no implicit collection creation
@@ -634,6 +638,10 @@ namespace mongo {
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbLock(txn->lockState(), ns.db(), MODE_X);
             Client::Context ctx(txn, ns);
+            uassert(ErrorCodes::NotMaster,
+                    str::stream() << "Not primary while performing update on " << ns.ns(),
+                    repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(ns.db()));
+
             Database* db = ctx.db();
             if ( db->getCollection( ns ) ) {
                 // someone else beat us to it, that's ok
@@ -701,7 +709,9 @@ namespace mongo {
                     break;
                 }
 
-                Lock::CollectionLock colLock(txn->lockState(), ns.ns(), MODE_IX);
+                Lock::CollectionLock collLock(txn->lockState(),
+                                              ns.ns(),
+                                              parsedDelete.isIsolated() ? MODE_X : MODE_IX);
                 Client::Context ctx(txn, ns);
 
                 PlanExecutor* rawExec;
@@ -867,21 +877,32 @@ namespace mongo {
         if ( !fixed.getValue().isEmpty() )
             js = fixed.getValue();
 
-        WriteUnitOfWork wunit(txn);
-        Collection* collection = ctx.db()->getCollection( ns );
-        if ( !collection ) {
-            collection = ctx.db()->createCollection( txn, ns );
-            verify( collection );
-            repl::logOp(txn,
-                        "c",
-                        (ctx.db()->name() + ".$cmd").c_str(),
-                        BSON("create" << nsToCollectionSubstring(ns)));
-        }
+        int attempt = 0;
+        while ( true ) {
+            try {
+                WriteUnitOfWork wunit(txn);
+                Collection* collection = ctx.db()->getCollection( ns );
+                if ( !collection ) {
+                    collection = ctx.db()->createCollection( txn, ns );
+                    verify( collection );
+                    repl::logOp(txn,
+                                "c",
+                                (ctx.db()->name() + ".$cmd").c_str(),
+                                BSON("create" << nsToCollectionSubstring(ns)));
+                }
 
-        StatusWith<RecordId> status = collection->insertDocument( txn, js, true );
-        uassertStatusOK( status.getStatus() );
-        repl::logOp(txn, "i", ns, js);
-        wunit.commit();
+                StatusWith<RecordId> status = collection->insertDocument( txn, js, true );
+                uassertStatusOK( status.getStatus() );
+                repl::logOp(txn, "i", ns, js);
+                wunit.commit();
+                break;
+            }
+            catch( const WriteConflictException& e ) {
+                txn->getCurOp()->debug().writeConflicts++;
+                txn->recoveryUnit()->commitAndRestart();
+                WriteConflictException::logAndBackoff( attempt++, "insert", ns);
+            }
+        }
     }
 
     NOINLINE_DECL void insertMulti(OperationContext* txn,
@@ -1091,7 +1112,7 @@ namespace mongo {
     }
 
     void exitCleanly(ExitCode code) {
-        if (shutdownInProgress.fetchAndAdd(1) != 0) {
+        if (shutdownInProgress.compareAndSwap(0, 1) != 0) {
             while (true) {
                 sleepsecs(1000);
             }

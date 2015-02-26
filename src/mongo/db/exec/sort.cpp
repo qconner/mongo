@@ -126,7 +126,7 @@ namespace mongo {
                                              BSONObj* objOut) const {
         BSONObj btreeKeyToUse;
 
-        Status btreeStatus = getBtreeKey(member.obj, &btreeKeyToUse);
+        Status btreeStatus = getBtreeKey(member.obj.value(), &btreeKeyToUse);
         if (!btreeStatus.isOK()) {
             return btreeStatus;
         }
@@ -399,8 +399,8 @@ namespace mongo {
             else if (PlanStage::NEED_TIME == code) {
                 ++_commonStats.needTime;
             }
-            else if (PlanStage::NEED_FETCH == code) {
-                ++_commonStats.needFetch;
+            else if (PlanStage::NEED_YIELD == code) {
+                ++_commonStats.needYield;
                 *out = id;
             }
 

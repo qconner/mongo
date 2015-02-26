@@ -41,7 +41,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -75,7 +74,7 @@ namespace repl {
                                            std::vector<Privilege>* out) {}
         CmdReplSetTest() : ReplSetCommand("replSetTest") { }
         virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            log() << "replSet replSetTest command received: " << cmdObj.toString();
+            log() << "replSetTest command received: " << cmdObj.toString();
 
             if( cmdObj.hasElement("forceInitialSyncFailure") ) {
                 replSetForceInitialSyncFailure = (unsigned) cmdObj["forceInitialSyncFailure"].Number();
@@ -233,9 +232,10 @@ namespace {
             }
 
             if (configObj.isEmpty()) {
-                result.append("info2", "no configuration explicitly specified -- making one");
-                log() << "replSet info initiate : no configuration specified.  "
+                string noConfigMessage = "no configuration specified. "
                     "Using a default configuration for the set";
+                result.append("info2", noConfigMessage);
+                log() << "initiate : " << noConfigMessage;
 
                 ReplicationCoordinatorExternalStateImpl externalState;
                 std::string name;
@@ -261,7 +261,7 @@ namespace {
                 }
                 b.appendArray("members", members.obj());
                 configObj = b.obj();
-                log() << "replSet created this configuration for initiation : " <<
+                log() << "created this configuration for initiation : " <<
                         configObj.toString();
             }
 
@@ -423,6 +423,8 @@ namespace {
                 return appendCommandStatus(result, status);
             }
 
+            log() << "Attempting to step down in response to replSetStepDown command";
+
             status = getGlobalReplicationCoordinator()->stepDown(
                     txn,
                     force,
@@ -513,36 +515,27 @@ namespace {
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 
+            // accept and ignore handshakes sent from old (3.0-series) nodes without erroring to
+            // enable mixed-version operation, since we no longer use the handshakes
             if (cmdObj.hasField("handshake")) {
-                // we have received a handshake, not an update message
-                // handshakes are done here to ensure the receiving end supports the update command
-
-                HandshakeArgs handshake;
-                status = handshake.initialize(cmdObj["handshake"].embeddedObject());
-                if (!status.isOK())
-                    return appendCommandStatus(result, status);
-
-                if (!handshake.hasMemberId()) {
-                    return appendCommandStatus(
-                            result,
-                            Status(ErrorCodes::NoSuchKey,
-                                   "replSetUpdatePosition handshake was missing 'member' field"));
-                }
-
-                return appendCommandStatus(
-                        result,
-                        getGlobalReplicationCoordinator()->processHandshake(txn, handshake));
+                return true;
             }
-
+            
             UpdatePositionArgs args;
             status = args.initialize(cmdObj);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
-            
-            return appendCommandStatus(
-                    result,
-                    getGlobalReplicationCoordinator()->processReplSetUpdatePosition(args));
-                    
+
+            // in the case of an update from a member with an invalid replica set config,
+            // we return our current config version
+            long long configVersion = -1;
+            status = getGlobalReplicationCoordinator()->
+                processReplSetUpdatePosition(args, &configVersion);
+
+            if (status == ErrorCodes::InvalidReplicaSetConfig) {
+                result.append("configVersion", configVersion);
+            }
+            return appendCommandStatus(result, status);
         }
     } cmdReplSetUpdatePosition;
 
@@ -691,8 +684,8 @@ namespace {
                          string& errmsg,
                          BSONObjBuilder& result,
                          bool fromRepl) {
-            DEV log() << "replSet received elect msg " << cmdObj.toString();
-            else LOG(2) << "replSet received elect msg " << cmdObj.toString();
+            DEV log() << "received elect msg " << cmdObj.toString();
+            else LOG(2) << "received elect msg " << cmdObj.toString();
 
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())

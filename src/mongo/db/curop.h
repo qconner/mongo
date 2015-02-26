@@ -95,7 +95,7 @@ namespace mongo {
             return _get();
         }
 
-        void append( BSONObjBuilder& b , const StringData& name ) const {
+        void append( BSONObjBuilder& b , StringData name ) const {
             scoped_spinlock lk(_lock);
             BSONObj temp = _get();
             b.append( name , temp );
@@ -129,13 +129,17 @@ namespace mongo {
 
         void recordStats();
 
-        std::string report( const CurOp& curop ) const;
+        std::string report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const;
 
         /**
-         * Appends information about the current operation to "builder".  "curop" must be a
-         * reference to the CurOp that owns this OpDebug.
+         * Appends information about the current operation to "builder"
+         *
+         * @param curop reference to the CurOp that owns this OpDebug
+         * @param lockStats lockStats object containing locking information about the operation
          */
-        void append(const CurOp& curop, BSONObjBuilder& builder) const;
+        void append(const CurOp& curop,
+                    const SingleThreadedLockStats& lockStats,
+                    BSONObjBuilder& builder) const;
 
         // -------------------
         
@@ -194,7 +198,7 @@ namespace mongo {
 
         bool haveQuery() const { return _query.have(); }
         BSONObj query() const { return _query.get();  }
-        void appendQuery( BSONObjBuilder& b , const StringData& name ) const { _query.append( b , name ); }
+        void appendQuery( BSONObjBuilder& b , StringData name ) const { _query.append( b , name ); }
         
         void enter(const char* ns, int dbProfileLevel);
         void reset();
@@ -313,7 +317,7 @@ namespace mongo {
          * generally the Context should set this up
          * but sometimes you want to do it ahead of time
          */
-        void setNS( const StringData& ns );
+        void setNS( StringData ns );
 
     private:
         friend class Client;

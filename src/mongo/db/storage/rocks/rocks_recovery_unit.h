@@ -50,7 +50,6 @@ namespace rocksdb {
     class WriteBatchWithIndex;
     class Comparator;
     class Status;
-    class ColumnFamilyHandle;
     class Slice;
     class Iterator;
 }
@@ -65,7 +64,7 @@ namespace mongo {
         RocksRecoveryUnit(RocksTransactionEngine* transactionEngine, rocksdb::DB* db, bool durable);
         virtual ~RocksRecoveryUnit();
 
-        virtual void beginUnitOfWork();
+        virtual void beginUnitOfWork(OperationContext* opCtx);
         virtual void commitUnitOfWork();
 
         virtual void endUnitOfWork();
@@ -78,6 +77,10 @@ namespace mongo {
 
         virtual void registerChange(Change* change);
 
+        virtual void setRollbackWritesDisabled() {}
+
+        virtual SnapshotId getSnapshotId() const;
+
         // local api
 
         rocksdb::WriteBatchWithIndex* writeBatch();
@@ -87,15 +90,18 @@ namespace mongo {
 
         RocksTransaction* transaction() { return &_transaction; }
 
-        rocksdb::Status Get(rocksdb::ColumnFamilyHandle* columnFamily, const rocksdb::Slice& key,
-                            std::string* value);
+        rocksdb::Status Get(const rocksdb::Slice& key, std::string* value);
 
-        rocksdb::Iterator* NewIterator(rocksdb::ColumnFamilyHandle* columnFamily);
+        rocksdb::Iterator* NewIterator(std::string prefix);
+
+        static rocksdb::Iterator* NewIteratorNoSnapshot(rocksdb::DB* db, std::string prefix);
 
         void incrementCounter(const rocksdb::Slice& counterKey,
                               std::atomic<long long>* counter, long long delta);
 
         long long getDeltaCounter(const rocksdb::Slice& counterKey);
+
+        static long long getCounterValue(rocksdb::DB* db, const rocksdb::Slice counterKey);
 
         void setOplogReadTill(const RecordId& loc);
         RecordId getOplogReadTill() const { return _oplogReadTill; }
@@ -139,6 +145,7 @@ namespace mongo {
         Changes _changes;
 
         int _depth;
+        uint64_t _myTransactionCount;
 
         RecordId _oplogReadTill;
     };

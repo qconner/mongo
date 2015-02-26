@@ -32,6 +32,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -105,7 +106,7 @@ namespace repl {
         return true;
     }
 
-    bool ReplicationCoordinatorMock::canAcceptWritesForDatabase(const StringData& dbName) {
+    bool ReplicationCoordinatorMock::canAcceptWritesForDatabase(StringData dbName) {
         // TODO
         return true;
     }
@@ -131,6 +132,8 @@ namespace repl {
     }
 
     void ReplicationCoordinatorMock::setMyLastOptime(const OpTime& ts) {}
+
+    void ReplicationCoordinatorMock::resetMyLastOptime() {}
 
     OpTime ReplicationCoordinatorMock::getMyLastOptime() const {
         // TODO
@@ -163,11 +166,14 @@ namespace repl {
 
     void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
 
-    void ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
-            BSONObjBuilder* cmdBuilder) {}
+    bool ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
+            BSONObjBuilder* cmdBuilder) {
+        return true;
+    }
 
-    void ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommandHandshakes(
-            std::vector<BSONObj>* handshakes) {}
+    ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
+        return ReplicaSetConfig();
+    }
 
     void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result) {
         // TODO
@@ -235,12 +241,12 @@ namespace repl {
     }
 
     Status ReplicationCoordinatorMock::processReplSetUpdatePosition(
-            const UpdatePositionArgs& updates) {
+            const UpdatePositionArgs& updates, long long* configVersion) {
         // TODO
         return Status::OK();
     }
 
-    Status ReplicationCoordinatorMock::processHandshake(OperationContext* txn,
+    Status ReplicationCoordinatorMock::processHandshake(OperationContext* txn,  
                                                         const HandshakeArgs& handshake) {
         return Status::OK();
     }

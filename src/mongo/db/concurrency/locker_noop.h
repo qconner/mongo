@@ -102,11 +102,11 @@ namespace mongo {
             return true;
         }
 
-        virtual bool isDbLockedForMode(const StringData& dbName, LockMode mode) const {
+        virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const {
             return true;
         }
 
-        virtual bool isCollectionLockedForMode(const StringData& ns, LockMode mode) const {
+        virtual bool isCollectionLockedForMode(StringData ns, LockMode mode) const {
             return true;
         }
 
@@ -143,14 +143,14 @@ namespace mongo {
         }
 
         virtual bool isWriteLocked() const {
-            invariant(false);
+            return false;
         }
 
         virtual bool isReadLocked() const {
             invariant(false);
         }
 
-        virtual void assertEmpty() const {
+        virtual void assertEmptyAndReset() {
             invariant(false);
         }
 
@@ -168,6 +168,10 @@ namespace mongo {
 
         virtual void setLockPendingParallelWriter(bool newValue) {
             invariant(false);
+        }
+
+        virtual bool hasStrongLocks() const {
+            return false;
         }
 
     };

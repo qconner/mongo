@@ -57,8 +57,10 @@ namespace repl {
 
     class ElectCmdRunner;
     class FreshnessChecker;
+    class HandshakeArgs;
     class HeartbeatResponseAction;
     class OplogReader;
+    class ReplicaSetConfig;
     class SyncSourceFeedback;
     class TopologyCoordinator;
 
@@ -122,7 +124,7 @@ namespace repl {
 
         virtual bool isMasterForReportingPurposes();
 
-        virtual bool canAcceptWritesForDatabase(const StringData& dbName);
+        virtual bool canAcceptWritesForDatabase(StringData dbName);
 
         virtual Status checkIfWriteConcernCanBeSatisfied(
                 const WriteConcernOptions& writeConcern) const;
@@ -136,6 +138,8 @@ namespace repl {
         virtual Status setLastOptimeForSlave(const OID& rid, const OpTime& ts);
 
         virtual void setMyLastOptime(const OpTime& ts);
+
+        virtual void resetMyLastOptime();
 
         virtual void setMyHeartbeatMessage(const std::string& msg);
 
@@ -155,16 +159,15 @@ namespace repl {
 
         virtual void signalUpstreamUpdater();
 
-        virtual void prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder);
-
-        virtual void prepareReplSetUpdatePositionCommandHandshakes(
-                std::vector<BSONObj>* handshakes);
+        virtual bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder);
 
         virtual Status processReplSetGetStatus(BSONObjBuilder* result);
 
         virtual void fillIsMasterForReplSet(IsMasterResponse* result);
 
         virtual void appendSlaveInfoData(BSONObjBuilder* result);
+
+        virtual ReplicaSetConfig getConfig() const;
 
         virtual void processReplSetGetConfig(BSONObjBuilder* result);
 
@@ -198,7 +201,8 @@ namespace repl {
         virtual Status processReplSetElect(const ReplSetElectArgs& args,
                                            BSONObjBuilder* response);
 
-        virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates);
+        virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
+                                                    long long* configVersion);
 
         virtual Status processHandshake(OperationContext* txn, const HandshakeArgs& handshake);
 
@@ -239,7 +243,7 @@ namespace repl {
         /**
          * Simple wrapper around _setLastOptime_inlock to make it easier to test.
          */
-        Status setLastOptime_forTest(const OID& rid, const OpTime& ts);
+        Status setLastOptime_forTest(long long cfgVer, long long memberId, const OpTime& ts);
 
     private:
 
@@ -493,8 +497,11 @@ namespace repl {
         /**
          * Helper method for updating our tracking of the last optime applied by a given node.
          * This is only valid to call on replica sets.
+         * "configVersion" will be populated with our config version if it and the configVersion
+         * of "args" differ.
          */
-        Status _setLastOptime_inlock(const UpdatePositionArgs::UpdateInfo& args);
+        Status _setLastOptime_inlock(const UpdatePositionArgs::UpdateInfo& args,
+                                     long long* configVersion);
 
         /**
          * Helper method for setMyLastOptime that takes in a unique lock on
@@ -660,13 +667,23 @@ namespace repl {
 
         /**
          * Adds 'host' to the sync source blacklist until 'until'. A blacklisted source cannot
-         * be chosen as a sync source.
+         * be chosen as a sync source. Schedules a callback to unblacklist the sync source to be
+         * run at 'until'.
          *
          * Must be scheduled as a callback.
          */
         void _blacklistSyncSource(const ReplicationExecutor::CallbackData& cbData,
                                   const HostAndPort& host,
                                   Date_t until);
+
+        /**
+         * Removes 'host' from the sync source blacklist. If 'host' isn't found, it's simply
+         * ignored and no error is thrown.
+         *
+         * Must be scheduled as a callback.
+         */
+        void _unblacklistSyncSource(const ReplicationExecutor::CallbackData& cbData,
+                                    const HostAndPort& host);
 
         /**
          * Determines if a new sync source should be considered.

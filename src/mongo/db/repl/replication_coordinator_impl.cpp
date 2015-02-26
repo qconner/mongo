@@ -541,7 +541,7 @@ namespace {
     }
 
     void ReplicationCoordinatorImpl::signalUpstreamUpdater() {
-        _externalState->forwardSlaveHandshake();
+        _externalState->forwardSlaveProgress();
     }
 
     ReplicationCoordinatorImpl::SlaveInfo*
@@ -686,6 +686,11 @@ namespace {
         _setMyLastOptime_inlock(&lock, ts, false);
     }
 
+    void ReplicationCoordinatorImpl::resetMyLastOptime() {
+        boost::unique_lock<boost::mutex> lock(_mutex);
+        _setMyLastOptime_inlock(&lock, OpTime(), true);
+    }
+
     void ReplicationCoordinatorImpl::_setMyLastOptime_inlock(
             boost::unique_lock<boost::mutex>* lock, const OpTime& ts, bool isRollbackAllowed) {
         invariant(lock->owns_lock());
@@ -712,16 +717,19 @@ namespace {
         return _slaveInfo[_getMyIndexInSlaveInfo_inlock()].opTime;
     }
 
-    Status ReplicationCoordinatorImpl::setLastOptime_forTest(const OID& rid, const OpTime& ts) {
+    Status ReplicationCoordinatorImpl::setLastOptime_forTest(long long cfgVer,
+                                                             long long memberId,
+                                                             const OpTime& ts) {
         boost::lock_guard<boost::mutex> lock(_mutex);
         invariant(_getReplicationMode_inlock() == modeReplSet);
 
-        const UpdatePositionArgs::UpdateInfo update(rid, ts, -1, -1);
-        return _setLastOptime_inlock(update);
+        const UpdatePositionArgs::UpdateInfo update(OID(), ts, cfgVer, memberId);
+        long long configVersion;
+        return _setLastOptime_inlock(update, &configVersion);
     }
 
     Status ReplicationCoordinatorImpl::_setLastOptime_inlock(
-            const UpdatePositionArgs::UpdateInfo& args) {
+            const UpdatePositionArgs::UpdateInfo& args, long long* configVersion) {
 
         if (_selfIndex == -1) {
             // Ignore updates when we're in state REMOVED
@@ -730,57 +738,50 @@ namespace {
         }
         invariant(_getReplicationMode_inlock() == modeReplSet);
 
+        if (args.memberId < 0) {
+            std::string errmsg = str::stream()
+                      << "Received replSetUpdatePosition for node with memberId "
+                      << args.memberId << " which is negative and therefore invalid";
+            LOG(1) << errmsg;
+            return Status(ErrorCodes::NodeNotFound, errmsg);
+        }
+
         if (args.rid == _getMyRID_inlock() ||
                 args.memberId == _rsConfig.getMemberAt(_selfIndex).getId()) {
             // Do not let remote nodes tell us what our optime is.
             return Status::OK();
         }
 
-        LOG(2) << "received notification that node with RID " << args.rid <<
-                " has reached optime: " << args.ts;
+        LOG(2) << "received notification that node with memberID " << args.memberId <<
+                  " in config with version " << args.cfgver << " has reached optime: " << args.ts;
 
         SlaveInfo* slaveInfo = NULL;
-        if (args.memberId >= 0) {
-            if (args.cfgver != _rsConfig.getConfigVersion()) {
-                std::string errmsg = str::stream()
-                          << "Received replSetUpdatePosition for node with memberId "
-                          << args.memberId << " whose config version of " << args.cfgver
-                          << " doesn't match our config version of "
-                          << _rsConfig.getConfigVersion();
-                LOG(1) << errmsg;
-                return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
-            }
-
-            slaveInfo = _findSlaveInfoByMemberID_inlock(args.memberId);
-            if (!slaveInfo) {
-                invariant(!_rsConfig.findMemberByID(args.memberId));
-
-                std::string errmsg = str::stream()
-                          << "Received replSetUpdatePosition for node with memberId "
-                          << args.memberId << " which doesn't exist in our config";
-                LOG(1) << errmsg;
-                return Status(ErrorCodes::NodeNotFound, errmsg);
-            }
+        if (args.cfgver != _rsConfig.getConfigVersion()) {
+            std::string errmsg = str::stream()
+                      << "Received replSetUpdatePosition for node with memberId "
+                      << args.memberId << " whose config version of " << args.cfgver
+                      << " doesn't match our config version of "
+                      << _rsConfig.getConfigVersion();
+            LOG(1) << errmsg;
+            *configVersion = _rsConfig.getConfigVersion();
+            return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
         }
-        else {
-            // The command we received didn't contain a memberId, most likely this is because it
-            // came from a member running something prior to 2.8.
-            // Fall back to finding the node by RID.
-            slaveInfo = _findSlaveInfoByRID_inlock(args.rid);
-            if (!slaveInfo) {
-                std::string errmsg = str::stream()
-                          << "Received replSetUpdatePosition for node with RID " << args.rid
-                          << ", but we haven't yet received a handshake for that node.";
-                LOG(1) << errmsg;
-                return Status(ErrorCodes::NodeNotFound, errmsg);
-            }
-            invariant(slaveInfo->memberId >= 0);
-        }
-        invariant(slaveInfo);
-        invariant(args.memberId < 0 || args.memberId == slaveInfo->memberId);
 
-        LOG(3) << "Node with RID " << args.rid << " and memberId " << slaveInfo->memberId
-               << " currently has optime " << slaveInfo->opTime << "; updating to " << args.ts;
+        slaveInfo = _findSlaveInfoByMemberID_inlock(args.memberId);
+        if (!slaveInfo) {
+            invariant(!_rsConfig.findMemberByID(args.memberId));
+
+            std::string errmsg = str::stream()
+                      << "Received replSetUpdatePosition for node with memberId "
+                      << args.memberId << " which doesn't exist in our config";
+            LOG(1) << errmsg;
+            return Status(ErrorCodes::NodeNotFound, errmsg);
+        }
+
+        invariant(args.memberId == slaveInfo->memberId);
+
+        LOG(3) << "Node with memberID " << args.memberId << " currently has optime " <<
+                  slaveInfo->opTime << "; updating to " << args.ts;
 
         // Only update remote optimes if they increase.
         if (slaveInfo->opTime < args.ts) {
@@ -1216,7 +1217,7 @@ namespace {
         return false;
     }
 
-    bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase(const StringData& dbName) {
+    bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase(StringData dbName) {
         // _canAcceptNonLocalWrites is always true for standalone nodes, always false for nodes
         // started with --slave, and adjusted based on primary+drain state in replica sets.
         //
@@ -1313,10 +1314,14 @@ namespace {
         return self.getId();
     }
 
-    void ReplicationCoordinatorImpl::prepareReplSetUpdatePositionCommand(
+    bool ReplicationCoordinatorImpl::prepareReplSetUpdatePositionCommand(
             BSONObjBuilder* cmdBuilder) {
         boost::lock_guard<boost::mutex> lock(_mutex);
         invariant(_rsConfig.isInitialized());
+        // do not send updates if we have been removed from the config
+        if (_selfIndex == -1) {
+            return false;
+        }
         cmdBuilder->append("replSetUpdatePosition", 1);
         // create an array containing objects each member connected to us and for ourself
         BSONArrayBuilder arrayBuilder(cmdBuilder->subarrayStart("optimes"));
@@ -1327,48 +1332,20 @@ namespace {
                     // Don't include info on members we haven't heard from yet.
                     continue;
                 }
-                invariant(itr->rid.isSet());
                 BSONObjBuilder entry(arrayBuilder.subobjStart());
                 entry.append("_id", itr->rid);
                 entry.append("optime", itr->opTime);
                 entry.append("memberId", itr->memberId);
                 entry.append("cfgver", _rsConfig.getConfigVersion());
-                // SERVER-14550 Even though the "config" field isn't used on the other end in 2.8,
+                // SERVER-14550 Even though the "config" field isn't used on the other end in 3.0,
                 // we need to keep sending it for 2.6 compatibility.
-                // TODO(spencer): Remove this after 2.8 is released.
+                // TODO(spencer): Remove this after 3.0 is released.
                 const MemberConfig* member = _rsConfig.findMemberByID(itr->memberId);
-                fassert(18651, member); // We ensured the member existed in processHandshake.
+                fassert(18651, member);
                 entry.append("config", member->toBSON(_rsConfig.getTagConfig()));
             }
         }
-    }
-
-    void ReplicationCoordinatorImpl::prepareReplSetUpdatePositionCommandHandshakes(
-            std::vector<BSONObj>* handshakes) {
-        boost::lock_guard<boost::mutex> lock(_mutex);
-        // handshake objs for ourself and all chained members
-        for (SlaveInfoVector::const_iterator itr = _slaveInfo.begin();
-                itr != _slaveInfo.end(); ++itr) {
-            if (!itr->rid.isSet()) {
-                // Don't include info on members we haven't heard from yet.
-                continue;
-            }
-
-            BSONObjBuilder cmd;
-            cmd.append("replSetUpdatePosition", 1);
-            {
-                BSONObjBuilder subCmd (cmd.subobjStart("handshake"));
-                subCmd.append("handshake", itr->rid);
-                subCmd.append("member", itr->memberId);
-                // SERVER-14550 Even though the "config" field isn't used on the other end in 2.8,
-                // we need to keep sending it for 2.6 compatibility.
-                // TODO(spencer): Remove this after 2.8 is released.
-                const MemberConfig* member = _rsConfig.findMemberByID(itr->memberId);
-                fassert(18650, member); // We ensured the member existed in processHandshake.
-                subCmd.append("config", member->toBSON(_rsConfig.getTagConfig()));
-            }
-            handshakes->push_back(cmd.obj());
-        }
+        return true;
     }
 
     Status ReplicationCoordinatorImpl::processReplSetGetStatus(BSONObjBuilder* response) {
@@ -1399,6 +1376,12 @@ namespace {
                        this,
                        stdx::placeholders::_1,
                        response));
+        if (cbh.getStatus() == ErrorCodes::ShutdownInProgress) {
+            response->markAsShutdownInProgress();
+            return;
+        }
+        fassert(28602, cbh.getStatus());
+
         _replExecutor.wait(cbh.getValue());
         if (isWaitingForApplierToDrain()) {
             // Report that we are secondary to ismaster callers until drain completes.
@@ -1418,11 +1401,11 @@ namespace {
 
     void ReplicationCoordinatorImpl::appendSlaveInfoData(BSONObjBuilder* result) {
         boost::lock_guard<boost::mutex> lock(_mutex);
-        BSONArrayBuilder slaves(result->subarrayStart("slaves"));
+        BSONArrayBuilder replicationProgress(result->subarrayStart("replicationProgress"));
         {
             for (SlaveInfoVector::const_iterator itr = _slaveInfo.begin();
                     itr != _slaveInfo.end(); ++itr) {
-                BSONObjBuilder entry(slaves.subobjStart());
+                BSONObjBuilder entry(replicationProgress.subobjStart());
                 entry.append("rid", itr->rid);
                 entry.append("optime", itr->opTime);
                 entry.append("host", itr->hostAndPort.toString());
@@ -1435,6 +1418,11 @@ namespace {
                 }
             }
         }
+    }
+
+    ReplicaSetConfig ReplicationCoordinatorImpl::getConfig() const {
+        boost::lock_guard<boost::mutex> lock(_mutex);
+        return _rsConfig;
     }
 
     void ReplicationCoordinatorImpl::processReplSetGetConfig(BSONObjBuilder* result) {
@@ -1504,7 +1492,7 @@ namespace {
 
         int curMaintenanceCalls = _topCoord->getMaintenanceCount();
         if (activate) {
-            log() << "replSet going into maintenance mode with " << curMaintenanceCalls
+            log() << "going into maintenance mode with " << curMaintenanceCalls
                   << " other maintenance mode tasks in progress" << rsLog;
             _topCoord->adjustMaintenanceCountBy(1);
         }
@@ -1829,7 +1817,7 @@ namespace {
             return Status(ErrorCodes::InvalidReplicaSetConfig, myIndex.getStatus().reason());
         }
 
-        log() << "replSet replSetInitiate config object with " << newConfig.getNumMembers() <<
+        log() << "replSetInitiate config object with " << newConfig.getNumMembers() <<
             " members parses ok";
 
         status = checkQuorumForInitiate(
@@ -1838,13 +1826,13 @@ namespace {
                 myIndex.getValue());
 
         if (!status.isOK()) {
-            error() << "replSet replSetInitiate failed; " << status;
+            error() << "replSetInitiate failed; " << status;
             return status;
         }
 
         status = _externalState->storeLocalConfigDocument(txn, newConfig.toBSON());
         if (!status.isOK()) {
-            error() << "replSet replSetInitiate failed to store config document; " << status;
+            error() << "replSetInitiate failed to store config document; " << status;
             return status;
         }
 
@@ -1894,6 +1882,9 @@ namespace {
         const MemberState newState = _topCoord->getMemberState();
         if (newState == _memberState) {
             if (_topCoord->getRole() == TopologyCoordinator::Role::candidate) {
+                invariant(_rsConfig.getNumMembers() == 1 &&
+                          _selfIndex == 0 &&
+                          _rsConfig.getMemberAt(0).isElectable());
                 return kActionWinElection;
             }
             return kActionNone;
@@ -1926,6 +1917,9 @@ namespace {
             // When transitioning to SECONDARY, the only way for _topCoord to report the candidate
             // role is if the configuration represents a single-node replica set.  In that case, the
             // overriding requirement is to elect this singleton node primary.
+            invariant(_rsConfig.getNumMembers() == 1 &&
+                      _selfIndex == 0 &&
+                      _rsConfig.getMemberAt(0).isElectable());
             result = kActionWinElection;
         }
 
@@ -2055,8 +2049,15 @@ namespace {
                  _replExecutor.now(),
                  myOptime);
          _rsConfig = newConfig;
-         log() << "new replica set config in use: " << _rsConfig.toBSON() << rsLog;
+         log() << "New replica set config in use: " << _rsConfig.toBSON() << rsLog;
          _selfIndex = myIndex;
+         if (_selfIndex >= 0) {
+             log() << "This node is " <<
+                 _rsConfig.getMemberAt(_selfIndex).getHostAndPort() << " in the config";
+         }
+         else {
+             log() << "This node is not a member of the config";
+         }
 
          const PostMemberStateUpdateAction action =
              _updateMemberStateFromTopologyCoordinator_inlock();
@@ -2081,7 +2082,7 @@ namespace {
     }
 
     Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(
-            const UpdatePositionArgs& updates) {
+            const UpdatePositionArgs& updates, long long* configVersion) {
 
         boost::unique_lock<boost::mutex> lock(_mutex);
         Status status = Status::OK();
@@ -2089,7 +2090,7 @@ namespace {
         for (UpdatePositionArgs::UpdateIterator update = updates.updatesBegin();
                 update != updates.updatesEnd();
                 ++update) {
-            status = _setLastOptime_inlock(*update);
+            status = _setLastOptime_inlock(*update, configVersion);
             if (!status.isOK()) {
                 break;
             }
@@ -2108,36 +2109,12 @@ namespace {
         LOG(2) << "Received handshake " << handshake.toBSON();
 
         boost::unique_lock<boost::mutex> lock(_mutex);
-        if (_getReplicationMode_inlock() == modeReplSet) {
-            if (_selfIndex == -1) {
-                // Ignore updates when we're in state REMOVED
-                return Status(ErrorCodes::NotMasterOrSecondaryCode,
-                              "Received replSetUpdatePosition command but we are in state REMOVED");
-            }
 
-            int memberId = handshake.getMemberId();
-            const MemberConfig* member = _rsConfig.findMemberByID(memberId);
-            if (!member) {
-                return Status(ErrorCodes::NodeNotFound,
-                              str::stream() << "Node with replica set memberId " << memberId <<
-                                      " could not be found in replica set config while attempting"
-                                      " to associate it with RID " << handshake.getRid() <<
-                                      " in replication handshake.  ReplSet Config: " <<
-                                      _rsConfig.toBSON().toString());
-            }
-            SlaveInfo* slaveInfo = _findSlaveInfoByMemberID_inlock(handshake.getMemberId());
-            invariant(slaveInfo); // If it's in the config it must be in _slaveInfo
-            slaveInfo->rid = handshake.getRid();
-            slaveInfo->hostAndPort = member->getHostAndPort();
-
-            if (!_getMemberState_inlock().primary()) {
-                lock.unlock();
-                _externalState->forwardSlaveHandshake(); // must do outside _mutex
-            }
-            return Status::OK();
+        if (_getReplicationMode_inlock() != modeMasterSlave) {
+            return Status(ErrorCodes::IllegalOperation,
+                          "The handshake command is only used for master/slave replication");
         }
 
-        // master-slave from here down
         SlaveInfo* slaveInfo = _findSlaveInfoByRID_inlock(handshake.getRid());
         if (slaveInfo) {
             return Status::OK(); // nothing to do
@@ -2285,6 +2262,25 @@ namespace {
             return;
         }
         _topCoord->blacklistSyncSource(host, until);
+
+        CBHStatus cbh = _replExecutor.scheduleWorkAt(
+                until,
+                stdx::bind(&ReplicationCoordinatorImpl::_unblacklistSyncSource,
+                           this,
+                           stdx::placeholders::_1,
+                           host));
+        if (cbh.getStatus() == ErrorCodes::ShutdownInProgress) {
+            return;
+        }
+        fassert(28610, cbh.getStatus());
+    }
+
+    void ReplicationCoordinatorImpl::_unblacklistSyncSource(
+            const ReplicationExecutor::CallbackData& cbData,
+            const HostAndPort& host) {
+        if (cbData.status == ErrorCodes::CallbackCanceled)
+            return;
+        _topCoord->unblacklistSyncSource(host, _replExecutor.now());
     }
 
     void ReplicationCoordinatorImpl::blacklistSyncSource(const HostAndPort& host, Date_t until) {
@@ -2323,7 +2319,8 @@ namespace {
         if (cbData.status == ErrorCodes::CallbackCanceled) {
             return;
         }
-        *shouldChange = _topCoord->shouldChangeSyncSource(currentSource);
+
+        *shouldChange = _topCoord->shouldChangeSyncSource(currentSource, _replExecutor.now());
     }
 
     bool ReplicationCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentSource) {

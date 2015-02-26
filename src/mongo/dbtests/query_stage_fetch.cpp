@@ -92,7 +92,7 @@ namespace QueryStageFetch {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
+            Database* db = ctx.db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
@@ -122,8 +122,8 @@ namespace QueryStageFetch {
 
                 mockMember.state = WorkingSetMember::OWNED_OBJ;
                 mockMember.loc = RecordId();
-                mockMember.obj = BSON("foo" << 6);
-                ASSERT_TRUE(mockMember.obj.isOwned());
+                mockMember.obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+                ASSERT_TRUE(mockMember.obj.value().isOwned());
                 mockStage->pushBack(mockMember);
             }
 

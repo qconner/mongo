@@ -154,7 +154,7 @@ namespace mongo {
         // Extract all the geometries out of this document for the near query
         OwnedPointerVector<StoredGeometry> geometriesOwned;
         vector<StoredGeometry*>& geometries = geometriesOwned.mutableVector();
-        extractGeometries(member->obj, nearParams.nearQuery->field, &geometries);
+        extractGeometries(member->obj.value(), nearParams.nearQuery->field, &geometries);
 
         // Compute the minimum distance of all the geometries in the document
         double minDistance = -1;
@@ -300,7 +300,12 @@ namespace mongo {
         PlanStage::StageState work(OperationContext* txn,
                                    WorkingSet* workingSet,
                                    Collection* collection,
+                                   WorkingSetID* out,
                                    double* estimatedDistance);
+
+        void saveState();
+        void restoreState(OperationContext* txn);
+        void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
     private:
         void buildIndexScan(OperationContext* txn, WorkingSet* workingSet, Collection* collection);
@@ -364,6 +369,7 @@ namespace mongo {
     PlanStage::StageState GeoNear2DStage::DensityEstimator::work(OperationContext* txn,
                                                                  WorkingSet* workingSet,
                                                                  Collection* collection,
+                                                                 WorkingSetID* out,
                                                                  double* estimatedDistance)
     {
         if (!_indexScan) {
@@ -393,17 +399,39 @@ namespace mongo {
             // Clean up working set.
             workingSet->free(workingSetID);
             return PlanStage::IS_EOF;
+        } else if (state == PlanStage::NEED_YIELD) {
+            *out = workingSetID;
         }
-
-        invariant(state != NEED_FETCH);
 
         // Propagate NEED_TIME or errors
         return state;
     }
 
+    void GeoNear2DStage::DensityEstimator::saveState() {
+        if (_indexScan) {
+            _indexScan->saveState();
+        }
+    }
+
+    void GeoNear2DStage::DensityEstimator::restoreState(OperationContext* txn) {
+        if (_indexScan) {
+            _indexScan->restoreState(txn);
+        }
+    }
+
+    void GeoNear2DStage::DensityEstimator::invalidate(OperationContext* txn,
+                                                      const RecordId& dl,
+                                                      InvalidationType type) {
+        if (_indexScan) {
+            _indexScan->invalidate(txn, dl, type);
+        }
+    }
+
+
     PlanStage::StageState GeoNear2DStage::initialize(OperationContext* txn,
                                                      WorkingSet* workingSet,
-                                                     Collection* collection)
+                                                     Collection* collection,
+                                                     WorkingSetID* out)
     {
         if (SPHERE == _nearParams.nearQuery->centroid->crs) {
             _boundsIncrement = kMaxEarthDistanceInMeters / 1000.0;
@@ -415,7 +443,8 @@ namespace mongo {
         }
 
         double estimatedDistance;
-        PlanStage::StageState state = _densityEstimator->work(txn, workingSet, collection, &estimatedDistance);
+        PlanStage::StageState state = _densityEstimator->work(txn, workingSet, collection, out,
+                                                              &estimatedDistance);
 
         if (state == PlanStage::IS_EOF) {
             // Estimator finished its work, we need to finish initialization too.
@@ -454,6 +483,26 @@ namespace mongo {
     GeoNear2DStage::~GeoNear2DStage() {
     }
 
+    void GeoNear2DStage::finishSaveState() {
+        if (_densityEstimator) {
+            _densityEstimator->saveState();
+        }
+    }
+
+    void GeoNear2DStage::finishRestoreState(OperationContext* txn) {
+        if (_densityEstimator) {
+            _densityEstimator->restoreState(txn);
+        }
+    }
+
+    void GeoNear2DStage::finishInvalidate(OperationContext* txn,
+                                          const RecordId& dl,
+                                          InvalidationType type) {
+        if (_densityEstimator) {
+            _densityEstimator->invalidate(txn, dl, type);
+        }
+    }
+
     namespace {
 
         /**
@@ -464,7 +513,7 @@ namespace mongo {
         class TwoDPtInAnnulusExpression : public LeafMatchExpression {
         public:
 
-            TwoDPtInAnnulusExpression(const R2Annulus& annulus, const StringData& twoDPath)
+            TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
                 : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS), _annulus(annulus) {
 
                 initPath(twoDPath);
@@ -519,7 +568,7 @@ namespace mongo {
 
             TwoDKeyInRegionExpression(R2Region* region,
                                       const GeoHashConverter::Parameters& hashParams,
-                                      const StringData& twoDKeyPath)
+                                      StringData twoDKeyPath)
                 : LeafMatchExpression(INTERNAL_2D_KEY_IN_REGION),
                   _region(region),
                   _unhasher(hashParams) {
@@ -969,7 +1018,12 @@ namespace mongo {
         PlanStage::StageState work(OperationContext* txn,
                                    WorkingSet* workingSet,
                                    Collection* collection,
+                                   WorkingSetID* out,
                                    double* estimatedDistance);
+
+        void saveState();
+        void restoreState(OperationContext* txn);
+        void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
     private:
         void buildIndexScan(OperationContext* txn, WorkingSet* workingSet, Collection* collection);
@@ -1032,6 +1086,7 @@ namespace mongo {
     PlanStage::StageState GeoNear2DSphereStage::DensityEstimator::work(OperationContext* txn,
                                                                        WorkingSet* workingSet,
                                                                        Collection* collection,
+                                                                       WorkingSetID* out,
                                                                        double* estimatedDistance)
     {
         if (!_indexScan) {
@@ -1061,25 +1116,47 @@ namespace mongo {
             // Clean up working set.
             workingSet->free(workingSetID);
             return PlanStage::IS_EOF;
+        } else if (state == PlanStage::NEED_YIELD) {
+            *out = workingSetID;
         }
-
-        invariant(state != NEED_FETCH);
 
         // Propagate NEED_TIME or errors
         return state;
     }
 
+    void GeoNear2DSphereStage::DensityEstimator::saveState() {
+        if (_indexScan) {
+            _indexScan->saveState();
+        }
+    }
+
+    void GeoNear2DSphereStage::DensityEstimator::restoreState(OperationContext* txn) {
+        if (_indexScan) {
+            _indexScan->restoreState(txn);
+        }
+    }
+
+    void GeoNear2DSphereStage::DensityEstimator::invalidate(OperationContext* txn,
+                                                            const RecordId& dl,
+                                                            InvalidationType type) {
+        if (_indexScan) {
+            _indexScan->invalidate(txn, dl, type);
+        }
+    }
+
 
     PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* txn,
                                                            WorkingSet* workingSet,
-                                                           Collection* collection)
+                                                           Collection* collection,
+                                                           WorkingSetID* out)
     {
         if (!_densityEstimator) {
             _densityEstimator.reset(new DensityEstimator(_s2Index, &_nearParams));
         }
 
         double estimatedDistance;
-        PlanStage::StageState state = _densityEstimator->work(txn, workingSet, collection, &estimatedDistance);
+        PlanStage::StageState state = _densityEstimator->work(txn, workingSet, collection, out,
+                                                              &estimatedDistance);
 
         if (state == IS_EOF) {
             // We find a document in 4 neighbors at current level, but didn't at previous level.
@@ -1097,6 +1174,26 @@ namespace mongo {
         }
 
         return state;
+    }
+
+    void GeoNear2DSphereStage::finishSaveState() {
+        if (_densityEstimator) {
+            _densityEstimator->saveState();
+        }
+    }
+
+    void GeoNear2DSphereStage::finishRestoreState(OperationContext* txn) {
+        if (_densityEstimator) {
+            _densityEstimator->restoreState(txn);
+        }
+    }
+
+    void GeoNear2DSphereStage::finishInvalidate(OperationContext* txn,
+                                                const RecordId& dl,
+                                                InvalidationType type) {
+        if (_densityEstimator) {
+            _densityEstimator->invalidate(txn, dl, type);
+        }
     }
 
     StatusWith<NearStage::CoveredInterval*> //

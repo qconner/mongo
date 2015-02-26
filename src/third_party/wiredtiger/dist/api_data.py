@@ -88,6 +88,12 @@ lsm_config = [
             create a bloom filter on the oldest LSM tree chunk. Only
             supported if bloom filters are enabled''',
             type='boolean'),
+        Config('chunk_count_limit', '0', r'''
+            the maximum number of chunks to allow in an LSM tree. This
+            option automatically times out old data. As new chunks are
+            added old chunks will be removed. Enabling this option
+            disables LSM background merges''',
+            type='int'),
         Config('chunk_max', '5GB', r'''
             the maximum size a single chunk can be. Chunks larger than this
             size are not considered for further merges. This is a soft
@@ -241,6 +247,12 @@ file_config = format_meta + [
         minimum gain before prefix compression will be used on row-store
         leaf pages''',
         min=0),
+    Config('split_deepen_min_child', '0', r'''
+        minimum entries in a page to consider deepening the tree''',
+        type='int', undoc=True),
+    Config('split_deepen_per_child', '0', r'''
+        entries allocated per child when deepening the tree''',
+        type='int', undoc=True),
     Config('split_pct', '75', r'''
         the Btree page split size as a percentage of the maximum Btree
         page size, that is, when a Btree page is split, it will be
@@ -309,8 +321,18 @@ connection_runtime_config = [
             ]),
     Config('cache_size', '100MB', r'''
         maximum heap memory to allocate for the cache. A database should
-        configure either a cache_size or a shared_cache not both''',
+        configure either \c cache_size or \c shared_cache but not both''',
         min='1MB', max='10TB'),
+    Config('cache_overhead', '8', r'''
+        assume the heap allocator overhead is the specified percentage, and
+        adjust the cache usage by that amount (for example, if there is 10GB
+        of data in cache, a percentage of 10 means WiredTiger treats this as
+        11GB).  This value is configurable because different heap allocators
+        have different overhead and different workloads will have different
+        heap allocation sizes and patterns, therefore applications may need to
+        adjust this value based on allocator choice and behavior in measured
+        workloads''',
+        min='0', max='30'),
     Config('checkpoint', '', r'''
         periodically checkpoint the database''',
         type='category', subconfig=[
@@ -528,6 +550,10 @@ common_wiredtiger_open = [
         Config('prealloc', 'true', r'''
             pre-allocate log files.''',
             type='boolean'),
+        Config('recover', 'on', r'''
+            run recovery or error if recovery needs to run after an
+            unclean shutdown.''',
+            choices=['error','on']),
         ]),
     Config('mmap', 'true', r'''
         Use memory mapping to access files when possible''',
@@ -559,6 +585,20 @@ common_wiredtiger_open = [
         ]),
 ]
 
+cursor_runtime_config = [
+    Config('append', 'false', r'''
+        append the value as a new record, creating a new record
+        number key; valid only for cursors with record number keys''',
+        type='boolean'),
+    Config('overwrite', 'true', r'''
+        configures whether the cursor's insert, update and remove
+        methods check the existing state of the record.  If \c overwrite
+        is \c false, WT_CURSOR::insert fails with ::WT_DUPLICATE_KEY
+        if the record exists, WT_CURSOR::update and WT_CURSOR::remove
+        fail with ::WT_NOTFOUND if the record does not exist''',
+        type='boolean'),
+]
+
 methods = {
 'file.meta' : Method(file_meta),
 
@@ -569,6 +609,8 @@ methods = {
 'table.meta' : Method(table_meta),
 
 'cursor.close' : Method([]),
+
+'cursor.reconfigure' : Method(cursor_runtime_config),
 
 'session.close' : Method([]),
 
@@ -600,11 +642,7 @@ methods = {
 
 'session.log_printf' : Method([]),
 
-'session.open_cursor' : Method([
-    Config('append', 'false', r'''
-        append the value as a new record, creating a new record
-        number key; valid only for cursors with record number keys''',
-        type='boolean'),
+'session.open_cursor' : Method(cursor_runtime_config + [
     Config('bulk', 'false', r'''
         configure the cursor for bulk-loading, a fast, initial load
         path (see @ref tune_bulk_load for more information).  Bulk-load
@@ -640,13 +678,6 @@ methods = {
         configured with \c next_random=true only support the
         WT_CURSOR::next and WT_CURSOR::close methods.  See @ref
         cursor_random for details''',
-        type='boolean'),
-    Config('overwrite', 'true', r'''
-        configures whether the cursor's insert, update and remove
-        methods check the existing state of the record.  If \c overwrite
-        is \c false, WT_CURSOR::insert fails with ::WT_DUPLICATE_KEY
-        if the record exists, WT_CURSOR::update and WT_CURSOR::remove
-        fail with ::WT_NOTFOUND if the record does not exist''',
         type='boolean'),
     Config('raw', 'false', r'''
         ignore the encodings for the key and value, manage data as if
@@ -692,24 +723,29 @@ methods = {
         files''',
         type='boolean'),
 ]),
+'session.strerror' : Method([]),
 'session.truncate' : Method([]),
 'session.upgrade' : Method([]),
 'session.verify' : Method([
     Config('dump_address', 'false', r'''
-        Display addresses and page types as pages are verified, using
-        the application's message handler, intended for debugging''',
+        Display addresses and page types as pages are verified,
+        using the application's message handler, intended for debugging''',
         type='boolean'),
     Config('dump_blocks', 'false', r'''
-        Display the contents of on-disk blocks as they are verified, using
-        the application's message handler, intended for debugging''',
+        Display the contents of on-disk blocks as they are verified,
+        using the application's message handler, intended for debugging''',
         type='boolean'),
     Config('dump_offsets', '', r'''
-        Display the contents of specific on-disk blocks, using
-        the application's message handler, intended for debugging''',
+        Display the contents of specific on-disk blocks,
+        using the application's message handler, intended for debugging''',
         type='list'),
     Config('dump_pages', 'false', r'''
-        Display the contents of in-memory pages as they are verified, using
-        the application's message handler, intended for debugging''',
+        Display the contents of in-memory pages as they are verified,
+        using the application's message handler, intended for debugging''',
+        type='boolean'),
+    Config('dump_shape', 'false', r'''
+        Display the shape of the tree after verification,
+        using the application's message handler, intended for debugging''',
         type='boolean')
 ]),
 

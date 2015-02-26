@@ -69,7 +69,7 @@ __cursor_enter(WT_SESSION_IMPL *session)
  * __cursor_leave --
  *	Deactivate a cursor.
  */
-static inline int
+static inline void
 __cursor_leave(WT_SESSION_IMPL *session)
 {
 	/*
@@ -80,8 +80,6 @@ __cursor_leave(WT_SESSION_IMPL *session)
 	WT_ASSERT(session, session->ncursors > 0);
 	if (--session->ncursors == 0)
 		__wt_txn_read_last(session);
-
-	return (0);
 }
 
 /*
@@ -113,7 +111,7 @@ __curfile_leave(WT_CURSOR_BTREE *cbt)
 
 	/* If the cursor was active, deactivate it. */
 	if (F_ISSET(cbt, WT_CBT_ACTIVE)) {
-		WT_RET(__cursor_leave(session));
+		__cursor_leave(session);
 		F_CLR(cbt, WT_CBT_ACTIVE);
 	}
 
@@ -164,8 +162,11 @@ __wt_cursor_dhandle_decr_use(WT_SESSION_IMPL *session)
 
 	dhandle = session->dhandle;
 
+	/* If we close a handle with a time of death set, clear it. */
 	WT_ASSERT(session, dhandle->session_inuse > 0);
-	(void)WT_ATOMIC_SUB4(dhandle->session_inuse, 1);
+	if (WT_ATOMIC_SUB4(dhandle->session_inuse, 1) == 0 &&
+	    dhandle->timeofdeath != 0)
+		dhandle->timeofdeath = 0;
 }
 
 /*

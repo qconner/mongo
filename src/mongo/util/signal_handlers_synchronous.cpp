@@ -131,7 +131,6 @@ namespace {
     void myTerminate() {
         boost::mutex::scoped_lock lk(streamMutex);
 
-#if __cplusplus >= 201103L || defined(_MSC_VER) // Available in MSVC++2010 and newer.
         // In c++11 we can recover the current exception to print it.
         if (std::exception_ptr eptr = std::current_exception()) {
             mallocFreeOStream << "terminate() called. An exception is active;"
@@ -172,9 +171,6 @@ namespace {
         else {
             mallocFreeOStream << "terminate() called. No exception is active";
         }
-#else
-        mallocFreeOStream << "terminate() called.\n";
-#endif
 
         printStackTrace(mallocFreeOStream);
         writeMallocFreeStreamToLog();
@@ -265,6 +261,9 @@ namespace {
         addrSignals.sa_sigaction = abruptQuitWithAddrSignal;
         sigemptyset(&addrSignals.sa_mask);
         addrSignals.sa_flags = SA_SIGINFO;
+
+        // ^\ is the stronger ^C. Log and quit hard without waiting for cleanup.
+        invariant(signal(SIGQUIT, abruptQuit) != SIG_ERR);
 
         invariant(sigaction(SIGSEGV, &addrSignals, 0) == 0);
         invariant(sigaction(SIGBUS, &addrSignals, 0) == 0);

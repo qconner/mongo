@@ -34,12 +34,13 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/snapshot.h"
 #include "mongo/platform/unordered_set.h"
 
 namespace mongo {
 
+    class IndexAccessMethod;
     class RecordFetcher;
-
     class WorkingSetMember;
 
     typedef size_t WorkingSetID;
@@ -191,14 +192,18 @@ namespace mongo {
      * the key.
      */
     struct IndexKeyDatum {
-        IndexKeyDatum(const BSONObj& keyPattern, const BSONObj& key) : indexKeyPattern(keyPattern),
-                                                                       keyData(key) { }
+        IndexKeyDatum(const BSONObj& keyPattern, const BSONObj& key, const IndexAccessMethod* index)
+            : indexKeyPattern(keyPattern),
+              keyData(key),
+              index(index) { }
 
         // This is not owned and points into the IndexDescriptor's data.
         BSONObj indexKeyPattern;
 
         // This is the BSONObj for the key that we put into the index.  Owned by us.
         BSONObj keyData;
+
+        const IndexAccessMethod* index;
     };
 
     /**
@@ -286,9 +291,13 @@ namespace mongo {
         //
 
         RecordId loc;
-        BSONObj obj;
+        Snapshotted<BSONObj> obj;
         std::vector<IndexKeyDatum> keyData;
         MemberState state;
+
+        // True if this WSM has survived a yield in LOC_AND_IDX state.
+        // TODO consider replacing by tracking SnapshotIds for IndexKeyDatums.
+        bool isSuspicious;
 
         bool hasLoc() const;
         bool hasObj() const;

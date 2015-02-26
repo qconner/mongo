@@ -214,45 +214,68 @@ namespace mongo {
         }
     }
 
+namespace {
+
     // Insert the same key multiple times and verify that all entries exists
-    // in the index when duplicates are allowed.
-    TEST( SortedDataInterface, InsertSameKeyWithDupsAllowed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+    // in the index when duplicates are allowed. Since it is illegal to open a cursor to an unique
+    // index while the unique constraint is violated, this is tested by running the test 3 times,
+    // removing all but one loc each time and verifying the correct loc remains.
+    void _testInsertSameKeyWithDupsAllowed(const RecordId locs[3]) {
+        for (int keeper = 0; keeper < 3; keeper++) {
+            scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
+            scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, false ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc2, true /* allow duplicates */ ) );
-                uow.commit();
+                scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+                ASSERT( sorted->isEmpty( opCtx.get() ) );
+            }
+
+            {
+                scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+                {
+                    WriteUnitOfWork uow( opCtx.get() );
+                    ASSERT_OK(sorted->insert(opCtx.get(), key1, locs[0], false));
+                    ASSERT_OK(sorted->insert(opCtx.get(), key1, locs[1], true));
+                    ASSERT_OK(sorted->insert(opCtx.get(), key1, locs[2], true));
+                    uow.commit();
+                }
+            }
+
+            {
+                scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+                {
+                    WriteUnitOfWork uow( opCtx.get() );
+                    for (int i = 0; i < 3; i++) {
+                        if (i != keeper) {
+                            sorted->unindex(opCtx.get(), key1, locs[i], true);
+                        }
+                    }
+                    uow.commit();
+                }
+            }
+
+            {
+                scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+                ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
+
+                scoped_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get(), 1));
+                cursor->locate(key1, RecordId::min());
+                ASSERT_EQUALS(key1, cursor->getKey());
+                ASSERT_EQUALS(locs[keeper], cursor->getRecordId());
             }
         }
+    }
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 2, sorted->numEntries( opCtx.get() ) );
-        }
+}  // namespace
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc3, true /* allow duplicates */ ) );
-                uow.commit();
-            }
-        }
+    TEST( SortedDataInterface, InsertSameKeyWithDupsAllowedLocsAscending ) {
+        const RecordId locs[3] = {loc1, loc2, loc3};
+        _testInsertSameKeyWithDupsAllowed(locs);
+    }
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
+    TEST( SortedDataInterface, InsertSameKeyWithDupsAllowedLocsDescending ) {
+        const RecordId locs[3] = {loc3, loc2, loc1};
+        _testInsertSameKeyWithDupsAllowed(locs);
     }
 
     // Insert multiple keys and verify that the number of entries

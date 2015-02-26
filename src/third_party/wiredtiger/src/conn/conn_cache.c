@@ -38,6 +38,9 @@ __wt_cache_config(WT_SESSION_IMPL *session, const char *cfg[])
 		cache->cp_reserved = (uint64_t)cval.val;
 	}
 
+	WT_RET(__wt_config_gets(session, cfg, "cache_overhead", &cval));
+	cache->overhead_pct = (u_int)cval.val;
+
 	WT_RET(__wt_config_gets(session, cfg, "eviction_target", &cval));
 	cache->eviction_target = (u_int)cval.val;
 
@@ -142,8 +145,10 @@ __wt_cache_stats_update(WT_SESSION_IMPL *session)
 
 	WT_STAT_SET(stats, cache_bytes_max, conn->cache_size);
 	WT_STAT_SET(stats, cache_bytes_inuse, __wt_cache_bytes_inuse(cache));
+
+	WT_STAT_SET(stats, cache_overhead, cache->overhead_pct);
 	WT_STAT_SET(stats, cache_pages_inuse, __wt_cache_pages_inuse(cache));
-	WT_STAT_SET(stats, cache_bytes_dirty, cache->bytes_dirty);
+	WT_STAT_SET(stats, cache_bytes_dirty, __wt_cache_dirty_inuse(cache));
 	WT_STAT_SET(stats,
 	    cache_eviction_maximum_page_size, cache->evict_max_page_size);
 	WT_STAT_SET(stats, cache_pages_dirty, cache->pages_dirty);

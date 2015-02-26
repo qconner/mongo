@@ -62,23 +62,35 @@ namespace mongo {
           _usingBackupChild(false),
           _alreadyProduced(false),
           _updatedCache(false),
+          _killed(false),
           _commonStats(kStageType) {}
 
     CachedPlanStage::~CachedPlanStage() {
-        // We may have produced all necessary results without hitting EOF.
-        // In this case, we still want to update the cache with feedback.
-        if (!_updatedCache) {
+        // We may have produced all necessary results without hitting EOF. In this case, we still
+        // want to update the cache with feedback.
+        //
+        // We can't touch the plan cache if we've been killed.
+        if (!_updatedCache && !_killed) {
             updateCache();
         }
     }
 
-    bool CachedPlanStage::isEOF() { return getActiveChild()->isEOF(); }
+    bool CachedPlanStage::isEOF() {
+        if (_killed) {
+            return true;
+        }
+
+        return getActiveChild()->isEOF();
+    }
 
     PlanStage::StageState CachedPlanStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
         // Adds the amount of time taken by work() to executionTimeMillis.
         ScopedTimer timer(&_commonStats.executionTimeMillis);
+
+        // We shouldn't be trying to work a dead plan.
+        invariant(!_killed);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -102,8 +114,8 @@ namespace mongo {
             _commonStats.needTime++;
             return PlanStage::NEED_TIME;
         }
-        else if (PlanStage::NEED_FETCH == childStatus) {
-            _commonStats.needFetch++;
+        else if (PlanStage::NEED_YIELD == childStatus) {
+            _commonStats.needYield++;
         }
         else if (PlanStage::NEED_TIME == childStatus) {
             _commonStats.needTime++;
@@ -199,6 +211,10 @@ namespace mongo {
 
     PlanStage* CachedPlanStage::getActiveChild() const {
         return _usingBackupChild ? _backupChildPlan.get() : _mainChildPlan.get();
+    }
+
+    void CachedPlanStage::kill() {
+        _killed = true;
     }
 
 }  // namespace mongo

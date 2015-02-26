@@ -36,6 +36,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/base/checked_cast.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
@@ -99,7 +100,7 @@ namespace mongo {
 
             {
                 WriteUnitOfWork uow(&txn);
-                WT_SESSION* s = ru->getSession()->getSession();
+                WT_SESSION* s = ru->getSession(&txn)->getSession();
                 invariantWTOK( s->create( s, uri.c_str(), config.c_str() ) );
                 uow.commit();
             }
@@ -125,7 +126,7 @@ namespace mongo {
 
             {
                 WriteUnitOfWork uow(&txn);
-                WT_SESSION* s = ru->getSession()->getSession();
+                WT_SESSION* s = ru->getSession(&txn)->getSession();
                 invariantWTOK( s->create( s, uri.c_str(), config.c_str() ) );
                 uow.commit();
             }
@@ -136,6 +137,9 @@ namespace mongo {
         virtual RecoveryUnit* newRecoveryUnit() {
             return new WiredTigerRecoveryUnit( _sessionCache );
         }
+
+        WT_CONNECTION* conn() const { return _conn; }
+
     private:
         unittest::TempDir _dbpath;
         WT_CONNECTION* _conn;
@@ -270,13 +274,14 @@ namespace mongo {
     }
 
     TEST(WiredTigerRecordStoreTest, SizeStorer1 ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
+        scoped_ptr<WiredTigerHarnessHelper> harnessHelper(new WiredTigerHarnessHelper());
         scoped_ptr<RecordStore> rs( harnessHelper->newNonCappedRecordStore() );
 
-        string uri = dynamic_cast<WiredTigerRecordStore*>( rs.get() )->getURI();
+        string uri = checked_cast<WiredTigerRecordStore*>( rs.get() )->getURI();
 
-        WiredTigerSizeStorer ss;
-        dynamic_cast<WiredTigerRecordStore*>( rs.get() )->setSizeStorer( &ss );
+        string indexUri = "table:myindex";
+        WiredTigerSizeStorer ss(harnessHelper->conn(), indexUri);
+        checked_cast<WiredTigerRecordStore*>( rs.get() )->setSizeStorer( &ss );
 
         int N = 12;
 
@@ -302,7 +307,7 @@ namespace mongo {
         {
             long long numRecords;
             long long dataSize;
-            ss.load( uri, &numRecords, &dataSize );
+            ss.loadFromCache( uri, &numRecords, &dataSize );
             ASSERT_EQUALS( N, numRecords );
         }
 
@@ -317,33 +322,28 @@ namespace mongo {
             ASSERT_EQUALS( N, rs->numRecords( opCtx.get() ) );
         }
 
-        string indexUri = "table:myindex";
         {
             scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             WiredTigerRecoveryUnit* ru =
-                dynamic_cast<WiredTigerRecoveryUnit*>( opCtx->recoveryUnit() );
+                checked_cast<WiredTigerRecoveryUnit*>( opCtx->recoveryUnit() );
 
             {
                 WriteUnitOfWork uow( opCtx.get() );
-                WT_SESSION* s = ru->getSession()->getSession();
+                WT_SESSION* s = ru->getSession(opCtx.get())->getSession();
                 invariantWTOK( s->create( s, indexUri.c_str(), "" ) );
                 uow.commit();
             }
 
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ss.storeInto( WiredTigerRecoveryUnit::get( opCtx.get() )->getSession(), indexUri );
-                uow.commit();
-            }
+            ss.syncCache(true);
         }
 
         {
             scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            WiredTigerSizeStorer ss2;
-            ss2.loadFrom( WiredTigerRecoveryUnit::get( opCtx.get() )->getSession(), indexUri );
+            WiredTigerSizeStorer ss2(harnessHelper->conn(), indexUri);
+            ss2.fillCache();
             long long numRecords;
             long long dataSize;
-            ss2.load( uri, &numRecords, &dataSize );
+            ss2.loadFromCache( uri, &numRecords, &dataSize );
             ASSERT_EQUALS( N, numRecords );
         }
 
@@ -372,9 +372,9 @@ namespace {
     private:
         virtual void setUp() {
             harnessHelper.reset(new WiredTigerHarnessHelper());
-            sizeStorer.reset(new WiredTigerSizeStorer());
+            sizeStorer.reset(new WiredTigerSizeStorer(harnessHelper->conn(), "table:sizeStorer"));
             rs.reset(harnessHelper->newNonCappedRecordStore());
-            WiredTigerRecordStore* wtrs = dynamic_cast<WiredTigerRecordStore*>(rs.get());
+            WiredTigerRecordStore* wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
             wtrs->setSizeStorer(sizeStorer.get());
             uri = wtrs->getURI();
 
@@ -390,7 +390,7 @@ namespace {
             }
             ASSERT_EQUALS(expectedNumRecords, rs->numRecords(NULL));
             ASSERT_EQUALS(expectedDataSize, rs->dataSize(NULL));
-            sizeStorer->store(uri, 0, 0);
+            sizeStorer->storeToCache(uri, 0, 0);
         }
         virtual void tearDown() {
             expectedNumRecords = 0;
@@ -406,14 +406,14 @@ namespace {
         long long getNumRecords() const {
             long long numRecords;
             long long unused;
-            sizeStorer->load(uri, &numRecords, &unused);
+            sizeStorer->loadFromCache(uri, &numRecords, &unused);
             return numRecords;
         }
 
         long long getDataSize() const {
             long long unused;
             long long dataSize;
-            sizeStorer->load(uri, &unused, &dataSize);
+            sizeStorer->loadFromCache(uri, &unused, &dataSize);
             return dataSize;
         }
 
@@ -469,7 +469,7 @@ namespace {
         rs.reset(NULL);
 
         scoped_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
-        sizeStorer->store(uri, expectedNumRecords*2, expectedDataSize*2);
+        sizeStorer->storeToCache(uri, expectedNumRecords*2, expectedDataSize*2);
         rs.reset(new WiredTigerRecordStore(opCtx.get(), "a.b", uri, false, -1, -1, NULL,
                                            sizeStorer.get()));
         ASSERT_EQUALS(expectedNumRecords*2, rs->numRecords(NULL));
@@ -497,7 +497,7 @@ namespace {
                                    const OpTime& opTime) {
         BSONObj obj = BSON( "ts" << opTime );
         WriteUnitOfWork wuow(opCtx.get());
-        WiredTigerRecordStore* wrs = dynamic_cast<WiredTigerRecordStore*>(rs.get());
+        WiredTigerRecordStore* wrs = checked_cast<WiredTigerRecordStore*>(rs.get());
         invariant( wrs );
         Status status = wrs->oplogDiskLocRegister( opCtx.get(), opTime );
         if (!status.isOK())
@@ -683,11 +683,50 @@ namespace {
         }
     }
 
+    TEST(WiredTigerRecordStoreTest, CappedCursorRollover) {
+        scoped_ptr<WiredTigerHarnessHelper> harnessHelper( new WiredTigerHarnessHelper() );
+        scoped_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("a.b", 10000, 5));
+
+        { // first insert 3 documents
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            for ( int i = 0; i < 3; ++i ) {
+                WriteUnitOfWork uow( opCtx.get() );
+                StatusWith<RecordId> res = rs->insertRecord( opCtx.get(), "a", 2, false );
+                ASSERT_OK( res.getStatus() );
+                uow.commit();
+            }
+        }
+
+        // set up our cursor that should rollover
+        scoped_ptr<OperationContext> cursorCtx( harnessHelper->newOperationContext() );
+        scoped_ptr<RecordIterator> it;
+        it.reset( rs->getIterator(cursorCtx.get()) );
+        ASSERT_FALSE(it->isEOF());
+        it->getNext();
+        ASSERT_FALSE(it->isEOF());
+        it->saveState();
+        cursorCtx->recoveryUnit()->commitAndRestart();
+
+        { // insert 100 documents which causes rollover
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            for ( int i = 0; i < 100; i++ ) {
+                WriteUnitOfWork uow( opCtx.get() );
+                StatusWith<RecordId> res = rs->insertRecord( opCtx.get(), "a", 2, false );
+                ASSERT_OK( res.getStatus() );
+                uow.commit();
+            }
+        }
+
+        // cursor should now be dead
+        ASSERT_FALSE(it->restoreState(cursorCtx.get()));
+        ASSERT_TRUE(it->isEOF());
+    }
+
     RecordId _oplogOrderInsertOplog( OperationContext* txn,
                                     scoped_ptr<RecordStore>& rs,
                                     int inc ) {
         OpTime opTime = OpTime(5,inc);
-        WiredTigerRecordStore* wrs = dynamic_cast<WiredTigerRecordStore*>(rs.get());
+        WiredTigerRecordStore* wrs = checked_cast<WiredTigerRecordStore*>(rs.get());
         Status status = wrs->oplogDiskLocRegister( txn, opTime );
         ASSERT_OK( status );
         BSONObj obj = BSON( "ts" << opTime );
@@ -703,7 +742,7 @@ namespace {
                                                                        -1));
 
         {
-            const WiredTigerRecordStore* wrs = dynamic_cast<WiredTigerRecordStore*>(rs.get());
+            const WiredTigerRecordStore* wrs = checked_cast<WiredTigerRecordStore*>(rs.get());
             ASSERT( wrs->isOplog() );
             ASSERT( wrs->usingOplogHack() );
         }
@@ -800,5 +839,31 @@ namespace {
         ASSERT_EQUALS(creationStringElement.type(), String);
     }
 
+    TEST(WiredTigerRecordStoreTest, CappedCursorYieldFirst) {
+        scoped_ptr<WiredTigerHarnessHelper> harnessHelper( new WiredTigerHarnessHelper() );
+        scoped_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("a.b", 10000, 50));
+
+        RecordId loc1;
+
+        { // first insert a document
+            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            WriteUnitOfWork uow( opCtx.get() );
+            StatusWith<RecordId> res = rs->insertRecord( opCtx.get(), "a", 2, false );
+            ASSERT_OK( res.getStatus() );
+            loc1 = res.getValue();
+            uow.commit();
+        }
+
+        scoped_ptr<OperationContext> cursorCtx( harnessHelper->newOperationContext() );
+        scoped_ptr<RecordIterator> it( rs->getIterator(cursorCtx.get()) );
+        ASSERT_FALSE(it->isEOF());
+
+        // See that things work if you yield before you first call getNext().
+        it->saveState();
+        cursorCtx->recoveryUnit()->commitAndRestart();
+        ASSERT_TRUE(it->restoreState(cursorCtx.get()));
+        ASSERT_EQ(loc1, it->getNext());
+        ASSERT_TRUE(it->isEOF());
+    }
 
 }  // namespace mongo

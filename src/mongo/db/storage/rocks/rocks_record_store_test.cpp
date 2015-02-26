@@ -58,31 +58,23 @@ namespace mongo {
         RocksRecordStoreHarnessHelper() : _tempDir(_testNamespace) {
             boost::filesystem::remove_all(_tempDir.path());
             rocksdb::DB* db;
-            std::vector<rocksdb::ColumnFamilyDescriptor> cfs;
-            cfs.emplace_back();
-            cfs.emplace_back("record_store", rocksdb::ColumnFamilyOptions());
-            cfs[1].options.comparator = RocksRecordStore::newRocksCollectionComparator();
-            rocksdb::DBOptions db_options;
-            db_options.create_if_missing = true;
-            db_options.create_missing_column_families = true;
-            std::vector<rocksdb::ColumnFamilyHandle*> handles;
-            auto s = rocksdb::DB::Open(db_options, _tempDir.path(), cfs, &handles, &db);
+            rocksdb::Options options;
+            options.create_if_missing = true;
+            auto s = rocksdb::DB::Open(options, _tempDir.path(), &db);
             ASSERT(s.ok());
             _db.reset(db);
-            delete handles[0];
-            _cf.reset(handles[1]);
         }
 
         virtual RecordStore* newNonCappedRecordStore() {
           return newNonCappedRecordStore("foo.bar");
         }
         RecordStore* newNonCappedRecordStore(const std::string& ns) {
-            return new RocksRecordStore(ns, "1", _db.get(), _cf);
+            return new RocksRecordStore(ns, "1", _db.get(), "prefix");
         }
 
         RecordStore* newCappedRecordStore(const std::string& ns, int64_t cappedMaxSize,
                                           int64_t cappedMaxDocs) {
-            return new RocksRecordStore(ns, "1", _db.get(), _cf, true, cappedMaxSize,
+            return new RocksRecordStore(ns, "1", _db.get(), "prefix", true, cappedMaxSize,
                                         cappedMaxDocs);
         }
 
@@ -94,7 +86,6 @@ namespace mongo {
         string _testNamespace = "mongo-rocks-record-store-test";
         unittest::TempDir _tempDir;
         boost::scoped_ptr<rocksdb::DB> _db;
-        boost::shared_ptr<rocksdb::ColumnFamilyHandle> _cf;
         RocksTransactionEngine _transactionEngine;
     };
 
@@ -137,15 +128,9 @@ namespace mongo {
             ASSERT_OK( rs->updateRecord( t1.get(), loc1, "b", 2, false, NULL ).getStatus() );
             ASSERT_OK( rs->updateRecord( t1.get(), loc2, "B", 2, false, NULL ).getStatus() );
 
-            try {
-                // this should fail
-                rs->updateRecord( t2.get(), loc1, "c", 2, false, NULL );
-                ASSERT( 0 );
-            }
-            catch ( WriteConflictException& dle ) {
-                w2.reset( NULL );
-                t2.reset( NULL );
-            }
+            // this should throw
+            ASSERT_THROWS(rs->updateRecord(t2.get(), loc1, "c", 2, false, NULL),
+                          WriteConflictException);
 
             w1->commit(); // this should succeed
         }
@@ -191,17 +176,11 @@ namespace mongo {
 
             {
                 WriteUnitOfWork w( t2.get() );
-                ASSERT_EQUALS( string("a"), rs->dataFor( t2.get(), loc1 ).data() );
-                try {
-                    // this should fail as our version of loc1 is too old
-                    rs->updateRecord( t2.get(), loc1, "c", 2, false, NULL );
-                    ASSERT( 0 );
-                }
-                catch ( WriteConflictException& dle ) {
-                }
-
+                ASSERT_EQUALS(string("a"), rs->dataFor(t2.get(), loc1).data());
+                // this should fail as our version of loc1 is too old
+                ASSERT_THROWS(rs->updateRecord(t2.get(), loc1, "c", 2, false, NULL),
+                              WriteConflictException);
             }
-
         }
     }
 

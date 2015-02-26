@@ -115,7 +115,7 @@ namespace mongo {
         RecordId loc = findOne( txn, collection, query, requireIndex );
         if ( loc.isNull() )
             return false;
-        result = collection->docFor(txn, loc);
+        result = collection->docFor(txn, loc).value();
         return true;
     }
 
@@ -188,7 +188,7 @@ namespace mongo {
         RecordId loc = accessMethod->findSingle( txn, query["_id"].wrap() );
         if ( loc.isNull() )
             return false;
-        result = collection->docFor( txn, loc );
+        result = collection->docFor(txn, loc).value();
         return true;
     }
 
@@ -271,24 +271,7 @@ namespace mongo {
 
         update(txn, context.db(), request, &debug);
 
-        context.getClient()->curop()->done();
-    }
-
-    void Helpers::putSingletonGod(OperationContext* txn, const char *ns, BSONObj obj, bool logTheOp) {
-        OpDebug debug;
-        Client::Context context(txn, ns);
-
-        const NamespaceString requestNs(ns);
-        UpdateRequest request(requestNs);
-
-        request.setGod();
-        request.setUpdates(obj);
-        request.setUpsert();
-        request.setUpdateOpLog(logTheOp);
-
-        update(txn, context.db(), request, &debug);
-
-        context.getClient()->curop()->done();
+        txn->getClient()->curop()->done();
     }
 
     BSONObj Helpers::toKeyFormat( const BSONObj& o ) {

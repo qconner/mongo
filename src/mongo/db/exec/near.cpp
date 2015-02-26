@@ -72,24 +72,17 @@ namespace mongo {
     }
 
 
-    PlanStage::StageState NearStage::initNext() {
-        PlanStage::StageState state = initialize(_txn, _workingSet, _collection);
+    PlanStage::StageState NearStage::initNext(WorkingSetID* out) {
+        PlanStage::StageState state = initialize(_txn, _workingSet, _collection, out);
         if (state == PlanStage::IS_EOF) {
             _searchState = SearchState_Buffering;
             return PlanStage::NEED_TIME;
         }
 
-        invariant(state != PlanStage::ADVANCED && state != PlanStage::NEED_FETCH);
+        invariant(state != PlanStage::ADVANCED);
 
         // Propagate NEED_TIME or errors upward.
         return state;
-    }
-
-    PlanStage::StageState NearStage::initialize(OperationContext* txn,
-                                                WorkingSet* workingSet,
-                                                Collection* collection)
-    {
-        return PlanStage::IS_EOF;
     }
 
     PlanStage::StageState NearStage::work(WorkingSetID* out) {
@@ -108,7 +101,7 @@ namespace mongo {
         //
 
         if (SearchState_Initializing == _searchState) {
-            nextState = initNext();
+            nextState = initNext(&toReturn);
         }
         else if (SearchState_Buffering == _searchState) {
             nextState = bufferNext(&toReturn, &error);
@@ -132,9 +125,9 @@ namespace mongo {
             *out = toReturn;
             ++_stats->common.advanced;
         }
-        else if (PlanStage::NEED_FETCH == nextState) {
+        else if (PlanStage::NEED_YIELD == nextState) {
             *out = toReturn;
-            ++_stats->common.needFetch;
+            ++_stats->common.needYield;
         }
         else if (PlanStage::NEED_TIME == nextState) {
             ++_stats->common.needTime;
@@ -164,7 +157,7 @@ namespace mongo {
         double distance;
     };
 
-    // Set "toReturn" when NEED_FETCH.
+    // Set "toReturn" when NEED_YIELD.
     PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn, Status* error) {
 
         //
@@ -201,8 +194,6 @@ namespace mongo {
 
         if (PlanStage::IS_EOF == intervalState) {
             _nextInterval = NULL;
-            _nextIntervalSeen.clear();
-
             _searchState = SearchState_Advancing;
             return PlanStage::NEED_TIME;
         }
@@ -210,7 +201,7 @@ namespace mongo {
             *error = WorkingSetCommon::getMemberStatus(*_workingSet->get(nextMemberID));
             return intervalState;
         }
-        else if (PlanStage::NEED_FETCH == intervalState) {
+        else if (PlanStage::NEED_YIELD == intervalState) {
             *toReturn = nextMemberID;
             return intervalState;
         }
@@ -226,8 +217,10 @@ namespace mongo {
 
         // The child stage may not dedup so we must dedup them ourselves.
         if (_nextInterval->dedupCovering && nextMember->hasLoc()) {
-            if (_nextIntervalSeen.end() != _nextIntervalSeen.find(nextMember->loc))
+            if (_nextIntervalSeen.end() != _nextIntervalSeen.find(nextMember->loc)) {
+                _workingSet->free(nextMemberID);
                 return PlanStage::NEED_TIME;
+            }
         }
 
         ++_nextIntervalStats->numResultsFound;
@@ -282,6 +275,9 @@ namespace mongo {
         }
         else {
             // We won't pass this WSM up, so deallocate it
+            if (nextMember->hasLoc()) {
+                _nextIntervalSeen.erase(nextMember->loc);
+            }
             _workingSet->free(nextMemberID);
         }
 
@@ -295,12 +291,24 @@ namespace mongo {
             getNearStats()->intervalStats.push_back(*_nextIntervalStats);
             _nextIntervalStats.reset();
 
+            // We're done returning the documents buffered for this annulus, so we can
+            // clear out our buffered RecordIds.
+            _nextIntervalSeen.clear();
+
             _searchState = SearchState_Buffering;
             return PlanStage::NEED_TIME;
         }
 
         *toReturn = _resultBuffer.top().resultID;
         _resultBuffer.pop();
+
+        // If we're returning something, take it out of our RecordId -> WSID map so that future
+        // calls to invalidate don't cause us to take action for a RecordId we're done with.
+        WorkingSetMember* member = _workingSet->get(*toReturn);
+        if (member->hasLoc()) {
+            _nextIntervalSeen.erase(member->loc);
+        }
+
         return PlanStage::ADVANCED;
     }
 
@@ -314,6 +322,9 @@ namespace mongo {
         for (size_t i = 0; i < _childrenIntervals.size(); i++) {
             _childrenIntervals[i]->covering->saveState();
         }
+
+        // Subclass specific saving, e.g. saving the 2d or 2dsphere density estimator.
+        finishSaveState();
     }
 
     void NearStage::restoreState(OperationContext* opCtx) {
@@ -323,6 +334,9 @@ namespace mongo {
         for (size_t i = 0; i < _childrenIntervals.size(); i++) {
             _childrenIntervals[i]->covering->restoreState(opCtx);
         }
+
+        // Subclass specific restoring, e.g. restoring the 2d or 2dsphere density estimator.
+        finishRestoreState(opCtx);
     }
 
     void NearStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
@@ -346,6 +360,10 @@ namespace mongo {
             // Don't keep it around in the seen map since there's no valid RecordId anymore
             _nextIntervalSeen.erase(seenIt);
         }
+
+        // Subclass specific invalidation, e.g. passing the invalidation to the 2d or 2dsphere
+        // density estimator.
+        finishInvalidate(txn, dl, type);
     }
 
     vector<PlanStage*> NearStage::getChildren() const {

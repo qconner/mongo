@@ -28,6 +28,7 @@
 
 #include "mongo/db/exec/count_scan.h"
 
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -55,6 +56,7 @@ namespace mongo {
         _specificStats.keyPattern = _params.descriptor->keyPattern();
         _specificStats.indexName = _params.descriptor->indexName();
         _specificStats.isMultiKey = _params.descriptor->isMultikey(txn);
+        _specificStats.indexVersion = _params.descriptor->version();
     }
 
     void CountScan::initIndexCursor() {
@@ -113,8 +115,17 @@ namespace mongo {
 
         if (NULL == _btreeCursor.get()) {
             // First call to work().  Perform cursor init.
-            initIndexCursor();
-            checkEnd();
+            try {
+                initIndexCursor();
+                checkEnd();
+            }
+            catch (const WriteConflictException& wce) {
+                // Release our owned cursors and try again next time.
+                _btreeCursor.reset();
+                _endCursor.reset();
+                *out = WorkingSet::INVALID_ID;
+                return PlanStage::NEED_YIELD;
+            }
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
@@ -122,7 +133,17 @@ namespace mongo {
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         RecordId loc = _btreeCursor->getValue();
-        _btreeCursor->next();
+
+        try {
+            _btreeCursor->next();
+        }
+        catch (const WriteConflictException& wce) {
+            // The cursor shouldn't have moved.
+            invariant(_btreeCursor->getValue() == loc);
+            *out = WorkingSet::INVALID_ID;
+            return PlanStage::NEED_YIELD;
+        }
+
         checkEnd();
 
         ++_specificStats.keysExamined;

@@ -400,6 +400,38 @@ namespace {
 
     }
 
+    TEST_F(TopoCoordTest, EmptySyncSourceOnPrimary) {
+        updateConfig(BSON("_id" << "rs0" <<
+                          "version" << 1 <<
+                          "members" << BSON_ARRAY(
+                              BSON("_id" << 10 << "host" << "hself") <<
+                              BSON("_id" << 20 << "host" << "h2") <<
+                              BSON("_id" << 30 << "host" << "h3"))),
+                     0);
+
+        setSelfMemberState(MemberState::RS_SECONDARY);
+
+        heartbeatFromMember(HostAndPort("h2"), "rs0", MemberState::RS_SECONDARY,
+                            OpTime(1, 0), Milliseconds(100));
+        heartbeatFromMember(HostAndPort("h2"), "rs0", MemberState::RS_SECONDARY,
+                            OpTime(1, 0), Milliseconds(100));
+        heartbeatFromMember(HostAndPort("h3"), "rs0", MemberState::RS_SECONDARY,
+                            OpTime(0, 0), Milliseconds(300));
+        heartbeatFromMember(HostAndPort("h3"), "rs0", MemberState::RS_SECONDARY,
+                            OpTime(0, 0), Milliseconds(300));
+
+        // No primary situation: should choose h2 sync source.
+        getTopoCoord().chooseNewSyncSource(now()++, OpTime(0,0));
+        ASSERT_EQUALS(HostAndPort("h2"), getTopoCoord().getSyncSourceAddress());
+
+        // Become primary
+        makeSelfPrimary(OpTime(3.0));
+        ASSERT_EQUALS(0, getCurrentPrimaryIndex());
+
+        // Check sync source
+        ASSERT_EQUALS(HostAndPort(), getTopoCoord().getSyncSourceAddress());
+    }
+
     TEST_F(TopoCoordTest, ForceSyncSource) {
         updateConfig(BSON("_id" << "rs0" <<
                           "version" << 1 <<
@@ -427,8 +459,8 @@ namespace {
         getTopoCoord().setForceSyncSourceIndex(1);
         // force should cause shouldChangeSyncSource() to return true
         // even if the currentSource is the force target
-        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("h2")));
-        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("h3")));
+        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("h2"), now()));
+        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("h3"), now()));
         getTopoCoord().chooseNewSyncSource(now()++, OpTime(0,0));
         ASSERT_EQUALS(HostAndPort("h2"), getTopoCoord().getSyncSourceAddress());
 
@@ -545,6 +577,18 @@ namespace {
         receiveDownHeartbeat(HostAndPort("h3"), "rs0", OpTime(), ErrorCodes::Unauthorized);
         ASSERT_TRUE(getTopoCoord().chooseNewSyncSource(now()++, OpTime(0,0)).empty());
         ASSERT_EQUALS(MemberState::RS_RECOVERING, getTopoCoord().getMemberState().s);
+
+        // Having an auth error but with another node up should bring us out of RECOVERING
+        HeartbeatResponseAction action = receiveUpHeartbeat(HostAndPort("h2"),
+                                                            "rs0",
+                                                            MemberState::RS_SECONDARY,
+                                                            OpTime(0, 0),
+                                                            OpTime(2, 0),
+                                                            OpTime(2, 0));
+        ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
+        // Test that the heartbeat that brings us from RECOVERING to SECONDARY doesn't initiate
+        // an election (SERVER-17164)
+        ASSERT_NO_ACTION(action.getAction());
     }
 
     TEST_F(TopoCoordTest, ReceiveHeartbeatWhileAbsentFromConfig) {
@@ -2971,7 +3015,7 @@ namespace {
     TEST_F(PrepareFreezeResponseTest, UnfreezeEvenWhenNotFrozen) {
         BSONObj response = prepareFreezeResponse(0);
         ASSERT_EQUALS("unfreezing", response["info"].String());
-        ASSERT_EQUALS(1, countLogLinesContaining("replSet info 'unfreezing'"));
+        ASSERT_EQUALS(1, countLogLinesContaining("'unfreezing'"));
         // 1 instead of 0 because it assigns to "now" in this case
         ASSERT_EQUALS(1LL, getTopoCoord().getStepDownTime().asInt64());
     }
@@ -2980,7 +3024,7 @@ namespace {
         BSONObj response = prepareFreezeResponse(1);
         ASSERT_EQUALS("you really want to freeze for only 1 second?",
                       response["warning"].String());
-        ASSERT_EQUALS(1, countLogLinesContaining("replSet info 'freezing' for 1 seconds"));
+        ASSERT_EQUALS(1, countLogLinesContaining("'freezing' for 1 seconds"));
         // 1001 because "now" was incremented once during initialization + 1000 ms wait
         ASSERT_EQUALS(1001LL, getTopoCoord().getStepDownTime().asInt64());
     }
@@ -2988,7 +3032,7 @@ namespace {
     TEST_F(PrepareFreezeResponseTest, FreezeForManySeconds) {
         BSONObj response = prepareFreezeResponse(20);
         ASSERT_TRUE(response.isEmpty());
-        ASSERT_EQUALS(1, countLogLinesContaining("replSet info 'freezing' for 20 seconds"));
+        ASSERT_EQUALS(1, countLogLinesContaining("'freezing' for 20 seconds"));
         // 20001 because "now" was incremented once during initialization + 20000 ms wait
         ASSERT_EQUALS(20001LL, getTopoCoord().getStepDownTime().asInt64());
     }
@@ -2999,7 +3043,7 @@ namespace {
         ASSERT_EQUALS("unfreezing", response["info"].String());
         // doesn't mention being primary in this case for some reason
         ASSERT_EQUALS(0, countLogLinesContaining(
-                "replSet info received freeze command but we are primary"));
+                "received freeze command but we are primary"));
         // 1 instead of 0 because it assigns to "now" in this case
         ASSERT_EQUALS(1LL, getTopoCoord().getStepDownTime().asInt64());
     }
@@ -3010,7 +3054,7 @@ namespace {
         ASSERT_EQUALS("you really want to freeze for only 1 second?",
                       response["warning"].String());
         ASSERT_EQUALS(1, countLogLinesContaining(
-                "replSet info received freeze command but we are primary"));
+                "received freeze command but we are primary"));
         ASSERT_EQUALS(0LL, getTopoCoord().getStepDownTime().asInt64());
     }
 
@@ -3019,7 +3063,7 @@ namespace {
         BSONObj response = prepareFreezeResponse(20);
         ASSERT_TRUE(response.isEmpty());
         ASSERT_EQUALS(1, countLogLinesContaining(
-                "replSet info received freeze command but we are primary"));
+                "received freeze command but we are primary"));
         ASSERT_EQUALS(0LL, getTopoCoord().getStepDownTime().asInt64());
     }
 
@@ -3736,14 +3780,14 @@ namespace {
     TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceMemberNotInConfig) {
         // In this test, the TopologyCoordinator should tell us to change sync sources away from
         // "host4" since "host4" is absent from the config
-        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host4")));
+        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host4"), now()));
     }
 
     TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceMemberHasYetToHeartbeat) {
         // In this test, the TopologyCoordinator should not tell us to change sync sources away from
         // "host2" since we do not yet have a heartbeat (and as a result do not yet have an optime)
         // for "host2"
-        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2")));
+        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
     }
 
     TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherHappierMemberExists) {
@@ -3772,7 +3816,49 @@ namespace {
 
         // set up complete, time for actual check
         startCapturingLogMessages();
-        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2")));
+        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+        stopCapturingLogMessages();
+        ASSERT_EQUALS(1, countLogLinesContaining("changing sync target"));
+    }
+
+    TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsBlackListed) {
+        // In this test, the TopologyCoordinator should not tell us to change sync sources away from
+        // "host2" and to "host3" despite "host2" being more than maxSyncSourceLagSecs(30) behind
+        // "host3", since "host3" is blacklisted
+        // Then, confirm that unblacklisting only works if time has passed the blacklist time.
+        OpTime election = OpTime(0,0);
+        OpTime lastOpTimeApplied = OpTime(400,0);
+        // ahead by more than maxSyncSourceLagSecs (30)
+        OpTime fresherLastOpTimeApplied = OpTime(3005,0);
+
+        HeartbeatResponseAction nextAction = receiveUpHeartbeat(HostAndPort("host2"),
+                                                                "rs0",
+                                                                MemberState::RS_SECONDARY,
+                                                                election,
+                                                                lastOpTimeApplied,
+                                                                lastOpTimeApplied);
+        ASSERT_NO_ACTION(nextAction.getAction());
+
+        nextAction = receiveUpHeartbeat(HostAndPort("host3"),
+                                        "rs0",
+                                        MemberState::RS_SECONDARY,
+                                        election,
+                                        fresherLastOpTimeApplied,
+                                        lastOpTimeApplied);
+        ASSERT_NO_ACTION(nextAction.getAction());
+        getTopoCoord().blacklistSyncSource(HostAndPort("host3"), now() + 100);
+
+        // set up complete, time for actual check
+        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+
+        // unblacklist with too early a time (node should remained blacklisted)
+        getTopoCoord().unblacklistSyncSource(HostAndPort("host3"), now() + 90);
+        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+
+        // unblacklist and it should succeed
+        getTopoCoord().unblacklistSyncSource(HostAndPort("host3"), now() + 100);
+        startCapturingLogMessages();
+        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
         stopCapturingLogMessages();
         ASSERT_EQUALS(1, countLogLinesContaining("changing sync target"));
     }
@@ -3805,7 +3891,7 @@ namespace {
         // set up complete, time for actual check
         nextAction = receiveDownHeartbeat(HostAndPort("host3"), "rs0", lastOpTimeApplied);
         ASSERT_NO_ACTION(nextAction.getAction());
-        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2")));
+        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
     }
 
     TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsNotReadable) {
@@ -3834,7 +3920,7 @@ namespace {
         ASSERT_NO_ACTION(nextAction.getAction());
 
         // set up complete, time for actual check
-        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2")));
+        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
     }
 
     TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberDoesNotBuildIndexes) {
@@ -3870,7 +3956,7 @@ namespace {
         ASSERT_NO_ACTION(nextAction.getAction());
 
         // set up complete, time for actual check
-        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2")));
+        ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
     }
 
     TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberDoesNotBuildIndexesNorDoWe) {
@@ -3908,7 +3994,7 @@ namespace {
 
         // set up complete, time for actual check
         startCapturingLogMessages();
-        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2")));
+        ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
         stopCapturingLogMessages();
         ASSERT_EQUALS(1, countLogLinesContaining("changing sync target"));
     }
