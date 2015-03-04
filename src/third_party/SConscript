@@ -181,10 +181,10 @@ else:
     lz4Env = env.Clone()
     lz4Env.InjectThirdPartyIncludePaths(libraries=['lz4'])
     lz4Env.InjectMongoIncludePaths()
-    lz4Env.SConscript('lz4' + lz4Suffix + '/SConscript', exports={ 'env' : lz4Env })
+    lz4Env.SConscript('lz4' + lz4Suffix + '/lib/SConscript', exports={ 'env' : lz4Env })
     lz4Env = lz4Env.Clone(
         LIBDEPS=[
-            'lz4' + lz4Suffix + '/lz4',
+            'lz4' + lz4Suffix + '/lib/lz4',
         ])
 
 lz4Env.Library(
