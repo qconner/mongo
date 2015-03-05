@@ -32,6 +32,12 @@
 #include <wiredtiger.h>
 #include <wiredtiger_ext.h>
 
+/*
+ * We use the https://github.com/Cyan4973/lz4 LZ4 implementation in C.
+ * The code is licensed under the new BSD 3-Clause License.
+ * From the MongoDB scons build perspective, it is "vendored"
+ * and lives in src/third_party/lz4-r127/
+ */
 #include <lz4.h>
 
 /*
@@ -41,22 +47,20 @@
 #include "wiredtiger_config.h"
 
 
-/*! [WT_COMPRESSOR initialization structure] */
 /* Local compressor structure. */
 typedef struct {
 	WT_COMPRESSOR compressor;		/* Must come first */
 
 	WT_EXTENSION_API *wt_api;		/* Extension API */
 
-	unsigned long nop_calls;		/* Count of calls */
+	unsigned long lz4_calls;		/* Count of calls */
 
 } LZ4_COMPRESSOR;
-/*! [WT_COMPRESSOR initialization structure] */
 
-/*! [WT_COMPRESSOR compress] */
+
 /*
- * nop_compress --
- *	A simple compression example that passes data through unchanged.
+ *  lz4_compress --
+ *	WiredTiger LZ4 compression.
  */
 static int
 lz4_compress(WT_COMPRESSOR *compressor, WT_SESSION *session,
@@ -64,31 +68,48 @@ lz4_compress(WT_COMPRESSOR *compressor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp, int *compression_failed)
 {
-	LZ4_COMPRESSOR *nop_compressor = (LZ4_COMPRESSOR *)compressor;
+	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
-	(void)session;				/* Unused parameters */
+	(void)session;    /* Unused parameters */
 
-	++nop_compressor->nop_calls;		/* Call count */
+	++lz4_compressor->lz4_calls;		/* Call count */
 
-    fprintf(stdout, "lz4_compress:  STUBBED OUT %lu %lu\n", src_len, dst_len);
+    //fprintf(stdout, "lz4_compress:  src data length: %lu  dest buffer length: %lu\n", src_len, dst_len);
 
 	*compression_failed = 0;
-	if (dst_len < src_len) {
+	if (dst_len < src_len + 8) {
+        // do not attempt but should not happen with prior call to lz4_pre_size
+        // TODO: consider change to assert
+        fprintf(stdout, "lz4_compress:  not attempting compression due to small destination buffer\n");
 		*compression_failed = 1;
 		return (0);
 	}
 
-	memcpy(dst, src, src_len);
-	*result_lenp = src_len;
+    /*
+     *  Store the length of the compressed block in the first sizeof(size_t) bytes.
+     *  We will skip past the length value to store the compressed bytes.
+	 */
+	char *buf = (char *)dst + sizeof(size_t);
+
+    /*
+     * Call LZ4 to compress
+     */
+    int lz4_len = LZ4_compress((const char *)src, buf, src_len);
+    //fprintf(stdout, "lz4_compress:  dest data length: %d\n", lz4_len);
+	*result_lenp = lz4_len;
+    *(size_t *)dst = (size_t)lz4_len;
+
+    // return the compressed data length, including our size_t compressed data byte count
+    *result_lenp = lz4_len + sizeof(size_t);
 
 	return (0);
 }
-/*! [WT_COMPRESSOR compress] */
 
-/*! [WT_COMPRESSOR decompress] */
+
+
 /*
- * nop_decompress --
- *	A simple decompression example that passes data through unchanged.
+ * lz4_decompress --
+ *	WiredTiger LZ4 decompression.
  */
 static int
 lz4_decompress(WT_COMPRESSOR *compressor, WT_SESSION *session,
@@ -96,73 +117,97 @@ lz4_decompress(WT_COMPRESSOR *compressor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
 {
-	LZ4_COMPRESSOR *nop_compressor = (LZ4_COMPRESSOR *)compressor;
+	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
 	(void)session;				/* Unused parameters */
 	(void)src_len;
 
-	++nop_compressor->nop_calls;		/* Call count */
+	++lz4_compressor->lz4_calls;		/* Call count */
 
-    fprintf(stdout, "lz4_decompress:  STUBBED OUT %lu %lu\n", src_len, dst_len);
+    //fprintf(stdout, "lz4_decompress:  compressed data buffer size: %lu   dest buffer size: %lu\n", src_len, dst_len);
 
-	/*
-	 * The destination length is the number of uncompressed bytes we're
-	 * expected to return.
-	 */
-	memcpy(dst, src, dst_len);
-	*result_lenp = dst_len;
-	return (0);
+    /* retrieve compressed data length from start of compressed data buffer */
+    size_t src_data_len = *(size_t *)src;
+    //fprintf(stdout, "lz4_decompress:  compressed data length: %lu\n", src_data_len);
+
+    /* skip over sizeof(size_t) bytes for actual start of compressed data */
+    char *compressed_data = (char *)src + sizeof(size_t);
+
+    // the destination buffer length should always be sufficient
+    // because WT keeps track of the byte count before compression
+
+    /* Call LZ4 to decompress */
+    int decoded = LZ4_decompress_safe(compressed_data, (char *)dst, src_data_len, dst_len);
+    //fprintf(stdout, "lz4_decompress:  decompressed data length: %d\n", decoded);
+    if (decoded < 0) {
+      fprintf(stdout, "lz4_decompress:  ERROR in LZ4_decompress_safe: %d\n", decoded);
+      return(1);
+    }
+
+    size_t decompressed_data_len = decoded;
+    // return the uncompressed data length
+    *result_lenp = decompressed_data_len;
+    
+    return(0);
 }
-/*! [WT_COMPRESSOR decompress] */
 
-/*! [WT_COMPRESSOR presize] */
+
+
+
 /*
- * nop_pre_size --
- *	A simple pre-size example that returns the source length.
+ * lz4_pre_size --
+ *	WiredTiger LZ4 destination buffer sizing for compression.
  */
 static int
 lz4_pre_size(WT_COMPRESSOR *compressor, WT_SESSION *session,
     uint8_t *src, size_t src_len,
     size_t *result_lenp)
 {
-	LZ4_COMPRESSOR *nop_compressor = (LZ4_COMPRESSOR *)compressor;
+	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
-	(void)session;				/* Unused parameters */
+	(void)session;    /* Unused parameters */
 	(void)src;
 
-    fprintf(stdout, "lz4_pre_size: STUBBED OUT %lu\n", src_len);
+	++lz4_compressor->lz4_calls;		/* Call count */
 
-	++nop_compressor->nop_calls;		/* Call count */
+    //  we must reserve a little extra space for our compressed data length
+    //  value stored at the start of the compressed data buffer.  Random
+    //  data doesn't compress well and we could overflow the destination buffer.
 
-	*result_lenp = src_len;
+    size_t dst_buffer_len_needed = src_len + sizeof(size_t);
+    //fprintf(stdout, "lz4_pre_size: dest buffer size needed: %lu\n", dst_buffer_len_needed);
+
+	*result_lenp = dst_buffer_len_needed;
 	return (0);
 }
-/*! [WT_COMPRESSOR presize] */
 
-/*! [WT_COMPRESSOR terminate] */
+
+
+
 /*
- * nop_terminate --
- *	WiredTiger no-op compression termination.
+ * lz4_terminate --
+ *	WiredTiger LZ4 compression termination.
  */
 static int
 lz4_terminate(WT_COMPRESSOR *compressor, WT_SESSION *session)
 {
-	LZ4_COMPRESSOR *nop_compressor = (LZ4_COMPRESSOR *)compressor;
+	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
-	(void)session;				/* Unused parameters */
+	(void)session;    /* Unused parameters */
 
-	++nop_compressor->nop_calls;		/* Call count */
+	++lz4_compressor->lz4_calls;		/* Call count */
 
-    fprintf(stdout, "lz4_terminate: %lu calls\n", nop_compressor->nop_calls);
+    fprintf(stdout, "lz4_terminate:  %lu calls\n", lz4_compressor->lz4_calls);
 
 	/* Free the allocated memory. */
 	free(compressor);
 
 	return (0);
 }
-/*! [WT_COMPRESSOR terminate] */
 
-/*! [WT_COMPRESSOR initialization function] */
+
+
+
 /*
  * wiredtiger_extension_init --
  *	A simple shared library compression example.
@@ -172,7 +217,7 @@ lz4_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *config)
 {
 	LZ4_COMPRESSOR *lz4_compressor;
 
-	(void)config;				/* Unused parameters */
+	(void)config;    /* Unused parameters */
 
     int dummy2 = LZ4_versionNumber();
     fprintf(stdout, "lz4_extension_init:  LZ4 library version: %d\n", dummy2);
@@ -204,7 +249,6 @@ lz4_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *config)
 	return (connection->add_compressor(
 	    connection, "lz4", (WT_COMPRESSOR *)lz4_compressor, NULL));
 }
-/*! [WT_COMPRESSOR initialization function] */
 
 
 
