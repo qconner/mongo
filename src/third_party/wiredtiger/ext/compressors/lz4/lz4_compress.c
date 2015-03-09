@@ -53,7 +53,7 @@ typedef struct {
 
 	WT_EXTENSION_API *wt_api;		/* Extension API */
 
-	unsigned long lz4_calls;		/* Count of calls */
+  //unsigned long lz4_calls;		/* Count of calls */
 
 } LZ4_COMPRESSOR;
 
@@ -72,7 +72,7 @@ lz4_compress(WT_COMPRESSOR *compressor, WT_SESSION *session,
 
 	(void)session;    /* Unused parameters */
 
-	++lz4_compressor->lz4_calls;		/* Call count */
+	//++lz4_compressor->lz4_calls;		/* Call count */
 
     //fprintf(stdout, "lz4_compress:  src data length: %lu  dest buffer length: %lu\n", src_len, dst_len);
 
@@ -122,7 +122,7 @@ lz4_decompress(WT_COMPRESSOR *compressor, WT_SESSION *session,
 	(void)session;				/* Unused parameters */
 	(void)src_len;
 
-	++lz4_compressor->lz4_calls;		/* Call count */
+	//++lz4_compressor->lz4_calls;		/* Call count */
 
     //fprintf(stdout, "lz4_decompress:  compressed data buffer size: %lu   dest buffer size: %lu\n", src_len, dst_len);
 
@@ -140,7 +140,7 @@ lz4_decompress(WT_COMPRESSOR *compressor, WT_SESSION *session,
     int decoded = LZ4_decompress_safe(compressed_data, (char *)dst, src_data_len, dst_len);
     //fprintf(stdout, "lz4_decompress:  decompressed data length: %d\n", decoded);
     if (decoded < 0) {
-      fprintf(stdout, "lz4_decompress:  ERROR in LZ4_decompress_safe: %d\n", decoded);
+      fprintf(stdout, "lz4_decompress:  ERROR in LZ4_decompress_safe(): %d\n", decoded);
       return(1);
     }
 
@@ -168,7 +168,7 @@ lz4_pre_size(WT_COMPRESSOR *compressor, WT_SESSION *session,
 	(void)session;    /* Unused parameters */
 	(void)src;
 
-	++lz4_compressor->lz4_calls;		/* Call count */
+	//++lz4_compressor->lz4_calls;		/* Call count */
 
     //  we must reserve a little extra space for our compressed data length
     //  value stored at the start of the compressed data buffer.  Random
@@ -197,7 +197,7 @@ lz4_terminate(WT_COMPRESSOR *compressor, WT_SESSION *session)
 
 	++lz4_compressor->lz4_calls;		/* Call count */
 
-    fprintf(stdout, "lz4_terminate:  %lu calls\n", lz4_compressor->lz4_calls);
+    //fprintf(stdout, "lz4_terminate:  %lu calls\n", lz4_compressor->lz4_calls);
 
 	/* Free the allocated memory. */
 	free(compressor);
@@ -220,7 +220,7 @@ lz4_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *config)
 	(void)config;    /* Unused parameters */
 
     int dummy2 = LZ4_versionNumber();
-    fprintf(stdout, "lz4_extension_init:  LZ4 library version: %d\n", dummy2);
+    //fprintf(stdout, "lz4_extension_init:  LZ4 library version: %d\n", dummy2);
 
 	if ((lz4_compressor = calloc(1, sizeof(LZ4_COMPRESSOR))) == NULL)
 		return (errno);
