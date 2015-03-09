@@ -68,7 +68,7 @@ lz4_compress(WT_COMPRESSOR *compressor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp, int *compression_failed)
 {
-	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
+    //LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
 	(void)session;    /* Unused parameters */
 
@@ -117,7 +117,7 @@ lz4_decompress(WT_COMPRESSOR *compressor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
 {
-	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
+    //LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
 	(void)session;				/* Unused parameters */
 	(void)src_len;
@@ -163,7 +163,7 @@ lz4_pre_size(WT_COMPRESSOR *compressor, WT_SESSION *session,
     uint8_t *src, size_t src_len,
     size_t *result_lenp)
 {
-	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
+    //LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
 	(void)session;    /* Unused parameters */
 	(void)src;
@@ -191,11 +191,11 @@ lz4_pre_size(WT_COMPRESSOR *compressor, WT_SESSION *session,
 static int
 lz4_terminate(WT_COMPRESSOR *compressor, WT_SESSION *session)
 {
-	LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
+    //LZ4_COMPRESSOR *lz4_compressor = (LZ4_COMPRESSOR *)compressor;
 
 	(void)session;    /* Unused parameters */
 
-	++lz4_compressor->lz4_calls;		/* Call count */
+	//++lz4_compressor->lz4_calls;		/* Call count */
 
     //fprintf(stdout, "lz4_terminate:  %lu calls\n", lz4_compressor->lz4_calls);
 
@@ -219,7 +219,7 @@ lz4_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *config)
 
 	(void)config;    /* Unused parameters */
 
-    int dummy2 = LZ4_versionNumber();
+    //int dummy2 = LZ4_versionNumber();
     //fprintf(stdout, "lz4_extension_init:  LZ4 library version: %d\n", dummy2);
 
 	if ((lz4_compressor = calloc(1, sizeof(LZ4_COMPRESSOR))) == NULL)
