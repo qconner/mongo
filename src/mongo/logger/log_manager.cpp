@@ -35,25 +35,40 @@
 namespace mongo {
 namespace logger {
 
-    LogManager::LogManager() {
-        // Should really fassert that the following status .isOK(), but it never fails.
-        _globalDomain.attachAppender(MessageLogDomain::AppenderAutoPtr(
-                new ConsoleAppender<MessageEventEphemeral>(new MessageEventDetailsEncoder)));
-    }
+LogManager::LogManager() {
+    reattachDefaultConsoleAppender();
+}
 
-    LogManager::~LogManager() {
-        for (DomainsByNameMap::iterator iter = _domains.begin(); iter != _domains.end(); ++iter) {
-            delete iter->second;
-        }
+LogManager::~LogManager() {
+    for (DomainsByNameMap::iterator iter = _domains.begin(); iter != _domains.end(); ++iter) {
+        delete iter->second;
     }
+}
 
-    MessageLogDomain* LogManager::getNamedDomain(const std::string& name) {
-        MessageLogDomain*& domain = _domains[name];
-        if (!domain) {
-            domain = new MessageLogDomain;
-        }
-        return domain;
+MessageLogDomain* LogManager::getNamedDomain(const std::string& name) {
+    MessageLogDomain*& domain = _domains[name];
+    if (!domain) {
+        domain = new MessageLogDomain;
     }
+    return domain;
+}
+
+void LogManager::detachDefaultConsoleAppender() {
+    invariant(_defaultAppender);
+    _globalDomain.detachAppender(_defaultAppender);
+    _defaultAppender.reset();
+}
+
+void LogManager::reattachDefaultConsoleAppender() {
+    invariant(!_defaultAppender);
+    _defaultAppender =
+        _globalDomain.attachAppender(std::make_unique<ConsoleAppender<MessageEventEphemeral>>(
+            std::make_unique<MessageEventDetailsEncoder>()));
+}
+
+bool LogManager::isDefaultConsoleAppenderAttached() const {
+    return static_cast<bool>(_defaultAppender);
+}
 
 }  // logger
 }  // mongo

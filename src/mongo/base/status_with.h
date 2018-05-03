@@ -1,5 +1,3 @@
-// status_with.h
-
 /*    Copyright 2013 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
@@ -29,146 +27,225 @@
 
 #pragma once
 
-#include <boost/static_assert.hpp>
-#include <boost/type_traits/is_same.hpp> // TODO replace with std::is_same in C++11
+#include <boost/optional.hpp>
 #include <iosfwd>
+#include <type_traits>
+#include <utility>
 
+#include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
+#include "mongo/platform/compiler.h"
+
+#define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+#include "mongo/util/invariant.h"
+#undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+
 
 namespace mongo {
 
+// Including builder.h here would cause a cycle.
+template <typename Allocator>
+class StringBuilderImpl;
 
-    /*
-     * StatusWith is used to return an error or a value
-     * this is designed to make exception code free cleaner by not needing as many out paramters
-     * example:
-      StatusWith<int> fib( int n ) {
-        if ( n < 0 ) return StatusWith<int>( ErrorCodes::BadValue, "paramter to fib has to be >= 0" );
-        if ( n <= 1 ) return StatusWith<int>( 1 );
-        StatusWith<int> a = fib( n - 1 );
-        StatusWith<int> b = fib( n - 2 );
-        if ( !a.isOK() ) return a;
-        if ( !b.isOK() ) return b;
-        return StatusWith<int>( a.getValue() + b.getValue() );
-      }
+template <typename T>
+class StatusWith;
 
-      * Note: the value is copied in the current implementation, so should be small (int, int*)
-      *  not a vector
+// Using extern constexpr to prevent the compiler from allocating storage as a poor man's c++17
+// inline constexpr variable.
+// TODO delete extern in c++17 because inline is the default for constexper variables.
+template <typename T>
+extern constexpr bool isStatusWith = false;
+template <typename T>
+extern constexpr bool isStatusWith<StatusWith<T>> = true;
+
+template <typename T>
+extern constexpr bool isStatusOrStatusWith =
+    std::is_same<T, mongo::Status>::value || isStatusWith<T>;
+
+template <typename T>
+using StatusOrStatusWith = std::conditional_t<std::is_void<T>::value, Status, StatusWith<T>>;
+
+/**
+ * StatusWith is used to return an error or a value.
+ * This class is designed to make exception-free code cleaner by not needing as many out
+ * parameters.
+ *
+ * Example:
+ * StatusWith<int> fib( int n ) {
+ *   if ( n < 0 )
+ *       return StatusWith<int>( ErrorCodes::BadValue, "parameter to fib has to be >= 0" );
+ *   if ( n <= 1 ) return StatusWith<int>( 1 );
+ *   StatusWith<int> a = fib( n - 1 );
+ *   StatusWith<int> b = fib( n - 2 );
+ *   if ( !a.isOK() ) return a;
+ *   if ( !b.isOK() ) return b;
+ *   return StatusWith<int>( a.getValue() + b.getValue() );
+ * }
+ */
+template <typename T>
+class MONGO_WARN_UNUSED_RESULT_CLASS StatusWith {
+    MONGO_STATIC_ASSERT_MSG(!isStatusOrStatusWith<T>,
+                            "StatusWith<Status> and StatusWith<StatusWith<T>> are banned.");
+
+public:
+    using value_type = T;
+
+    /**
+     * for the error case
      */
-    template<typename T>
-    class StatusWith {
-        BOOST_STATIC_ASSERT(!(boost::is_same<T, Status>::value)); // StatusWith<Status> is banned.
-    public:
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, StringData reason)
+        : _status(code, reason) {}
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, std::string reason)
+        : _status(code, std::move(reason)) {}
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, const char* reason)
+        : _status(code, reason) {}
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code,
+                                            const mongoutils::str::stream& reason)
+        : _status(code, reason) {}
 
-        /**
-         * for the error case
-         */
-        StatusWith( ErrorCodes::Error code, const std::string& reason, int location = 0 )
-            : _status( Status( code, reason, location ) ) {
-        }
-
-        /**
-         * for the error case
-         */
-        /*implicit*/ StatusWith( const Status& status )
-            : _status( status ) {
-            // verify(( !status.isOK() ); // TODO
-        }
-
-        /**
-         * for the OK case
-         */
-        /*implicit*/ StatusWith( const T& t )
-            : _status( Status::OK() ), _t( t ) {
-        }
-
-        const T& getValue() const { /* verify( isOK() ); */ return _t; } // TODO
-        const Status& getStatus() const { return _status;}
-
-        bool isOK() const { return _status.isOK(); }
-
-    private:
-        Status _status;
-        T _t;
-    };
-
-    template<typename T>
-    std::ostream& operator<<(std::ostream& stream, const StatusWith<T>& sw) {
-        if (sw.isOK())
-            return stream << sw.getValue();
-        return stream << sw.getStatus();
+    /**
+     * for the error case
+     */
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(Status status) : _status(std::move(status)) {
+        dassert(!isOK());
     }
 
-    //
-    // EqualityComparable(StatusWith<T>, T). Intentionally not providing an ordering relation.
-    //
+    /**
+     * for the OK case
+     */
+    StatusWith(T t) : _status(Status::OK()), _t(std::move(t)) {}
 
-    template<typename T>
-    bool operator==(const StatusWith<T>& sw, const T& val) {
-        return sw.isOK() && sw.getValue() == val;
+    const T& getValue() const {
+        dassert(isOK());
+        return *_t;
     }
 
-    template<typename T>
-    bool operator==(const T& val, const StatusWith<T>& sw) {
-        return sw.isOK() && val == sw.getValue();
+    T& getValue() {
+        dassert(isOK());
+        return *_t;
     }
 
-    template<typename T>
-    bool operator!=(const StatusWith<T>& sw, const T& val) {
-        return !(sw == val);
+    const Status& getStatus() const {
+        return _status;
     }
 
-    template<typename T>
-    bool operator!=(const T& val, const StatusWith<T>& sw) {
-        return !(val == sw);
+    bool isOK() const {
+        return _status.isOK();
     }
 
-    //
-    // EqualityComparable(StatusWith<T>, Status)
-    //
+    /**
+     * This method is a transitional tool, to facilitate transition to compile-time enforced status
+     * checking.
+     *
+     * NOTE: DO NOT ADD NEW CALLS TO THIS METHOD. This method serves the same purpose as
+     * `.getStatus().ignore()`; however, it indicates a situation where the code that presently
+     * ignores a status code has not been audited for correctness. This method will be removed at
+     * some point. If you encounter a compiler error from ignoring the result of a `StatusWith`
+     * returning function be sure to check the return value, or deliberately ignore the return
+     * value. The function is named to be auditable independently from unaudited `Status` ignore
+     * cases.
+     */
+    void status_with_transitional_ignore() && noexcept {};
+    void status_with_transitional_ignore() const& noexcept = delete;
 
-    template<typename T>
-    bool operator==(const StatusWith<T>& sw, const Status& status) {
-        return sw.getStatus() == status;
-    }
+private:
+    Status _status;
+    boost::optional<T> _t;
+};
 
-    template<typename T>
-    bool operator==(const Status& status, const StatusWith<T>& sw) {
-        return status == sw.getStatus();
-    }
+template <typename T, typename... Args>
+StatusWith<T> makeStatusWith(Args&&... args) {
+    return StatusWith<T>{T(std::forward<Args>(args)...)};
+}
 
-    template<typename T>
-    bool operator!=(const StatusWith<T>& sw, const Status& status) {
-        return !(sw == status);
-    }
+template <typename T>
+auto operator<<(std::ostream& stream, const StatusWith<T>& sw)
+    -> decltype(stream << sw.getValue())  // SFINAE on T streamability.
+{
+    if (sw.isOK())
+        return stream << sw.getValue();
+    return stream << sw.getStatus();
+}
 
-    template<typename T>
-    bool operator!=(const Status& status, const StatusWith<T>& sw) {
-        return !(status == sw);
-    }
+template <typename Allocator, typename T>
+auto operator<<(StringBuilderImpl<Allocator>& stream, const StatusWith<T>& sw)
+    -> decltype(stream << sw.getValue())  // SFINAE on T streamability.
+{
+    if (sw.isOK())
+        return stream << sw.getValue();
+    return stream << sw.getStatus();
+}
 
-    //
-    // EqualityComparable(StatusWith<T>, ErrorCode)
-    //
+//
+// EqualityComparable(StatusWith<T>, T). Intentionally not providing an ordering relation.
+//
 
-    template<typename T>
-    bool operator==(const StatusWith<T>& sw, const ErrorCodes& code) {
-        return sw.getStatus() == code;
-    }
+template <typename T>
+bool operator==(const StatusWith<T>& sw, const T& val) {
+    return sw.isOK() && sw.getValue() == val;
+}
 
-    template<typename T>
-    bool operator==(const ErrorCodes::Error& code, const StatusWith<T>& sw) {
-        return code == sw.getStatus();
-    }
+template <typename T>
+bool operator==(const T& val, const StatusWith<T>& sw) {
+    return sw.isOK() && val == sw.getValue();
+}
 
-    template<typename T>
-    bool operator!=(const StatusWith<T>& sw, const ErrorCodes::Error& code) {
-        return !(sw == code);
-    }
+template <typename T>
+bool operator!=(const StatusWith<T>& sw, const T& val) {
+    return !(sw == val);
+}
 
-    template<typename T>
-    bool operator!=(const ErrorCodes::Error& code, const StatusWith<T>& sw) {
-        return !(code == sw);
-    }
+template <typename T>
+bool operator!=(const T& val, const StatusWith<T>& sw) {
+    return !(val == sw);
+}
 
-} // namespace mongo
+//
+// EqualityComparable(StatusWith<T>, Status)
+//
+
+template <typename T>
+bool operator==(const StatusWith<T>& sw, const Status& status) {
+    return sw.getStatus() == status;
+}
+
+template <typename T>
+bool operator==(const Status& status, const StatusWith<T>& sw) {
+    return status == sw.getStatus();
+}
+
+template <typename T>
+bool operator!=(const StatusWith<T>& sw, const Status& status) {
+    return !(sw == status);
+}
+
+template <typename T>
+bool operator!=(const Status& status, const StatusWith<T>& sw) {
+    return !(status == sw);
+}
+
+//
+// EqualityComparable(StatusWith<T>, ErrorCode)
+//
+
+template <typename T>
+bool operator==(const StatusWith<T>& sw, const ErrorCodes::Error code) {
+    return sw.getStatus() == code;
+}
+
+template <typename T>
+bool operator==(const ErrorCodes::Error code, const StatusWith<T>& sw) {
+    return code == sw.getStatus();
+}
+
+template <typename T>
+bool operator!=(const StatusWith<T>& sw, const ErrorCodes::Error code) {
+    return !(sw == code);
+}
+
+template <typename T>
+bool operator!=(const ErrorCodes::Error code, const StatusWith<T>& sw) {
+    return !(code == sw);
+}
+
+}  // namespace mongo

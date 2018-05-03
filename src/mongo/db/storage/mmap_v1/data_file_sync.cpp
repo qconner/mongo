@@ -32,106 +32,106 @@
 
 #include "mongo/db/storage/mmap_v1/data_file_sync.h"
 
+#include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/mmap_v1/dur_journal.h"
+#include "mongo/db/storage/mmap_v1/mmap.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mmap.h"
 
 namespace mongo {
 
-    using std::endl;
+using std::endl;
 
-    DataFileSync dataFileSync;
+DataFileSync dataFileSync;
 
-    DataFileSync::DataFileSync()
-        : ServerStatusSection( "backgroundFlushing" ),
-          _total_time( 0 ),
-          _flushes( 0 ),
-          _last() {
+DataFileSync::DataFileSync()
+    : ServerStatusSection("backgroundFlushing"), _total_time(0), _flushes(0), _last() {}
 
+void DataFileSync::run() {
+    Client::initThread(name().c_str());
+
+    if (storageGlobalParams.syncdelay == 0) {
+        log() << "warning: --syncdelay 0 is not recommended and can have strange performance"
+              << endl;
+    } else if (storageGlobalParams.syncdelay == 1) {
+        log() << "--syncdelay 1" << endl;
+    } else if (storageGlobalParams.syncdelay != 60) {
+        LOG(1) << "--syncdelay " << storageGlobalParams.syncdelay.load() << endl;
     }
-
-    void DataFileSync::run() {
-        Client::initThread( name().c_str() );
-
+    int time_flushing = 0;
+    while (!globalInShutdownDeprecated()) {
         if (storageGlobalParams.syncdelay == 0) {
-            log() << "warning: --syncdelay 0 is not recommended and can have strange performance" << endl;
+            // in case at some point we add an option to change at runtime
+            sleepsecs(5);
+            continue;
         }
-        else if (storageGlobalParams.syncdelay == 1) {
-            log() << "--syncdelay 1" << endl;
+
+        sleepmillis(
+            (long long)std::max(0.0, (storageGlobalParams.syncdelay * 1000) - time_flushing));
+
+        if (globalInShutdownDeprecated()) {
+            // occasional issue trying to flush during shutdown when sleep interrupted
+            break;
         }
-        else if (storageGlobalParams.syncdelay != 60) {
-            LOG(1) << "--syncdelay " << storageGlobalParams.syncdelay << endl;
-        }
-        int time_flushing = 0;
-        while ( ! inShutdown() ) {
-            _diaglog.flush();
-            if (storageGlobalParams.syncdelay == 0) {
-                // in case at some point we add an option to change at runtime
-                sleepsecs(5);
-                continue;
-            }
 
-            sleepmillis((long long) std::max(0.0, (storageGlobalParams.syncdelay * 1000) - time_flushing));
+        auto opCtx = cc().makeOperationContext();
+        Date_t start = jsTime();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
 
-            if ( inShutdown() ) {
-                // occasional issue trying to flush during shutdown when sleep interrupted
-                break;
-            }
+        dur::notifyPreDataFileFlush();
+        int numFiles = storageEngine->flushAllFiles(opCtx.get(), true);
+        dur::notifyPostDataFileFlush();
 
-            Date_t start = jsTime();
-            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
-            int numFiles = storageEngine->flushAllFiles( true );
-            time_flushing = (int) (jsTime() - start);
+        time_flushing = durationCount<Milliseconds>(jsTime() - start);
 
-            _flushed(time_flushing);
+        _flushed(time_flushing);
 
-            if( shouldLog(logger::LogSeverity::Debug(1)) || time_flushing >= 10000 ) {
-                log() << "flushing mmaps took " << time_flushing << "ms " << " for " << numFiles << " files" << endl;
-            }
+        if (shouldLog(logger::LogSeverity::Debug(1)) || time_flushing >= 10000) {
+            log() << "flushing mmaps took " << time_flushing << "ms "
+                  << " for " << numFiles << " files" << endl;
         }
     }
+}
 
-    BSONObj DataFileSync::generateSection(OperationContext* txn,
-                                          const BSONElement& configElement) const {
-        if (!running()) {
-            return BSONObj();
-        }
-
-        BSONObjBuilder b;
-        b.appendNumber( "flushes" , _flushes );
-        b.appendNumber( "total_ms" , _total_time );
-        b.appendNumber( "average_ms" , (_flushes ? (_total_time / double(_flushes)) : 0.0) );
-        b.appendNumber( "last_ms" , _last_time );
-        b.append("last_finished", _last);
-        return b.obj();
+BSONObj DataFileSync::generateSection(OperationContext* opCtx,
+                                      const BSONElement& configElement) const {
+    if (!running()) {
+        return BSONObj();
     }
 
-    void DataFileSync::_flushed(int ms) {
-        _flushes++;
-        _total_time += ms;
-        _last_time = ms;
-        _last = jsTime();
-    }
+    BSONObjBuilder b;
+    b.appendNumber("flushes", _flushes);
+    b.appendNumber("total_ms", _total_time);
+    b.appendNumber("average_ms", (_flushes ? (_total_time / double(_flushes)) : 0.0));
+    b.appendNumber("last_ms", _last_time);
+    b.append("last_finished", _last);
+    return b.obj();
+}
+
+void DataFileSync::_flushed(int ms) {
+    _flushes++;
+    _total_time += ms;
+    _last_time = ms;
+    _last = jsTime();
+}
 
 
-    class MemJournalServerStatusMetric : public ServerStatusMetric {
-    public:
-        MemJournalServerStatusMetric() : ServerStatusMetric(".mem.mapped") {}
-        virtual void appendAtLeaf( BSONObjBuilder& b ) const {
-            int m = static_cast<int>(MemoryMappedFile::totalMappedLength() / ( 1024 * 1024 ));
-            b.appendNumber( "mapped" , m );
+class MemJournalServerStatusMetric : public ServerStatusMetric {
+public:
+    MemJournalServerStatusMetric() : ServerStatusMetric(".mem.mapped") {}
+    virtual void appendAtLeaf(BSONObjBuilder& b) const {
+        int m = MemoryMappedFile::totalMappedLengthInMB();
+        b.appendNumber("mapped", m);
 
-            if (storageGlobalParams.dur) {
-                m *= 2;
-                b.appendNumber( "mappedWithJournal" , m );
-            }
-
+        if (storageGlobalParams.dur) {
+            m *= 2;
+            b.appendNumber("mappedWithJournal", m);
         }
-
-    } memJournalServerStatusMetric;
+    }
+} memJournalServerStatusMetric;
 }

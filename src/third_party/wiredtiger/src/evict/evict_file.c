@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,26 +13,62 @@
  *	Discard pages for a specific file.
  */
 int
-__wt_evict_file(WT_SESSION_IMPL *session, int syncop)
+__wt_evict_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 {
+	WT_BTREE *btree;
+	WT_CONNECTION_IMPL *conn;
+	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
 	WT_PAGE *page;
 	WT_REF *next_ref, *ref;
-	int evict_reset;
+	uint32_t walk_flags;
+
+	dhandle = session->dhandle;
+	btree = dhandle->handle;
+	conn = S2C(session);
 
 	/*
-	 * We need exclusive access to the file -- disable ordinary eviction
-	 * and drain any blocks already queued.
+	 * We need exclusive access to the file, we're about to discard the root
+	 * page. Assert eviction has been locked out.
 	 */
-	WT_RET(__wt_evict_file_exclusive_on(session, &evict_reset));
+	WT_ASSERT(session,
+	    btree->evict_disabled > 0 || !F_ISSET(dhandle, WT_DHANDLE_OPEN));
+
+	/*
+	 * We do discard objects without pages in memory. If that's the case,
+	 * we're done.
+	 */
+	if (btree->root.page == NULL)
+		return (0);
+
+	/*
+	 * If discarding a dead tree, remove any lookaside entries.  This deals
+	 * with the case where a tree is dropped with "force=true".  It happens
+	 * that we also force-drop the lookaside table itself: it can never
+	 * participate in lookaside eviction, and we can't open a cursor on it
+	 * as we are discarding it.
+	 *
+	 * We use the special page ID zero so that all lookaside entries for
+	 * the tree are removed.
+	 */
+	if (F_ISSET(dhandle, WT_DHANDLE_DEAD) &&
+	    F_ISSET(conn, WT_CONN_LOOKASIDE_OPEN) && btree->lookaside_entries) {
+		WT_ASSERT(session, !WT_IS_METADATA(dhandle) &&
+		    !F_ISSET(btree, WT_BTREE_LOOKASIDE));
+
+		WT_RET(__wt_las_save_dropped(session));
+	}
 
 	/* Make sure the oldest transaction ID is up-to-date. */
-	__wt_txn_update_oldest(session);
+	WT_RET(__wt_txn_update_oldest(
+	    session, WT_TXN_OLDEST_STRICT | WT_TXN_OLDEST_WAIT));
 
 	/* Walk the tree, discarding pages. */
+	walk_flags =
+	    WT_READ_CACHE | WT_READ_NO_EVICT |
+	    (syncop == WT_SYNC_CLOSE ? WT_READ_LOOKASIDE : 0);
 	next_ref = NULL;
-	WT_ERR(__wt_tree_walk(session, &next_ref, NULL,
-	    WT_READ_CACHE | WT_READ_NO_EVICT));
+	WT_ERR(__wt_tree_walk(session, &next_ref, walk_flags));
 	while ((ref = next_ref) != NULL) {
 		page = ref->page;
 
@@ -57,7 +93,8 @@ __wt_evict_file(WT_SESSION_IMPL *session, int syncop)
 		 * error, retrying later.
 		 */
 		if (syncop == WT_SYNC_CLOSE && __wt_page_is_modified(page))
-			WT_ERR(__wt_reconcile(session, ref, NULL, WT_EVICTING));
+			WT_ERR(__wt_reconcile(session, ref, NULL,
+			    WT_REC_EVICT | WT_REC_VISIBLE_ALL, NULL));
 
 		/*
 		 * We can't evict the page just returned to us (it marks our
@@ -68,63 +105,29 @@ __wt_evict_file(WT_SESSION_IMPL *session, int syncop)
 		 * the reconciliation, the next walk call could miss a page in
 		 * the tree.
 		 */
-		WT_ERR(__wt_tree_walk(session, &next_ref, NULL,
-		    WT_READ_CACHE | WT_READ_NO_EVICT));
+		WT_ERR(__wt_tree_walk(session, &next_ref, walk_flags));
 
 		switch (syncop) {
 		case WT_SYNC_CLOSE:
 			/*
 			 * Evict the page.
-			 * Do not attempt to evict pages expected to be merged
-			 * into their parents, with the exception that the root
-			 * page can't be merged, it must be written.
 			 */
-			if (__wt_ref_is_root(ref) ||
-			    page->modify == NULL ||
-			    !F_ISSET(page->modify, WT_PM_REC_EMPTY))
-				WT_ERR(__wt_evict(session, ref, 1));
+			WT_ERR(__wt_evict(session, ref, true));
 			break;
 		case WT_SYNC_DISCARD:
 			/*
-			 * Ordinary discard of the page, whether clean or dirty.
-			 * If we see a dirty page in an ordinary discard (e.g.,
-			 * from sweep), give up: an update must have happened
-			 * since the file was selected for sweeping.
+			 * Discard the page regardless of whether it is dirty.
 			 */
-			if (__wt_page_is_modified(page))
-				WT_ERR(EBUSY);
-
-			/*
-			 * If the page contains an update that is too recent to
-			 * evict, stop.  This should never happen during
-			 * connection close, but in other paths our caller
-			 * should be prepared to deal with this case.
-			 */
-			if (page->modify != NULL &&
-			    !__wt_txn_visible_all(session,
-			    page->modify->rec_max_txn))
-				WT_ERR(EBUSY);
-
-			__wt_evict_page_clean_update(session, ref);
+			WT_ASSERT(session,
+			    F_ISSET(dhandle, WT_DHANDLE_DEAD) ||
+			    F_ISSET(conn, WT_CONN_CLOSING) ||
+			    __wt_page_can_evict(session, ref, NULL));
+			__wt_ref_out(session, ref);
 			break;
-		case WT_SYNC_DISCARD_FORCE:
-			/*
-			 * Forced discard of the page, whether clean or dirty.
-			 * If we see a dirty page in a forced discard, clean
-			 * the page, both to keep statistics correct, and to
-			 * let the page-discard function assert no dirty page
-			 * is ever discarded.
-			 */
-			if (__wt_page_is_modified(page)) {
-				page->modify->write_gen = 0;
-				__wt_cache_dirty_decr(session, page);
-			}
-
-			F_SET(session, WT_SESSION_DISCARD_FORCE);
-			__wt_evict_page_clean_update(session, ref);
-			F_CLR(session, WT_SESSION_DISCARD_FORCE);
+		case WT_SYNC_CHECKPOINT:
+		case WT_SYNC_WRITE_LEAVES:
+			WT_ERR(__wt_illegal_value(session, NULL));
 			break;
-		WT_ILLEGAL_VALUE_ERR(session);
 		}
 	}
 
@@ -132,11 +135,8 @@ __wt_evict_file(WT_SESSION_IMPL *session, int syncop)
 err:		/* On error, clear any left-over tree walk. */
 		if (next_ref != NULL)
 			WT_TRET(__wt_page_release(
-			    session, next_ref, WT_READ_NO_EVICT));
+			    session, next_ref, walk_flags));
 	}
-
-	if (evict_reset)
-		__wt_evict_file_exclusive_off(session);
 
 	return (ret);
 }

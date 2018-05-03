@@ -29,59 +29,64 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/accumulator.h"
+
+#include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using std::vector;
+using boost::intrusive_ptr;
+using std::vector;
 
-    void AccumulatorAddToSet::processInternal(const Value& input, bool merging) {
-        if (!merging) {
-            if (!input.missing()) {
-                bool inserted = set.insert(input).second;
-                if (inserted) {
-                    _memUsageBytes += input.getApproximateSize();
-                }
+REGISTER_ACCUMULATOR(addToSet, AccumulatorAddToSet::create);
+
+const char* AccumulatorAddToSet::getOpName() const {
+    return "$addToSet";
+}
+
+void AccumulatorAddToSet::processInternal(const Value& input, bool merging) {
+    if (!merging) {
+        if (!input.missing()) {
+            bool inserted = _set.insert(input).second;
+            if (inserted) {
+                _memUsageBytes += input.getApproximateSize();
             }
         }
-        else {
-            // If we're merging, we need to take apart the arrays we
-            // receive and put their elements into the array we are collecting.
-            // If we didn't, then we'd get an array of arrays, with one array
-            // from each merge source.
-            verify(input.getType() == Array);
-            
-            const vector<Value>& array = input.getArray();
-            for (size_t i=0; i < array.size(); i++) {
-                bool inserted = set.insert(array[i]).second;
-                if (inserted) {
-                    _memUsageBytes += array[i].getApproximateSize();
-                }
+    } else {
+        // If we're merging, we need to take apart the arrays we
+        // receive and put their elements into the array we are collecting.
+        // If we didn't, then we'd get an array of arrays, with one array
+        // from each merge source.
+        verify(input.getType() == Array);
+
+        const vector<Value>& array = input.getArray();
+        for (size_t i = 0; i < array.size(); i++) {
+            bool inserted = _set.insert(array[i]).second;
+            if (inserted) {
+                _memUsageBytes += array[i].getApproximateSize();
             }
         }
-    }
-
-    Value AccumulatorAddToSet::getValue(bool toBeMerged) const {
-        vector<Value> valVec(set.begin(), set.end());
-        return Value::consume(valVec);
-    }
-
-    AccumulatorAddToSet::AccumulatorAddToSet() {
-        _memUsageBytes = sizeof(*this);
-    }
-
-    void AccumulatorAddToSet::reset() {
-        SetType().swap(set);
-        _memUsageBytes = sizeof(*this);
-    }
-
-    intrusive_ptr<Accumulator> AccumulatorAddToSet::create() {
-        return new AccumulatorAddToSet();
-    }
-
-    const char *AccumulatorAddToSet::getOpName() const {
-        return "$addToSet";
     }
 }
+
+Value AccumulatorAddToSet::getValue(bool toBeMerged) {
+    return Value(vector<Value>(_set.begin(), _set.end()));
+}
+
+AccumulatorAddToSet::AccumulatorAddToSet(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    : Accumulator(expCtx), _set(expCtx->getValueComparator().makeUnorderedValueSet()) {
+    _memUsageBytes = sizeof(*this);
+}
+
+void AccumulatorAddToSet::reset() {
+    _set = getExpressionContext()->getValueComparator().makeUnorderedValueSet();
+    _memUsageBytes = sizeof(*this);
+}
+
+intrusive_ptr<Accumulator> AccumulatorAddToSet::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return new AccumulatorAddToSet(expCtx);
+}
+
+}  // namespace mongo

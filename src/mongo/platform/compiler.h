@@ -34,10 +34,19 @@
  * The following macros are provided in all compiler environments:
  *
  *
+ * MONGO_COMPILER_COLD_FUNCTION
+ *
+ *   Informs the compiler that the function is cold. This can have the following effects:
+ *   - The function is optimized for size over speed.
+ *   - The function may be placed in a special cold section of the binary, away from other code.
+ *   - Code paths that call this function are considered implicitly unlikely.
+ *
+ *
  * MONGO_COMPILER_NORETURN
  *
  *   Instructs the compiler that the decorated function will not return through the normal return
- *   path.
+ *   path. All noreturn functions are also implicitly cold since they are either run-once code
+ *   executed at startup or shutdown or code that handles errors by throwing an exception.
  *
  *   Correct: MONGO_COMPILER_NORETURN void myAbortFunction();
  *
@@ -95,12 +104,13 @@
  *       class MONGO_COMPILER_API_EXPORT ExportedType { ... };
  *       MONGO_COMPILER_API_EXPORT SomeType exportedFunction(...);
  *
- *   NOTE: Rather than using this macro directly, one typically declares another macro named for the
- *   library, which is conditionally defined to either MONGO_COMIPLER_API_EXPORT or
- *   MONGO_COMPILER_API_IMPORT based on whether the compiler is currently building the library or
- *   building an object that depends on the library, respectively.  For example, MONGO_CLIENT_API
- *   might be defined to MONGO_COMPILER_API_EXPORT when building the MongoDB shared library, and to
- *   MONGO_COMPILER_API_IMPORT when building an application that links against the shared library.
+ *   NOTE: Rather than using this macro directly, one typically declares another macro named
+ *   for the library, which is conditionally defined to either MONGO_COMIPLER_API_EXPORT or
+ *   MONGO_COMPILER_API_IMPORT based on whether the compiler is currently building the library
+ *   or building an object that depends on the library, respectively.  For example,
+ *   MONGO_FOO_API might be defined to MONGO_COMPILER_API_EXPORT when building the MongoDB
+ *   libfoo shared library, and to MONGO_COMPILER_API_IMPORT when building an application that
+ *   links against that shared library.
  *
  *
  * MONGO_COMPILER_API_IMPORT
@@ -117,7 +127,31 @@
  *    shared libraries.
  *
  *    Same correct/incorrect usage as for MONGO_COMPILER_API_EXPORT.
+ *
+ *
+ * MONGO_COMPILER_ALWAYS_INLINE
+ *
+ *    Overrides compiler heuristics to force that a particular function should always
+ *    be inlined.
+ *
+ *
+ * MONGO_COMPILER_UNREACHABLE
+ *
+ *    Tells the compiler that it can assume that this line will never execute. Unlike with
+ *    MONGO_UNREACHABLE, there is no runtime check and reaching this macro is completely undefined
+ *    behavior. It should only be used where it is provably impossible to reach, even in the face of
+ *    adversarial inputs, but for some reason the compiler cannot figure this out on its own, for
+ *    example after a call to a function that never returns but cannot be labeled with
+ *    MONGO_COMPILER_NORETURN. In almost all cases MONGO_UNREACHABLE is preferred.
+ *
+ *
+ * MONGO_WARN_UNUSED_RESULT_CLASS
+ *
+ *    Tells the compiler that a class defines a type for which checking results is necessary.  Types
+ *    thus defined turn functions returning them into "must check results" style functions.  Preview
+ *    of the `[[nodiscard]]` C++17 attribute.
  */
+
 
 #if defined(_MSC_VER)
 #include "mongo/platform/compiler_msvc.h"

@@ -33,179 +33,199 @@
 
 #include "mongo/db/stats/top.h"
 
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/message.h"
-#include "mongo/db/commands.h"
 
 namespace mongo {
 
-    using std::endl;
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+using std::endl;
+using std::string;
+using std::stringstream;
+using std::vector;
 
-    Top::UsageData::UsageData( const UsageData& older, const UsageData& newer ) {
-        // this won't be 100% accurate on rollovers and drop(), but at least it won't be negative
-        time  = (newer.time  >= older.time)  ? (newer.time  - older.time)  : newer.time;
-        count = (newer.count >= older.count) ? (newer.count - older.count) : newer.count;
+namespace {
+
+const auto getTop = ServiceContext::declareDecoration<Top>();
+
+}  // namespace
+
+Top::UsageData::UsageData(const UsageData& older, const UsageData& newer) {
+    // this won't be 100% accurate on rollovers and drop(), but at least it won't be negative
+    time = (newer.time >= older.time) ? (newer.time - older.time) : newer.time;
+    count = (newer.count >= older.count) ? (newer.count - older.count) : newer.count;
+}
+
+Top::CollectionData::CollectionData(const CollectionData& older, const CollectionData& newer)
+    : total(older.total, newer.total),
+      readLock(older.readLock, newer.readLock),
+      writeLock(older.writeLock, newer.writeLock),
+      queries(older.queries, newer.queries),
+      getmore(older.getmore, newer.getmore),
+      insert(older.insert, newer.insert),
+      update(older.update, newer.update),
+      remove(older.remove, newer.remove),
+      commands(older.commands, newer.commands) {}
+
+// static
+Top& Top::get(ServiceContext* service) {
+    return getTop(service);
+}
+
+void Top::record(OperationContext* opCtx,
+                 StringData ns,
+                 LogicalOp logicalOp,
+                 LockType lockType,
+                 long long micros,
+                 bool command,
+                 Command::ReadWriteType readWriteType) {
+    if (ns[0] == '?')
+        return;
+
+    auto hashedNs = UsageMap::HashedKey(ns);
+    stdx::lock_guard<SimpleMutex> lk(_lock);
+
+    if ((command || logicalOp == LogicalOp::opQuery) && ns == _lastDropped) {
+        _lastDropped = "";
+        return;
     }
 
-    Top::CollectionData::CollectionData( const CollectionData& older, const CollectionData& newer )
-        : total( older.total, newer.total ),
-          readLock( older.readLock, newer.readLock ),
-          writeLock( older.writeLock, newer.writeLock ),
-          queries( older.queries, newer.queries ),
-          getmore( older.getmore, newer.getmore ),
-          insert( older.insert, newer.insert ),
-          update( older.update, newer.update ),
-          remove( older.remove, newer.remove ),
-          commands( older.commands, newer.commands ) {
+    CollectionData& coll = _usage[hashedNs];
+    _record(opCtx, coll, logicalOp, lockType, micros, readWriteType);
+}
 
-    }
+void Top::_record(OperationContext* opCtx,
+                  CollectionData& c,
+                  LogicalOp logicalOp,
+                  LockType lockType,
+                  long long micros,
+                  Command::ReadWriteType readWriteType) {
 
-    void Top::record( StringData ns, int op, int lockType, long long micros, bool command ) {
-        if ( ns[0] == '?' )
-            return;
+    _incrementHistogram(opCtx, micros, &c.opLatencyHistogram, readWriteType);
 
-        //cout << "record: " << ns << "\t" << op << "\t" << command << endl;
-        SimpleMutex::scoped_lock lk(_lock);
+    c.total.inc(micros);
 
-        if ( ( command || op == dbQuery ) && ns == _lastDropped ) {
-            _lastDropped = "";
-            return;
-        }
+    if (lockType == LockType::WriteLocked)
+        c.writeLock.inc(micros);
+    else if (lockType == LockType::ReadLocked)
+        c.readLock.inc(micros);
 
-        CollectionData& coll = _usage[ns];
-        _record( coll, op, lockType, micros, command );
-    }
-
-    void Top::_record( CollectionData& c, int op, int lockType, long long micros, bool command ) {
-        c.total.inc( micros );
-
-        if ( lockType > 0 )
-            c.writeLock.inc( micros );
-        else if ( lockType < 0 )
-            c.readLock.inc( micros );
-
-        switch ( op ) {
-        case 0:
+    switch (logicalOp) {
+        case LogicalOp::opInvalid:
             // use 0 for unknown, non-specific
             break;
-        case dbUpdate:
-            c.update.inc( micros );
+        case LogicalOp::opUpdate:
+            c.update.inc(micros);
             break;
-        case dbInsert:
-            c.insert.inc( micros );
+        case LogicalOp::opInsert:
+            c.insert.inc(micros);
             break;
-        case dbQuery:
-            if ( command )
-                c.commands.inc( micros );
-            else
-                c.queries.inc( micros );
+        case LogicalOp::opQuery:
+            c.queries.inc(micros);
             break;
-        case dbGetMore:
-            c.getmore.inc( micros );
+        case LogicalOp::opGetMore:
+            c.getmore.inc(micros);
             break;
-        case dbDelete:
-            c.remove.inc( micros );
+        case LogicalOp::opDelete:
+            c.remove.inc(micros);
             break;
-        case dbKillCursors:
+        case LogicalOp::opKillCursors:
             break;
-        case opReply:
-        case dbMsg:
-            log() << "unexpected op in Top::record: " << op << endl;
+        case LogicalOp::opCommand:
+            c.commands.inc(micros);
             break;
         default:
-            log() << "unknown op in Top::record: " << op << endl;
-        }
-
+            MONGO_UNREACHABLE;
     }
+}
 
-    void Top::collectionDropped( StringData ns ) {
-        SimpleMutex::scoped_lock lk(_lock);
-        _usage.erase(ns);
+void Top::collectionDropped(StringData ns, bool databaseDropped) {
+    stdx::lock_guard<SimpleMutex> lk(_lock);
+    _usage.erase(ns);
+    if (!databaseDropped) {
+        // If a collection drop occurred, there will be a subsequent call to record for this
+        // collection namespace which must be ignored. This does not apply to a database drop.
         _lastDropped = ns.toString();
     }
+}
 
-    void Top::cloneMap(Top::UsageMap& out) const {
-        SimpleMutex::scoped_lock lk(_lock);
-        out = _usage;
+void Top::cloneMap(Top::UsageMap& out) const {
+    stdx::lock_guard<SimpleMutex> lk(_lock);
+    out = _usage;
+}
+
+void Top::append(BSONObjBuilder& b) {
+    stdx::lock_guard<SimpleMutex> lk(_lock);
+    _appendToUsageMap(b, _usage);
+}
+
+void Top::_appendToUsageMap(BSONObjBuilder& b, const UsageMap& map) const {
+    // pull all the names into a vector so we can sort them for the user
+
+    vector<string> names;
+    for (UsageMap::const_iterator i = map.begin(); i != map.end(); ++i) {
+        names.push_back(i->first);
     }
 
-    void Top::append( BSONObjBuilder& b ) {
-        SimpleMutex::scoped_lock lk( _lock );
-        _appendToUsageMap( b, _usage );
-    }
+    std::sort(names.begin(), names.end());
 
-    void Top::_appendToUsageMap( BSONObjBuilder& b, const UsageMap& map ) const {
-        // pull all the names into a vector so we can sort them for the user
+    for (size_t i = 0; i < names.size(); i++) {
+        BSONObjBuilder bb(b.subobjStart(names[i]));
 
-        vector<string> names;
-        for ( UsageMap::const_iterator i = map.begin(); i != map.end(); ++i ) {
-            names.push_back( i->first );
-        }
+        const CollectionData& coll = map.find(names[i])->second;
 
-        std::sort( names.begin(), names.end() );
+        _appendStatsEntry(b, "total", coll.total);
 
-        for ( size_t i=0; i<names.size(); i++ ) {
-            BSONObjBuilder bb( b.subobjStart( names[i] ) );
+        _appendStatsEntry(b, "readLock", coll.readLock);
+        _appendStatsEntry(b, "writeLock", coll.writeLock);
 
-            const CollectionData& coll = map.find(names[i])->second;
+        _appendStatsEntry(b, "queries", coll.queries);
+        _appendStatsEntry(b, "getmore", coll.getmore);
+        _appendStatsEntry(b, "insert", coll.insert);
+        _appendStatsEntry(b, "update", coll.update);
+        _appendStatsEntry(b, "remove", coll.remove);
+        _appendStatsEntry(b, "commands", coll.commands);
 
-            _appendStatsEntry( b, "total", coll.total );
-
-            _appendStatsEntry( b, "readLock", coll.readLock );
-            _appendStatsEntry( b, "writeLock", coll.writeLock );
-
-            _appendStatsEntry( b, "queries", coll.queries );
-            _appendStatsEntry( b, "getmore", coll.getmore );
-            _appendStatsEntry( b, "insert", coll.insert );
-            _appendStatsEntry( b, "update", coll.update );
-            _appendStatsEntry( b, "remove", coll.remove );
-            _appendStatsEntry( b, "commands", coll.commands );
-
-            bb.done();
-        }
-    }
-
-    void Top::_appendStatsEntry( BSONObjBuilder& b, const char * statsName, const UsageData& map ) const {
-        BSONObjBuilder bb( b.subobjStart( statsName ) );
-        bb.appendNumber( "time", map.time );
-        bb.appendNumber( "count", map.count );
         bb.done();
     }
-
-    class TopCmd : public Command {
-    public:
-        TopCmd() : Command( "top", true ) {}
-
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( stringstream& help ) const { help << "usage by collection, in micros "; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::top);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        virtual bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            {
-                BSONObjBuilder b( result.subobjStart( "totals" ) );
-                b.append( "note", "all times in microseconds" );
-                Top::global.append( b );
-                b.done();
-            }
-            return true;
-        }
-
-    } topCmd;
-
-    Top Top::global;
-
 }
+
+void Top::_appendStatsEntry(BSONObjBuilder& b, const char* statsName, const UsageData& map) const {
+    BSONObjBuilder bb(b.subobjStart(statsName));
+    bb.appendNumber("time", map.time);
+    bb.appendNumber("count", map.count);
+    bb.done();
+}
+
+void Top::appendLatencyStats(StringData ns, bool includeHistograms, BSONObjBuilder* builder) {
+    auto hashedNs = UsageMap::HashedKey(ns);
+    stdx::lock_guard<SimpleMutex> lk(_lock);
+    BSONObjBuilder latencyStatsBuilder;
+    _usage[hashedNs].opLatencyHistogram.append(includeHistograms, &latencyStatsBuilder);
+    builder->append("ns", ns);
+    builder->append("latencyStats", latencyStatsBuilder.obj());
+}
+
+void Top::incrementGlobalLatencyStats(OperationContext* opCtx,
+                                      uint64_t latency,
+                                      Command::ReadWriteType readWriteType) {
+    stdx::lock_guard<SimpleMutex> guard(_lock);
+    _incrementHistogram(opCtx, latency, &_globalHistogramStats, readWriteType);
+}
+
+void Top::appendGlobalLatencyStats(bool includeHistograms, BSONObjBuilder* builder) {
+    stdx::lock_guard<SimpleMutex> guard(_lock);
+    _globalHistogramStats.append(includeHistograms, builder);
+}
+
+void Top::_incrementHistogram(OperationContext* opCtx,
+                              long long latency,
+                              OperationLatencyHistogram* histogram,
+                              Command::ReadWriteType readWriteType) {
+    // Only update histogram if operation came from a user.
+    Client* client = opCtx->getClient();
+    if (client->isFromUserConnection() && !client->isInDirectClient()) {
+        histogram->increment(latency, readWriteType);
+    }
+}
+}  // namespace mongo

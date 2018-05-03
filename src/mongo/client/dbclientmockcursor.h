@@ -30,24 +30,27 @@
 #pragma once
 
 #include "mongo/client/dbclientcursor.h"
-#include "mongo/client/export_macros.h"
 
 namespace mongo {
 
-    class MONGO_CLIENT_API DBClientMockCursor : public DBClientCursorInterface {
-    public:
-        DBClientMockCursor( const BSONArray& mockCollection ) : _iter( mockCollection ) {}
-        virtual ~DBClientMockCursor() {}
+class DBClientMockCursor {
+public:
+    DBClientMockCursor(const BSONArray& mockCollection) : _iter(mockCollection) {}
+    virtual ~DBClientMockCursor() {}
 
-        bool more() { return _iter.more(); }
-        BSONObj next() { return _iter.next().Obj(); }
+    bool more() {
+        return _iter.more();
+    }
+    BSONObj next() {
+        return _iter.next().Obj();
+    }
 
-    private:
-        BSONObjIterator _iter;
+private:
+    BSONObjIterator _iter;
 
-        // non-copyable , non-assignable
-        DBClientMockCursor( const DBClientMockCursor& );
-        DBClientMockCursor& operator=( const DBClientMockCursor& );
-    };
+    // non-copyable , non-assignable
+    DBClientMockCursor(const DBClientMockCursor&);
+    DBClientMockCursor& operator=(const DBClientMockCursor&);
+};
 
-} // namespace mongo
+}  // namespace mongo

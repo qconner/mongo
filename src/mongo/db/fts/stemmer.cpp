@@ -29,46 +29,40 @@
 */
 
 #include <cstdlib>
-#include <string>
 
 #include "mongo/db/fts/stemmer.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    namespace fts {
+namespace fts {
 
-        using std::string;
+Stemmer::Stemmer(const FTSLanguage* language) {
+    _stemmer = NULL;
+    if (language->str() != "none")
+        _stemmer = sb_stemmer_new(language->str().c_str(), "UTF_8");
+}
 
-        Stemmer::Stemmer( const FTSLanguage& language ) {
-            _stemmer = NULL;
-            if ( language.str() != "none" )
-                _stemmer = sb_stemmer_new(language.str().c_str(), "UTF_8");
-        }
+Stemmer::~Stemmer() {
+    if (_stemmer) {
+        sb_stemmer_delete(_stemmer);
+        _stemmer = NULL;
+    }
+}
 
-        Stemmer::~Stemmer() {
-            if ( _stemmer ) {
-                sb_stemmer_delete(_stemmer);
-                _stemmer = NULL;
-            }
-        }
+StringData Stemmer::stem(StringData word) const {
+    if (!_stemmer)
+        return word;
 
-        string Stemmer::stem( StringData word ) const {
-            if ( !_stemmer )
-                return word.toString();
+    const sb_symbol* sb_sym =
+        sb_stemmer_stem(_stemmer, (const sb_symbol*)word.rawData(), word.size());
 
-            const sb_symbol* sb_sym = sb_stemmer_stem( _stemmer,
-                                                       (const sb_symbol*)word.rawData(),
-                                                       word.size() );
-
-            if ( sb_sym == NULL ) {
-                // out of memory
-                abort();
-            }
-
-            return string( (const char*)(sb_sym), sb_stemmer_length( _stemmer ) );
-        }
-
+    if (sb_sym == NULL) {
+        // out of memory
+        MONGO_UNREACHABLE;
     }
 
+    return StringData((const char*)(sb_sym), sb_stemmer_length(_stemmer));
+}
+}
 }

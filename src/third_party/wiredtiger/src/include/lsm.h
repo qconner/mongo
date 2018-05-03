@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -23,11 +23,25 @@ struct __wt_lsm_worker_cookie {
 struct __wt_lsm_worker_args {
 	WT_SESSION_IMPL	*session;	/* Session */
 	WT_CONDVAR	*work_cond;	/* Owned by the manager */
+
 	wt_thread_t	tid;		/* Thread id */
+	bool		tid_set;	/* Thread id set */
+
 	u_int		id;		/* My manager slot id */
 	uint32_t	type;		/* Types of operations handled */
-#define	WT_LSM_WORKER_RUN	0x01
-	uint32_t	flags;		/* Worker flags */
+
+	volatile bool	running;	/* Worker is running */
+};
+
+/*
+ * WT_LSM_CURSOR_CHUNK --
+ *	Iterator struct containing all the LSM cursor access points for a chunk.
+ */
+struct __wt_lsm_cursor_chunk {
+	WT_BLOOM *bloom;		/* Bloom filter handle for each chunk.*/
+	WT_CURSOR *cursor;		/* Cursor handle for each chunk. */
+	uint64_t count;			/* Number of items in chunk */
+	uint64_t switch_txn;		/* Switch txn for each chunk */
 };
 
 /*
@@ -43,29 +57,26 @@ struct __wt_cursor_lsm {
 	u_int nchunks;			/* Number of chunks in the cursor */
 	u_int nupdates;			/* Updates needed (including
 					   snapshot isolation checks). */
-	WT_BLOOM **blooms;		/* Bloom filter handles. */
-	size_t bloom_alloc;
-
-	WT_CURSOR **cursors;		/* Cursor handles. */
-	size_t cursor_alloc;
-
-	WT_CURSOR *current;     	/* The current cursor for iteration */
+	WT_CURSOR *current;		/* The current cursor for iteration */
 	WT_LSM_CHUNK *primary_chunk;	/* The current primary chunk */
 
-	uint64_t *switch_txn;		/* Switch txn for each chunk */
-	size_t txnid_alloc;
+	WT_LSM_CURSOR_CHUNK **chunks;	/* Array of LSM cursor units */
+	size_t chunks_alloc;		/* Current size iterators array */
+	size_t chunks_count;		/* Current number of iterators */
 
 	u_int update_count;		/* Updates performed. */
 
-#define	WT_CLSM_ACTIVE		0x01    /* Incremented the session count */
-#define	WT_CLSM_ITERATE_NEXT    0x02    /* Forward iteration */
-#define	WT_CLSM_ITERATE_PREV    0x04    /* Backward iteration */
-#define	WT_CLSM_MERGE           0x08    /* Merge cursor, don't update */
-#define	WT_CLSM_MINOR_MERGE	0x10    /* Minor merge, include tombstones */
-#define	WT_CLSM_MULTIPLE        0x20    /* Multiple cursors have values for the
-					   current key */
-#define	WT_CLSM_OPEN_READ	0x40    /* Open for reads */
-#define	WT_CLSM_OPEN_SNAPSHOT	0x80    /* Open for snapshot isolation */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_CLSM_ACTIVE		0x001u	/* Incremented the session count */
+#define	WT_CLSM_BULK		0x002u	/* Open for snapshot isolation */
+#define	WT_CLSM_ITERATE_NEXT    0x004u	/* Forward iteration */
+#define	WT_CLSM_ITERATE_PREV    0x008u	/* Backward iteration */
+#define	WT_CLSM_MERGE           0x010u	/* Merge cursor, don't update */
+#define	WT_CLSM_MINOR_MERGE	0x020u	/* Minor merge, include tombstones */
+#define	WT_CLSM_MULTIPLE        0x040u	/* Multiple cursors have values */
+#define	WT_CLSM_OPEN_READ	0x080u	/* Open for reads */
+#define	WT_CLSM_OPEN_SNAPSHOT	0x100u	/* Open for snapshot isolation */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t flags;
 };
 
@@ -73,10 +84,10 @@ struct __wt_cursor_lsm {
  * WT_LSM_CHUNK --
  *	A single chunk (file) in an LSM tree.
  */
-struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_lsm_chunk {
+struct __wt_lsm_chunk {
 	const char *uri;		/* Data source for this chunk */
 	const char *bloom_uri;		/* URI of Bloom filter, if any */
-	struct timespec create_ts;	/* Creation time (for rate limiting) */
+	struct timespec create_time;	/* Creation time (for rate limiting) */
 	uint64_t count;			/* Approximate count of records */
 	uint64_t size;			/* Final chunk size */
 
@@ -87,6 +98,11 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_lsm_chunk {
 					 * out, or by compact to get the most
 					 * recent chunk flushed.
 					 */
+	WT_DECL_TIMESTAMP(switch_timestamp)/*
+					 * The timestamp used to decide when
+					 * updates need to detect conflicts.
+					 */
+	WT_SPINLOCK timestamp_spinlock;
 
 	uint32_t id;			/* ID used to generate URIs */
 	uint32_t generation;		/* Merge generation */
@@ -95,11 +111,15 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_lsm_chunk {
 
 	int8_t empty;			/* 1/0: checkpoint missing */
 	int8_t evicted;			/* 1/0: in-memory chunk was evicted */
+	uint8_t flushing;		/* 1/0: chunk flush in progress */
 
-#define	WT_LSM_CHUNK_BLOOM	0x01
-#define	WT_LSM_CHUNK_MERGING	0x02
-#define	WT_LSM_CHUNK_ONDISK	0x04
-#define	WT_LSM_CHUNK_STABLE	0x08
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LSM_CHUNK_BLOOM		0x01u
+#define	WT_LSM_CHUNK_HAS_TIMESTAMP	0x02u
+#define	WT_LSM_CHUNK_MERGING		0x04u
+#define	WT_LSM_CHUNK_ONDISK		0x08u
+#define	WT_LSM_CHUNK_STABLE		0x10u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t flags;
 };
 
@@ -108,11 +128,13 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_lsm_chunk {
  * type of work they will execute, and by work units to define which action
  * is required.
  */
-#define	WT_LSM_WORK_BLOOM	0x01	/* Create a bloom filter */
-#define	WT_LSM_WORK_DROP	0x02	/* Drop unused chunks */
-#define	WT_LSM_WORK_FLUSH	0x04	/* Flush a chunk to disk */
-#define	WT_LSM_WORK_MERGE	0x08	/* Look for a tree merge */
-#define	WT_LSM_WORK_SWITCH	0x10	/* Switch to new in-memory chunk */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LSM_WORK_BLOOM	0x01u	/* Create a bloom filter */
+#define	WT_LSM_WORK_DROP	0x02u	/* Drop unused chunks */
+#define	WT_LSM_WORK_FLUSH	0x04u	/* Flush a chunk to disk */
+#define	WT_LSM_WORK_MERGE	0x08u	/* Look for a tree merge */
+#define	WT_LSM_WORK_SWITCH	0x10u	/* Switch to new in-memory chunk */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 /*
  * WT_LSM_WORK_UNIT --
@@ -121,7 +143,9 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_lsm_chunk {
 struct __wt_lsm_work_unit {
 	TAILQ_ENTRY(__wt_lsm_work_unit) q;	/* Worker unit queue */
 	uint32_t	type;			/* Type of operation */
-#define	WT_LSM_WORK_FORCE	0x0001		/* Force operation */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LSM_WORK_FORCE	0x1u		/* Force operation */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t	flags;			/* Flags for operation */
 	WT_LSM_TREE *lsm_tree;
 };
@@ -154,9 +178,27 @@ struct __wt_lsm_manager {
 #define	WT_LSM_MAX_WORKERS	20
 #define	WT_LSM_MIN_WORKERS	3
 	WT_LSM_WORKER_ARGS lsm_worker_cookies[WT_LSM_MAX_WORKERS];
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LSM_MANAGER_SHUTDOWN	0x1u	/* Manager has shut down */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
+	uint32_t flags;
 };
 
-#define	WT_LSM_AGGRESSIVE_THRESHOLD	5
+/*
+ * The value aggressive needs to get to before it influences how merges
+ * are chosen. The default value translates to enough level 0 chunks being
+ * generated to create a second level merge.
+ */
+#define	WT_LSM_AGGRESSIVE_THRESHOLD	2
+
+/*
+ * The minimum size for opening a tree: three chunks, plus one page for each
+ * participant in up to three concurrent merges.
+ */
+#define	WT_LSM_TREE_MINIMUM_SIZE(chunk_size, merge_max, maxleafpage)	\
+	(3 * (chunk_size) + 3 * ((merge_max) * (maxleafpage)))
+
 /*
  * WT_LSM_TREE --
  *	An LSM tree.
@@ -166,29 +208,36 @@ struct __wt_lsm_tree {
 	const char *key_format, *value_format;
 	const char *bloom_config, *file_config;
 
+	uint32_t custom_generation;	/* Level at which a custom data source
+					   should be used for merges. */
+	const char *custom_prefix;	/* Prefix for custom data source */
+	const char *custom_suffix;	/* Suffix for custom data source */
+
 	WT_COLLATOR *collator;
 	const char *collator_name;
 	int collator_owned;
 
-	int refcnt;			/* Number of users of the tree */
-	int8_t exclusive;		/* Tree is locked exclusively */
+	uint32_t refcnt;		/* Number of users of the tree */
+	WT_SESSION_IMPL *excl_session;	/* Session has exclusive lock */
 
 #define	LSM_TREE_MAX_QUEUE	100
-	int queue_ref;
-	WT_RWLOCK *rwlock;
+	uint32_t queue_ref;
+	WT_RWLOCK rwlock;
 	TAILQ_ENTRY(__wt_lsm_tree) q;
-
-	WT_DSRC_STATS stats;		/* LSM-level statistics */
 
 	uint64_t dsk_gen;
 
-	long ckpt_throttle;		/* Rate limiting due to checkpoints */
-	long merge_throttle;		/* Rate limiting due to merges */
+	uint64_t ckpt_throttle;		/* Rate limiting due to checkpoints */
+	uint64_t merge_throttle;	/* Rate limiting due to merges */
 	uint64_t chunk_fill_ms;		/* Estimate of time to fill a chunk */
-	struct timespec last_flush_ts;	/* Timestamp last flush finished */
-	struct timespec work_push_ts;	/* Timestamp last work unit added */
+	struct timespec last_flush_time;/* Time last flush finished */
+	uint64_t chunks_flushed;	/* Count of chunks flushed since open */
+	struct timespec merge_aggressive_time;/* Time for merge aggression */
 	uint64_t merge_progressing;	/* Bumped when merges are active */
 	uint32_t merge_syncing;		/* Bumped when merges are syncing */
+	struct timespec last_active;	/* Time last work unit added */
+	uint64_t mgr_work_count;	/* Manager work count */
+	uint64_t work_count;		/* Work units added */
 
 	/* Configuration parameters */
 	uint32_t bloom_bit_count;
@@ -198,31 +247,62 @@ struct __wt_lsm_tree {
 	uint64_t chunk_max;		/* Maximum chunk a merge creates */
 	u_int merge_min, merge_max;
 
-	u_int merge_idle;		/* Count of idle merge threads */
-
-#define	WT_LSM_BLOOM_MERGED				0x00000001
-#define	WT_LSM_BLOOM_OFF				0x00000002
-#define	WT_LSM_BLOOM_OLDEST				0x00000004
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LSM_BLOOM_MERGED	0x1u
+#define	WT_LSM_BLOOM_OFF	0x2u
+#define	WT_LSM_BLOOM_OLDEST	0x4u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t bloom;			/* Bloom creation policy */
 
 	WT_LSM_CHUNK **chunk;		/* Array of active LSM chunks */
 	size_t chunk_alloc;		/* Space allocated for chunks */
 	uint32_t nchunks;		/* Number of active chunks */
 	uint32_t last;			/* Last allocated ID */
-	int modified;			/* Have there been updates? */
+	bool modified;			/* Have there been updates? */
 
 	WT_LSM_CHUNK **old_chunks;	/* Array of old LSM chunks */
 	size_t old_alloc;		/* Space allocated for old chunks */
 	u_int nold_chunks;		/* Number of old chunks */
-	int freeing_old_chunks;		/* Whether chunks are being freed */
+	uint32_t freeing_old_chunks;	/* Whether chunks are being freed */
 	uint32_t merge_aggressiveness;	/* Increase amount of work per merge */
 
-#define	WT_LSM_TREE_ACTIVE		0x01	/* Workers are active */
-#define	WT_LSM_TREE_COMPACTING		0x02	/* Tree being compacted */
-#define	WT_LSM_TREE_MERGES		0x04	/* Tree should run merges */
-#define	WT_LSM_TREE_NEED_SWITCH		0x08	/* New chunk needs creating */
-#define	WT_LSM_TREE_OPEN		0x10	/* The tree is open */
-#define	WT_LSM_TREE_THROTTLE		0x20	/* Throttle updates */
+	/*
+	 * We maintain a set of statistics outside of the normal statistics
+	 * area, copying them into place when a statistics cursor is created.
+	 */
+#define	WT_LSM_TREE_STAT_INCR(session, fld) do {			\
+	if (WT_STAT_ENABLED(session))					\
+		++(fld);						\
+} while (0)
+#define	WT_LSM_TREE_STAT_INCRV(session, fld, v) do {			\
+	if (WT_STAT_ENABLED(session))					\
+		(fld) += (int64_t)(v);					\
+} while (0)
+	int64_t bloom_false_positive;
+	int64_t bloom_hit;
+	int64_t bloom_miss;
+	int64_t lsm_checkpoint_throttle;
+	int64_t lsm_lookup_no_bloom;
+	int64_t lsm_merge_throttle;
+
+	/*
+	 * Following fields used to be flags but are susceptible to races.
+	 * Don't merge them with flags.
+	 */
+	bool active;			/* The tree is open for business */
+	bool aggressive_timer_enabled;	/* Timer for merge aggression enabled */
+	bool need_switch;		/* New chunk needs creating */
+
+	/*
+	 * flags here are not protected for concurrent access, don't put
+	 * anything here that is susceptible to races.
+	 */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LSM_TREE_COMPACTING		0x1u	/* Tree being compacted */
+#define	WT_LSM_TREE_MERGES		0x2u	/* Tree should run merges */
+#define	WT_LSM_TREE_OPEN		0x4u	/* The tree is open */
+#define	WT_LSM_TREE_THROTTLE		0x8u	/* Throttle updates */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t flags;
 };
 

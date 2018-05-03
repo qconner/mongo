@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 
 #include "mongo/base/init.h"
@@ -33,80 +35,69 @@
 
 namespace mongo {
 
-    using std::string;
+using std::string;
 
-    boost::scoped_ptr<MockConnRegistry> MockConnRegistry::_instance;
+std::unique_ptr<MockConnRegistry> MockConnRegistry::_instance;
 
-    MONGO_INITIALIZER(MockConnRegistry)(InitializerContext* context) {
-        return MockConnRegistry::init();
-    }
-
-    Status MockConnRegistry::init() {
-        MockConnRegistry::_instance.reset(new MockConnRegistry());
-        return Status::OK();
-    }
-
-    MockConnRegistry::MockConnRegistry():
-            _mockConnStrHook(this),
-            _registryMutex("mockConnRegistryMutex") {
-    }
-
-    MockConnRegistry* MockConnRegistry::get() {
-        return _instance.get();
-    }
-
-    ConnectionString::ConnectionHook* MockConnRegistry::getConnStrHook() {
-        return &_mockConnStrHook;
-    }
-
-    void MockConnRegistry::addServer(MockRemoteDBServer* server) {
-        scoped_lock sl(_registryMutex);
-
-        const std::string hostName(server->getServerAddress());
-        fassert(16533, _registry.count(hostName) == 0);
-
-        _registry[hostName] = server;
-    }
-
-    bool MockConnRegistry::removeServer(const std::string& hostName) {
-        scoped_lock sl(_registryMutex);
-        return _registry.erase(hostName) == 1;
-    }
-
-    void MockConnRegistry::clear() {
-        scoped_lock sl(_registryMutex);
-        _registry.clear();
-    }
-
-    MockDBClientConnection* MockConnRegistry::connect(const std::string& connStr) {
-        scoped_lock sl(_registryMutex);
-        fassert(16534, _registry.count(connStr) == 1);
-        return new MockDBClientConnection(_registry[connStr], true);
-    }
-
-    MockConnRegistry::MockConnHook::MockConnHook(MockConnRegistry* registry):
-            _registry(registry) {
-    }
-
-    MockConnRegistry::MockConnHook::~MockConnHook() {
-    }
-
-    mongo::DBClientBase* MockConnRegistry::MockConnHook::connect(
-                const ConnectionString& connString,
-                std::string& errmsg,
-                double socketTimeout) {
-        const string hostName(connString.toString());
-        MockDBClientConnection* conn = _registry->connect(hostName);
-
-        if (!conn->connect(hostName.c_str(), errmsg)) {
-            // Assumption: connect never throws, so no leak.
-            delete conn;
-
-            // mimic ConnectionString::connect for MASTER type connection to return NULL
-            // if the destination is unreachable.
-            return NULL;
-        }
-
-        return conn;
-    }
+MONGO_INITIALIZER(MockConnRegistry)(InitializerContext* context) {
+    return MockConnRegistry::init();
 }
+
+Status MockConnRegistry::init() {
+    MockConnRegistry::_instance.reset(new MockConnRegistry());
+    return Status::OK();
+}
+
+MockConnRegistry::MockConnRegistry() : _mockConnStrHook(this) {}
+
+MockConnRegistry* MockConnRegistry::get() {
+    return _instance.get();
+}
+
+ConnectionString::ConnectionHook* MockConnRegistry::getConnStrHook() {
+    return &_mockConnStrHook;
+}
+
+void MockConnRegistry::addServer(MockRemoteDBServer* server) {
+    stdx::lock_guard<stdx::mutex> sl(_registryMutex);
+
+    const std::string hostName(server->getServerAddress());
+    fassert(16533, _registry.count(hostName) == 0);
+
+    _registry[hostName] = server;
+}
+
+bool MockConnRegistry::removeServer(const std::string& hostName) {
+    stdx::lock_guard<stdx::mutex> sl(_registryMutex);
+    return _registry.erase(hostName) == 1;
+}
+
+void MockConnRegistry::clear() {
+    stdx::lock_guard<stdx::mutex> sl(_registryMutex);
+    _registry.clear();
+}
+
+std::unique_ptr<MockDBClientConnection> MockConnRegistry::connect(const std::string& connStr) {
+    stdx::lock_guard<stdx::mutex> sl(_registryMutex);
+    fassert(16534, _registry.count(connStr) == 1);
+    return stdx::make_unique<MockDBClientConnection>(_registry[connStr], true);
+}
+
+MockConnRegistry::MockConnHook::MockConnHook(MockConnRegistry* registry) : _registry(registry) {}
+
+MockConnRegistry::MockConnHook::~MockConnHook() {}
+
+std::unique_ptr<mongo::DBClientBase> MockConnRegistry::MockConnHook::connect(
+    const ConnectionString& connString, std::string& errmsg, double socketTimeout) {
+    const string hostName(connString.toString());
+    auto conn = _registry->connect(hostName);
+
+    if (!conn->connect(hostName.c_str(), StringData(), errmsg)) {
+        // mimic ConnectionString::connect for MASTER type connection to return NULL
+        // if the destination is unreachable.
+        return nullptr;
+    }
+
+    return std::move(conn);
+}
+}  // namespace mongo

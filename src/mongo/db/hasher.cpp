@@ -34,86 +34,107 @@
 
 #include "mongo/db/hasher.h"
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/util/md5.hpp"
 #include "mongo/util/startup_test.h"
 
 namespace mongo {
 
-    using boost::scoped_ptr;
+using std::unique_ptr;
 
-    Hasher::Hasher( HashSeed seed ) : _seed( seed ) {
-        md5_init( &_md5State );
-        md5_append( &_md5State , reinterpret_cast< const md5_byte_t * >( & _seed ) , sizeof( _seed ) );
-    }
+namespace {
 
-    void Hasher::addData( const void * keyData , size_t numBytes ) {
-        md5_append( &_md5State , static_cast< const md5_byte_t * >( keyData ), numBytes );
-    }
+typedef unsigned char HashDigest[16];
 
-    void Hasher::finish( HashDigest out ) {
-        md5_finish( &_md5State , out );
-    }
+class Hasher {
+    MONGO_DISALLOW_COPYING(Hasher);
 
-    long long int BSONElementHasher::hash64( const BSONElement& e , HashSeed seed ){
-        scoped_ptr<Hasher> h( HasherFactory::createHasher( seed ) );
-        recursiveHash( h.get() , e , false );
-        HashDigest d;
-        h->finish(d);
-        //HashDigest is actually 16 bytes, but we just get 8 via truncation
-        // NOTE: assumes little-endian
-        return *reinterpret_cast< long long int * >( d );
-    }
+public:
+    explicit Hasher(HashSeed seed);
+    ~Hasher(){};
 
-    void BSONElementHasher::recursiveHash( Hasher* h ,
-                                           const BSONElement& e ,
-                                           bool includeFieldName ) {
+    // pointer to next part of input key, length in bytes to read
+    void addData(const void* keyData, size_t numBytes);
 
-        int canonicalType = e.canonicalType();
-        h->addData( &canonicalType , sizeof( canonicalType ) );
+    // finish computing the hash, put the result in the digest
+    // only call this once per Hasher
+    void finish(HashDigest out);
 
-        if ( includeFieldName ){
-            h->addData( e.fieldName() , e.fieldNameSize() );
-        }
+private:
+    md5_state_t _md5State;
+    HashSeed _seed;
+};
 
-        if ( !e.mayEncapsulate() ){
-            //if there are no embedded objects (subobjects or arrays),
-            //compute the hash, squashing numeric types to 64-bit ints
-            if ( e.isNumber() ){
-                long long int i = e.safeNumberLong(); //well-defined for troublesome doubles
-                h->addData( &i , sizeof( i ) );
-            }
-            else {
-                h->addData( e.value() , e.valuesize() );
-            }
-        }
-        else {
-            //else identify the subobject.
-            //hash any preceding stuff (in the case of codeWscope)
-            //then each sub-element
-            //then finish with the EOO element.
-            BSONObj b;
-            if ( e.type() == CodeWScope ) {
-                h->addData( e.codeWScopeCode() , e.codeWScopeCodeLen() );
-                b = e.codeWScopeObject();
-            }
-            else {
-                b = e.embeddedObject();
-            }
-            BSONObjIterator i(b);
-            while( i.moreWithEOO() ) {
-                BSONElement el = i.next();
-                recursiveHash( h , el ,  true );
-            }
-        }
-    }
-
-    struct HasherUnitTest : public StartupTest {
-        void run() {
-            // Hard-coded check to ensure the hash function is consistent across platforms
-            BSONObj o = BSON( "check" << 42 );
-            verify( BSONElementHasher::hash64( o.firstElement(), 0 ) == -944302157085130861LL );
-        }
-    } hasherUnitTest;
+Hasher::Hasher(HashSeed seed) : _seed(seed) {
+    md5_init(&_md5State);
+    md5_append(&_md5State, reinterpret_cast<const md5_byte_t*>(&_seed), sizeof(_seed));
 }
+
+void Hasher::addData(const void* keyData, size_t numBytes) {
+    md5_append(&_md5State, static_cast<const md5_byte_t*>(keyData), numBytes);
+}
+
+void Hasher::finish(HashDigest out) {
+    md5_finish(&_md5State, out);
+}
+
+void recursiveHash(Hasher* h, const BSONElement& e, bool includeFieldName) {
+    int canonicalType = endian::nativeToLittle(e.canonicalType());
+    h->addData(&canonicalType, sizeof(canonicalType));
+
+    if (includeFieldName) {
+        h->addData(e.fieldName(), e.fieldNameSize());
+    }
+
+    if (!e.mayEncapsulate()) {
+        // if there are no embedded objects (subobjects or arrays),
+        // compute the hash, squashing numeric types to 64-bit ints
+        if (e.isNumber()) {
+            // Use safeNumberLong, it is well-defined for troublesome doubles.
+            const auto i = endian::nativeToLittle(e.safeNumberLong());
+            h->addData(&i, sizeof(i));
+        } else {
+            h->addData(e.value(), e.valuesize());
+        }
+    } else {
+        // else identify the subobject.
+        // hash any preceding stuff (in the case of codeWscope)
+        // then each sub-element
+        // then finish with the EOO element.
+        BSONObj b;
+        if (e.type() == CodeWScope) {
+            h->addData(e.codeWScopeCode(), e.codeWScopeCodeLen());
+            b = e.codeWScopeObject();
+        } else {
+            b = e.embeddedObject();
+        }
+        BSONObjIterator i(b);
+        while (i.moreWithEOO()) {
+            BSONElement el = i.next();
+            recursiveHash(h, el, true);
+        }
+    }
+}
+
+struct HasherUnitTest : public StartupTest {
+    void run() {
+        // Hard-coded check to ensure the hash function is consistent across platforms
+        BSONObj o = BSON("check" << 42);
+        verify(BSONElementHasher::hash64(o.firstElement(), 0) == -944302157085130861LL);
+    }
+} hasherUnitTest;
+
+}  // namespace
+
+long long int BSONElementHasher::hash64(const BSONElement& e, HashSeed seed) {
+    Hasher h(seed);
+    recursiveHash(&h, e, false);
+    HashDigest d;
+    h.finish(d);
+    // HashDigest is actually 16 bytes, but we just read 8 bytes
+    ConstDataView digestView(reinterpret_cast<const char*>(d));
+    return digestView.read<LittleEndian<long long int>>();
+}
+
+}  // namespace mongo

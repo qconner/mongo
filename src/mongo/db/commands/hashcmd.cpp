@@ -41,66 +41,71 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    using std::string;
-    using std::stringstream;
+using std::string;
+using std::stringstream;
 
-    // Testing only, enabled via command-line.
-    class CmdHashElt : public Command {
-    public:
-        CmdHashElt() : Command("_hashBSONElement") {};
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        // No auth needed because it only works when enabled via command line.
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {}
-        virtual void help( stringstream& help ) const {
-            help << "returns the hash of the first BSONElement val in a BSONObj";
-        }
-
-        /* CmdObj has the form {"hash" : <thingToHash>}
-         * or {"hash" : <thingToHash>, "seed" : <number> }
-         * Result has the form
-         * {"key" : <thingTohash>, "seed" : <int>, "out": NumberLong(<hash>)}
-         *
-         * Example use in the shell:
-         *> db.runCommand({hash: "hashthis", seed: 1})
-         *> {"key" : "hashthis",
-         *>  "seed" : 1,
-         *>  "out" : NumberLong(6271151123721111923),
-         *>  "ok" : 1 }
-         **/
-        bool run(OperationContext* txn, const string& db,
-                  BSONObj& cmdObj,
-                  int options, string& errmsg,
-                  BSONObjBuilder& result,
-                  bool fromRepl = false ){
-            result.appendAs(cmdObj.firstElement(),"key");
-
-            int seed = 0;
-            if (cmdObj.hasField("seed")){
-                if (! cmdObj["seed"].isNumber()) {
-                    errmsg += "seed must be a number";
-                    return false;
-                }
-                seed = cmdObj["seed"].numberInt();
-            }
-            result.append( "seed" , seed );
-
-            result.append( "out" , BSONElementHasher::hash64( cmdObj.firstElement() , seed ) );
-            return true;
-        }
-    };
-    MONGO_INITIALIZER(RegisterHashEltCmd)(InitializerContext* context) {
-        if (Command::testCommandsEnabled) {
-            // Leaked intentionally: a Command registers itself when constructed.
-            new CmdHashElt();
-        }
-        return Status::OK();
+// Testing only, enabled via command-line.
+class CmdHashElt : public ErrmsgCommandDeprecated {
+public:
+    CmdHashElt() : ErrmsgCommandDeprecated("_hashBSONElement"){};
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+    // No auth needed because it only works when enabled via command line.
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {}
+    std::string help() const override {
+        return "returns the hash of the first BSONElement val in a BSONObj";
+    }
+
+    /* CmdObj has the form {"hash" : <thingToHash>}
+     * or {"hash" : <thingToHash>, "seed" : <number> }
+     * Result has the form
+     * {"key" : <thingTohash>, "seed" : <int>, "out": NumberLong(<hash>)}
+     *
+     * Example use in the shell:
+     *> db.runCommand({hash: "hashthis", seed: 1})
+     *> {"key" : "hashthis",
+     *>  "seed" : 1,
+     *>  "out" : NumberLong(6271151123721111923),
+     *>  "ok" : 1 }
+     **/
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& db,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        result.appendAs(cmdObj.firstElement(), "key");
+
+        int seed = 0;
+        if (cmdObj.hasField("seed")) {
+            if (!cmdObj["seed"].isNumber()) {
+                errmsg += "seed must be a number";
+                return false;
+            }
+            seed = cmdObj["seed"].numberInt();
+        }
+        result.append("seed", seed);
+
+        result.append("out", BSONElementHasher::hash64(cmdObj.firstElement(), seed));
+        return true;
+    }
+};
+MONGO_INITIALIZER(RegisterHashEltCmd)(InitializerContext* context) {
+    if (getTestCommandsEnabled()) {
+        // Leaked intentionally: a Command registers itself when constructed.
+        new CmdHashElt();
+    }
+    return Status::OK();
+}
 }

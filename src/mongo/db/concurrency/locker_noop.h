@@ -31,149 +31,186 @@
 #include "mongo/db/concurrency/locker.h"
 
 namespace mongo {
-    
-    /**
-     * Locker, which cannot be used to lock/unlock resources and just returns true for checks for
-     * whether a particular resource is locked. Do not use it for cases where actual locking
-     * behaviour is expected or locking is performed.
-     */
-    class LockerNoop : public Locker {
-    public:
-        LockerNoop() { }
 
-        virtual LockerId getId() const { invariant(false); }
+/**
+ * Locker, which cannot be used to lock/unlock resources and just returns true for checks for
+ * whether a particular resource is locked. Do not use it for cases where actual locking
+ * behaviour is expected or locking is performed.
+ */
+class LockerNoop : public Locker {
+public:
+    LockerNoop() {}
 
-        virtual LockResult lockGlobal(LockMode mode, unsigned timeoutMs) {
-            invariant(false);
-        }
+    virtual bool isNoop() const {
+        return true;
+    }
 
-        virtual LockResult lockGlobalBegin(LockMode mode) {
-            invariant(false);
-        }
+    virtual ClientState getClientState() const {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual LockResult lockGlobalComplete(unsigned timeoutMs) {
-            invariant(false);
-        }
+    virtual LockerId getId() const {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void lockMMAPV1Flush() {
-            invariant(false);
-        }
+    stdx::thread::id getThreadId() const override {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool unlockAll() {
-            invariant(false);
-        }
+    void updateThreadIdToCurrentThread() override {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void downgradeGlobalXtoSForMMAPV1() {
-            invariant(false);
-        }
+    void unsetThreadId() override {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void beginWriteUnitOfWork() {
+    void setSharedLocksShouldTwoPhaseLock(bool sharedLocksShouldTwoPhaseLock) override {
+        MONGO_UNREACHABLE;
+    }
 
-        }
+    virtual LockResult lockGlobal(OperationContext* opCtx, LockMode mode) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void endWriteUnitOfWork() {
+    virtual LockResult lockGlobal(LockMode mode) {
+        MONGO_UNREACHABLE;
+    }
 
-        }
+    virtual LockResult lockGlobalBegin(OperationContext* opCtx, LockMode mode, Date_t deadline) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool inAWriteUnitOfWork() const {
-            invariant(false);
-        }
+    virtual LockResult lockGlobalBegin(LockMode mode, Date_t deadline) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual LockResult lock(ResourceId resId,
-                                LockMode mode,
-                                unsigned timeoutMs,
-                                bool checkDeadlock) {
-            invariant(false);
-        }
+    virtual LockResult lockGlobalComplete(OperationContext* opCtx, Date_t deadline) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void downgrade(ResourceId resId, LockMode newMode) {
-            invariant(false);
-        }
+    virtual LockResult lockGlobalComplete(Date_t deadline) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool unlock(ResourceId resId) {
-            invariant(false);
-        }
+    virtual void lockMMAPV1Flush() {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual LockMode getLockMode(ResourceId resId) const {
-            invariant(false);
-        }
+    virtual bool unlockGlobal() {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool isLockHeldForMode(ResourceId resId, LockMode mode) const {
-            return true;
-        }
+    virtual void downgradeGlobalXtoSForMMAPV1() {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const {
-            return true;
-        }
+    virtual void beginWriteUnitOfWork() {}
 
-        virtual bool isCollectionLockedForMode(StringData ns, LockMode mode) const {
-            return true;
-        }
+    virtual void endWriteUnitOfWork() {}
 
-        virtual ResourceId getWaitingResource() const {
-            invariant(false);
-        }
+    virtual bool inAWriteUnitOfWork() const {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void getLockerInfo(LockerInfo* lockerInfo) const {
-            invariant(false);
-        }
+    virtual LockResult lock(OperationContext* opCtx,
+                            ResourceId resId,
+                            LockMode mode,
+                            Date_t deadline,
+                            bool checkDeadlock) {
+        return LockResult::LOCK_OK;
+    }
 
-        virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut) {
-            invariant(false);
-        }
+    virtual LockResult lock(ResourceId resId, LockMode mode, Date_t deadline, bool checkDeadlock) {
+        return LockResult::LOCK_OK;
+    }
 
-        virtual void restoreLockState(const LockSnapshot& stateToRestore) {
-            invariant(false);
-        }
+    virtual void downgrade(ResourceId resId, LockMode newMode) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void dump() const {
-            invariant(false);
-        }
+    virtual bool unlock(ResourceId resId) {
+        return true;
+    }
 
-        virtual bool isW() const {
-            invariant(false);
-        }
+    virtual LockMode getLockMode(ResourceId resId) const {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool isR() const {
-            invariant(false);
-        }
+    virtual bool isLockHeldForMode(ResourceId resId, LockMode mode) const {
+        return true;
+    }
 
-        virtual bool isLocked() const {
-            invariant(false);
-        }
+    virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const {
+        return true;
+    }
 
-        virtual bool isWriteLocked() const {
-            return false;
-        }
+    virtual bool isCollectionLockedForMode(StringData ns, LockMode mode) const {
+        return true;
+    }
 
-        virtual bool isReadLocked() const {
-            invariant(false);
-        }
+    virtual ResourceId getWaitingResource() const {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void assertEmptyAndReset() {
-            invariant(false);
-        }
+    virtual void getLockerInfo(LockerInfo* lockerInfo) const {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool hasLockPending() const {
-            invariant(false);
-        }
+    virtual boost::optional<LockerInfo> getLockerInfo() const {
+        return boost::none;
+    }
 
-        virtual void setIsBatchWriter(bool newValue) {
-            invariant(false);
-        }
+    virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool isBatchWriter() const {
-            invariant(false);
-        }
+    virtual void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore) {
+        MONGO_UNREACHABLE;
+    }
+    virtual void restoreLockState(const LockSnapshot& stateToRestore) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual void setLockPendingParallelWriter(bool newValue) {
-            invariant(false);
-        }
+    virtual void releaseTicket() {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual bool hasStrongLocks() const {
-            return false;
-        }
+    virtual void reacquireTicket(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
 
-    };
+    virtual void dump() const {
+        MONGO_UNREACHABLE;
+    }
 
-} // namespace mongo
+    virtual bool isW() const {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual bool isR() const {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual bool isLocked() const {
+        return false;
+    }
+
+    virtual bool isWriteLocked() const {
+        return false;
+    }
+
+    virtual bool isReadLocked() const {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual bool hasLockPending() const {
+        MONGO_UNREACHABLE;
+    }
+
+    bool isGlobalLockedRecursively() override {
+        return false;
+    }
+};
+
+}  // namespace mongo

@@ -28,17 +28,17 @@
 
 #include "mongo/platform/basic.h"
 
-#include <string>
 #include "mongo/util/mongoutils/str.h"
+#include <string>
 
 namespace mongo {
 
 #ifdef _WIN32
-    // Generate windows event name for shutdown signal
-    std::string getShutdownSignalName(int processId) {
-        const char* strEventNamePrefix = "Global\\Mongo_";
+// Generate windows event name for shutdown signal
+std::string getShutdownSignalName(int processId) {
+    const char* strEventNamePrefix = "Global\\Mongo_";
 
-        return mongoutils::str::stream() << strEventNamePrefix << processId;
-    }
+    return mongoutils::str::stream() << strEventNamePrefix << processId;
+}
 #endif
 }

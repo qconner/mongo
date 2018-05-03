@@ -31,105 +31,113 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
-
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/mutex.hpp>
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
+#include "mongo/db/storage/kv/kv_prefix.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
-    class OperationContext;
-    class RecordStore;
+class OperationContext;
+class RecordStore;
 
-    class KVCatalog {
-    public:
-        /**
-         * @param rs - does NOT take ownership
-         */
-        KVCatalog( RecordStore* rs,
-                   bool isRsThreadSafe,
-                   bool directoryPerDb,
-                   bool directoryForIndexes );
-        ~KVCatalog();
+class KVCatalog {
+public:
+    class FeatureTracker;
 
-        void init( OperationContext* opCtx );
+    /**
+     * @param rs - does NOT take ownership. The RecordStore must be thread-safe, in particular
+     * with concurrent calls to RecordStore::find, updateRecord, insertRecord, deleteRecord and
+     * dataFor. The KVCatalog does not utilize Cursors and those methods may omit further
+     * protection.
+     */
+    KVCatalog(RecordStore* rs, bool directoryPerDb, bool directoryForIndexes);
+    ~KVCatalog();
 
-        void getAllCollections( std::vector<std::string>* out ) const;
+    void init(OperationContext* opCtx);
 
-        /**
-         * @return error or ident for instance
-         */
-        Status newCollection( OperationContext* opCtx,
-                              StringData ns,
-                              const CollectionOptions& options );
+    void getAllCollections(std::vector<std::string>* out) const;
 
-        std::string getCollectionIdent( StringData ns ) const;
+    /**
+     * @return error or ident for instance
+     */
+    Status newCollection(OperationContext* opCtx,
+                         StringData ns,
+                         const CollectionOptions& options,
+                         KVPrefix prefix);
 
-        std::string getIndexIdent( OperationContext* opCtx,
-                                   StringData ns,
-                                   StringData idName ) const;
+    std::string getCollectionIdent(StringData ns) const;
 
-        const BSONCollectionCatalogEntry::MetaData getMetaData( OperationContext* opCtx,
-                                                                StringData ns );
-        void putMetaData( OperationContext* opCtx,
-                          StringData ns,
-                          BSONCollectionCatalogEntry::MetaData& md );
+    std::string getIndexIdent(OperationContext* opCtx, StringData ns, StringData idName) const;
 
-        Status renameCollection( OperationContext* opCtx,
-                                 StringData fromNS,
-                                 StringData toNS,
-                                 bool stayTemp );
+    BSONCollectionCatalogEntry::MetaData getMetaData(OperationContext* opCtx, StringData ns) const;
+    void putMetaData(OperationContext* opCtx,
+                     StringData ns,
+                     BSONCollectionCatalogEntry::MetaData& md);
 
-        Status dropCollection( OperationContext* opCtx,
-                               StringData ns );
+    Status renameCollection(OperationContext* opCtx,
+                            StringData fromNS,
+                            StringData toNS,
+                            bool stayTemp);
 
-        std::vector<std::string> getAllIdentsForDB( StringData db ) const;
-        std::vector<std::string> getAllIdents( OperationContext* opCtx ) const;
+    Status dropCollection(OperationContext* opCtx, StringData ns);
 
-        bool isUserDataIdent( StringData ident ) const;
-    private:
-        class AddIdentChange;
-        class RemoveIdentChange;
+    std::vector<std::string> getAllIdentsForDB(StringData db) const;
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
 
-        BSONObj _findEntry( OperationContext* opCtx,
-                            StringData ns,
-                            RecordId* out=NULL ) const;
+    bool isUserDataIdent(StringData ident) const;
 
-        /**
-         * Generates a new unique identifier for a new "thing".
-         * @param ns - the containing ns
-         * @param kind - what this "thing" is, likely collection or index
-         */
-        std::string _newUniqueIdent(StringData ns, const char* kind);
+    FeatureTracker* getFeatureTracker() const {
+        invariant(_featureTracker);
+        return _featureTracker.get();
+    }
 
-        // Helpers only used by constructor and init(). Don't call from elsewhere.
-        static std::string _newRand();
-        bool _hasEntryCollidingWithRand() const;
+    RecordStore* getRecordStore() {
+        return _rs;
+    }
 
-        RecordStore* _rs; // not owned
-        const bool _isRsThreadSafe;
-        const bool _directoryPerDb;
-        const bool _directoryForIndexes;
+private:
+    class AddIdentChange;
+    class RemoveIdentChange;
 
-        // These two are only used for ident generation inside _newUniqueIdent.
-        std::string _rand; // effectively const after init() returns
-        AtomicUInt64 _next;
+    BSONObj _findEntry(OperationContext* opCtx, StringData ns, RecordId* out = NULL) const;
 
-        struct Entry {
-            Entry(){}
-            Entry( std::string i, RecordId l )
-                : ident(i), storedLoc( l ) {}
-            std::string ident;
-            RecordId storedLoc;
-        };
-        typedef std::map<std::string,Entry> NSToIdentMap;
-        NSToIdentMap _idents;
-        mutable boost::mutex _identsLock;
+    /**
+     * Generates a new unique identifier for a new "thing".
+     * @param ns - the containing ns
+     * @param kind - what this "thing" is, likely collection or index
+     */
+    std::string _newUniqueIdent(StringData ns, const char* kind);
+
+    // Helpers only used by constructor and init(). Don't call from elsewhere.
+    static std::string _newRand();
+    bool _hasEntryCollidingWithRand() const;
+
+    RecordStore* _rs;  // not owned
+    const bool _directoryPerDb;
+    const bool _directoryForIndexes;
+
+    // These two are only used for ident generation inside _newUniqueIdent.
+    std::string _rand;  // effectively const after init() returns
+    AtomicUInt64 _next;
+
+    struct Entry {
+        Entry() {}
+        Entry(std::string i, RecordId l) : ident(i), storedLoc(l) {}
+        std::string ident;
+        RecordId storedLoc;
     };
+    typedef std::map<std::string, Entry> NSToIdentMap;
+    NSToIdentMap _idents;
+    mutable stdx::mutex _identsLock;
 
+    // Manages the feature document that may be present in the KVCatalog. '_featureTracker' is
+    // guaranteed to be non-null after KVCatalog::init() is called.
+    std::unique_ptr<FeatureTracker> _featureTracker;
+};
 }

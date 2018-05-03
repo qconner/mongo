@@ -30,63 +30,126 @@
 
 #include <string>
 
+#include <boost/optional.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-    struct CollectionOptions {
-        CollectionOptions() {
-            reset();
-        }
+class CollatorFactoryInterface;
 
-        void reset();
+/**
+ * A CollectionUUID is a 128-bit unique identifier, per RFC 4122, v4. for a database collection.
+ * Newly created collections are assigned a new randomly generated CollectionUUID. In a replica-set
+ * or a sharded cluster, all nodes will use the same UUID for a given collection. The UUID stays
+ * with the collection until it is dropped, so even across renames. A copied collection must have
+ * its own new unique UUID though.
+ */
+using CollectionUUID = UUID;
 
-        /**
-         * Updates fields based on BSON document from client.
-         * If document contains a 'storageEngine' field, ensures that 'storageEngine'
-         * contains a single field of Object type.
-         */
-        Status parse( const BSONObj& obj );
+using OptionalCollectionUUID = boost::optional<CollectionUUID>;
 
-        BSONObj toBSON() const;
+struct CollectionOptions {
+    /**
+     * Returns true if the options indicate the namespace is a view.
+     */
+    bool isView() const;
 
-        /**
-         * @param max in and out, will be adjusted
-         * @return if the value is valid at all
-         */
-        static bool validMaxCappedDocs( long long* max );
+    /**
+     * The 'uuid' member is a collection property stored in the catalog with user-settable options,
+     * but is not valid for the user to specify as collection option. So, parsing commands must
+     * reject the 'uuid' property, but parsing stored options must accept it.
+     */
+    enum ParseKind { parseForCommand, parseForStorage };
 
-        // ----
+    /**
+     * Confirms that collection options can be converted to BSON and back without errors.
+     */
+    Status validateForStorage() const;
 
-        bool capped;
-        long long cappedSize;
-        long long cappedMaxDocs;
+    /**
+     * Parses the "options" subfield of the collection info object.
+     */
+    Status parse(const BSONObj& obj, ParseKind kind = parseForCommand);
 
-        // following 2 are mutually exclusive, can only have one set
-        long long initialNumExtents;
-        std::vector<long long> initialExtentSizes;
+    void appendBSON(BSONObjBuilder* builder) const;
+    BSONObj toBSON() const;
 
-        // behavior of _id index creation when collection created
-        void setNoIdIndex() { autoIndexId = NO; }
-        enum {
-            DEFAULT, // currently yes for most collections, NO for some system ones
-            YES, // create _id index
-            NO // do not create _id index
-        } autoIndexId;
+    /**
+     * @param max in and out, will be adjusted
+     * @return if the value is valid at all
+     */
+    static bool validMaxCappedDocs(long long* max);
 
-        // user flags
-        enum UserFlags {
-            Flag_UsePowerOf2Sizes = 1 << 0,
-            Flag_NoPadding = 1 << 1,
-        };
-        int flags; // a bitvector of UserFlags
-        bool flagsSet;
+    /**
+     * Returns true if given options matches to this.
+     *
+     * Uses the collatorFactory to normalize the collation property being compared.
+     *
+     * Note: ignores idIndex property.
+     */
+    bool matchesStorageOptions(const CollectionOptions& other,
+                               CollatorFactoryInterface* collatorFactory) const;
 
-        bool temp;
+    // ----
 
-        // Storage engine collection options. Always owned or empty.
-        BSONObj storageEngine;
+    // Collection UUID. Present for all CollectionOptions parsed for storage, except for those
+    // corresponding to the system.namespaces and system.indexes collections on MMAP (see
+    // SERVER-29926, SERVER-30095).
+    OptionalCollectionUUID uuid;
+
+    bool capped = false;
+    long long cappedSize = 0;
+    long long cappedMaxDocs = 0;
+
+    // (MMAPv1) The following 2 are mutually exclusive, can only have one set.
+    long long initialNumExtents = 0;
+    std::vector<long long> initialExtentSizes;
+
+    // The behavior of _id index creation when collection created
+    void setNoIdIndex() {
+        autoIndexId = NO;
+    }
+    enum {
+        DEFAULT,  // currently yes for most collections, NO for some system ones
+        YES,      // create _id index
+        NO        // do not create _id index
+    } autoIndexId = DEFAULT;
+
+    // user flags
+    enum UserFlags {
+        Flag_UsePowerOf2Sizes = 1 << 0,
+        Flag_NoPadding = 1 << 1,
     };
+    int flags = Flag_UsePowerOf2Sizes;  // a bitvector of UserFlags
+    bool flagsSet = false;
 
+    bool temp = false;
+
+    // Storage engine collection options. Always owned or empty.
+    BSONObj storageEngine;
+
+    // Default options for indexes created on the collection. Always owned or empty.
+    BSONObj indexOptionDefaults;
+
+    // Index specs for the _id index.
+    BSONObj idIndex;
+
+    // Always owned or empty.
+    BSONObj validator;
+    std::string validationAction;
+    std::string validationLevel;
+
+    // The namespace's default collation.
+    BSONObj collation;
+
+    // View-related options.
+    // The namespace of the view or collection that "backs" this view, or the empty string if this
+    // collection is not a view.
+    std::string viewOn;
+    // The aggregation pipeline that defines this view.
+    BSONObj pipeline;
+};
 }

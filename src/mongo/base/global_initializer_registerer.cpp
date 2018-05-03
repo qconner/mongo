@@ -35,21 +35,23 @@
 
 namespace mongo {
 
-    GlobalInitializerRegisterer::GlobalInitializerRegisterer(
-            const std::string& name,
-            const InitializerFunction& fn,
-            const std::vector<std::string>& prerequisites,
-            const std::vector<std::string>& dependents) {
+GlobalInitializerRegisterer::GlobalInitializerRegisterer(std::string name,
+                                                         std::vector<std::string> prerequisites,
+                                                         std::vector<std::string> dependents,
+                                                         InitializerFunction initFn,
+                                                         DeinitializerFunction deinitFn) {
+    Status status = getGlobalInitializer().getInitializerDependencyGraph().addInitializer(
+        std::move(name),
+        std::move(initFn),
+        std::move(deinitFn),
+        std::move(prerequisites),
+        std::move(dependents));
 
-        Status status = getGlobalInitializer().getInitializerDependencyGraph().addInitializer(
-                name, fn, prerequisites, dependents);
 
-
-        if (Status::OK() != status) {
-            std::cerr << "Attempt to add global initializer failed, status: "
-                      << status << std::endl;
-            ::abort();
-        }
+    if (Status::OK() != status) {
+        std::cerr << "Attempt to add global initializer failed, status: " << status << std::endl;
+        ::abort();
     }
+}
 
 }  // namespace mongo

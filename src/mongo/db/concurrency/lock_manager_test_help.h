@@ -33,43 +33,60 @@
 
 namespace mongo {
 
-    class LockerForTests : public LockerImpl<false> {
-    public:
-        explicit LockerForTests(LockMode globalLockMode) {
-            lockGlobal(globalLockMode);
-        }
+class LockerForTests : public LockerImpl<false> {
+public:
+    explicit LockerForTests(LockMode globalLockMode) {
+        lockGlobal(globalLockMode);
+    }
 
-        ~LockerForTests() {
-            unlockAll();
-        }
-    };
-
-
-    class TrackingLockGrantNotification : public LockGrantNotification {
-    public:
-        TrackingLockGrantNotification() : numNotifies(0), lastResult(LOCK_INVALID) {
-
-        }
-
-        virtual void notify(ResourceId resId, LockResult result) {
-            numNotifies++;
-            lastResId = resId;
-            lastResult = result;
-        }
-
-    public:
-        int numNotifies;
-
-        ResourceId lastResId;
-        LockResult lastResult;
-    };
+    ~LockerForTests() {
+        unlockGlobal();
+    }
+};
 
 
-    struct LockRequestCombo : public LockRequest, TrackingLockGrantNotification {
-    public:
-        explicit LockRequestCombo (Locker* locker) {
-            initNew(locker, this);
-        }
-    };
+class TrackingLockGrantNotification : public LockGrantNotification {
+public:
+    TrackingLockGrantNotification() : numNotifies(0), lastResult(LOCK_INVALID) {}
 
-} // namespace mongo
+    virtual void notify(ResourceId resId, LockResult result) {
+        numNotifies++;
+        lastResId = resId;
+        lastResult = result;
+    }
+
+public:
+    int numNotifies;
+
+    ResourceId lastResId;
+    LockResult lastResult;
+};
+
+
+struct LockRequestCombo : public LockRequest, TrackingLockGrantNotification {
+public:
+    explicit LockRequestCombo(Locker* locker) {
+        initNew(locker, this);
+    }
+};
+
+/**
+ * A RAII object that temporarily forces setting of the _supportsDocLocking global variable (defined
+ * in db/service_context.cpp and returned by mongo::supportsDocLocking()) for testing purposes.
+ */
+extern bool _supportsDocLocking;
+class ForceSupportsDocLocking {
+public:
+    explicit ForceSupportsDocLocking(bool supported) : _oldSupportsDocLocking(_supportsDocLocking) {
+        _supportsDocLocking = supported;
+    }
+
+    ~ForceSupportsDocLocking() {
+        _supportsDocLocking = _oldSupportsDocLocking;
+    }
+
+private:
+    const bool _oldSupportsDocLocking;
+};
+
+}  // namespace mongo

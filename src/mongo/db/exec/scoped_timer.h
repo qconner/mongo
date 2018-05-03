@@ -30,28 +30,31 @@
 
 #include "mongo/base/disallow_copying.h"
 
+#include "mongo/util/time_support.h"
+
 namespace mongo {
 
-    /**
-     * This class increments a counter by a rough estimate of the time elapsed since its
-     * construction when it goes out of scope.
-     */
-    class ScopedTimer {
-        MONGO_DISALLOW_COPYING(ScopedTimer);
-    public:
-        ScopedTimer(long long* counter);
+class ClockSource;
 
-        ~ScopedTimer();
+/**
+ * This class increments a counter by a rough estimate of the time elapsed since its
+ * construction when it goes out of scope.
+ */
+class ScopedTimer {
+    MONGO_DISALLOW_COPYING(ScopedTimer);
 
-    private:
-        // Default constructor disallowed.
-        ScopedTimer();
+public:
+    ScopedTimer(ClockSource* cs, long long* counter);
 
-        // Reference to the counter that we are incrementing with the elapsed time.
-        long long* _counter;
+    ~ScopedTimer();
 
-        // Time at which the timer was constructed.
-        long long _start;
-    };
+private:
+    ClockSource* const _clock;
+    // Reference to the counter that we are incrementing with the elapsed time.
+    long long* _counter;
+
+    // Time at which the timer was constructed.
+    const Date_t _start;
+};
 
 }  // namespace mongo

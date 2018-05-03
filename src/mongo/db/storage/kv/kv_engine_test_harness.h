@@ -1,5 +1,3 @@
-// kv_engine_test_harness.h
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -30,18 +28,26 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/stdx/functional.h"
 
 namespace mongo {
-    class KVHarnessHelper {
-    public:
-        virtual ~KVHarnessHelper(){}
 
-        // returns same thing for entire life
-        virtual KVEngine* getEngine() = 0;
+class ClockSource;
 
-        virtual KVEngine* restartEngine() = 0;
+class KVHarnessHelper {
+public:
+    virtual ~KVHarnessHelper() {}
 
-        static KVHarnessHelper* create();
-    };
-}
+    // returns same thing for entire life
+    virtual KVEngine* getEngine() = 0;
+
+    virtual KVEngine* restartEngine() = 0;
+
+    static std::unique_ptr<KVHarnessHelper> create();
+    static void registerFactory(stdx::function<std::unique_ptr<KVHarnessHelper>()> factory);
+};
+
+}  // namespace mongo

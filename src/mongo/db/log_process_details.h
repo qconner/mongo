@@ -30,15 +30,17 @@
 
 namespace mongo {
 
-    /**
-     * Writes useful information about the running process to the diagnostic log on startup.
-     */
-    void logProcessDetails();
+class ServiceContext;
 
-    /**
-     * Writes useful information about the running process to diagnostic log
-     * for after a log rotation.
-     */
-    void logProcessDetailsForLogRotate();
+/**
+ * Writes useful information about the running process to the diagnostic log on startup.
+ */
+void logProcessDetails();
+
+/**
+ * Writes useful information about the running process to diagnostic log
+ * for after a log rotation.
+ */
+void logProcessDetailsForLogRotate(ServiceContext* serviceContext);
 
 }  // namespace mongo

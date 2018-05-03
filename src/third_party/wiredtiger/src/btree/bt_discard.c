@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -12,10 +12,10 @@ static void __free_page_modify(WT_SESSION_IMPL *, WT_PAGE *);
 static void __free_page_col_var(WT_SESSION_IMPL *, WT_PAGE *);
 static void __free_page_int(WT_SESSION_IMPL *, WT_PAGE *);
 static void __free_page_row_leaf(WT_SESSION_IMPL *, WT_PAGE *);
-static void __free_skip_array(WT_SESSION_IMPL *, WT_INSERT_HEAD **, uint32_t);
-static void __free_skip_list(WT_SESSION_IMPL *, WT_INSERT *);
-static void __free_update(WT_SESSION_IMPL *, WT_UPDATE **, uint32_t);
-static void __free_update_list(WT_SESSION_IMPL *, WT_UPDATE *);
+static void __free_skip_array(
+		WT_SESSION_IMPL *, WT_INSERT_HEAD **, uint32_t, bool);
+static void __free_skip_list(WT_SESSION_IMPL *, WT_INSERT *, bool);
+static void __free_update(WT_SESSION_IMPL *, WT_UPDATE **, uint32_t, bool);
 
 /*
  * __wt_ref_out --
@@ -27,8 +27,34 @@ __wt_ref_out(WT_SESSION_IMPL *session, WT_REF *ref)
 	/*
 	 * A version of the page-out function that allows us to make additional
 	 * diagnostic checks.
+	 *
+	 * The WT_REF cannot be the eviction thread's location.
 	 */
 	WT_ASSERT(session, S2BT(session)->evict_ref != ref);
+
+#ifdef HAVE_DIAGNOSTIC
+	{
+	WT_HAZARD *hp;
+	int i;
+	/*
+	 * Make sure no other thread has a hazard pointer on the page we are
+	 * about to discard.  This is complicated by the fact that readers
+	 * publish their hazard pointer before re-checking the page state, so
+	 * our check can race with readers without indicating a real problem.
+	 * Wait for up to a second for hazard pointers to be cleared.
+	 */
+	for (hp = NULL, i = 0; i < 100; i++) {
+		if ((hp = __wt_hazard_check(session, ref)) == NULL)
+			break;
+		__wt_sleep(0, 10000);
+	}
+	if (hp != NULL)
+		__wt_errx(session,
+		    "discarded page has hazard pointer: (%p: %s, line %d)",
+		    (void *)hp->ref, hp->file, hp->line);
+	WT_ASSERT(session, hp == NULL);
+	}
+#endif
 
 	__wt_page_out(session, &ref->page);
 }
@@ -51,36 +77,18 @@ __wt_page_out(WT_SESSION_IMPL *session, WT_PAGE **pagep)
 	*pagep = NULL;
 
 	/*
-	 * We should never discard a dirty page, the file's current eviction
-	 * point or a page queued for LRU eviction.
+	 * Unless we have a dead handle or we're closing the database, we
+	 * should never discard a dirty page.  We do ordinary eviction from
+	 * dead trees until sweep gets to them, so we may not in the
+	 * WT_SYNC_DISCARD loop.
 	 */
+	if (F_ISSET(session->dhandle, WT_DHANDLE_DEAD) ||
+	    F_ISSET(S2C(session), WT_CONN_CLOSING))
+		__wt_page_modify_clear(session, page);
+
+	/* Assert we never discard a dirty page or a page queue for eviction. */
 	WT_ASSERT(session, !__wt_page_is_modified(page));
 	WT_ASSERT(session, !F_ISSET_ATOMIC(page, WT_PAGE_EVICT_LRU));
-	WT_ASSERT(session, !F_ISSET_ATOMIC(page, WT_PAGE_SPLITTING));
-
-#ifdef HAVE_DIAGNOSTIC
-	{
-	WT_HAZARD *hp;
-	int i;
-	/*
-	 * Make sure no other thread has a hazard pointer on the page we are
-	 * about to discard.  This is complicated by the fact that readers
-	 * publish their hazard pointer before re-checking the page state, so
-	 * our check can race with readers without indicating a real problem.
-	 * Wait for up to a second for hazard pointers to be cleared.
-	 */
-	for (hp = NULL, i = 0; i < 100; i++) {
-		if ((hp = __wt_page_hazard_check(session, page)) == NULL)
-			break;
-		__wt_sleep(0, 10000);
-	}
-	if (hp != NULL)
-		__wt_errx(session,
-		    "discarded page has hazard pointer: (%p: %s, line %d)",
-		    hp->page, hp->file, hp->line);
-	WT_ASSERT(session, hp == NULL);
-	}
-#endif
 
 	/*
 	 * If a root page split, there may be one or more pages linked from the
@@ -97,6 +105,15 @@ __wt_page_out(WT_SESSION_IMPL *session, WT_PAGE **pagep)
 
 	/* Update the cache's information. */
 	__wt_cache_page_evict(session, page);
+
+	dsk = (WT_PAGE_HEADER *)page->dsk;
+	if (F_ISSET_ATOMIC(page, WT_PAGE_DISK_ALLOC))
+		__wt_cache_page_image_decr(session, dsk->mem_size);
+
+	/* Discard any mapped image. */
+	if (F_ISSET_ATOMIC(page, WT_PAGE_DISK_MAPPED))
+		(void)S2BT(session)->bm->map_discard(
+		    S2BT(session)->bm, session, dsk, (size_t)dsk->mem_size);
 
 	/*
 	 * If discarding the page as part of process exit, the application may
@@ -124,12 +141,9 @@ __wt_page_out(WT_SESSION_IMPL *session, WT_PAGE **pagep)
 		break;
 	}
 
-	/* Discard any disk image. */
-	dsk = (WT_PAGE_HEADER *)page->dsk;
+	/* Discard any allocated disk image. */
 	if (F_ISSET_ATOMIC(page, WT_PAGE_DISK_ALLOC))
 		__wt_overwrite_and_free_len(session, dsk, dsk->mem_size);
-	if (F_ISSET_ATOMIC(page, WT_PAGE_DISK_MAPPED))
-		(void)__wt_mmap_discard(session, dsk, dsk->mem_size);
 
 	__wt_overwrite_and_free(session, page);
 }
@@ -145,10 +159,14 @@ __free_page_modify(WT_SESSION_IMPL *session, WT_PAGE *page)
 	WT_MULTI *multi;
 	WT_PAGE_MODIFY *mod;
 	uint32_t i;
+	bool update_ignore;
 
 	mod = page->modify;
 
-	switch (F_ISSET(mod, WT_PM_REC_MASK)) {
+	/* In some failed-split cases, we can't discard updates. */
+	update_ignore = F_ISSET_ATOMIC(page, WT_PAGE_UPDATE_IGNORE);
+
+	switch (mod->rec_result) {
 	case WT_PM_REC_MULTIBLOCK:
 		/* Free list of replacement blocks. */
 		for (multi = mod->mod_multi,
@@ -159,8 +177,8 @@ __free_page_modify(WT_SESSION_IMPL *session, WT_PAGE *page)
 				__wt_free(session, multi->key.ikey);
 				break;
 			}
-			__wt_free(session, multi->skip);
-			__wt_free(session, multi->skip_dsk);
+			__wt_free(session, multi->supd);
+			__wt_free(session, multi->disk_image);
 			__wt_free(session, multi->addr.addr);
 		}
 		__wt_free(session, mod->mod_multi);
@@ -179,25 +197,44 @@ __free_page_modify(WT_SESSION_IMPL *session, WT_PAGE *page)
 	case WT_PAGE_COL_VAR:
 		/* Free the append array. */
 		if ((append = WT_COL_APPEND(page)) != NULL) {
-			__free_skip_list(session, WT_SKIP_FIRST(append));
+			__free_skip_list(
+			    session, WT_SKIP_FIRST(append), update_ignore);
 			__wt_free(session, append);
-			__wt_free(session, mod->mod_append);
+			__wt_free(session, mod->mod_col_append);
 		}
 
 		/* Free the insert/update array. */
-		if (mod->mod_update != NULL)
-			__free_skip_array(session, mod->mod_update,
+		if (mod->mod_col_update != NULL)
+			__free_skip_array(session, mod->mod_col_update,
 			    page->type ==
-			    WT_PAGE_COL_FIX ? 1 : page->pg_var_entries);
+			    WT_PAGE_COL_FIX ? 1 : page->entries, update_ignore);
+		break;
+	case WT_PAGE_ROW_LEAF:
+		/*
+		 * Free the insert array.
+		 *
+		 * Row-store tables have one additional slot in the insert array
+		 * (the insert array has an extra slot to hold keys that sort
+		 * before keys found on the original page).
+		 */
+		if (mod->mod_row_insert != NULL)
+			__free_skip_array(session, mod->mod_row_insert,
+			    page->entries + 1, update_ignore);
+
+		/* Free the update array. */
+		if (mod->mod_row_update != NULL)
+			__free_update(session, mod->mod_row_update,
+			    page->entries, update_ignore);
 		break;
 	}
 
 	/* Free the overflow on-page, reuse and transaction-cache skiplists. */
 	__wt_ovfl_reuse_free(session, page);
-	__wt_ovfl_txnc_free(session, page);
 	__wt_ovfl_discard_free(session, page);
+	__wt_ovfl_discard_remove(session, page);
 
 	__wt_free(session, page->modify->ovfl_track);
+	__wt_spin_destroy(session, &page->modify->page_lock);
 
 	__wt_free(session, page->modify);
 }
@@ -209,7 +246,7 @@ __free_page_modify(WT_SESSION_IMPL *session, WT_PAGE *page)
 static void
 __free_page_int(WT_SESSION_IMPL *session, WT_PAGE *page)
 {
-	__wt_free_ref_index(session, page, WT_INTL_INDEX_COPY(page), 0);
+	__wt_free_ref_index(session, page, WT_INTL_INDEX_GET_SAFE(page), false);
 }
 
 /*
@@ -219,7 +256,7 @@ __free_page_int(WT_SESSION_IMPL *session, WT_PAGE *page)
  */
 void
 __wt_free_ref(
-    WT_SESSION_IMPL *session, WT_PAGE *page, WT_REF *ref, int free_pages)
+    WT_SESSION_IMPL *session, WT_REF *ref, int page_type, bool free_pages)
 {
 	WT_IKEY *ikey;
 
@@ -234,15 +271,19 @@ __wt_free_ref(
 	 * it clean explicitly.)
 	 */
 	if (free_pages && ref->page != NULL) {
-		if (ref->page->modify != NULL) {
-			ref->page->modify->write_gen = 0;
-			__wt_cache_dirty_decr(session, ref->page);
-		}
+		__wt_page_modify_clear(session, ref->page);
 		__wt_page_out(session, &ref->page);
 	}
 
-	/* Free any key allocation. */
-	switch (page->type) {
+	/*
+	 * Optionally free row-store WT_REF key allocation. Historic versions of
+	 * this code looked in a passed-in page argument, but that is dangerous,
+	 * some of our error-path callers create WT_REF structures without ever
+	 * setting WT_REF.home or having a parent page to which the WT_REF will
+	 * be linked. Those WT_REF structures invariably have instantiated keys,
+	 * (they obviously cannot be on-page keys), and we must free the memory.
+	 */
+	switch (page_type) {
 	case WT_PAGE_ROW_INT:
 	case WT_PAGE_ROW_LEAF:
 		if ((ikey = __wt_ref_key_instantiated(ref)) != NULL)
@@ -251,12 +292,10 @@ __wt_free_ref(
 	}
 
 	/* Free any address allocation. */
-	if (ref->addr != NULL && __wt_off_page(page, ref->addr)) {
-		__wt_free(session, ((WT_ADDR *)ref->addr)->addr);
-		__wt_free(session, ref->addr);
-	}
+	__wt_ref_addr_free(session, ref);
 
-	/* Free any page-deleted information. */
+	/* Free any lookaside or page-deleted information. */
+	__wt_free(session, ref->page_las);
 	if (ref->page_del != NULL) {
 		__wt_free(session, ref->page_del->update_list);
 		__wt_free(session, ref->page_del);
@@ -267,11 +306,11 @@ __wt_free_ref(
 
 /*
  * __wt_free_ref_index --
- *	Discard a page index and it's references.
+ *	Discard a page index and its references.
  */
 void
 __wt_free_ref_index(WT_SESSION_IMPL *session,
-    WT_PAGE *page, WT_PAGE_INDEX *pindex, int free_pages)
+    WT_PAGE *page, WT_PAGE_INDEX *pindex, bool free_pages)
 {
 	uint32_t i;
 
@@ -279,7 +318,8 @@ __wt_free_ref_index(WT_SESSION_IMPL *session,
 		return;
 
 	for (i = 0; i < pindex->entries; ++i)
-		__wt_free_ref(session, page, pindex->index[i], free_pages);
+		__wt_free_ref(
+		    session, pindex->index[i], page->type, free_pages);
 	__wt_free(session, pindex);
 }
 
@@ -291,7 +331,7 @@ static void
 __free_page_col_var(WT_SESSION_IMPL *session, WT_PAGE *page)
 {
 	/* Free the RLE lookup array. */
-	__wt_free(session, page->pg_var_repeats);
+	__wt_free(session, page->u.col_var.repeats);
 }
 
 /*
@@ -317,24 +357,8 @@ __free_page_row_leaf(WT_SESSION_IMPL *session, WT_PAGE *page)
 		copy = WT_ROW_KEY_COPY(rip);
 		(void)__wt_row_leaf_key_info(
 		    page, copy, &ikey, NULL, NULL, NULL);
-		if (ikey != NULL)
-			__wt_free(session, ikey);
+		__wt_free(session, ikey);
 	}
-
-	/*
-	 * Free the insert array.
-	 *
-	 * Row-store tables have one additional slot in the insert array (the
-	 * insert array has an extra slot to hold keys that sort before keys
-	 * found on the original page).
-	 */
-	if (page->pg_row_ins != NULL)
-		__free_skip_array(
-		    session, page->pg_row_ins, page->pg_row_entries + 1);
-
-	/* Free the update array. */
-	if (page->pg_row_upd != NULL)
-		__free_update(session, page->pg_row_upd, page->pg_row_entries);
 }
 
 /*
@@ -342,8 +366,8 @@ __free_page_row_leaf(WT_SESSION_IMPL *session, WT_PAGE *page)
  *	Discard an array of skip list headers.
  */
 static void
-__free_skip_array(
-    WT_SESSION_IMPL *session, WT_INSERT_HEAD **head_arg, uint32_t entries)
+__free_skip_array(WT_SESSION_IMPL *session,
+    WT_INSERT_HEAD **head_arg, uint32_t entries, bool update_ignore)
 {
 	WT_INSERT_HEAD **head;
 
@@ -353,7 +377,8 @@ __free_skip_array(
 	 */
 	for (head = head_arg; entries > 0; --entries, ++head)
 		if (*head != NULL) {
-			__free_skip_list(session, WT_SKIP_FIRST(*head));
+			__free_skip_list(
+			    session, WT_SKIP_FIRST(*head), update_ignore);
 			__wt_free(session, *head);
 		}
 
@@ -367,12 +392,13 @@ __free_skip_array(
  * of a WT_INSERT structure and its associated chain of WT_UPDATE structures.
  */
 static void
-__free_skip_list(WT_SESSION_IMPL *session, WT_INSERT *ins)
+__free_skip_list(WT_SESSION_IMPL *session, WT_INSERT *ins, bool update_ignore)
 {
 	WT_INSERT *next;
 
 	for (; ins != NULL; ins = next) {
-		__free_update_list(session, ins->upd);
+		if (!update_ignore)
+			__wt_free_update_list(session, ins->upd);
 		next = WT_SKIP_NEXT(ins);
 		__wt_free(session, ins);
 	}
@@ -383,8 +409,8 @@ __free_skip_list(WT_SESSION_IMPL *session, WT_INSERT *ins)
  *	Discard the update array.
  */
 static void
-__free_update(
-    WT_SESSION_IMPL *session, WT_UPDATE **update_head, uint32_t entries)
+__free_update(WT_SESSION_IMPL *session,
+    WT_UPDATE **update_head, uint32_t entries, bool update_ignore)
 {
 	WT_UPDATE **updp;
 
@@ -392,31 +418,26 @@ __free_update(
 	 * For each non-NULL slot in the page's array of updates, free the
 	 * linked list anchored in that slot.
 	 */
-	for (updp = update_head; entries > 0; --entries, ++updp)
-		if (*updp != NULL)
-			__free_update_list(session, *updp);
+	if (!update_ignore)
+		for (updp = update_head; entries > 0; --entries, ++updp)
+			if (*updp != NULL)
+				__wt_free_update_list(session, *updp);
 
 	/* Free the update array. */
 	__wt_free(session, update_head);
 }
 
 /*
- * __free_update_list --
+ * __wt_free_update_list --
  *	Walk a WT_UPDATE forward-linked list and free the per-thread combination
  *	of a WT_UPDATE structure and its associated data.
  */
-static void
-__free_update_list(WT_SESSION_IMPL *session, WT_UPDATE *upd)
+void
+__wt_free_update_list(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 {
 	WT_UPDATE *next;
 
 	for (; upd != NULL; upd = next) {
-		/* Everything we free should be visible to everyone. */
-		WT_ASSERT(session,
-		    F_ISSET(session, WT_SESSION_DISCARD_FORCE) ||
-		    upd->txnid == WT_TXN_ABORTED ||
-		    __wt_txn_visible_all(session, upd->txnid));
-
 		next = upd->next;
 		__wt_free(session, upd);
 	}

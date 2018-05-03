@@ -29,50 +29,57 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/privilege_parser.h"
 
 namespace mongo {
 
-    void Privilege::addPrivilegeToPrivilegeVector(PrivilegeVector* privileges,
-                                                  const Privilege& privilegeToAdd) {
-        for (PrivilegeVector::iterator it = privileges->begin(); it != privileges->end(); ++it) {
-            if (it->getResourcePattern() == privilegeToAdd.getResourcePattern()) {
-                it->addActions(privilegeToAdd.getActions());
-                return;
-            }
+void Privilege::addPrivilegeToPrivilegeVector(PrivilegeVector* privileges,
+                                              const Privilege& privilegeToAdd) {
+    for (PrivilegeVector::iterator it = privileges->begin(); it != privileges->end(); ++it) {
+        if (it->getResourcePattern() == privilegeToAdd.getResourcePattern()) {
+            it->addActions(privilegeToAdd.getActions());
+            return;
         }
-        // No privilege exists yet for this resource
-        privileges->push_back(privilegeToAdd);
     }
+    // No privilege exists yet for this resource
+    privileges->push_back(privilegeToAdd);
+}
 
-    Privilege::Privilege(const ResourcePattern& resource, const ActionType& action) :
-        _resource(resource) {
-
-        _actions.addAction(action);
+void Privilege::addPrivilegesToPrivilegeVector(PrivilegeVector* privileges,
+                                               const PrivilegeVector& privilegesToAdd) {
+    for (auto&& priv : privilegesToAdd) {
+        addPrivilegeToPrivilegeVector(privileges, priv);
     }
-    Privilege::Privilege(const ResourcePattern& resource, const ActionSet& actions) :
-            _resource(resource), _actions(actions) {}
+}
 
-    void Privilege::addActions(const ActionSet& actionsToAdd) {
-        _actions.addAllActionsFromSet(actionsToAdd);
-    }
+Privilege::Privilege(const ResourcePattern& resource, const ActionType& action)
+    : _resource(resource) {
+    _actions.addAction(action);
+}
+Privilege::Privilege(const ResourcePattern& resource, const ActionSet& actions)
+    : _resource(resource), _actions(actions) {}
 
-    void Privilege::removeActions(const ActionSet& actionsToRemove) {
-        _actions.removeAllActionsFromSet(actionsToRemove);
-    }
+void Privilege::addActions(const ActionSet& actionsToAdd) {
+    _actions.addAllActionsFromSet(actionsToAdd);
+}
 
-    bool Privilege::includesAction(const ActionType& action) const {
-        return _actions.contains(action);
-    }
+void Privilege::removeActions(const ActionSet& actionsToRemove) {
+    _actions.removeAllActionsFromSet(actionsToRemove);
+}
 
-    bool Privilege::includesActions(const ActionSet& actions) const {
-        return _actions.isSupersetOf(actions);
-    }
+bool Privilege::includesAction(const ActionType& action) const {
+    return _actions.contains(action);
+}
 
-    BSONObj Privilege::toBSON() const {
-        ParsedPrivilege pp;
-        std::string errmsg;
-        invariant(ParsedPrivilege::privilegeToParsedPrivilege(*this, &pp, &errmsg));
-        return pp.toBSON();
-    }
+bool Privilege::includesActions(const ActionSet& actions) const {
+    return _actions.isSupersetOf(actions);
+}
 
-} // namespace mongo
+BSONObj Privilege::toBSON() const {
+    ParsedPrivilege pp;
+    std::string errmsg;
+    invariant(ParsedPrivilege::privilegeToParsedPrivilege(*this, &pp, &errmsg));
+    return pp.toBSON();
+}
+
+}  // namespace mongo

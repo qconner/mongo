@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -21,12 +21,6 @@ __wt_connection_open(WT_CONNECTION_IMPL *conn, const char *cfg[])
 	session = conn->default_session;
 	WT_ASSERT(session, session->iface.connection == &conn->iface);
 
-	/*
-	 * Tell internal server threads to run: this must be set before opening
-	 * any sessions.
-	 */
-	F_SET(conn, WT_CONN_SERVER_RUN | WT_CONN_LOG_SERVER_RUN);
-
 	/* WT_SESSION_IMPL array. */
 	WT_RET(__wt_calloc(session,
 	    conn->session_size, sizeof(WT_SESSION_IMPL), &conn->sessions));
@@ -36,7 +30,8 @@ __wt_connection_open(WT_CONNECTION_IMPL *conn, const char *cfg[])
 	 * threads because those may allocate and use session resources that
 	 * need to get cleaned up on close.
 	 */
-	WT_RET(__wt_open_internal_session(conn, "connection", 1, 0, &session));
+	WT_RET(__wt_open_internal_session(
+	    conn, "connection", false, 0, &session));
 
 	/*
 	 * The connection's default session is originally a static structure,
@@ -54,9 +49,6 @@ __wt_connection_open(WT_CONNECTION_IMPL *conn, const char *cfg[])
 	 * fields are set before other threads read from the pointer.
 	 */
 	WT_WRITE_BARRIER();
-
-	/* Connect to a cache pool. */
-	WT_RET(__wt_cache_pool_config(session, cfg));
 
 	/* Create the cache. */
 	WT_RET(__wt_cache_create(session, cfg));
@@ -77,32 +69,22 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	WT_CONNECTION *wt_conn;
 	WT_DECL_RET;
 	WT_DLH *dlh;
-	WT_FH *fh;
 	WT_SESSION_IMPL *s, *session;
-	WT_TXN_GLOBAL *txn_global;
 	u_int i;
 
 	wt_conn = &conn->iface;
-	txn_global = &conn->txn_global;
 	session = conn->default_session;
 
-	/*
-	 * We're shutting down.  Make sure everything gets freed.
-	 *
-	 * It's possible that the eviction server is in the middle of a long
-	 * operation, with a transaction ID pinned.  In that case, we will loop
-	 * here until the transaction ID is released, when the oldest
-	 * transaction ID will catch up with the current ID.
-	 */
-	for (;;) {
-		__wt_txn_update_oldest(session);
-		if (txn_global->oldest_id == txn_global->current)
-			break;
-		__wt_yield();
-	}
+	/* Shut down the subsystems, ensuring workers see the state change. */
+	F_SET(conn, WT_CONN_CLOSING);
+	WT_FULL_BARRIER();
 
-	/* Clear any pending async ops. */
+	/*
+	 * Clear any pending async operations and shut down the async worker
+	 * threads and system before closing LSM.
+	 */
 	WT_TRET(__wt_async_flush(session));
+	WT_TRET(__wt_async_destroy(session));
 
 	/*
 	 * Shut down server threads other than the eviction server, which is
@@ -110,15 +92,27 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	 * btree handles, so take care in ordering shutdown to make sure they
 	 * exit before files are closed.
 	 */
-	F_CLR(conn, WT_CONN_SERVER_RUN);
-	WT_TRET(__wt_async_destroy(session));
 	WT_TRET(__wt_lsm_manager_destroy(session));
+
+	/*
+	 * Once the async and LSM threads exit, we shouldn't be opening any
+	 * more files.
+	 */
+	F_SET(conn, WT_CONN_CLOSING_NO_MORE_OPENS);
+	WT_FULL_BARRIER();
+
 	WT_TRET(__wt_checkpoint_server_destroy(session));
-	WT_TRET(__wt_statlog_destroy(session, 1));
+	WT_TRET(__wt_statlog_destroy(session, true));
 	WT_TRET(__wt_sweep_destroy(session));
+
+	/* The eviction server is shut down last. */
+	WT_TRET(__wt_evict_destroy(session));
 
 	/* Close open data handles. */
 	WT_TRET(__wt_conn_dhandle_discard(session));
+
+	/* Shut down metadata tracking. */
+	WT_TRET(__wt_meta_track_destroy(session));
 
 	/*
 	 * Now that all data handles are closed, tell logging that a checkpoint
@@ -127,34 +121,18 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	 * conditional because we allocate the log path so that printlog can
 	 * run without running logging or recovery.
 	 */
-	if (FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))
+	if (ret == 0 && FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED) &&
+	    FLD_ISSET(conn->log_flags, WT_CONN_LOG_RECOVER_DONE))
 		WT_TRET(__wt_txn_checkpoint_log(
-		    session, 1, WT_TXN_LOG_CKPT_STOP, NULL));
-	F_CLR(conn, WT_CONN_LOG_SERVER_RUN);
+		    session, true, WT_TXN_LOG_CKPT_STOP, NULL));
 	WT_TRET(__wt_logmgr_destroy(session));
 
 	/* Free memory for collators, compressors, data sources. */
 	WT_TRET(__wt_conn_remove_collator(session));
 	WT_TRET(__wt_conn_remove_compressor(session));
 	WT_TRET(__wt_conn_remove_data_source(session));
+	WT_TRET(__wt_conn_remove_encryptor(session));
 	WT_TRET(__wt_conn_remove_extractor(session));
-
-	/*
-	 * Complain if files weren't closed, ignoring the lock file, we'll
-	 * close it in a minute.
-	 */
-	SLIST_FOREACH(fh, &conn->fhlh, l) {
-		if (fh == conn->lock_fh)
-			continue;
-
-		__wt_errx(session,
-		    "Connection has open file handles: %s", fh->name);
-		WT_TRET(__wt_close(session, fh));
-		fh = SLIST_FIRST(&conn->fhlh);
-	}
-
-	/* Shut down the eviction server thread. */
-	WT_TRET(__wt_evict_destroy(session));
 
 	/* Disconnect from shared cache - must be before cache destroy. */
 	WT_TRET(__wt_conn_cache_pool_destroy(session));
@@ -165,14 +143,19 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	/* Discard transaction state. */
 	__wt_txn_global_destroy(session);
 
-	/* Close extensions, first calling any unload entry point. */
-	while ((dlh = TAILQ_FIRST(&conn->dlhqh)) != NULL) {
-		TAILQ_REMOVE(&conn->dlhqh, dlh, q);
+	/* Close the lock file, opening up the database to other connections. */
+	if (conn->lock_fh != NULL)
+		WT_TRET(__wt_close(session, &conn->lock_fh));
 
-		if (dlh->terminate != NULL)
-			WT_TRET(dlh->terminate(wt_conn));
-		WT_TRET(__wt_dlclose(session, dlh));
-	}
+	/* Close any optrack files */
+	if (session->optrack_fh != NULL)
+		WT_TRET(__wt_close(session, &session->optrack_fh));
+
+	/* Close operation tracking */
+	WT_TRET(__wt_conn_optrack_teardown(session, false));
+
+	/* Close any file handles left open. */
+	WT_TRET(__wt_close_connection_close(session));
 
 	/*
 	 * Close the internal (default) session, and switch back to the dummy
@@ -185,34 +168,35 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	}
 
 	/*
-	 * The session's split stash isn't discarded during normal session close
-	 * because it may persist past the life of the session.  Discard it now.
+	 * The session split stash, hazard information and handle arrays aren't
+	 * discarded during normal session close, they persist past the life of
+	 * the session. Discard them now.
 	 */
-	if ((s = conn->sessions) != NULL)
-		for (i = 0; i < conn->session_size; ++s, ++i)
-			__wt_split_stash_discard_all(session, s);
-
-	/*
-	 * The session's hazard pointer memory isn't discarded during normal
-	 * session close because access to it isn't serialized.  Discard it
-	 * now.
-	 */
-	if ((s = conn->sessions) != NULL)
-		for (i = 0; i < conn->session_size; ++s, ++i)
-			if (s != session) {
-				/*
-				 * If hash arrays were allocated,
-				 * free them now.
-				 */
-				if (s->dhhash != NULL)
-					__wt_free(session, s->dhhash);
-				if (s->tablehash != NULL)
-					__wt_free(session, s->tablehash);
+	if (!F_ISSET(conn, WT_CONN_LEAK_MEMORY))
+		if ((s = conn->sessions) != NULL)
+			for (i = 0; i < conn->session_size; ++s, ++i) {
+				__wt_free(session, s->cursor_cache);
+				__wt_free(session, s->dhhash);
+				__wt_stash_discard_all(session, s);
 				__wt_free(session, s->hazard);
 			}
 
+	/* Destroy the file-system configuration. */
+	if (conn->file_system != NULL && conn->file_system->terminate != NULL)
+		WT_TRET(conn->file_system->terminate(
+		    conn->file_system, (WT_SESSION *)session));
+
+	/* Close extensions, first calling any unload entry point. */
+	while ((dlh = TAILQ_FIRST(&conn->dlhqh)) != NULL) {
+		TAILQ_REMOVE(&conn->dlhqh, dlh, q);
+
+		if (dlh->terminate != NULL)
+			WT_TRET(dlh->terminate(wt_conn));
+		WT_TRET(__wt_dlclose(session, dlh));
+	}
+
 	/* Destroy the handle. */
-	WT_TRET(__wt_connection_destroy(conn));
+	__wt_connection_destroy(conn);
 
 	return (ret);
 }
@@ -225,35 +209,47 @@ int
 __wt_connection_workers(WT_SESSION_IMPL *session, const char *cfg[])
 {
 	/*
-	 * Start the eviction thread.
-	 */
-	WT_RET(__wt_evict_create(session));
-
-	/*
-	 * Start the handle sweep thread.
-	 */
-	WT_RET(__wt_sweep_create(session));
-
-	/*
 	 * Start the optional statistics thread.  Start statistics first so that
 	 * other optional threads can know if statistics are enabled or not.
 	 */
 	WT_RET(__wt_statlog_create(session, cfg));
-
-	/* Start the optional async threads. */
-	WT_RET(__wt_async_create(session, cfg));
-
 	WT_RET(__wt_logmgr_create(session, cfg));
 
-	/* Run recovery. */
+	/*
+	 * Run recovery.
+	 * NOTE: This call will start (and stop) eviction if recovery is
+	 * required.  Recovery must run before the lookaside table is created
+	 * (because recovery will update the metadata), and before eviction is
+	 * started for real.
+	 */
 	WT_RET(__wt_txn_recover(session));
 
 	/*
-	 * Start the optional logging/archive thread.
+	 * Start the optional logging/archive threads.
 	 * NOTE: The log manager must be started before checkpoints so that the
-	 * checkpoint server knows if logging is enabled.
+	 * checkpoint server knows if logging is enabled.  It must also be
+	 * started before any operation that can commit, or the commit can
+	 * block.
 	 */
 	WT_RET(__wt_logmgr_open(session));
+
+	/* Initialize metadata tracking, required before creating tables. */
+	WT_RET(__wt_meta_track_init(session));
+
+	/* Create the lookaside table. */
+	WT_RET(__wt_las_create(session));
+
+	/*
+	 * Start eviction threads.
+	 * NOTE: Eviction must be started after the lookaside table is created.
+	 */
+	WT_RET(__wt_evict_create(session));
+
+	/* Start the handle sweep thread. */
+	WT_RET(__wt_sweep_create(session));
+
+	/* Start the optional async threads. */
+	WT_RET(__wt_async_create(session, cfg));
 
 	/* Start the optional checkpoint thread. */
 	WT_RET(__wt_checkpoint_server_create(session, cfg));

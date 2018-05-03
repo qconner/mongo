@@ -28,137 +28,89 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/index/btree_index_cursor.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/record_id.h"
-#include "mongo/platform/unordered_set.h"
 
 namespace mongo {
 
-    class IndexAccessMethod;
-    class IndexCursor;
-    class IndexDescriptor;
-    class WorkingSet;
+class IndexAccessMethod;
+class IndexDescriptor;
+class WorkingSet;
 
-    struct DistinctParams {
-        DistinctParams() : descriptor(NULL),
-                           direction(1),
-                           fieldNo(0) { }
+struct DistinctParams {
+    DistinctParams() : descriptor(NULL), direction(1), fieldNo(0) {}
 
-        // What index are we traversing?
-        const IndexDescriptor* descriptor;
+    // What index are we traversing?
+    const IndexDescriptor* descriptor;
 
-        // And in what direction?
-        int direction;
+    // And in what direction?
+    int direction;
 
-        // What are the bounds?
-        IndexBounds bounds;
+    // What are the bounds?
+    IndexBounds bounds;
 
-        // What field in the index's key pattern is the one we're distinct-ing over?
-        // For example:
-        // If we have an index {a:1, b:1} we could use it to distinct over either 'a' or 'b'.
-        // If we distinct over 'a' the position is 0.
-        // If we distinct over 'b' the position is 1.
-        int fieldNo;
-    };
+    // What field in the index's key pattern is the one we're distinct-ing over?
+    // For example:
+    // If we have an index {a:1, b:1} we could use it to distinct over either 'a' or 'b'.
+    // If we distinct over 'a' the position is 0.
+    // If we distinct over 'b' the position is 1.
+    int fieldNo;
+};
 
-    /**
-     * Used by the distinct command.  Executes a mutated index scan over the provided bounds.
-     * However, rather than looking at every key in the bounds, it skips to the next value of the
-     * _params.fieldNo-th indexed field.  This is because distinct only cares about distinct values
-     * for that field, so there is no point in examining all keys with the same value for that
-     * field.
-     *
-     * Only created through the getExecutorDistinct path.  See db/query/get_executor.cpp
-     */
-    class DistinctScan : public PlanStage {
-    public:
-        /**
-         * Keeps track of what this distinct scan is currently doing so that it
-         * can do the right thing on the next call to work().
-         */
-        enum ScanState {
-            // Need to initialize the underlying index traversal machinery.
-            INITIALIZING,
+/**
+ * Used by the distinct command.  Executes a mutated index scan over the provided bounds.
+ * However, rather than looking at every key in the bounds, it skips to the next value of the
+ * _params.fieldNo-th indexed field.  This is because distinct only cares about distinct values
+ * for that field, so there is no point in examining all keys with the same value for that
+ * field.
+ *
+ * Only created through the getExecutorDistinct path.  See db/query/get_executor.cpp
+ */
+class DistinctScan final : public PlanStage {
+public:
+    DistinctScan(OperationContext* opCtx, const DistinctParams& params, WorkingSet* workingSet);
 
-            // Skipping keys in order to check whether we have reached the end.
-            CHECKING_END,
+    StageState doWork(WorkingSetID* out) final;
+    bool isEOF() final;
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
 
-            // Retrieving the next key, and applying the filter if necessary.
-            GETTING_NEXT,
+    StageType stageType() const final {
+        return STAGE_DISTINCT_SCAN;
+    }
 
-            // The index scan is finished.
-            HIT_END
-        };
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        DistinctScan(OperationContext* txn, const DistinctParams& params, WorkingSet* workingSet);
-        virtual ~DistinctScan() { }
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    static const char* kStageType;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+private:
+    // The WorkingSet we annotate with results.  Not owned by us.
+    WorkingSet* _workingSet;
 
-        virtual StageType stageType() const { return STAGE_DISTINCT_SCAN; }
+    // Index access.
+    const IndexDescriptor* _descriptor;  // owned by Collection -> IndexCatalog
+    const IndexAccessMethod* _iam;       // owned by Collection -> IndexCatalog
 
-        virtual PlanStageStats* getStats();
+    // The cursor we use to navigate the tree.
+    std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
-        virtual const CommonStats* getCommonStats();
+    DistinctParams _params;
 
-        virtual const SpecificStats* getSpecificStats();
+    // _checker gives us our start key and ensures we stay in bounds.
+    IndexBoundsChecker _checker;
+    IndexSeekPoint _seekPoint;
 
-        static const char* kStageType;
-
-    private:
-        /**
-         * Initialize the underlying IndexCursor
-         */
-        void initIndexCursor();
-
-        /** See if the cursor is pointing at or past _endKey, if _endKey is non-empty. */
-        void checkEnd();
-
-        // transactional context for read locks. Not owned by us
-        OperationContext* _txn;
-
-        // The WorkingSet we annotate with results.  Not owned by us.
-        WorkingSet* _workingSet;
-
-        // Index access.
-        const IndexDescriptor* _descriptor; // owned by Collection -> IndexCatalog
-        const IndexAccessMethod* _iam; // owned by Collection -> IndexCatalog
-
-        // The cursor we use to navigate the tree.
-        boost::scoped_ptr<BtreeIndexCursor> _btreeCursor;
-
-        // Keeps track of what work we need to do next.
-        ScanState _scanState;
-
-        // For yielding.
-        BSONObj _savedKey;
-        RecordId _savedLoc;
-
-        DistinctParams _params;
-
-        // _checker gives us our start key and ensures we stay in bounds.
-        boost::scoped_ptr<IndexBoundsChecker> _checker;
-        int _keyEltsToUse;
-        bool _movePastKeyElts;
-        std::vector<const BSONElement*> _keyElts;
-        std::vector<bool> _keyEltsInc;
-
-        // Stats
-        CommonStats _commonStats;
-        DistinctScanStats _specificStats;
-    };
+    // Stats
+    DistinctScanStats _specificStats;
+};
 
 }  // namespace mongo

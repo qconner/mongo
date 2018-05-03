@@ -28,66 +28,42 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
-
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/optime.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/s/multi_command_dispatch.h"
-#include "mongo/s/write_ops/batch_write_exec.h"
-#include "mongo/s/write_ops/batch_write_op.h"
-#include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/write_ops/write_error_detail.h"
-
-// TODO: Remove post-2.6
 
 namespace mongo {
 
-    // Used for reporting legacy write concern responses
-    struct LegacyWCResponse {
-        std::string shardHost;
-        BSONObj gleResponse;
-        std::string errToReport;
-    };
+// Used for reporting legacy write concern responses
+struct LegacyWCResponse {
+    std::string shardHost;
+    BSONObj gleResponse;
+    std::string errToReport;
+};
 
-    /**
-     * Uses GLE and the shard hosts and opTimes last written by write commands to enforce a
-     * write concern across the previously used shards.
-     *
-     * Returns OK with the LegacyWCResponses containing only write concern error information
-     * Returns !OK if there was an error getting a GLE response
-     */
-    Status enforceLegacyWriteConcern( MultiCommandDispatch* dispatcher,
-                                      StringData dbName,
-                                      const BSONObj& options,
-                                      const HostOpTimeMap& hostOpTimes,
-                                      std::vector<LegacyWCResponse>* wcResponses );
+//
+// Below exposed for testing only
+//
 
-    //
-    // Below exposed for testing only
-    //
+// Helper that acts as an auto-ptr for write and wc errors
+struct GLEErrors {
+    std::unique_ptr<WriteErrorDetail> writeError;
+    std::unique_ptr<WriteConcernErrorDetail> wcError;
+};
 
-    // Helper that acts as an auto-ptr for write and wc errors
-    struct GLEErrors {
-        std::auto_ptr<WriteErrorDetail> writeError;
-        std::auto_ptr<WCErrorDetail> wcError;
-    };
+/**
+ * Given a GLE response, extracts a write error and a write concern error for the previous
+ * operation.
+ *
+ * Returns !OK if the GLE itself failed in an unknown way.
+ */
+Status extractGLEErrors(const BSONObj& gleResponse, GLEErrors* errors);
 
-    /**
-     * Given a GLE response, extracts a write error and a write concern error for the previous
-     * operation.
-     *
-     * Returns !OK if the GLE itself failed in an unknown way.
-     */
-    Status extractGLEErrors( const BSONObj& gleResponse, GLEErrors* errors );
+/**
+ * Given a GLE response, strips out all non-write-concern related information
+ */
+BSONObj stripNonWCInfo(const BSONObj& gleResponse);
 
-    /**
-     * Given a GLE response, strips out all non-write-concern related information
-     */
-    BSONObj stripNonWCInfo( const BSONObj& gleResponse );
-
-
-}
+}  // namespace mongo

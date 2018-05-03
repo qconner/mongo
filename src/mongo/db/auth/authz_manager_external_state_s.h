@@ -28,89 +28,55 @@
 
 #pragma once
 
-#include <boost/thread/mutex.hpp>
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
+#include "mongo/db/auth/privilege_format.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/stdx/functional.h"
 
 
 namespace mongo {
 
-    class ScopedDistributedLock;
+/**
+ * The implementation of AuthzManagerExternalState functionality for mongos.
+ */
+class AuthzManagerExternalStateMongos : public AuthzManagerExternalState {
+    MONGO_DISALLOW_COPYING(AuthzManagerExternalStateMongos);
 
-    /**
-     * The implementation of AuthzManagerExternalState functionality for mongos.
-     */
-    class AuthzManagerExternalStateMongos : public AuthzManagerExternalState{
-        MONGO_DISALLOW_COPYING(AuthzManagerExternalStateMongos);
+public:
+    AuthzManagerExternalStateMongos();
+    ~AuthzManagerExternalStateMongos() override;
 
-    public:
-        AuthzManagerExternalStateMongos();
-        virtual ~AuthzManagerExternalStateMongos();
+    Status initialize(OperationContext* opCtx) override;
+    std::unique_ptr<AuthzSessionExternalState> makeAuthzSessionExternalState(
+        AuthorizationManager* authzManager) override;
+    Status getStoredAuthorizationVersion(OperationContext* opCtx, int* outVersion) override;
+    Status getUserDescription(OperationContext* opCtx,
+                              const UserName& userName,
+                              BSONObj* result) override;
+    Status getRoleDescription(OperationContext* opCtx,
+                              const RoleName& roleName,
+                              PrivilegeFormat showPrivileges,
+                              AuthenticationRestrictionsFormat,
+                              BSONObj* result) override;
+    Status getRolesDescription(OperationContext* opCtx,
+                               const std::vector<RoleName>& roles,
+                               PrivilegeFormat showPrivileges,
+                               AuthenticationRestrictionsFormat,
+                               BSONObj* result) override;
+    Status getRoleDescriptionsForDB(OperationContext* opCtx,
+                                    const std::string& dbname,
+                                    PrivilegeFormat showPrivileges,
+                                    AuthenticationRestrictionsFormat,
+                                    bool showBuiltinRoles,
+                                    std::vector<BSONObj>* result) override;
 
-        virtual Status initialize(OperationContext* txn);
-        virtual Status getStoredAuthorizationVersion(OperationContext* txn, int* outVersion);
-        virtual Status getUserDescription(
-                            OperationContext* txn, const UserName& userName, BSONObj* result);
-        virtual Status getRoleDescription(const RoleName& roleName,
-                                          bool showPrivileges,
-                                          BSONObj* result);
-        virtual Status getRoleDescriptionsForDB(const std::string dbname,
-                                                bool showPrivileges,
-                                                bool showBuiltinRoles,
-                                                std::vector<BSONObj>* result);
+    bool hasAnyPrivilegeDocuments(OperationContext* opCtx) override;
+};
 
-        /**
-         * Implements findOne of the AuthzManagerExternalState interface
-         *
-         * NOTE: The data returned from this helper may be from any config server or replica set
-         * node.  The first config server or primary node is preferred, when available.
-         */
-        virtual Status findOne(OperationContext* txn,
-                               const NamespaceString& collectionName,
-                               const BSONObj& query,
-                               BSONObj* result);
-
-        /**
-         * Implements query of the AuthzManagerExternalState interface
-         *
-         * NOTE: The data returned from this helper may be from any config server or replica set
-         * node.  The first config server or primary node is preferred, when available.
-         */
-        virtual Status query(OperationContext* txn,
-                             const NamespaceString& collectionName,
-                             const BSONObj& query,
-                             const BSONObj& projection,
-                             const stdx::function<void(const BSONObj&)>& resultProcessor);
-
-        virtual Status insert(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& document,
-                              const BSONObj& writeConcern);
-        virtual Status update(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& query,
-                              const BSONObj& updatePattern,
-                              bool upsert,
-                              bool multi,
-                              const BSONObj& writeConcern,
-                              int* nMatched);
-        virtual Status remove(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& query,
-                              const BSONObj& writeConcern,
-                              int* numRemoved);
-        virtual bool tryAcquireAuthzUpdateLock(StringData why);
-        virtual void releaseAuthzUpdateLock();
-
-    private:
-        boost::mutex _distLockGuard; // Guards access to _authzDataUpdateLock
-        boost::scoped_ptr<ScopedDistributedLock> _authzDataUpdateLock;
-    };
-
-} // namespace mongo
+}  // namespace mongo

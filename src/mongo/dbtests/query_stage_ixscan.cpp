@@ -26,296 +26,305 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
+#include "mongo/client/dbclientinterface.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageIxscan {
+namespace {
+const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
+}  // namespace
 
-    class IndexScanTest {
-    public:
-        IndexScanTest()
-            : _txn(),
-              _scopedXact(&_txn, MODE_IX),
-              _dbLock(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X),
-              _ctx(&_txn, ns()),
-              _coll(NULL) {
+class IndexScanTest {
+public:
+    IndexScanTest()
+        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X), _ctx(&_opCtx, ns()), _coll(NULL) {}
 
+    virtual ~IndexScanTest() {}
+
+    virtual void setup() {
+        WriteUnitOfWork wunit(&_opCtx);
+
+        _ctx.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
+        _coll = _ctx.db()->createCollection(&_opCtx, ns());
+
+        ASSERT_OK(_coll->getIndexCatalog()->createIndexOnEmptyCollection(
+            &_opCtx,
+            BSON("ns" << ns() << "key" << BSON("x" << 1) << "name"
+                      << DBClientBase::genIndexName(BSON("x" << 1))
+                      << "v"
+                      << static_cast<int>(kIndexVersion))));
+
+        wunit.commit();
+    }
+
+    void insert(const BSONObj& doc) {
+        WriteUnitOfWork wunit(&_opCtx);
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT_OK(_coll->insertDocument(&_opCtx, InsertStatement(doc), nullOpDebug, false));
+        wunit.commit();
+    }
+
+    /**
+     * Works 'ixscan' until it advances. Returns the index key via a pointer to the
+     * WorkingSetMember containing the key.
+     */
+    WorkingSetMember* getNext(IndexScan* ixscan) {
+        WorkingSetID out;
+
+        PlanStage::StageState state = PlanStage::NEED_TIME;
+        while (PlanStage::ADVANCED != state) {
+            state = ixscan->work(&out);
+
+            // There are certain states we shouldn't get.
+            ASSERT_NE(PlanStage::IS_EOF, state);
+            ASSERT_NE(PlanStage::DEAD, state);
+            ASSERT_NE(PlanStage::FAILURE, state);
         }
 
-        virtual ~IndexScanTest() { }
-
-        virtual void setup() {
-            WriteUnitOfWork wunit(&_txn);
-
-            _ctx.db()->dropCollection(&_txn, ns());
-            _coll = _ctx.db()->createCollection(&_txn, ns());
-
-            ASSERT_OK(_coll->getIndexCatalog()->createIndexOnEmptyCollection(
-                        &_txn,
-                        BSON("ns" << ns()
-                          << "key" << BSON("x" << 1)
-                          << "name" << DBClientBase::genIndexName(BSON("x" << 1)))));
-
-            wunit.commit();
-        }
-
-        void insert(const BSONObj& doc) {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(_coll->insertDocument(&_txn, doc, false).getStatus());
-            wunit.commit();
-        }
-
-        /**
-         * Works 'ixscan' until it advances. Returns the index key via a pointer to the
-         * WorkingSetMember containing the key.
-         */
-        WorkingSetMember* getNext(IndexScan* ixscan) {
-            WorkingSetID out;
-
-            PlanStage::StageState state = PlanStage::NEED_TIME;
-            while (PlanStage::ADVANCED != state) {
-                state = ixscan->work(&out);
-
-                // There are certain states we shouldn't get.
-                ASSERT_NE(PlanStage::IS_EOF, state);
-                ASSERT_NE(PlanStage::DEAD, state);
-                ASSERT_NE(PlanStage::FAILURE, state);
-            }
-
-            return _ws.get(out);
-        }
+        return _ws.get(out);
+    }
 
 
-        IndexScan* createIndexScanSimpleRange(BSONObj startKey, BSONObj endKey) {
-            IndexCatalog* catalog = _coll->getIndexCatalog();
-            IndexDescriptor* descriptor = catalog->findIndexByKeyPattern(&_txn, BSON("x" << 1));
-            invariant(descriptor);
+    IndexScan* createIndexScanSimpleRange(BSONObj startKey, BSONObj endKey) {
+        IndexCatalog* catalog = _coll->getIndexCatalog();
+        std::vector<IndexDescriptor*> indexes;
+        catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
+        ASSERT_EQ(indexes.size(), 1U);
 
-            // We are not testing indexing here so use maximal bounds
-            IndexScanParams params;
-            params.descriptor = descriptor;
-            params.bounds.isSimpleRange = true;
-            params.bounds.startKey = startKey;
-            params.bounds.endKey = endKey;
-            params.bounds.endKeyInclusive = true;
-            params.direction = 1;
+        // We are not testing indexing here so use maximal bounds
+        IndexScanParams params;
+        params.descriptor = indexes[0];
+        params.bounds.isSimpleRange = true;
+        params.bounds.startKey = startKey;
+        params.bounds.endKey = endKey;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
+        params.direction = 1;
 
-            // This child stage gets owned and freed by the caller.
-            MatchExpression* filter = NULL;
-            return new IndexScan(&_txn, params, &_ws, filter);
-        }
+        // This child stage gets owned and freed by the caller.
+        MatchExpression* filter = NULL;
+        return new IndexScan(&_opCtx, params, &_ws, filter);
+    }
 
-        IndexScan* createIndexScan(BSONObj startKey,
-                                   BSONObj endKey,
-                                   bool startInclusive,
-                                   bool endInclusive,
-                                   int direction = 1) {
-            IndexCatalog* catalog = _coll->getIndexCatalog();
-            IndexDescriptor* descriptor = catalog->findIndexByKeyPattern(&_txn, BSON("x" << 1));
-            invariant(descriptor);
+    IndexScan* createIndexScan(BSONObj startKey,
+                               BSONObj endKey,
+                               bool startInclusive,
+                               bool endInclusive,
+                               int direction = 1) {
+        IndexCatalog* catalog = _coll->getIndexCatalog();
+        std::vector<IndexDescriptor*> indexes;
+        catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
+        ASSERT_EQ(indexes.size(), 1U);
 
-            IndexScanParams params;
-            params.descriptor = descriptor;
-            params.direction = direction;
+        IndexScanParams params;
+        params.descriptor = indexes[0];
+        params.direction = direction;
 
-            OrderedIntervalList oil("x");
-            BSONObjBuilder bob;
-            bob.appendAs(startKey.firstElement(), "");
-            bob.appendAs(endKey.firstElement(), "");
-            oil.intervals.push_back(Interval(bob.obj(), startInclusive, endInclusive));
-            params.bounds.fields.push_back(oil);
+        OrderedIntervalList oil("x");
+        BSONObjBuilder bob;
+        bob.appendAs(startKey.firstElement(), "");
+        bob.appendAs(endKey.firstElement(), "");
+        oil.intervals.push_back(Interval(bob.obj(), startInclusive, endInclusive));
+        params.bounds.fields.push_back(oil);
 
-            MatchExpression* filter = NULL;
-            return new IndexScan(&_txn, params, &_ws, filter);
-        }
+        MatchExpression* filter = NULL;
+        return new IndexScan(&_opCtx, params, &_ws, filter);
+    }
 
-        static const char* ns() { return "unittest.QueryStageIxscan"; }
+    static const char* ns() {
+        return "unittest.QueryStageIxscan";
+    }
 
-    protected:
-        OperationContextImpl _txn;
+protected:
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
 
-        ScopedTransaction _scopedXact;
-        Lock::DBLock _dbLock;
-        Client::Context _ctx;
-        Collection* _coll;
+    Lock::DBLock _dbLock;
+    OldClientContext _ctx;
+    Collection* _coll;
 
-        WorkingSet _ws;
-    };
+    WorkingSet _ws;
+};
 
-    // SERVER-15958: Some IndexScanStats info must be initialized on construction of an IndexScan.
-    class QueryStageIxscanInitializeStats : public IndexScanTest {
-    public:
-        void run() {
-            setup();
+// SERVER-15958: Some IndexScanStats info must be initialized on construction of an IndexScan.
+class QueryStageIxscanInitializeStats : public IndexScanTest {
+public:
+    void run() {
+        setup();
 
-            // Make the {x: 1} index multikey by inserting a doc where 'x' is an array.
-            insert(fromjson("{_id: 1, x: [1, 2, 3]}"));
+        // Make the {x: 1} index multikey by inserting a doc where 'x' is an array.
+        insert(fromjson("{_id: 1, x: [1, 2, 3]}"));
 
-            std::auto_ptr<IndexScan> ixscan(
-                createIndexScanSimpleRange(BSON("x" << 1), BSON("x" << 3)));
+        std::unique_ptr<IndexScan> ixscan(
+            createIndexScanSimpleRange(BSON("x" << 1), BSON("x" << 3)));
 
-            // Verify that SpecificStats of 'ixscan' have been properly initialized.
-            const IndexScanStats* stats =
-                static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
-            ASSERT(stats);
-            ASSERT_TRUE(stats->isMultiKey);
-            ASSERT_EQUALS(stats->keyPattern, BSON("x" << 1));
-        }
-    };
+        // Verify that SpecificStats of 'ixscan' have been properly initialized.
+        const IndexScanStats* stats =
+            static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
+        ASSERT(stats);
+        ASSERT_TRUE(stats->isMultiKey);
+        ASSERT_BSONOBJ_EQ(stats->keyPattern, BSON("x" << 1));
+    }
+};
 
-    // SERVER-16437
-    class QueryStageIxscanInsertDuringSave : public IndexScanTest {
-    public:
-        void run() {
-            setup();
+// SERVER-16437
+class QueryStageIxscanInsertDuringSave : public IndexScanTest {
+public:
+    void run() {
+        setup();
 
-            insert(fromjson("{_id: 1, x: 5}"));
-            insert(fromjson("{_id: 2, x: 6}"));
-            insert(fromjson("{_id: 3, x: 12}"));
+        insert(fromjson("{_id: 1, x: 5}"));
+        insert(fromjson("{_id: 2, x: 6}"));
+        insert(fromjson("{_id: 3, x: 12}"));
 
-            boost::scoped_ptr<IndexScan> ixscan(createIndexScan(BSON("x" << 5),
-                                                                BSON("x" << 10),
-                                                                true,
-                                                                true));
+        std::unique_ptr<IndexScan> ixscan(
+            createIndexScan(BSON("x" << 5), BSON("x" << 10), true, true));
 
-            // Expect to get key {'': 5} and then key {'': 6}.
-            WorkingSetMember* member = getNext(ixscan.get());
-            ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->state);
-            ASSERT_EQ(member->keyData[0].keyData, BSON("" << 5));
-            member = getNext(ixscan.get());
-            ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->state);
-            ASSERT_EQ(member->keyData[0].keyData, BSON("" << 6));
+        // Expect to get key {'': 5} and then key {'': 6}.
+        WorkingSetMember* member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 5));
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
 
-            // Save state and insert a few indexed docs.
-            ixscan->saveState();
-            insert(fromjson("{_id: 4, x: 10}"));
-            insert(fromjson("{_id: 5, x: 11}"));
-            ixscan->restoreState(&_txn);
+        // Save state and insert a few indexed docs.
+        ixscan->saveState();
+        insert(fromjson("{_id: 4, x: 10}"));
+        insert(fromjson("{_id: 5, x: 11}"));
+        ixscan->restoreState();
 
-            // Expect EOF: we miss {'': 10} because it is inserted behind the cursor.
-            ASSERT(ixscan->isEOF());
-            WorkingSetID id;
-            ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
-        }
-    };
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 10));
 
-    // SERVER-16437
-    class QueryStageIxscanInsertDuringSaveExclusive : public IndexScanTest {
-    public:
-        void run() {
-            setup();
+        WorkingSetID id;
+        ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
+        ASSERT(ixscan->isEOF());
+    }
+};
 
-            insert(fromjson("{_id: 1, x: 5}"));
-            insert(fromjson("{_id: 2, x: 6}"));
-            insert(fromjson("{_id: 3, x: 10}"));
+// SERVER-16437
+class QueryStageIxscanInsertDuringSaveExclusive : public IndexScanTest {
+public:
+    void run() {
+        setup();
 
-            boost::scoped_ptr<IndexScan> ixscan(createIndexScan(BSON("x" << 5),
-                                                                BSON("x" << 10),
-                                                                false,
-                                                                false));
+        insert(fromjson("{_id: 1, x: 5}"));
+        insert(fromjson("{_id: 2, x: 6}"));
+        insert(fromjson("{_id: 3, x: 10}"));
 
-            // Expect to get key {'': 6}.
-            WorkingSetMember* member = getNext(ixscan.get());
-            ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->state);
-            ASSERT_EQ(member->keyData[0].keyData, BSON("" << 6));
+        std::unique_ptr<IndexScan> ixscan(
+            createIndexScan(BSON("x" << 5), BSON("x" << 10), false, false));
 
-            // Save state and insert an indexed doc.
-            ixscan->saveState();
-            insert(fromjson("{_id: 4, x: 7}"));
-            ixscan->restoreState(&_txn);
+        // Expect to get key {'': 6}.
+        WorkingSetMember* member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
 
-            // Expect EOF: we miss {'': 7} because it is inserted behind the cursor, and
-            // {'': 10} is not in the range (5, 10)
-            ASSERT(ixscan->isEOF());
-            WorkingSetID id;
-            ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
-        }
-    };
+        // Save state and insert an indexed doc.
+        ixscan->saveState();
+        insert(fromjson("{_id: 4, x: 7}"));
+        ixscan->restoreState();
 
-    // SERVER-16437
-    class QueryStageIxscanInsertDuringSaveExclusive2 : public IndexScanTest {
-    public:
-        void run() {
-            setup();
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 7));
 
-            insert(fromjson("{_id: 1, x: 5}"));
-            insert(fromjson("{_id: 2, x: 6}"));
-            insert(fromjson("{_id: 3, x: 12}"));
+        WorkingSetID id;
+        ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
+        ASSERT(ixscan->isEOF());
+    }
+};
 
-            boost::scoped_ptr<IndexScan> ixscan(createIndexScan(BSON("x" << 5),
-                                                                BSON("x" << 10),
-                                                                false,
-                                                                false));
+// SERVER-16437
+class QueryStageIxscanInsertDuringSaveExclusive2 : public IndexScanTest {
+public:
+    void run() {
+        setup();
 
-            // Expect to get key {'': 6}.
-            WorkingSetMember* member = getNext(ixscan.get());
-            ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->state);
-            ASSERT_EQ(member->keyData[0].keyData, BSON("" << 6));
+        insert(fromjson("{_id: 1, x: 5}"));
+        insert(fromjson("{_id: 2, x: 6}"));
+        insert(fromjson("{_id: 3, x: 12}"));
 
-            // Save state and insert an indexed doc.
-            ixscan->saveState();
-            insert(fromjson("{_id: 4, x: 10}"));
-            ixscan->restoreState(&_txn);
+        std::unique_ptr<IndexScan> ixscan(
+            createIndexScan(BSON("x" << 5), BSON("x" << 10), false, false));
 
-            // Ensure that we're EOF and we don't erroneously return {'': 12}.
-            ASSERT(ixscan->isEOF());
-            WorkingSetID id;
-            ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
-        }
-    };
+        // Expect to get key {'': 6}.
+        WorkingSetMember* member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
 
-    // SERVER-16437
-    class QueryStageIxscanInsertDuringSaveReverse : public IndexScanTest {
-    public:
-        void run() {
-            setup();
+        // Save state and insert an indexed doc.
+        ixscan->saveState();
+        insert(fromjson("{_id: 4, x: 10}"));
+        ixscan->restoreState();
 
-            insert(fromjson("{_id: 1, x: 10}"));
-            insert(fromjson("{_id: 2, x: 8}"));
-            insert(fromjson("{_id: 3, x: 3}"));
+        // Ensure that we're EOF and we don't erroneously return {'': 12}.
+        WorkingSetID id;
+        ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
+        ASSERT(ixscan->isEOF());
+    }
+};
 
-            boost::scoped_ptr<IndexScan> ixscan(createIndexScan(BSON("x" << 10),
-                                                                BSON("x" << 5),
-                                                                true,
-                                                                true,
-                                                                -1 /* reverse scan */));
+// SERVER-16437
+class QueryStageIxscanInsertDuringSaveReverse : public IndexScanTest {
+public:
+    void run() {
+        setup();
 
-            // Expect to get key {'': 10} and then {'': 8}.
-            WorkingSetMember* member = getNext(ixscan.get());
-            ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->state);
-            ASSERT_EQ(member->keyData[0].keyData, BSON("" << 10));
-            member = getNext(ixscan.get());
-            ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->state);
-            ASSERT_EQ(member->keyData[0].keyData, BSON("" << 8));
+        insert(fromjson("{_id: 1, x: 10}"));
+        insert(fromjson("{_id: 2, x: 8}"));
+        insert(fromjson("{_id: 3, x: 3}"));
 
-            // Save state and insert an indexed doc.
-            ixscan->saveState();
-            insert(fromjson("{_id: 4, x: 6}"));
-            ixscan->restoreState(&_txn);
+        std::unique_ptr<IndexScan> ixscan(
+            createIndexScan(BSON("x" << 10), BSON("x" << 5), true, true, -1 /* reverse scan */));
 
-            // Ensure that we're EOF and we don't erroneously return {'': 6}.
-            ASSERT(ixscan->isEOF());
-            WorkingSetID id;
-            ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
-        }
-    };
+        // Expect to get key {'': 10} and then {'': 8}.
+        WorkingSetMember* member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 10));
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 8));
 
-    class All : public Suite {
-    public:
-        All() : Suite("query_stage_ixscan") {}
+        // Save state and insert an indexed doc.
+        ixscan->saveState();
+        insert(fromjson("{_id: 4, x: 6}"));
+        insert(fromjson("{_id: 5, x: 9}"));
+        ixscan->restoreState();
 
-        void setupTests() {
-            add<QueryStageIxscanInitializeStats>();
-            add<QueryStageIxscanInsertDuringSave>();
-            add<QueryStageIxscanInsertDuringSaveExclusive>();
-            add<QueryStageIxscanInsertDuringSaveExclusive2>();
-            add<QueryStageIxscanInsertDuringSaveReverse>();
-        }
-    } QueryStageIxscanAll;
+        // Ensure that we don't erroneously return {'': 9} or {'':3}.
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
 
-} // namespace QueryStageIxscan
+        WorkingSetID id;
+        ASSERT_EQ(PlanStage::IS_EOF, ixscan->work(&id));
+        ASSERT(ixscan->isEOF());
+    }
+};
+
+class All : public Suite {
+public:
+    All() : Suite("query_stage_ixscan") {}
+
+    void setupTests() {
+        add<QueryStageIxscanInitializeStats>();
+        add<QueryStageIxscanInsertDuringSave>();
+        add<QueryStageIxscanInsertDuringSaveExclusive>();
+        add<QueryStageIxscanInsertDuringSaveExclusive2>();
+        add<QueryStageIxscanInsertDuringSaveReverse>();
+    }
+} QueryStageIxscanAll;
+
+}  // namespace QueryStageIxscan

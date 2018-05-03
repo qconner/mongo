@@ -34,7 +34,7 @@
 #include <limits>
 
 #include "mongo/bson/bson_validate.h"
-#include "mongo/bson/optime.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
 #include "mongo/util/debug_util.h"
@@ -42,40 +42,42 @@
 namespace mongo {
 namespace oploghack {
 
-    StatusWith<RecordId> keyForOptime(const OpTime& opTime) {
-        // Make sure secs and inc wouldn't be negative if treated as signed. This ensures that they
-        // don't sort differently when put in a RecordId. It also avoids issues with Null/Invalid
-        // RecordIds
-        if (opTime.getSecs() > uint32_t(std::numeric_limits<int32_t>::max()))
-            return StatusWith<RecordId>(ErrorCodes::BadValue, "ts secs too high");
+StatusWith<RecordId> keyForOptime(const Timestamp& opTime) {
+    // Make sure secs and inc wouldn't be negative if treated as signed. This ensures that they
+    // don't sort differently when put in a RecordId. It also avoids issues with Null/Invalid
+    // RecordIds
+    if (opTime.getSecs() > uint32_t(std::numeric_limits<int32_t>::max()))
+        return StatusWith<RecordId>(ErrorCodes::BadValue, "ts secs too high");
 
-        if (opTime.getInc() > uint32_t(std::numeric_limits<int32_t>::max()))
-            return StatusWith<RecordId>(ErrorCodes::BadValue, "ts inc too high");
+    if (opTime.getInc() > uint32_t(std::numeric_limits<int32_t>::max()))
+        return StatusWith<RecordId>(ErrorCodes::BadValue, "ts inc too high");
 
-        const RecordId out = RecordId(opTime.getSecs(), opTime.getInc());
-        if (out <= RecordId::min())
-            return StatusWith<RecordId>(ErrorCodes::BadValue, "ts too low");
-        if (out >= RecordId::max())
-            return StatusWith<RecordId>(ErrorCodes::BadValue, "ts too high");
+    const RecordId out = RecordId(opTime.getSecs(), opTime.getInc());
+    if (out <= RecordId::min())
+        return StatusWith<RecordId>(ErrorCodes::BadValue, "ts too low");
+    if (out >= RecordId::max())
+        return StatusWith<RecordId>(ErrorCodes::BadValue, "ts too high");
 
-        return StatusWith<RecordId>(out);
-    }
+    return StatusWith<RecordId>(out);
+}
 
-    /**
-     * data and len must be the arguments from RecordStore::insert() on an oplog collection.
-     */
-    StatusWith<RecordId> extractKey(const char* data, int len) {
-        DEV invariant(validateBSON(data, len).isOK());
+/**
+ * data and len must be the arguments from RecordStore::insert() on an oplog collection.
+ */
+StatusWith<RecordId> extractKey(const char* data, int len) {
+    // Use the latest BSON validation version. Oplog entries are allowed to contain decimal data
+    // even if decimal is disabled.
+    DEV invariant(validateBSON(data, len, BSONVersion::kLatest).isOK());
 
-        const BSONObj obj(data);
-        const BSONElement elem = obj["ts"];
-        if (elem.eoo())
-            return StatusWith<RecordId>(ErrorCodes::BadValue, "no ts field");
-        if (elem.type() != Timestamp)
-            return StatusWith<RecordId>(ErrorCodes::BadValue, "ts must be a Timestamp");
+    const BSONObj obj(data);
+    const BSONElement elem = obj["ts"];
+    if (elem.eoo())
+        return StatusWith<RecordId>(ErrorCodes::BadValue, "no ts field");
+    if (elem.type() != bsonTimestamp)
+        return StatusWith<RecordId>(ErrorCodes::BadValue, "ts must be a Timestamp");
 
-        return keyForOptime(elem._opTime());
-    }
+    return keyForOptime(elem.timestamp());
+}
 
 }  // namespace oploghack
-} // namespace mongo
+}  // namespace mongo

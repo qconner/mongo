@@ -30,30 +30,35 @@
 
 #pragma once
 
-#include "mongo/platform/cstdint.h"
+#include <cstdint>
+
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    /** Keep track of elapsed time. After a set amount of time, tells you to do something. */
-    class ElapsedTracker {
-    public:
-        ElapsedTracker( int32_t hitsBetweenMarks, int32_t msBetweenMarks );
+class ClockSource;
 
-        /**
-         * Call this for every iteration.
-         * @return true if one of the triggers has gone off.
-         */
-        bool intervalHasElapsed();
+/** Keep track of elapsed time. After a set amount of time, tells you to do something. */
+class ElapsedTracker {
+public:
+    ElapsedTracker(ClockSource* cs, int32_t hitsBetweenMarks, Milliseconds msBetweenMarks);
 
-        void resetLastTime();
-        
-    private:
-        const int32_t _hitsBetweenMarks;
-        const int32_t _msBetweenMarks;
+    /**
+     * Call this for every iteration.
+     * @return true if one of the triggers has gone off.
+     */
+    bool intervalHasElapsed();
 
-        int32_t _pings;
+    void resetLastTime();
 
-        int64_t _last;
-    };
+private:
+    ClockSource* const _clock;
+    const int32_t _hitsBetweenMarks;
+    const Milliseconds _msBetweenMarks;
 
-} // namespace mongo
+    int32_t _pings;
+
+    Date_t _last;
+};
+
+}  // namespace mongo

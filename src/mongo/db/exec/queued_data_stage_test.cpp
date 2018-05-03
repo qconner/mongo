@@ -31,77 +31,112 @@
 //
 
 #include "mongo/db/exec/queued_data_stage.h"
+
+#include <boost/optional.hpp>
+
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 
 using namespace mongo;
 
 namespace {
 
-    using std::auto_ptr;
+using std::unique_ptr;
+using stdx::make_unique;
 
-    //
-    // Basic test that we get out valid stats objects.
-    //
-    TEST(QueuedDataStageTest, getValidStats) {
-        WorkingSet ws;
-        auto_ptr<QueuedDataStage> mock(new QueuedDataStage(&ws));
-        const CommonStats* commonStats = mock->getCommonStats();
-        ASSERT_EQUALS(commonStats->works, static_cast<size_t>(0));
-        const SpecificStats* specificStats = mock->getSpecificStats();
-        ASSERT(specificStats);
-        auto_ptr<PlanStageStats> allStats(mock->getStats());
-        ASSERT_EQUALS(allStats->stageType, mock->stageType());
+class QueuedDataStageTest : public unittest::Test {
+public:
+    QueuedDataStageTest() {
+        _service = stdx::make_unique<ServiceContextNoop>();
+        _service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+        _client = _service->makeClient("test");
+        _opCtxNoop = _client->makeOperationContext();
+        _opCtx = _opCtxNoop.get();
     }
 
-    //
-    // Test that our stats are updated as we perform operations.
-    //
-    TEST(QueuedDataStageTest, validateStats) {
-        WorkingSet ws;
-        WorkingSetID wsID;
-        auto_ptr<QueuedDataStage> mock(new QueuedDataStage(&ws));
-
-        // make sure that we're at all zero
-        const CommonStats* stats = mock->getCommonStats();
-        ASSERT_EQUALS(stats->yields, 0U);
-        ASSERT_EQUALS(stats->unyields, 0U);
-        ASSERT_EQUALS(stats->invalidates, 0U);
-        ASSERT_EQUALS(stats->works, 0U);
-        ASSERT_EQUALS(stats->needTime, 0U);
-        ASSERT_EQUALS(stats->advanced, 0U);
-        ASSERT_FALSE(stats->isEOF);
-
-        // 'perform' some operations, validate stats
-        // needTime
-        mock->pushBack(PlanStage::NEED_TIME);
-        mock->work(&wsID);
-        ASSERT_EQUALS(stats->works, 1U);
-        ASSERT_EQUALS(stats->needTime, 1U);
-
-        // advanced, with pushed data
-        const WorkingSetMember member;
-        mock->pushBack(member);
-        mock->work(&wsID);
-        ASSERT_EQUALS(stats->works, 2U);
-        ASSERT_EQUALS(stats->advanced, 1U);
-
-        // yields
-        mock->saveState();
-        ASSERT_EQUALS(stats->yields, 1U);
-
-        // unyields
-        mock->restoreState(NULL);
-        ASSERT_EQUALS(stats->unyields, 1U);
-
-        // invalidates
-        const RecordId dl(0, 0);
-        mock->invalidate(NULL, dl, INVALIDATION_MUTATION);
-        ASSERT_EQUALS(stats->invalidates, 1U);
-
-        // and now we are d1U, but must trigger EOF with getStats()
-        ASSERT_FALSE(stats->isEOF);
-        auto_ptr<PlanStageStats> allStats(mock->getStats());
-        ASSERT_TRUE(stats->isEOF);
+protected:
+    OperationContext* getOpCtx() {
+        return _opCtx;
     }
+
+private:
+    OperationContext* _opCtx;
+
+    // Members of a class are destroyed in reverse order of declaration.
+    // The UniqueClient must be destroyed before the ServiceContextNoop is destroyed.
+    // The OperationContextNoop must be destroyed before the UniqueClient is destroyed.
+    std::unique_ptr<ServiceContextNoop> _service;
+    ServiceContext::UniqueClient _client;
+    ServiceContext::UniqueOperationContext _opCtxNoop;
+};
+
+//
+// Basic test that we get out valid stats objects.
+//
+TEST_F(QueuedDataStageTest, getValidStats) {
+    WorkingSet ws;
+    auto mock = make_unique<QueuedDataStage>(getOpCtx(), &ws);
+    const CommonStats* commonStats = mock->getCommonStats();
+    ASSERT_EQUALS(commonStats->works, static_cast<size_t>(0));
+    const SpecificStats* specificStats = mock->getSpecificStats();
+    ASSERT(specificStats);
+    unique_ptr<PlanStageStats> allStats(mock->getStats());
+    ASSERT_EQUALS(allStats->stageType, mock->stageType());
+}
+
+//
+// Test that our stats are updated as we perform operations.
+//
+TEST_F(QueuedDataStageTest, validateStats) {
+    WorkingSet ws;
+    WorkingSetID wsID;
+    auto mock = make_unique<QueuedDataStage>(getOpCtx(), &ws);
+
+    // make sure that we're at all zero
+    const CommonStats* stats = mock->getCommonStats();
+    ASSERT_EQUALS(stats->yields, 0U);
+    ASSERT_EQUALS(stats->unyields, 0U);
+    ASSERT_EQUALS(stats->invalidates, 0U);
+    ASSERT_EQUALS(stats->works, 0U);
+    ASSERT_EQUALS(stats->needTime, 0U);
+    ASSERT_EQUALS(stats->advanced, 0U);
+    ASSERT_FALSE(stats->isEOF);
+
+    // 'perform' some operations, validate stats
+    // needTime
+    mock->pushBack(PlanStage::NEED_TIME);
+    mock->work(&wsID);
+    ASSERT_EQUALS(stats->works, 1U);
+    ASSERT_EQUALS(stats->needTime, 1U);
+
+    // advanced, with pushed data
+    WorkingSetID id = ws.allocate();
+    mock->pushBack(id);
+    mock->work(&wsID);
+    ASSERT_EQUALS(stats->works, 2U);
+    ASSERT_EQUALS(stats->advanced, 1U);
+
+    // yields
+    mock->saveState();
+    ASSERT_EQUALS(stats->yields, 1U);
+
+    // unyields
+    mock->restoreState();
+    ASSERT_EQUALS(stats->unyields, 1U);
+
+    // invalidates
+    const RecordId dl(0, 0);
+    mock->invalidate(NULL, dl, INVALIDATION_MUTATION);
+    ASSERT_EQUALS(stats->invalidates, 1U);
+
+    // and now we are d1U, but must trigger EOF with getStats()
+    ASSERT_FALSE(stats->isEOF);
+    unique_ptr<PlanStageStats> allStats(mock->getStats());
+    ASSERT_TRUE(stats->isEOF);
+}
 }

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2017 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,53 +28,33 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
-    namespace str = mongoutils::str;
+struct UpdateResult {
+    UpdateResult(bool existing_,
+                 bool modifiers_,
+                 unsigned long long numDocsModified_,
+                 unsigned long long numMatched_,
+                 const BSONObj& upsertedObject_);
 
-    struct UpdateResult {
+    std::string toString() const;
 
-        UpdateResult( bool existing_,
-                      bool modifiers_,
-                      unsigned long long numDocsModified_,
-                      unsigned long long numMatched_,
-                      const BSONObj& upsertedObject_,
-                      const BSONObj& newObj_ );
+    // if existing objects were modified
+    const bool existing;
 
+    // was this a $ mod
+    const bool modifiers;
 
-        // if existing objects were modified
-        const bool existing;
+    // how many docs updated
+    const long long numDocsModified;
 
-        // was this a $ mod
-        const bool modifiers;
+    // how many docs seen by update
+    const long long numMatched;
 
-        // how many docs updated
-        const long long numDocsModified;
+    // if something was upserted, the new _id of the object
+    BSONObj upserted;
+};
 
-        // how many docs seen by update
-        const long long numMatched;
-
-        // if something was upserted, the new _id of the object
-        BSONObj upserted;
-
-        // For a non-multi update, the new version of the document. If we did an insert, this
-        // is the full document that got inserted (whereas 'upserted' is just the _id field).
-        BSONObj newObj;
-
-        const std::string toString() const {
-            return str::stream()
-                        << " upserted: " << upserted
-                        << " modifiers: " << modifiers
-                        << " existing: " << existing
-                        << " numDocsModified: " << numDocsModified
-                        << " numMatched: " << numMatched
-                        << " newObj: " << newObj;
-        }
-    };
-
-} // namespace mongo
+}  // namespace mongo

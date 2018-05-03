@@ -32,91 +32,114 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/stdx/functional.h"
 
 namespace mongo {
 namespace optionenvironment {
 
-    class Environment;
-    class OptionSection;
-    class Value;
+class Environment;
+class OptionSection;
+class Value;
 
-    /** Handles parsing of the command line as well as YAML and INI config files.  Takes an
-     *  OptionSection instance that describes the allowed options, parses argv (env not yet
-     *  supported), and populates an Environment with the results.
+/** Handles parsing of the command line as well as YAML and INI config files.  Takes an
+ *  OptionSection instance that describes the allowed options, parses argv (env not yet
+ *  supported), and populates an Environment with the results.
+ *
+ *  Usage:
+ *
+ *  namespace moe = mongo::optionenvironment;
+ *
+ *  moe::OptionsParser parser;
+ *  moe::Environment environment;
+ *  moe::OptionSection options;
+ *
+ *  // Register our allowed options with our OptionSection
+ *  options.addOptionChaining("help", "help", moe::Switch, "Display Help");
+ *  options.addOptionChaining("port", "port", moe::Int, "Port");
+ *
+ *  // Run the parser
+ *  Status ret = parser.run(options, argv, env, &environment);
+ *  if (!ret.isOK()) {
+ *      cerr << options.helpString() << std::endl;
+ *      exit(EXIT_FAILURE);
+ *  }
+ *
+ *  bool displayHelp;
+ *  ret = environment.get(moe::Key("help"), &displayHelp);
+ *  if (!ret.isOK()) {
+ *      // Help is a switch, so it should always be set
+ *      cout << "Should not get here" << std::endl;
+ *      exit(EXIT_FAILURE);
+ *  }
+ *  if (displayHelp) {
+ *      cout << options.helpString() << std::endl;
+ *      exit(EXIT_SUCCESS);
+ *  }
+ *
+ *  // Get the value of port from the environment
+ *  int port = 27017;
+ *  ret = environment.get(moe::Key("port"), &port);
+ *  if (ret.isOK()) {
+ *      // We have overridden port here, otherwise it stays as the default.
+ *  }
+ */
+class OptionsParser {
+public:
+    /** Indicates if unknown config options are allowed or not.
      *
-     *  Usage:
-     *
-     *  namespace moe = mongo::optionenvironment;
-     *
-     *  moe::OptionsParser parser;
-     *  moe::Environment environment;
-     *  moe::OptionSection options;
-     *
-     *  // Register our allowed options with our OptionSection
-     *  options.addOptionChaining("help", "help", moe::Switch, "Display Help");
-     *  options.addOptionChaining("port", "port", moe::Int, "Port");
-     *
-     *  // Run the parser
-     *  Status ret = parser.run(options, argv, env, &environment);
-     *  if (!ret.isOK()) {
-     *      cerr << options.helpString() << std::endl;
-     *      exit(EXIT_FAILURE);
-     *  }
-     *
-     *  bool displayHelp;
-     *  ret = environment.get(moe::Key("help"), &displayHelp);
-     *  if (!ret.isOK()) {
-     *      // Help is a switch, so it should always be set
-     *      cout << "Should not get here" << std::endl;
-     *      exit(EXIT_FAILURE);
-     *  }
-     *  if (displayHelp) {
-     *      cout << options.helpString() << std::endl;
-     *      exit(EXIT_SUCCESS);
-     *  }
-     *
-     *  // Get the value of port from the environment
-     *  int port = 27017;
-     *  ret = environment.get(moe::Key("port"), &port);
-     *  if (ret.isOK()) {
-     *      // We have overridden port here, otherwise it stays as the default.
-     *  }
+     *  true - unknown config options will generate an error during parsing.
+     *  false - unknow config options will be ignored during parsing.
      */
-    class OptionsParser {
-    public:
-        OptionsParser() { }
-        virtual ~OptionsParser() { }
+    static stdx::function<bool()> useStrict;
 
-        /** Handles parsing of the command line as well as YAML and INI config files.  The
-         *  OptionSection be a description of the allowed options.  This function populates the
-         *  given Environment with the results of parsing the command line and or config files but
-         *  does not call validate on the Environment.
-         *
-         *  The only special option is the "config" option.  This function will check if the
-         *  "config" option was set on the command line and if so attempt to read the given config
-         *  file.  For binaries that do not support config files, the "config" option should not be
-         *  registered in the OptionSection.
-         */
-        Status run(const OptionSection&,
-                const std::vector<std::string>& argv,
-                const std::map<std::string, std::string>& env,
-                Environment*);
+    OptionsParser() {}
+    virtual ~OptionsParser() {}
 
-    private:
-        /** Handles parsing of the command line and adds the results to the given Environment */
-        Status parseCommandLine(const OptionSection&,
-                                const std::vector<std::string>& argv, Environment*);
+    /** Handles parsing of the command line as well as YAML and INI config files.  The
+     *  OptionSection be a description of the allowed options.  This function populates the
+     *  given Environment with the results of parsing the command line and or config files but
+     *  does not call validate on the Environment.
+     *
+     *  The only special option is the "config" option.  This function will check if the
+     *  "config" option was set on the command line and if so attempt to read the given config
+     *  file.  For binaries that do not support config files, the "config" option should not be
+     *  registered in the OptionSection.
+     */
+    Status run(const OptionSection&,
+               const std::vector<std::string>& argv,
+               const std::map<std::string, std::string>& env,
+               Environment*);
 
-        /** Handles parsing of an INI config std::string and adds the results to the given Environment */
-        Status parseINIConfigFile(const OptionSection&, const std::string& config, Environment*);
+    /** Handles parsing of a YAML or INI formatted string. The
+     *  OptionSection be a description of the allowed options.  This function populates the
+     *  given Environment with the results but does not call validate on the Environment.
+     */
+    Status runConfigFile(const OptionSection&,
+                         const std::string& config,
+                         const std::map<std::string, std::string>& env,
+                         Environment*);
 
-        /** Gets defaults from the OptionSection and adds them to the given Environment */
-        Status addDefaultValues(const OptionSection&, Environment*);
+private:
+    /** Handles parsing of the command line and adds the results to the given Environment */
+    Status parseCommandLine(const OptionSection&,
+                            const std::vector<std::string>& argv,
+                            Environment*);
 
-        /** Reads the given config file into the output string.  This function is virtual for
-         *  testing purposes only. */
-        virtual Status readConfigFile(const std::string& filename, std::string*);
-    };
+    /** Handles parsing of an INI config std::string and adds the results to the given Environment
+     * */
+    Status parseINIConfigFile(const OptionSection&, const std::string& config, Environment*);
 
-} // namespace optionenvironment
-} // namespace mongo
+    /** Handles parsing of either YAML or INI config and adds the results to the given Environment
+     */
+    Status parseConfigFile(const OptionSection&, const std::string& argv, Environment*);
+
+    /** Gets defaults from the OptionSection and adds them to the given Environment */
+    Status addDefaultValues(const OptionSection&, Environment*);
+
+    /** Reads the given config file into the output string.  This function is virtual for
+     *  testing purposes only. */
+    virtual Status readConfigFile(const std::string& filename, std::string*);
+};
+
+}  // namespace optionenvironment
+}  // namespace mongo

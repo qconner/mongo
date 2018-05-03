@@ -28,14 +28,19 @@
 #pragma once
 
 namespace mongo {
-    class BSONObj;
-    class Database;
-    class OperationContext;
+
+class BSONObj;
+class Database;
+class OperationContext;
+
 namespace repl {
 
-    // page in possible index and/or data pages for an op from the oplog
-    void prefetchPagesForReplicatedOp(OperationContext* txn,
-                                      Database* db,
-                                      const BSONObj& op);
-} // namespace repl
-} // namespace mongo
+class OplogEntry;
+
+// page in possible index and/or data pages for an op from the oplog
+void prefetchPagesForReplicatedOp(OperationContext* opCtx,
+                                  Database* db,
+                                  const OplogEntry& oplogEntry);
+
+}  // namespace repl
+}  // namespace mongo

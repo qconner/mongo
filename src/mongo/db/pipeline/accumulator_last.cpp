@@ -29,36 +29,42 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/accumulator.h"
+
+#include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
+using boost::intrusive_ptr;
 
-    void AccumulatorLast::processInternal(const Value& input, bool merging) {
-        /* always remember the last value seen */
-        _last = input;
-        _memUsageBytes = sizeof(*this) + _last.getApproximateSize() - sizeof(Value);
-    }
+REGISTER_ACCUMULATOR(last, AccumulatorLast::create);
 
-    Value AccumulatorLast::getValue(bool toBeMerged) const {
-        return _last;
-    }
+const char* AccumulatorLast::getOpName() const {
+    return "$last";
+}
 
-    AccumulatorLast::AccumulatorLast() {
-        _memUsageBytes = sizeof(*this);
-    }
+void AccumulatorLast::processInternal(const Value& input, bool merging) {
+    /* always remember the last value seen */
+    _last = input;
+    _memUsageBytes = sizeof(*this) + _last.getApproximateSize() - sizeof(Value);
+}
 
-    void AccumulatorLast::reset() {
-        _memUsageBytes = sizeof(*this);
-        _last = Value();
-    }
+Value AccumulatorLast::getValue(bool toBeMerged) {
+    return _last;
+}
 
-    intrusive_ptr<Accumulator> AccumulatorLast::create() {
-        return new AccumulatorLast();
-    }
+AccumulatorLast::AccumulatorLast(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    : Accumulator(expCtx) {
+    _memUsageBytes = sizeof(*this);
+}
 
-    const char *AccumulatorLast::getOpName() const {
-        return "$last";
-    }
+void AccumulatorLast::reset() {
+    _memUsageBytes = sizeof(*this);
+    _last = Value();
+}
+
+intrusive_ptr<Accumulator> AccumulatorLast::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return new AccumulatorLast(expCtx);
+}
 }

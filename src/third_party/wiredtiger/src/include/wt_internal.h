@@ -1,10 +1,13 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
+
+#ifndef __WT_INTERNAL_H
+#define	__WT_INTERNAL_H
 
 #if defined(__cplusplus)
 extern "C" {
@@ -21,16 +24,18 @@ extern "C" {
  *******************************************/
 #ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <sys/time.h>
 #include <sys/uio.h>
 #endif
-#include <ctype.h>
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <inttypes.h>
 #ifdef _WIN32
 #include <io.h>
@@ -41,9 +46,7 @@ extern "C" {
 #else
 #include <pthread.h>
 #endif
-#ifdef HAVE_PTHREAD_NP_H
-#include <pthread_np.h>
-#endif
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -57,11 +60,6 @@ extern "C" {
 #define	WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
-
-/*******************************************
- * WiredTiger externally maintained include files.
- *******************************************/
-#include "queue.h"
 
 /*
  * DO NOT EDIT: automatically built by dist/s_typedef.
@@ -109,10 +107,12 @@ struct __wt_col;
     typedef struct __wt_col WT_COL;
 struct __wt_col_rle;
     typedef struct __wt_col_rle WT_COL_RLE;
+struct __wt_col_var_repeat;
+    typedef struct __wt_col_var_repeat WT_COL_VAR_REPEAT;
 struct __wt_colgroup;
     typedef struct __wt_colgroup WT_COLGROUP;
-struct __wt_compact;
-    typedef struct __wt_compact WT_COMPACT;
+struct __wt_compact_state;
+    typedef struct __wt_compact_state WT_COMPACT_STATE;
 struct __wt_condvar;
     typedef struct __wt_condvar WT_CONDVAR;
 struct __wt_config;
@@ -127,12 +127,8 @@ struct __wt_connection_impl;
     typedef struct __wt_connection_impl WT_CONNECTION_IMPL;
 struct __wt_connection_stats;
     typedef struct __wt_connection_stats WT_CONNECTION_STATS;
-struct __wt_connection_stats_spinlock;
-    typedef struct __wt_connection_stats_spinlock WT_CONNECTION_STATS_SPINLOCK;
 struct __wt_cursor_backup;
     typedef struct __wt_cursor_backup WT_CURSOR_BACKUP;
-struct __wt_cursor_backup_entry;
-    typedef struct __wt_cursor_backup_entry WT_CURSOR_BACKUP_ENTRY;
 struct __wt_cursor_btree;
     typedef struct __wt_cursor_btree WT_CURSOR_BTREE;
 struct __wt_cursor_bulk;
@@ -145,6 +141,14 @@ struct __wt_cursor_dump;
     typedef struct __wt_cursor_dump WT_CURSOR_DUMP;
 struct __wt_cursor_index;
     typedef struct __wt_cursor_index WT_CURSOR_INDEX;
+struct __wt_cursor_join;
+    typedef struct __wt_cursor_join WT_CURSOR_JOIN;
+struct __wt_cursor_join_endpoint;
+    typedef struct __wt_cursor_join_endpoint WT_CURSOR_JOIN_ENDPOINT;
+struct __wt_cursor_join_entry;
+    typedef struct __wt_cursor_join_entry WT_CURSOR_JOIN_ENTRY;
+struct __wt_cursor_join_iter;
+    typedef struct __wt_cursor_join_iter WT_CURSOR_JOIN_ITER;
 struct __wt_cursor_json;
     typedef struct __wt_cursor_json WT_CURSOR_JSON;
 struct __wt_cursor_log;
@@ -167,14 +171,22 @@ struct __wt_dsrc_stats;
     typedef struct __wt_dsrc_stats WT_DSRC_STATS;
 struct __wt_evict_entry;
     typedef struct __wt_evict_entry WT_EVICT_ENTRY;
-struct __wt_evict_worker;
-    typedef struct __wt_evict_worker WT_EVICT_WORKER;
+struct __wt_evict_queue;
+    typedef struct __wt_evict_queue WT_EVICT_QUEUE;
 struct __wt_ext;
     typedef struct __wt_ext WT_EXT;
 struct __wt_extlist;
     typedef struct __wt_extlist WT_EXTLIST;
 struct __wt_fh;
     typedef struct __wt_fh WT_FH;
+struct __wt_file_handle_inmem;
+    typedef struct __wt_file_handle_inmem WT_FILE_HANDLE_INMEM;
+struct __wt_file_handle_posix;
+    typedef struct __wt_file_handle_posix WT_FILE_HANDLE_POSIX;
+struct __wt_file_handle_win;
+    typedef struct __wt_file_handle_win WT_FILE_HANDLE_WIN;
+struct __wt_fstream;
+    typedef struct __wt_fstream WT_FSTREAM;
 struct __wt_hazard;
     typedef struct __wt_hazard WT_HAZARD;
 struct __wt_ikey;
@@ -185,14 +197,28 @@ struct __wt_insert;
     typedef struct __wt_insert WT_INSERT;
 struct __wt_insert_head;
     typedef struct __wt_insert_head WT_INSERT_HEAD;
+struct __wt_join_stats;
+    typedef struct __wt_join_stats WT_JOIN_STATS;
+struct __wt_join_stats_group;
+    typedef struct __wt_join_stats_group WT_JOIN_STATS_GROUP;
+struct __wt_keyed_encryptor;
+    typedef struct __wt_keyed_encryptor WT_KEYED_ENCRYPTOR;
+struct __wt_log;
+    typedef struct __wt_log WT_LOG;
 struct __wt_log_desc;
     typedef struct __wt_log_desc WT_LOG_DESC;
 struct __wt_log_op_desc;
     typedef struct __wt_log_op_desc WT_LOG_OP_DESC;
 struct __wt_log_rec_desc;
     typedef struct __wt_log_rec_desc WT_LOG_REC_DESC;
+struct __wt_log_record;
+    typedef struct __wt_log_record WT_LOG_RECORD;
+struct __wt_logslot;
+    typedef struct __wt_logslot WT_LOGSLOT;
 struct __wt_lsm_chunk;
     typedef struct __wt_lsm_chunk WT_LSM_CHUNK;
+struct __wt_lsm_cursor_chunk;
+    typedef struct __wt_lsm_cursor_chunk WT_LSM_CURSOR_CHUNK;
 struct __wt_lsm_data_source;
     typedef struct __wt_lsm_data_source WT_LSM_DATA_SOURCE;
 struct __wt_lsm_manager;
@@ -207,20 +233,28 @@ struct __wt_lsm_worker_cookie;
     typedef struct __wt_lsm_worker_cookie WT_LSM_WORKER_COOKIE;
 struct __wt_multi;
     typedef struct __wt_multi WT_MULTI;
+struct __wt_myslot;
+    typedef struct __wt_myslot WT_MYSLOT;
 struct __wt_named_collator;
     typedef struct __wt_named_collator WT_NAMED_COLLATOR;
 struct __wt_named_compressor;
     typedef struct __wt_named_compressor WT_NAMED_COMPRESSOR;
 struct __wt_named_data_source;
     typedef struct __wt_named_data_source WT_NAMED_DATA_SOURCE;
+struct __wt_named_encryptor;
+    typedef struct __wt_named_encryptor WT_NAMED_ENCRYPTOR;
 struct __wt_named_extractor;
     typedef struct __wt_named_extractor WT_NAMED_EXTRACTOR;
+struct __wt_named_snapshot;
+    typedef struct __wt_named_snapshot WT_NAMED_SNAPSHOT;
+struct __wt_optrack_header;
+    typedef struct __wt_optrack_header WT_OPTRACK_HEADER;
+struct __wt_optrack_record;
+    typedef struct __wt_optrack_record WT_OPTRACK_RECORD;
 struct __wt_ovfl_reuse;
     typedef struct __wt_ovfl_reuse WT_OVFL_REUSE;
 struct __wt_ovfl_track;
     typedef struct __wt_ovfl_track WT_OVFL_TRACK;
-struct __wt_ovfl_txnc;
-    typedef struct __wt_ovfl_txnc WT_OVFL_TXNC;
 struct __wt_page;
     typedef struct __wt_page WT_PAGE;
 struct __wt_page_deleted;
@@ -229,6 +263,8 @@ struct __wt_page_header;
     typedef struct __wt_page_header WT_PAGE_HEADER;
 struct __wt_page_index;
     typedef struct __wt_page_index WT_PAGE_INDEX;
+struct __wt_page_lookaside;
+    typedef struct __wt_page_lookaside WT_PAGE_LOOKASIDE;
 struct __wt_page_modify;
     typedef struct __wt_page_modify WT_PAGE_MODIFY;
 struct __wt_process;
@@ -241,18 +277,28 @@ struct __wt_rwlock;
     typedef struct __wt_rwlock WT_RWLOCK;
 struct __wt_salvage_cookie;
     typedef struct __wt_salvage_cookie WT_SALVAGE_COOKIE;
+struct __wt_save_upd;
+    typedef struct __wt_save_upd WT_SAVE_UPD;
 struct __wt_scratch_track;
     typedef struct __wt_scratch_track WT_SCRATCH_TRACK;
 struct __wt_session_impl;
     typedef struct __wt_session_impl WT_SESSION_IMPL;
+struct __wt_session_stash;
+    typedef struct __wt_session_stash WT_SESSION_STASH;
 struct __wt_size;
     typedef struct __wt_size WT_SIZE;
-struct __wt_split_stash;
-    typedef struct __wt_split_stash WT_SPLIT_STASH;
-struct __wt_stats;
-    typedef struct __wt_stats WT_STATS;
+struct __wt_spinlock;
+    typedef struct __wt_spinlock WT_SPINLOCK;
+struct __wt_stash;
+    typedef struct __wt_stash WT_STASH;
 struct __wt_table;
     typedef struct __wt_table WT_TABLE;
+struct __wt_thread;
+    typedef struct __wt_thread WT_THREAD;
+struct __wt_thread_group;
+    typedef struct __wt_thread_group WT_THREAD_GROUP;
+struct __wt_timestamp_t;
+    typedef struct __wt_timestamp_t WT_TIMESTAMP_T;
 struct __wt_txn;
     typedef struct __wt_txn WT_TXN;
 struct __wt_txn_global;
@@ -261,10 +307,12 @@ struct __wt_txn_op;
     typedef struct __wt_txn_op WT_TXN_OP;
 struct __wt_txn_state;
     typedef struct __wt_txn_state WT_TXN_STATE;
-struct __wt_upd_skipped;
-    typedef struct __wt_upd_skipped WT_UPD_SKIPPED;
 struct __wt_update;
     typedef struct __wt_update WT_UPDATE;
+union __wt_lsn;
+    typedef union __wt_lsn WT_LSN;
+union __wt_rand_state;
+    typedef union __wt_rand_state WT_RAND_STATE;
 /*
  * Forward type declarations for internal types: END
  * DO NOT EDIT: automatically built by dist/s_typedef.
@@ -281,6 +329,9 @@ struct __wt_update;
 #include "msvc.h"
 #endif
 #include "hardware.h"
+#include "swap.h"
+
+#include "queue.h"
 
 #ifdef _WIN32
 #include "os_windows.h"
@@ -301,42 +352,54 @@ struct __wt_update;
 #include "btmem.h"
 #include "btree.h"
 #include "cache.h"
-#include "config.h"
 #include "compact.h"
+#include "config.h"
 #include "cursor.h"
 #include "dlh.h"
 #include "error.h"
-#include "flags.h"
 #include "log.h"
 #include "lsm.h"
 #include "meta.h"
+#include "optrack.h"
 #include "os.h"
 #include "schema.h"
+#include "thread_group.h"
 #include "txn.h"
 
 #include "session.h"			/* required by connection.h */
 #include "connection.h"
 
 #include "extern.h"
+#ifdef _WIN32
+#include "extern_win.h"
+#else
+#include "extern_posix.h"
+#endif
 #include "verify_build.h"
 
-#include "buf.i"
-#include "misc.i"
+#include "ctype.i"			/* required by packing.i */
 #include "intpack.i"			/* required by cell.i, packing.i */
-#include "packing.i"
+#include "misc.i"			/* required by mutex.i */
+
+#include "buf.i"                        /* required by cell.i */
 #include "cache.i"			/* required by txn.i */
 #include "cell.i"			/* required by btree.i */
-
 #include "mutex.i"			/* required by btree.i */
 #include "txn.i"			/* required by btree.i */
 
-#include "btree.i"			/* required by cursor.i */
-#include "cursor.i"
-
 #include "bitstring.i"
+#include "btree.i"			/* required by cursor.i */
+#include "btree_cmp.i"
 #include "column.i"
+#include "cursor.i"
+#include "log.i"
+#include "os_fhandle.i"
+#include "os_fs.i"
+#include "os_fstream.i"
+#include "packing.i"
 #include "serial.i"
 
 #if defined(__cplusplus)
 }
 #endif
+#endif					/* !__WT_INTERNAL_H */

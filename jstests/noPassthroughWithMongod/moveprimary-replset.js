@@ -1,71 +1,68 @@
 // This test ensures that data we add on a replica set is still accessible via mongos when we add it
 // as a shard.  Then it makes sure that we can move the primary for this unsharded database to
 // another shard that we add later, and after the move the data is still accessible.
+// @tags: [requires_replication, requires_sharding]
 
 (function() {
     "use strict";
+    function movePrimaryReplset() {
+        var replSet1 = shardingTest.rs0;
+        var replSet2 = shardingTest.rs1;
 
-var numDocs = 10000;
-var baseName = "moveprimary-replset";
-var testDBName = baseName;
-var testCollName = 'coll';
+        var repset1DB = replSet1.getPrimary().getDB(testDBName);
+        for (var i = 1; i <= numDocs; i++) {
+            repset1DB[testCollName].insert({x: i});
+        }
+        replSet1.awaitReplication();
 
-jsTest.log("Spinning up a sharded cluster, but not adding the shards");
-var shardingTestConfig = {
-    name : baseName,
-    mongos : 1,
-    shards : 2,
-    config : 3,
-    rs : { nodes : 3 },
-    other : { manualAddShard : true }
-}
-var shardingTest = new ShardingTest(shardingTestConfig);
+        var mongosConn = shardingTest.s;
+        var testDB = mongosConn.getDB(testDBName);
 
-jsTest.log("Geting connections to the individual shards");
-var replSet1 = shardingTest.rs0;
-var replSet2 = shardingTest.rs1;
+        mongosConn.adminCommand({addshard: replSet1.getURL()});
 
-jsTest.log("Adding data to our first replica set");
-var repset1DB = replSet1.getMaster().getDB(testDBName);
-for (var i = 1; i <= numDocs; i++) {
-    repset1DB[testCollName].insert({ x : i });
-}
-replSet1.awaitReplication();
+        testDB[testCollName].update({}, {$set: {y: 'hello'}}, false /*upsert*/, true /*multi*/);
+        assert.eq(testDB[testCollName].count({y: 'hello'}),
+                  numDocs,
+                  'updating and counting docs via mongos failed');
 
-jsTest.log("Geting connection to mongos for the cluster");
-var mongosConn = shardingTest.s;
-var testDB = mongosConn.getDB(testDBName);
+        mongosConn.adminCommand({addshard: replSet2.getURL()});
 
-jsTest.log("Adding replSet1 as only shard");
-mongosConn.adminCommand({ addshard : replSet1.getURL() });
+        assert.commandWorked(
+            mongosConn.getDB('admin').runCommand({moveprimary: testDBName, to: replSet2.getURL()}));
+        mongosConn.getDB('admin').printShardingStatus();
+        assert.eq(testDB.getSiblingDB("config").databases.findOne({"_id": testDBName}).primary,
+                  replSet2.name,
+                  "Failed to change primary shard for unsharded database.");
 
-jsTest.log("Updating the data via mongos and making sure all documents are updated and present");
-testDB[testCollName].update({}, { $set : { y : 'hello' } }, false/*upsert*/, true/*multi*/);
-assert.eq(testDB[testCollName].count({ y : 'hello' }), numDocs,
-          'updating and counting docs via mongos failed');
+        testDB[testCollName].update({}, {$set: {z: 'world'}}, false /*upsert*/, true /*multi*/);
+        assert.eq(testDB[testCollName].count({z: 'world'}),
+                  numDocs,
+                  'updating and counting docs via mongos failed');
+    }
 
-jsTest.log("Adding replSet2 as second shard");
-mongosConn.adminCommand({ addshard : replSet2.getURL() });
+    var numDocs = 10000;
+    var baseName = "moveprimary-replset";
+    var testDBName = baseName;
+    var testCollName = 'coll';
 
-mongosConn.getDB('admin').printShardingStatus();
-printjson(replSet2.getMaster().getDBs());
+    var shardingTestConfig = {
+        name: baseName,
+        mongos: 1,
+        shards: 2,
+        config: 3,
+        rs: {nodes: 3},
+        other: {manualAddShard: true}
+    };
 
-jsTest.log("Moving test db from replSet1 to replSet2");
-assert.commandWorked(mongosConn.getDB('admin').runCommand({ moveprimary: testDBName,
-                                                            to: replSet2.getURL() }));
-mongosConn.getDB('admin').printShardingStatus();
-printjson(replSet2.getMaster().getDBs());
-assert.eq(testDB.getSiblingDB("config").databases.findOne({ "_id" : testDBName }).primary,
-          replSet2.name, "Failed to change primary shard for unsharded database.");
+    var shardingTest = new ShardingTest(shardingTestConfig);
 
-jsTest.log("Updating the data via mongos and making sure all documents are updated and present");
-testDB[testCollName].update({}, { $set : { z : 'world' } }, false/*upsert*/, true/*multi*/);
-assert.eq(testDB[testCollName].count({ z : 'world' }), numDocs,
-          'updating and counting docs via mongos failed');
+    // Set FCV to 3.6
+    assert.commandWorked(shardingTest.s.adminCommand({setFeatureCompatibilityVersion: "3.6"}));
+    movePrimaryReplset();
 
-jsTest.log("Shutting down cluster");
-shardingTest.stop();
+    // Set FCV to 4.0
+    assert.commandWorked(shardingTest.s.adminCommand({setFeatureCompatibilityVersion: "4.0"}));
+    movePrimaryReplset();
 
-print('moveprimary-replset.js SUCCESS');
-
+    shardingTest.stop();
 })();

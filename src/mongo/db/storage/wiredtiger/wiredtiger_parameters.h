@@ -32,21 +32,29 @@
 
 namespace mongo {
 
+/**
+ * WT_CONNECTION::reconfigure get/setParameter support
+ */
+class WiredTigerEngineRuntimeConfigParameter : public ServerParameter {
+    MONGO_DISALLOW_COPYING(WiredTigerEngineRuntimeConfigParameter);
+
+public:
+    explicit WiredTigerEngineRuntimeConfigParameter(WiredTigerKVEngine* engine);
+
     /**
-     * WT_CONNECTION::reconfigure get/setParameter support
+     * Appends the last value that was successfully assigned via a call to `set` or
+     * `setFromString`. To conclude what options WiredTiger is running with, consult what MongoDB
+     * logged at startup when making the `wiredtiger_open` call.
      */
-    class WiredTigerEngineRuntimeConfigParameter : public ServerParameter {
-        MONGO_DISALLOW_COPYING(WiredTigerEngineRuntimeConfigParameter);
-    public:
-        explicit WiredTigerEngineRuntimeConfigParameter(WiredTigerKVEngine* engine);
+    virtual void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name);
+    virtual Status set(const BSONElement& newValueElement);
 
-        virtual void append(OperationContext* txn, BSONObjBuilder& b,
-                            const std::string& name);
-        virtual Status set(const BSONElement& newValueElement);
+    virtual Status setFromString(const std::string& str);
 
-        virtual Status setFromString(const std::string& str);
-
-    private:
-        WiredTigerKVEngine* _engine;
-    };
+private:
+    WiredTigerKVEngine* _engine;
+    // This parameter can only be modified at runtime via `setParameter`. This string always
+    // starts out as the empty string.
+    std::string _currentValue;
+};
 }

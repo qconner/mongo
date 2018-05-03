@@ -32,128 +32,144 @@
 
 #include "mongo/db/storage/mmap_v1/aligned_builder.h"
 
+#include "mongo/base/static_assert.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    using std::endl;
+using std::endl;
 
-    AlignedBuilder::AlignedBuilder(unsigned initSize) {
-        _len = 0;
-        _malloc(initSize);
-        uassert(13584, "out of memory AlignedBuilder", _p._allocationAddress);
+AlignedBuilder::AlignedBuilder(unsigned initSize) {
+    _len = 0;
+    _malloc(initSize);
+    uassert(13584, "out of memory AlignedBuilder", _p._allocationAddress);
+}
+
+MONGO_STATIC_ASSERT(sizeof(void*) == sizeof(size_t));
+
+/** reset for a re-use. shrinks if > 128MB */
+void AlignedBuilder::reset() {
+    _len = 0;
+    RARELY {
+        const unsigned sizeCap = 128 * 1024 * 1024;
+        if (_p._size > sizeCap)
+            _realloc(sizeCap, _len);
     }
+}
 
-    BOOST_STATIC_ASSERT(sizeof(void*) == sizeof(size_t));
-
-    /** reset for a re-use. shrinks if > 128MB */
-    void AlignedBuilder::reset() {
-        _len = 0;
-        RARELY {
-            const unsigned sizeCap = 128*1024*1024;
-            if (_p._size > sizeCap)
-                _realloc(sizeCap, _len);
-        }
+/** reset with a hint as to the upcoming needed size specified */
+void AlignedBuilder::reset(unsigned sz) {
+    _len = 0;
+    unsigned Q = 32 * 1024 * 1024 - 1;
+    unsigned want = (sz + Q) & (~Q);
+    if (_p._size == want) {
+        return;
     }
-
-    /** reset with a hint as to the upcoming needed size specified */
-    void AlignedBuilder::reset(unsigned sz) { 
-        _len = 0;
-        unsigned Q = 32 * 1024 * 1024 - 1;
-        unsigned want = (sz+Q) & (~Q);
-        if( _p._size == want ) {
+    if (_p._size > want) {
+        if (_p._size <= 64 * 1024 * 1024)
             return;
-        }        
-        if( _p._size > want ) {
-            if( _p._size <= 64 * 1024 * 1024 )
-                return;
-            bool downsize = false;
-            RARELY { downsize = true; }
-            if( !downsize )
-                return;
+        bool downsize = false;
+        RARELY {
+            downsize = true;
         }
-        _realloc(want, _len);
+        if (!downsize)
+            return;
+    }
+    _realloc(want, _len);
+}
+
+void AlignedBuilder::mallocSelfAligned(unsigned sz) {
+    verify(sz == _p._size);
+    void* p = malloc(sz + Alignment - 1);
+    _p._allocationAddress = p;
+    size_t s = (size_t)p;
+    size_t sold = s;
+    s += Alignment - 1;
+    s = (s / Alignment) * Alignment;
+    verify(s >= sold);                                // beginning
+    verify((s + sz) <= (sold + sz + Alignment - 1));  // end
+    _p._data = (char*)s;
+}
+
+/* "slow"/infrequent portion of 'grow()'  */
+void NOINLINE_DECL AlignedBuilder::growReallocate(unsigned oldLen) {
+    const unsigned MB = 1024 * 1024;
+    const unsigned kMaxSize = (sizeof(int*) == 4) ? 512 * MB : 2000 * MB;
+    const unsigned kWarnSize = (sizeof(int*) == 4) ? 256 * MB : 512 * MB;
+
+    const unsigned oldSize = _p._size;
+
+    // Warn for unexpectedly large buffer
+    if (_len > kWarnSize) {
+        warning() << "large amount of uncommitted data (" << _len << " bytes)";
     }
 
-    void AlignedBuilder::mallocSelfAligned(unsigned sz) {
-        verify( sz == _p._size );
-        void *p = malloc(sz + Alignment - 1);
-        _p._allocationAddress = p;
-        size_t s = (size_t) p;
-        size_t sold = s;
-        s += Alignment - 1;
-        s = (s/Alignment)*Alignment;
-        verify( s >= sold ); // beginning
-        verify( (s + sz) <= (sold + sz + Alignment - 1) ); //end
-        _p._data = (char *) s;
+    // Check validity of requested size
+    invariant(_len > oldSize);
+    if (_len > kMaxSize) {
+        error() << "error writing journal: too much uncommitted data (" << _len << " bytes)";
+        error() << "shutting down immediately to avoid corruption";
+        fassert(28614, _len <= kMaxSize);
     }
 
-    /* "slow"/infrequent portion of 'grow()'  */
-    void NOINLINE_DECL AlignedBuilder::growReallocate(unsigned oldLen) {
-        dassert( _len > _p._size );
-        unsigned a = _p._size;
-        verify( a );
-        while( 1 ) {
-            if( a < 128 * 1024 * 1024 )
-                a *= 2;
-            else if( sizeof(int*) == 4 )
-                a += 32 * 1024 * 1024;
-            else 
-                a += 64 * 1024 * 1024;
-            DEV if( a > 256*1024*1024 ) { 
-                log() << "dur AlignedBuilder too big, aborting in _DEBUG build";
-                abort();
-            }
-            wassert( a <= 256*1024*1024 );
-            verify( a <= 512*1024*1024 );
-            if( _len < a )
-                break;
-        }
-        _realloc(a, oldLen);
+    // Use smaller maximum for debug builds, as we should never be close the the maximum
+    dassert(_len <= 1000 * MB);
+
+    // Compute newSize by doubling the existing maximum size until the maximum is reached
+    invariant(oldSize > 0);
+    uint64_t newSize = oldSize;  // use 64 bits to defend against accidental overflow
+    while (newSize < _len) {
+        newSize *= 2;
     }
 
-    void AlignedBuilder::_malloc(unsigned sz) {
-        _p._size = sz;
+    if (newSize > kMaxSize) {
+        newSize = kMaxSize;
+    }
+
+    _realloc(newSize, oldLen);
+}
+
+void AlignedBuilder::_malloc(unsigned sz) {
+    _p._size = sz;
 #if defined(_WIN32)
-        void *p = VirtualAlloc(0, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        _p._allocationAddress = p;
-        _p._data = (char *) p;
+    void* p = VirtualAlloc(0, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    _p._allocationAddress = p;
+    _p._data = (char*)p;
 #elif defined(__linux__)
-        // in theory #ifdef _POSIX_VERSION should work, but it doesn't on OS X 10.4, and needs to be tested on solaris.
-        // so for now, linux only for this.
-        void *p = 0;
-        int res = posix_memalign(&p, Alignment, sz);
-        massert(13524, "out of memory AlignedBuilder", res == 0);
-        _p._allocationAddress = p;
-        _p._data = (char *) p;
+    // in theory #ifdef _POSIX_VERSION should work, but it doesn't on OS X 10.4, and needs to be
+    // tested on solaris. so for now, linux only for this.
+    void* p = 0;
+    int res = posix_memalign(&p, Alignment, sz);
+    massert(13524, "out of memory AlignedBuilder", res == 0);
+    _p._allocationAddress = p;
+    _p._data = (char*)p;
 #else
-        mallocSelfAligned(sz);
-        verify( ((size_t) _p._data) % Alignment == 0 );
+    mallocSelfAligned(sz);
+    verify(((size_t)_p._data) % Alignment == 0);
 #endif
-    }
+}
 
-    void AlignedBuilder::_realloc(unsigned newSize, unsigned oldLen) {
-        // posix_memalign alignment is not maintained on reallocs, so we can't use realloc().
-        AllocationInfo old = _p;
-        _malloc(newSize);
-        verify( oldLen <= _len );
-        memcpy(_p._data, old._data, oldLen);
-        _free(old._allocationAddress);
-    }
+void AlignedBuilder::_realloc(unsigned newSize, unsigned oldLen) {
+    // posix_memalign alignment is not maintained on reallocs, so we can't use realloc().
+    AllocationInfo old = _p;
+    _malloc(newSize);
+    verify(oldLen <= _len);
+    memcpy(_p._data, old._data, oldLen);
+    _free(old._allocationAddress);
+}
 
-    void AlignedBuilder::_free(void *p) {
+void AlignedBuilder::_free(void* p) {
 #if defined(_WIN32)
-        VirtualFree(p, 0, MEM_RELEASE);
+    VirtualFree(p, 0, MEM_RELEASE);
 #else
-        free(p);
+    free(p);
 #endif
-    }
+}
 
-    void AlignedBuilder::kill() {
-        _free(_p._allocationAddress);
-        _p._allocationAddress = 0;
-        _p._data = 0;
-    }
-
+void AlignedBuilder::kill() {
+    _free(_p._allocationAddress);
+    _p._allocationAddress = 0;
+    _p._data = 0;
+}
 }

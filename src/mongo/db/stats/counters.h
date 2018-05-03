@@ -29,73 +29,98 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/basic.h"
+#include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/processinfo.h"
-#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/with_alignment.h"
 
 namespace mongo {
 
-    /**
-     * for storing operation counters
-     * note: not thread safe.  ok with that for speed
-     */
-    class OpCounters {
-    public:
+/**
+ * for storing operation counters
+ * note: not thread safe.  ok with that for speed
+ */
+class OpCounters {
+public:
+    OpCounters();
+    void gotInserts(int n);
+    void gotInsert();
+    void gotQuery();
+    void gotUpdate();
+    void gotDelete();
+    void gotGetMore();
+    void gotCommand();
 
-        OpCounters();
-        void incInsertInWriteLock(int n);
-        void gotInsert();
-        void gotQuery();
-        void gotUpdate();
-        void gotDelete();
-        void gotGetMore();
-        void gotCommand();
+    void gotOp(int op, bool isCommand);
 
-        void gotOp( int op , bool isCommand );
+    BSONObj getObj() const;
 
-        BSONObj getObj() const;
-        
-        // thse are used by snmp, and other things, do not remove
-        const AtomicUInt32 * getInsert() const { return &_insert; }
-        const AtomicUInt32 * getQuery() const { return &_query; }
-        const AtomicUInt32 * getUpdate() const { return &_update; }
-        const AtomicUInt32 * getDelete() const { return &_delete; }
-        const AtomicUInt32 * getGetMore() const { return &_getmore; }
-        const AtomicUInt32 * getCommand() const { return &_command; }
+    // thse are used by snmp, and other things, do not remove
+    const AtomicUInt32* getInsert() const {
+        return &_insert;
+    }
+    const AtomicUInt32* getQuery() const {
+        return &_query;
+    }
+    const AtomicUInt32* getUpdate() const {
+        return &_update;
+    }
+    const AtomicUInt32* getDelete() const {
+        return &_delete;
+    }
+    const AtomicUInt32* getGetMore() const {
+        return &_getmore;
+    }
+    const AtomicUInt32* getCommand() const {
+        return &_command;
+    }
 
-    private:
-        void _checkWrap();
-        
-        // todo: there will be a lot of cache line contention on these.  need to do something 
-        //       else eventually.
-        AtomicUInt32 _insert;
-        AtomicUInt32 _query;
-        AtomicUInt32 _update;
-        AtomicUInt32 _delete;
-        AtomicUInt32 _getmore;
-        AtomicUInt32 _command;
+private:
+    void _checkWrap();
+
+    CacheAligned<AtomicUInt32> _insert;
+    CacheAligned<AtomicUInt32> _query;
+    CacheAligned<AtomicUInt32> _update;
+    CacheAligned<AtomicUInt32> _delete;
+    CacheAligned<AtomicUInt32> _getmore;
+    CacheAligned<AtomicUInt32> _command;
+};
+
+extern OpCounters globalOpCounters;
+extern OpCounters replOpCounters;
+
+class NetworkCounter {
+public:
+    // Increment the counters for the number of bytes read directly off the wire
+    void hitPhysicalIn(long long bytes);
+    void hitPhysicalOut(long long bytes);
+
+    // Increment the counters for the number of bytes passed out of the TransportLayer to the
+    // server
+    void hitLogicalIn(long long bytes);
+    void hitLogicalOut(long long bytes);
+
+    void append(BSONObjBuilder& b);
+
+private:
+    CacheAligned<AtomicInt64> _physicalBytesIn{0};
+    CacheAligned<AtomicInt64> _physicalBytesOut{0};
+
+    // These two counters are always incremented at the same time, so
+    // we place them on the same cache line.
+    struct Together {
+        AtomicInt64 logicalBytesIn{0};
+        AtomicInt64 requests{0};
     };
+    CacheAligned<Together> _together{};
+    static_assert(sizeof(decltype(_together)) <= stdx::hardware_constructive_interference_size,
+                  "cache line spill");
 
-    extern OpCounters globalOpCounters;
-    extern OpCounters replOpCounters;
+    CacheAligned<AtomicInt64> _logicalBytesOut{0};
+};
 
-    class NetworkCounter {
-    public:
-        NetworkCounter() : _bytesIn(0), _bytesOut(0), _requests(0), _overflows(0) {}
-        void hit( long long bytesIn , long long bytesOut );
-        void append( BSONObjBuilder& b );
-    private:
-        long long _bytesIn;
-        long long _bytesOut;
-        long long _requests;
-
-        long long _overflows;
-
-        SpinLock _lock;
-    };
-
-    extern NetworkCounter networkCounter;
+extern NetworkCounter networkCounter;
 }

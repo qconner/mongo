@@ -29,9 +29,8 @@
 
 #include "mongo/logger/log_component.h"
 
-#include <boost/static_assert.hpp>
-
 #include "mongo/base/init.h"
+#include "mongo/base/static_assert.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -41,122 +40,184 @@ namespace {
 
 // Component dotted names.
 // Lazily evaluated in LogComponent::getDottedName().
-std::string _dottedNames[LogComponent::kNumLogComponents+1];
+std::string _dottedNames[LogComponent::kNumLogComponents + 1];
 
-    /**
-     * Returns StringData created from a string literal
-     */
-    template<size_t N>
-    StringData createStringData(const char (&val)[N]) {
-        return StringData(val, StringData::LiteralTag());
+//
+// Fully initialize _dottedNames before we enter multithreaded execution.
+//
+
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetupDottedNames, MONGO_NO_PREREQUISITES)
+(InitializerContext* context) {
+    for (int i = 0; i <= int(LogComponent::kNumLogComponents); ++i) {
+        logger::LogComponent component = static_cast<logger::LogComponent::Value>(i);
+        component.getDottedName();
     }
 
-    //
-    // Fully initialize _dottedNames before we enter multithreaded execution.
-    //
-
-    MONGO_INITIALIZER_WITH_PREREQUISITES(SetupDottedNames, MONGO_NO_PREREQUISITES)(
-            InitializerContext* context) {
-
-        for (int i = 0; i <= int(LogComponent::kNumLogComponents); ++i) {
-            logger::LogComponent component = static_cast<logger::LogComponent::Value>(i);
-            component.getDottedName();
-        }
-
-        return Status::OK();
-    }
+    return Status::OK();
+}
 
 }  // namespace
 
 // Children always come after parent component.
 // This makes it unnecessary to compute children of each component
 // when setting/clearing log severities in LogComponentSettings.
-#define DECLARE_LOG_COMPONENT_PARENT(CHILD, PARENT) \
-    case (CHILD): \
-        do { \
-            BOOST_STATIC_ASSERT(int(CHILD) > int(PARENT)); \
-            return (PARENT); \
+#define DECLARE_LOG_COMPONENT_PARENT(CHILD, PARENT)        \
+    case (CHILD):                                          \
+        do {                                               \
+            MONGO_STATIC_ASSERT(int(CHILD) > int(PARENT)); \
+            return (PARENT);                               \
         } while (0)
 
-    LogComponent LogComponent::parent() const {
+LogComponent LogComponent::parent() const {
+    switch (_value) {
+        case kDefault:
+            return kNumLogComponents;
+            DECLARE_LOG_COMPONENT_PARENT(kJournal, kStorage);
+            DECLARE_LOG_COMPONENT_PARENT(kASIO, kNetwork);
+            DECLARE_LOG_COMPONENT_PARENT(kBridge, kNetwork);
+            DECLARE_LOG_COMPONENT_PARENT(kReplicationHeartbeats, kReplication);
+            DECLARE_LOG_COMPONENT_PARENT(kReplicationRollback, kReplication);
+            DECLARE_LOG_COMPONENT_PARENT(kStorageRecovery, kStorage);
+        case kNumLogComponents:
+            return kNumLogComponents;
+        default:
+            return kDefault;
+    }
+    MONGO_UNREACHABLE;
+}
+
+StringData LogComponent::toStringData() const {
+    switch (_value) {
+        case kDefault:
+            return "default"_sd;
+        case kAccessControl:
+            return "accessControl"_sd;
+        case kCommand:
+            return "command"_sd;
+        case kControl:
+            return "control"_sd;
+        case kExecutor:
+            return "executor"_sd;
+        case kGeo:
+            return "geo"_sd;
+        case kIndex:
+            return "index"_sd;
+        case kNetwork:
+            return "network"_sd;
+        case kQuery:
+            return "query"_sd;
+        case kReplication:
+            return "replication"_sd;
+        case kReplicationHeartbeats:
+            return "heartbeats"_sd;
+        case kReplicationRollback:
+            return "rollback"_sd;
+        case kSharding:
+            return "sharding"_sd;
+        case kStorage:
+            return "storage"_sd;
+        case kStorageRecovery:
+            return "recovery"_sd;
+        case kJournal:
+            return "journal"_sd;
+        case kWrite:
+            return "write"_sd;
+        case kFTDC:
+            return "ftdc"_sd;
+        case kASIO:
+            return "asio"_sd;
+        case kBridge:
+            return "bridge"_sd;
+        case kTracking:
+            return "tracking"_sd;
+        case kNumLogComponents:
+            return "total"_sd;
+            // No default. Compiler should complain if there's a log component that's not handled.
+    }
+    MONGO_UNREACHABLE;
+}
+
+std::string LogComponent::getShortName() const {
+    return toStringData().toString();
+}
+
+std::string LogComponent::getDottedName() const {
+    // Lazily evaluate dotted names in anonymous namespace.
+    if (_dottedNames[_value].empty()) {
         switch (_value) {
-        case kDefault: return kNumLogComponents;
-        DECLARE_LOG_COMPONENT_PARENT(kJournal, kStorage);
-        case kNumLogComponents: return kNumLogComponents;
-        default: return kDefault;
-        }
-        invariant(false);
-    }
-
-    StringData LogComponent::toStringData() const {
-        switch (_value) {
-        case kDefault: return createStringData("default");
-        case kAccessControl: return createStringData("accessControl");
-        case kCommand: return createStringData("command");
-        case kControl: return createStringData("control");
-        case kGeo: return createStringData("geo");
-        case kIndex: return createStringData("index");
-        case kNetwork: return createStringData("network");
-        case kQuery: return createStringData("query");
-        case kReplication: return createStringData("replication");
-        case kSharding: return createStringData("sharding");
-        case kStorage: return createStringData("storage");
-        case kJournal: return createStringData("journal");
-        case kWrite: return createStringData("write");
-        case kNumLogComponents: return createStringData("total");
-        // No default. Compiler should complain if there's a log component that's not handled.
-        }
-        invariant(false);
-    }
-
-    std::string LogComponent::getShortName() const {
-        return toStringData().toString();
-    }
-
-    std::string LogComponent::getDottedName() const {
-        // Lazily evaluate dotted names in anonymous namespace.
-        if (_dottedNames[_value].empty()) {
-            switch (_value) {
-            case kDefault: _dottedNames[_value] = getShortName(); break;
-            case kNumLogComponents: _dottedNames[_value] = getShortName(); break;
+            case kDefault:
+                _dottedNames[_value] = getShortName();
+                break;
+            case kNumLogComponents:
+                _dottedNames[_value] = getShortName();
+                break;
             default:
                 // Omit short name of 'default' component from dotted name.
                 if (parent() == kDefault) {
                     _dottedNames[_value] = getShortName();
-                }
-                else {
+                } else {
                     _dottedNames[_value] = parent().getDottedName() + "." + getShortName();
                 }
                 break;
-            }
         }
-        return _dottedNames[_value];
     }
+    return _dottedNames[_value];
+}
 
-    StringData LogComponent::getNameForLog() const {
-        switch (_value) {
-        case kDefault:              return createStringData("-       ");
-        case kAccessControl:        return createStringData("ACCESS  ");
-        case kCommand:              return createStringData("COMMAND ");
-        case kControl:              return createStringData("CONTROL ");
-        case kGeo:                  return createStringData("GEO     ");
-        case kIndex:                return createStringData("INDEX   ");
-        case kNetwork:              return createStringData("NETWORK ");
-        case kQuery:                return createStringData("QUERY   ");
-        case kReplication:          return createStringData("REPL    ");
-        case kSharding:             return createStringData("SHARDING");
-        case kStorage:              return createStringData("STORAGE ");
-        case kJournal:              return createStringData("JOURNAL ");
-        case kWrite:                return createStringData("WRITE   ");
-        case kNumLogComponents:     return createStringData("TOTAL   ");
-        // No default. Compiler should complain if there's a log component that's not handled.
-        }
-        invariant(false);
+StringData LogComponent::getNameForLog() const {
+    switch (_value) {
+        case kDefault:
+            return "-       "_sd;
+        case kAccessControl:
+            return "ACCESS  "_sd;
+        case kCommand:
+            return "COMMAND "_sd;
+        case kControl:
+            return "CONTROL "_sd;
+        case kExecutor:
+            return "EXECUTOR"_sd;
+        case kGeo:
+            return "GEO     "_sd;
+        case kIndex:
+            return "INDEX   "_sd;
+        case kNetwork:
+            return "NETWORK "_sd;
+        case kQuery:
+            return "QUERY   "_sd;
+        case kReplication:
+            return "REPL    "_sd;
+        case kReplicationHeartbeats:
+            return "REPL_HB "_sd;
+        case kReplicationRollback:
+            return "ROLLBACK"_sd;
+        case kSharding:
+            return "SHARDING"_sd;
+        case kStorage:
+            return "STORAGE "_sd;
+        case kStorageRecovery:
+            return "RECOVERY"_sd;
+        case kJournal:
+            return "JOURNAL "_sd;
+        case kWrite:
+            return "WRITE   "_sd;
+        case kFTDC:
+            return "FTDC    "_sd;
+        case kASIO:
+            return "ASIO    "_sd;
+        case kBridge:
+            return "BRIDGE  "_sd;
+        case kTracking:
+            return "TRACKING"_sd;
+        case kNumLogComponents:
+            return "TOTAL   "_sd;
+            // No default. Compiler should complain if there's a log component that's not handled.
     }
+    MONGO_UNREACHABLE;
+}
 
-    std::ostream& operator<<(std::ostream& os, LogComponent component) {
-        return os << component.getNameForLog();
-    }
+std::ostream& operator<<(std::ostream& os, LogComponent component) {
+    return os << component.getNameForLog();
+}
 
 }  // logger
 }  // mongo

@@ -30,68 +30,95 @@
 
 #pragma once
 
-#include <string>
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/platform/atomic_word.h"
+#include <string>
 
 namespace mongo {
 
-    class ServerStatusSection {
-    public:
-        ServerStatusSection( const std::string& sectionName );
-        virtual ~ServerStatusSection(){}
+class ServerStatusSection {
+public:
+    ServerStatusSection(const std::string& sectionName);
+    virtual ~ServerStatusSection() {}
 
-        const std::string& getSectionName() const { return _sectionName; }
+    const std::string& getSectionName() const {
+        return _sectionName;
+    }
 
-        /**
-         * if this returns true, if the user doesn't mention this section
-         * it will be included in the result
-         * if they do : 1, it will be included
-         * if they do : 0, it will not
-         * 
-         * examples (section 'foo')
-         *  includeByDefault returning true
-         *     foo : 0 = not included
-         *     foo : 1 = included
-         *     foo missing = included
-         *  includeByDefault returning false
-         *     foo : 0 = not included
-         *     foo : 1 = included
-         *     foo missing = false
-         */
-        virtual bool includeByDefault() const = 0;
-        
-        /**
-         * Adds the privileges that are required to view this section
-         * TODO: Remove this empty default implementation and implement for every section.
-         */
-        virtual void addRequiredPrivileges(std::vector<Privilege>* out) {};
+    /**
+     * if this returns true, if the user doesn't mention this section
+     * it will be included in the result
+     * if they do : 1, it will be included
+     * if they do : 0, it will not
+     *
+     * examples (section 'foo')
+     *  includeByDefault returning true
+     *     foo : 0 = not included
+     *     foo : 1 = included
+     *     foo missing = included
+     *  includeByDefault returning false
+     *     foo : 0 = not included
+     *     foo : 1 = included
+     *     foo missing = false
+     */
+    virtual bool includeByDefault() const = 0;
 
-        /**
-         * actually generate the result
-         * @param configElement the element from the actual command related to this section
-         *                      so if the section is 'foo', this is cmdObj['foo']
-         */
-        virtual BSONObj generateSection(OperationContext* txn,
-                                        const BSONElement& configElement) const = 0;
+    /**
+     * Adds the privileges that are required to view this section
+     * TODO: Remove this empty default implementation and implement for every section.
+     */
+    virtual void addRequiredPrivileges(std::vector<Privilege>* out){};
 
-    private:
-        const std::string _sectionName;
+    /**
+     * actually generate the result
+     *
+     * You should either implement this function or appendSection below, but not both. In
+     * most cases you should just implement this function.
+     *
+     * @param configElement the element from the actual command related to this section
+     *                      so if the section is 'foo', this is cmdObj['foo']
+     */
+    virtual BSONObj generateSection(OperationContext* opCtx,
+                                    const BSONElement& configElement) const {
+        return BSONObj{};
     };
 
-    class OpCounterServerStatusSection : public ServerStatusSection {
-    public:
-        OpCounterServerStatusSection( const std::string& sectionName, OpCounters* counters );
-        virtual bool includeByDefault() const { return true; }
-        
-        virtual BSONObj generateSection(OperationContext* txn,
-                                        const BSONElement& configElement) const;
+    /**
+     * This is what gets called by the serverStatus command to append the section to the
+     * command result.
+     *
+     * If you are just implementing a normal ServerStatusSection, then you don't need to
+     * implement this.
+     *
+     * If you are doing something a bit more complicated, you can implement this and have
+     * full control over what gets included in the command result.
+     */
+    virtual void appendSection(OperationContext* opCtx,
+                               const BSONElement& configElement,
+                               BSONObjBuilder* result) const {
+        const auto ret = generateSection(opCtx, configElement);
+        if (ret.isEmpty())
+            return;
+        result->append(getSectionName(), ret);
+    }
 
-    private:
-        const OpCounters* _counters;
-    };
+private:
+    const std::string _sectionName;
+};
 
+class OpCounterServerStatusSection : public ServerStatusSection {
+public:
+    OpCounterServerStatusSection(const std::string& sectionName, OpCounters* counters);
+    virtual bool includeByDefault() const {
+        return true;
+    }
+
+    virtual BSONObj generateSection(OperationContext* opCtx,
+                                    const BSONElement& configElement) const;
+
+private:
+    const OpCounters* _counters;
+};
 }
-

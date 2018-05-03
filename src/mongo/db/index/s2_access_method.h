@@ -29,35 +29,47 @@
 #pragma once
 
 #include "mongo/base/status.h"
-#include "mongo/db/index/s2_common.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/s2_common.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    class IndexCursor;
-    struct S2IndexingParams;
+class S2AccessMethod : public IndexAccessMethod {
+public:
+    S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
-    class S2AccessMethod : public BtreeBasedAccessMethod {
-    public:
-        using BtreeBasedAccessMethod::_descriptor;
+    /**
+     * Takes an index spec object for this index and returns a copy tweaked to conform to the
+     * expected format.  When an index build is initiated, this function is called on the spec
+     * object the user provides, and the return value of this function is the final spec object
+     * that gets saved in the index catalog.
+     *
+     * Returns a non-OK status if 'specObj' is invalid.
+     */
+    static StatusWith<BSONObj> fixSpec(const BSONObj& specObj);
 
-        S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
-        virtual ~S2AccessMethod() { }
+private:
+    /**
+     * Fills 'keys' with the keys that should be generated for 'obj' on this index.
+     *
+     * This function ignores the 'multikeyPaths' pointer because text indexes don't support tracking
+     * path-level multikey information.
+     *
+     * If the 'multikeyPaths' pointer is non-null, then it must point to an empty vector. This
+     * function resizes 'multikeyPaths' to have the same number of elements as the index key pattern
+     * and fills each element with the prefixes of the indexed field that would cause this index to
+     * be multikey as a result of inserting 'keys'.
+     */
+    void doGetKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const final;
 
-        /**
-         * Takes an index spec object for this index and returns a copy tweaked to conform to the
-         * expected format.  When an index build is initiated, this function is called on the spec
-         * object the user provides, and the return value of this function is the final spec object
-         * that gets saved in the index catalog.  Throws a UserException if 'specObj' is invalid.
-         */
-        static BSONObj fixSpec(const BSONObj& specObj);
+    S2IndexingParams _params;
 
-    private:
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
-
-        S2IndexingParams _params;
-    };
+    // Null if this index orders strings according to the simple binary compare. If non-null,
+    // represents the collator used to generate index keys for indexed strings.
+    const CollatorInterface* _collator;
+};
 
 }  // namespace mongo

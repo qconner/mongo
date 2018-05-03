@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -52,9 +52,10 @@ struct __wt_extlist {
 	uint32_t entries;			/* Entry count */
 
 	wt_off_t offset;			/* Written extent offset */
-	uint32_t cksum, size;			/* Written extent cksum, size */
+	uint32_t checksum;			/* Written extent checksum */
+	uint32_t size;				/* Written extent size */
 
-	int	track_size;			/* Maintain per-size skiplist */
+	bool	 track_size;			/* Maintain per-size skiplist */
 
 	WT_EXT	*last;				/* Cached last element */
 
@@ -128,7 +129,7 @@ struct __wt_block_ckpt {
 	uint8_t	 version;			/* Version */
 
 	wt_off_t root_offset;			/* The root */
-	uint32_t root_cksum, root_size;
+	uint32_t root_checksum, root_size;
 
 	WT_EXTLIST alloc;			/* Extents allocated */
 	WT_EXTLIST avail;			/* Extents available */
@@ -155,52 +156,59 @@ struct __wt_block_ckpt {
  */
 struct __wt_bm {
 						/* Methods */
+	int (*addr_invalid)
+	    (WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
 	int (*addr_string)
 	    (WT_BM *, WT_SESSION_IMPL *, WT_ITEM *, const uint8_t *, size_t);
-	int (*addr_valid)(WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
 	u_int (*block_header)(WT_BM *);
 	int (*checkpoint)
-	    (WT_BM *, WT_SESSION_IMPL *, WT_ITEM *, WT_CKPT *, int);
+	    (WT_BM *, WT_SESSION_IMPL *, WT_ITEM *, WT_CKPT *, bool);
 	int (*checkpoint_load)(WT_BM *, WT_SESSION_IMPL *,
-	    const uint8_t *, size_t, uint8_t *, size_t *, int);
-	int (*checkpoint_resolve)(WT_BM *, WT_SESSION_IMPL *);
+	    const uint8_t *, size_t, uint8_t *, size_t *, bool);
+	int (*checkpoint_resolve)(WT_BM *, WT_SESSION_IMPL *, bool);
+	int (*checkpoint_start)(WT_BM *, WT_SESSION_IMPL *);
 	int (*checkpoint_unload)(WT_BM *, WT_SESSION_IMPL *);
 	int (*close)(WT_BM *, WT_SESSION_IMPL *);
 	int (*compact_end)(WT_BM *, WT_SESSION_IMPL *);
 	int (*compact_page_skip)
-	    (WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t, int *);
-	int (*compact_skip)(WT_BM *, WT_SESSION_IMPL *, int *);
+	    (WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t, bool *);
+	int (*compact_skip)(WT_BM *, WT_SESSION_IMPL *, bool *);
 	int (*compact_start)(WT_BM *, WT_SESSION_IMPL *);
+	int (*corrupt)(WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
 	int (*free)(WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
+	bool (*is_mapped)(WT_BM *, WT_SESSION_IMPL *);
+	int (*map_discard)(WT_BM *, WT_SESSION_IMPL *, void *, size_t);
 	int (*preload)(WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
 	int (*read)
 	    (WT_BM *, WT_SESSION_IMPL *, WT_ITEM *, const uint8_t *, size_t);
 	int (*salvage_end)(WT_BM *, WT_SESSION_IMPL *);
 	int (*salvage_next)
-	    (WT_BM *, WT_SESSION_IMPL *, uint8_t *, size_t *, int *);
+	    (WT_BM *, WT_SESSION_IMPL *, uint8_t *, size_t *, bool *);
 	int (*salvage_start)(WT_BM *, WT_SESSION_IMPL *);
 	int (*salvage_valid)
-	    (WT_BM *, WT_SESSION_IMPL *, uint8_t *, size_t, int);
+	    (WT_BM *, WT_SESSION_IMPL *, uint8_t *, size_t, bool);
+	int (*size)(WT_BM *, WT_SESSION_IMPL *, wt_off_t *);
 	int (*stat)(WT_BM *, WT_SESSION_IMPL *, WT_DSRC_STATS *stats);
-	int (*sync)(WT_BM *, WT_SESSION_IMPL *, int);
+	int (*sync)(WT_BM *, WT_SESSION_IMPL *, bool);
 	int (*verify_addr)(WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
 	int (*verify_end)(WT_BM *, WT_SESSION_IMPL *);
-	int (*verify_start)(WT_BM *, WT_SESSION_IMPL *, WT_CKPT *);
+	int (*verify_start)
+	    (WT_BM *, WT_SESSION_IMPL *, WT_CKPT *, const char *[]);
 	int (*write) (WT_BM *,
-	    WT_SESSION_IMPL *, WT_ITEM *, uint8_t *, size_t *, int);
+	    WT_SESSION_IMPL *, WT_ITEM *, uint8_t *, size_t *, bool, bool);
 	int (*write_size)(WT_BM *, WT_SESSION_IMPL *, size_t *);
 
 	WT_BLOCK *block;			/* Underlying file */
 
-	void  *map;				/* Mapped region */
-	size_t maplen;
-	void *mappingcookie;
+	void	*map;				/* Mapped region */
+	size_t	 maplen;
+	void	*mapped_cookie;
 
 	/*
 	 * There's only a single block manager handle that can be written, all
 	 * others are checkpoints.
 	 */
-	int is_live;				/* The live system */
+	bool is_live;				/* The live system */
 };
 
 /*
@@ -213,12 +221,16 @@ struct __wt_block {
 
 	/* A list of block manager handles, sharing a file descriptor. */
 	uint32_t ref;			/* References */
+	TAILQ_ENTRY(__wt_block) q;	/* Linked list of handles */
+	TAILQ_ENTRY(__wt_block) hashq;	/* Hashed list of handles */
+
 	WT_FH	*fh;			/* Backing file handle */
-	SLIST_ENTRY(__wt_block) l;	/* Linked list of handles */
-	SLIST_ENTRY(__wt_block) hashl;	/* Hashed list of handles */
+	wt_off_t size;			/* File size */
+	wt_off_t extend_size;		/* File extended size */
+	wt_off_t extend_len;		/* File extend chunk size */
 
 	/* Configuration information, set when the file is opened. */
-	int	 allocfirst;		/* Allocation is first-fit */
+	uint32_t allocfirst;		/* Allocation is first-fit */
 	uint32_t allocsize;		/* Allocation size */
 	size_t	 os_cache;		/* System buffer cache flush max */
 	size_t	 os_cache_max;
@@ -236,17 +248,26 @@ struct __wt_block {
 	 */
 	WT_SPINLOCK	live_lock;	/* Live checkpoint lock */
 	WT_BLOCK_CKPT	live;		/* Live checkpoint */
-	int		ckpt_inprogress;/* Live checkpoint in progress */
+#ifdef HAVE_DIAGNOSTIC
+	bool		live_open;	/* Live system is open */
+#endif
+					/* Live checkpoint status */
+	enum { WT_CKPT_NONE=0, WT_CKPT_INPROGRESS,
+	    WT_CKPT_PANIC_ON_FAILURE, WT_CKPT_SALVAGE } ckpt_state;
 
 				/* Compaction support */
-	int	allocfirst_save;	/* Saved: allocation is first-fit */
-	int	compact_pct_tenths;	/* Percent to compact */
+	int	 compact_pct_tenths;	/* Percent to compact */
+	uint64_t compact_pages_reviewed;/* Pages reviewed */
+	uint64_t compact_pages_skipped;	/* Pages skipped */
+	uint64_t compact_pages_written;	/* Pages rewritten */
 
 				/* Salvage support */
 	wt_off_t	slvg_off;	/* Salvage file offset */
 
 				/* Verification support */
-	int	   verify;		/* If performing verification */
+	bool	   verify;		/* If performing verification */
+	bool	   verify_layout;	/* Print out file layout information */
+	bool	   verify_strict;	/* Fail hard on any error */
 	wt_off_t   verify_size;		/* Checkpoint's file size */
 	WT_EXTLIST verify_alloc;	/* Verification allocation list */
 	uint64_t   frags;		/* Maximum frags in the file */
@@ -266,7 +287,7 @@ struct __wt_block_desc {
 #define	WT_BLOCK_MINOR_VERSION	0
 	uint16_t minorv;		/* 06-07: Minor version */
 
-	uint32_t cksum;			/* 08-11: Description block checksum */
+	uint32_t checksum;		/* 08-11: Description block checksum */
 
 	uint32_t unused;		/* 12-15: Padding */
 };
@@ -277,6 +298,23 @@ struct __wt_block_desc {
  * but it would be worth investigation, regardless).
  */
 #define	WT_BLOCK_DESC_SIZE		16
+
+/*
+ * __wt_block_desc_byteswap --
+ *	Handle big- and little-endian transformation of a description block.
+ */
+static inline void
+__wt_block_desc_byteswap(WT_BLOCK_DESC *desc)
+{
+#ifdef WORDS_BIGENDIAN
+	desc->magic = __wt_bswap32(desc->magic);
+	desc->majorv = __wt_bswap16(desc->majorv);
+	desc->minorv = __wt_bswap16(desc->minorv);
+	desc->checksum = __wt_bswap32(desc->checksum);
+#else
+	WT_UNUSED(desc);
+#endif
+}
 
 /*
  * WT_BLOCK_HEADER --
@@ -302,9 +340,13 @@ struct __wt_block_header {
 	 * stored in the disk header.  This is for salvage, so salvage knows it
 	 * has found a page that may be useful.
 	 */
-	uint32_t cksum;			/* 04-07: checksum */
+	uint32_t checksum;		/* 04-07: checksum */
 
-#define	WT_BLOCK_DATA_CKSUM	0x01	/* Block data is part of the checksum */
+	/*
+	 * No automatic generation: flag values cannot change, they're written
+	 * to disk.
+	 */
+#define	WT_BLOCK_DATA_CKSUM	0x1u	/* Block data is part of the checksum */
 	uint8_t flags;			/* 08: flags */
 
 	/*
@@ -321,6 +363,35 @@ struct __wt_block_header {
 #define	WT_BLOCK_HEADER_SIZE		12
 
 /*
+ * __wt_block_header_byteswap_copy --
+ *	Handle big- and little-endian transformation of a header block,
+ * copying from a source to a target.
+ */
+static inline void
+__wt_block_header_byteswap_copy(WT_BLOCK_HEADER *from, WT_BLOCK_HEADER *to)
+{
+	*to = *from;
+#ifdef WORDS_BIGENDIAN
+	to->disk_size = __wt_bswap32(from->disk_size);
+	to->checksum = __wt_bswap32(from->checksum);
+#endif
+}
+
+/*
+ * __wt_block_header_byteswap --
+ *	Handle big- and little-endian transformation of a header block.
+ */
+static inline void
+__wt_block_header_byteswap(WT_BLOCK_HEADER *blk)
+{
+#ifdef WORDS_BIGENDIAN
+	__wt_block_header_byteswap_copy(blk, blk);
+#else
+	WT_UNUSED(blk);
+#endif
+}
+
+/*
  * WT_BLOCK_HEADER_BYTE
  * WT_BLOCK_HEADER_BYTE_SIZE --
  *	The first usable data byte on the block (past the combined headers).
@@ -331,13 +402,27 @@ struct __wt_block_header {
 	((void *)((uint8_t *)(dsk) + WT_BLOCK_HEADER_BYTE_SIZE))
 
 /*
- * Don't compress the block's WT_PAGE_HEADER and WT_BLOCK_HEADER structures.
- * We need the WT_PAGE_HEADER in-memory size, and the WT_BLOCK_HEADER checksum
- * and on-disk size to be immediately available without decompression.  We use
- * the on-disk size and checksum during salvage to figure out where the blocks
- * are, and the in-memory size tells us how large a buffer we need to decompress
- * the block.  We could skip less than 64B, but a 64B boundary may offer better
- * alignment for the underlying compression engine, and skipping 64B won't make
- * a difference in terms of compression efficiency.
+ * We don't compress or encrypt the block's WT_PAGE_HEADER or WT_BLOCK_HEADER
+ * structures because we need both available with decompression or decryption.
+ * We use the WT_BLOCK_HEADER checksum and on-disk size during salvage to
+ * figure out where the blocks are, and we use the WT_PAGE_HEADER in-memory
+ * size during decompression and decryption to know how large a target buffer
+ * to allocate. We can only skip the header information when doing encryption,
+ * but we skip the first 64B when doing compression; a 64B boundary may offer
+ * better alignment for the underlying compression engine, and skipping 64B
+ * shouldn't make any difference in terms of compression efficiency.
  */
 #define	WT_BLOCK_COMPRESS_SKIP	64
+#define	WT_BLOCK_ENCRYPT_SKIP	WT_BLOCK_HEADER_BYTE_SIZE
+
+/*
+ * __wt_block_header --
+ *	Return the size of the block-specific header.
+ */
+static inline u_int
+__wt_block_header(WT_BLOCK *block)
+{
+	WT_UNUSED(block);
+
+	return ((u_int)WT_BLOCK_HEADER_SIZE);
+}

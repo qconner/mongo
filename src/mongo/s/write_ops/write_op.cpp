@@ -26,266 +26,218 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/write_ops/write_op.h"
 
-#include "mongo/base/error_codes.h"
-#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-    using std::stringstream;
-    using std::vector;
+using std::stringstream;
+using std::vector;
 
-    static void clear( vector<ChildWriteOp*>* childOps ) {
-        for ( vector<ChildWriteOp*>::const_iterator it = childOps->begin(); it != childOps->end();
-            ++it ) {
-            delete *it;
-        }
-        childOps->clear();
-    }
+const BatchItemRef& WriteOp::getWriteItem() const {
+    return _itemRef;
+}
 
-    WriteOp::~WriteOp() {
-        clear( &_childOps );
-        clear( &_history );
-    }
+WriteOpState WriteOp::getWriteState() const {
+    return _state;
+}
 
-    const BatchItemRef& WriteOp::getWriteItem() const {
-        return _itemRef;
-    }
+const WriteErrorDetail& WriteOp::getOpError() const {
+    dassert(_state == WriteOpState_Error);
+    return *_error;
+}
 
-    WriteOpState WriteOp::getWriteState() const {
-        return _state;
-    }
+Status WriteOp::targetWrites(OperationContext* opCtx,
+                             const NSTargeter& targeter,
+                             std::vector<TargetedWrite*>* targetedWrites) {
+    const bool isIndexInsert = _itemRef.getRequest()->isInsertIndexRequest();
 
-    const WriteErrorDetail& WriteOp::getOpError() const {
-        dassert( _state == WriteOpState_Error );
-        return *_error;
-    }
-
-    Status WriteOp::targetWrites( const NSTargeter& targeter,
-                                  std::vector<TargetedWrite*>* targetedWrites ) {
-
-        bool isUpdate = _itemRef.getOpType() == BatchedCommandRequest::BatchType_Update;
-        bool isDelete = _itemRef.getOpType() == BatchedCommandRequest::BatchType_Delete;
-        bool isIndexInsert = _itemRef.getRequest()->isInsertIndexRequest();
-
-        Status targetStatus = Status::OK();
-        OwnedPointerVector<ShardEndpoint> endpointsOwned;
-        vector<ShardEndpoint*>& endpoints = endpointsOwned.mutableVector();
-
-        if ( isUpdate ) {
-            targetStatus = targeter.targetUpdate( *_itemRef.getUpdate(), &endpoints );
-        }
-        else if ( isDelete ) {
-            targetStatus = targeter.targetDelete( *_itemRef.getDelete(), &endpoints );
-        }
-        else {
-            dassert( _itemRef.getOpType() == BatchedCommandRequest::BatchType_Insert );
-
-            ShardEndpoint* endpoint = NULL;
-            // TODO: Remove the index targeting stuff once there is a command for it
-            if ( !isIndexInsert ) {
-                targetStatus = targeter.targetInsert( _itemRef.getDocument(), &endpoint );
-            }
-            else {
+    auto swEndpoints = [&]() -> StatusWith<std::vector<ShardEndpoint>> {
+        if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Insert) {
+            if (isIndexInsert) {
+                // TODO: Remove the index targeting stuff once there is a command for it?
                 // TODO: Retry index writes with stale version?
-                targetStatus = targeter.targetCollection( &endpoints );
+                return targeter.targetCollection();
             }
 
-            if ( !targetStatus.isOK() ) {
-                dassert( NULL == endpoint );
-                return targetStatus;
-            }
+            auto swEndpoint = targeter.targetInsert(opCtx, _itemRef.getDocument());
+            if (!swEndpoint.isOK())
+                return swEndpoint.getStatus();
 
-            // Store single endpoint result if we targeted a single endpoint
-            if ( endpoint ) endpoints.push_back( endpoint );
+            return std::vector<ShardEndpoint>{std::move(swEndpoint.getValue())};
+        } else if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Update) {
+            return targeter.targetUpdate(opCtx, _itemRef.getUpdate());
+        } else if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Delete) {
+            return targeter.targetDelete(opCtx, _itemRef.getDelete());
+        } else {
+            MONGO_UNREACHABLE;
         }
+    }();
 
-        // If we're targeting more than one endpoint with an update/delete, we have to target
-        // everywhere since we cannot currently retry partial results.
-        // NOTE: Index inserts are currently specially targeted only at the current collection to
-        // avoid creating collections everywhere.
-        if ( targetStatus.isOK() && endpoints.size() > 1u && !isIndexInsert ) {
-            endpointsOwned.clear();
-            invariant( endpoints.empty() );
-            targetStatus = targeter.targetAllShards( &endpoints );
-        }
-
-        // If we had an error, stop here
-        if ( !targetStatus.isOK() ) return targetStatus;
-
-        for ( vector<ShardEndpoint*>::iterator it = endpoints.begin(); it != endpoints.end();
-            ++it ) {
-
-            ShardEndpoint* endpoint = *it;
-
-            _childOps.push_back( new ChildWriteOp( this ) );
-
-            WriteOpRef ref( _itemRef.getItemIndex(), _childOps.size() - 1 );
-
-            // For now, multiple endpoints imply no versioning - we can't retry half a multi-write
-            if ( endpoints.size() == 1u ) {
-                targetedWrites->push_back( new TargetedWrite( *endpoint, ref ) );
-            }
-            else {
-                ShardEndpoint broadcastEndpoint( endpoint->shardName,
-                                                 ChunkVersion::IGNORED() );
-                targetedWrites->push_back( new TargetedWrite( broadcastEndpoint, ref ) );
-            }
-
-            _childOps.back()->pendingWrite = targetedWrites->back();
-            _childOps.back()->state = WriteOpState_Pending;
-        }
-
-        _state = WriteOpState_Pending;
-        return Status::OK();
+    // If we're targeting more than one endpoint with an update/delete, we have to target everywhere
+    // since we cannot currently retry partial results.
+    //
+    // NOTE: Index inserts are currently specially targeted only at the current collection to avoid
+    // creating collections everywhere.
+    if (swEndpoints.isOK() && swEndpoints.getValue().size() > 1u && !isIndexInsert) {
+        swEndpoints = targeter.targetAllShards(opCtx);
     }
 
-    size_t WriteOp::getNumTargeted() {
-        return _childOps.size();
+    // If we had an error, stop here
+    if (!swEndpoints.isOK())
+        return swEndpoints.getStatus();
+
+    auto& endpoints = swEndpoints.getValue();
+
+    for (auto&& endpoint : endpoints) {
+        _childOps.emplace_back(this);
+
+        WriteOpRef ref(_itemRef.getItemIndex(), _childOps.size() - 1);
+
+        // For now, multiple endpoints imply no versioning - we can't retry half a multi-write
+        if (endpoints.size() > 1u) {
+            endpoint.shardVersion = ChunkVersion::IGNORED();
+        }
+
+        targetedWrites->push_back(new TargetedWrite(std::move(endpoint), ref));
+
+        _childOps.back().pendingWrite = targetedWrites->back();
+        _childOps.back().state = WriteOpState_Pending;
     }
 
-    static bool isRetryErrCode( int errCode ) {
-        return errCode == ErrorCodes::StaleShardVersion;
+    _state = WriteOpState_Pending;
+    return Status::OK();
+}
+
+size_t WriteOp::getNumTargeted() {
+    return _childOps.size();
+}
+
+static bool isRetryErrCode(int errCode) {
+    return errCode == ErrorCodes::StaleShardVersion ||
+        errCode == ErrorCodes::CannotImplicitlyCreateCollection;
+}
+
+// Aggregate a bunch of errors for a single op together
+static void combineOpErrors(const vector<ChildWriteOp const*>& errOps, WriteErrorDetail* error) {
+    // Special case single response
+    if (errOps.size() == 1) {
+        errOps.front()->error->cloneTo(error);
+        return;
     }
 
-    // Aggregate a bunch of errors for a single op together
-    static void combineOpErrors( const vector<ChildWriteOp*>& errOps, WriteErrorDetail* error ) {
+    // Generate the multi-error message below
+    stringstream msg;
+    msg << "multiple errors for op : ";
 
-        // Special case single response
-        if ( errOps.size() == 1 ) {
-            errOps.front()->error->cloneTo( error );
+    BSONArrayBuilder errB;
+    for (vector<ChildWriteOp const*>::const_iterator it = errOps.begin(); it != errOps.end();
+         ++it) {
+        const ChildWriteOp* errOp = *it;
+        if (it != errOps.begin())
+            msg << " :: and :: ";
+        msg << errOp->error->toStatus().reason();
+        errB.append(errOp->error->toBSON());
+    }
+
+    error->setErrInfo(BSON("causedBy" << errB.arr()));
+    error->setIndex(errOps.front()->error->getIndex());
+    error->setStatus({ErrorCodes::MultipleErrorsOccurred, msg.str()});
+}
+
+/**
+ * This is the core function which aggregates all the results of a write operation on multiple
+ * shards and updates the write operation's state.
+ */
+void WriteOp::_updateOpState() {
+    std::vector<ChildWriteOp const*> childErrors;
+
+    bool isRetryError = true;
+    for (const auto& childOp : _childOps) {
+        // Don't do anything till we have all the info
+        if (childOp.state != WriteOpState_Completed && childOp.state != WriteOpState_Error) {
             return;
         }
 
-        error->setErrCode( ErrorCodes::MultipleErrorsOccurred );
+        if (childOp.state == WriteOpState_Error) {
+            childErrors.push_back(&childOp);
 
-        // Generate the multi-error message below
-        stringstream msg;
-        msg << "multiple errors for op : ";
-
-        BSONArrayBuilder errB;
-        for ( vector<ChildWriteOp*>::const_iterator it = errOps.begin(); it != errOps.end();
-            ++it ) {
-            const ChildWriteOp* errOp = *it;
-            if ( it != errOps.begin() ) msg << " :: and :: ";
-            msg << errOp->error->getErrMessage();
-            errB.append( errOp->error->toBSON() );
+            // Any non-retry error aborts all
+            if (!isRetryErrCode(childOp.error->toStatus().code())) {
+                isRetryError = false;
+            }
         }
-
-        error->setErrInfo( BSON( "causedBy" << errB.arr() ) );
-        error->setIndex( errOps.front()->error->getIndex() );
-        error->setErrMessage( msg.str() );
     }
 
-    /**
-     * This is the core function which aggregates all the results of a write operation on multiple
-     * shards and updates the write operation's state.
-     */
-    void WriteOp::updateOpState() {
-
-        vector<ChildWriteOp*> childErrors;
-
-        bool isRetryError = true;
-        for ( vector<ChildWriteOp*>::iterator it = _childOps.begin(); it != _childOps.end();
-            it++ ) {
-
-            ChildWriteOp* childOp = *it;
-
-            // Don't do anything till we have all the info
-            if ( childOp->state != WriteOpState_Completed
-                 && childOp->state != WriteOpState_Error ) {
-                return;
-            }
-
-            if ( childOp->state == WriteOpState_Error ) {
-                childErrors.push_back( childOp );
-                // Any non-retry error aborts all
-                if ( !isRetryErrCode( childOp->error->getErrCode() ) ) isRetryError = false;
-            }
-        }
-
-        if ( !childErrors.empty() && isRetryError ) {
-            // Since we're using broadcast mode for multi-shard writes, which cannot SCE
-            dassert( childErrors.size() == 1u );
-            _state = WriteOpState_Ready;
-        }
-        else if ( !childErrors.empty() ) {
-            _error.reset( new WriteErrorDetail );
-            combineOpErrors( childErrors, _error.get() );
-            _state = WriteOpState_Error;
-        }
-        else {
-            _state = WriteOpState_Completed;
-        }
-
-        // Now that we're done with the child ops, do something with them
-        // TODO: Don't store unlimited history?
-        dassert( _state != WriteOpState_Pending );
-        _history.insert( _history.end(), _childOps.begin(), _childOps.end() );
-        _childOps.clear();
-    }
-
-    void WriteOp::cancelWrites( const WriteErrorDetail* why ) {
-
-        dassert( _state == WriteOpState_Pending || _state == WriteOpState_Ready );
-        for ( vector<ChildWriteOp*>::iterator it = _childOps.begin(); it != _childOps.end();
-            ++it ) {
-
-            ChildWriteOp* childOp = *it;
-
-            if ( childOp->state == WriteOpState_Pending ) {
-                childOp->endpoint.reset( new ShardEndpoint( childOp->pendingWrite->endpoint ) );
-                if ( why ) {
-                    childOp->error.reset( new WriteErrorDetail );
-                    why->cloneTo( childOp->error.get() );
-                }
-                childOp->state = WriteOpState_Cancelled;
-            }
-        }
-
-        _history.insert( _history.end(), _childOps.begin(), _childOps.end() );
-        _childOps.clear();
-
+    if (!childErrors.empty() && isRetryError) {
+        // Since we're using broadcast mode for multi-shard writes, which cannot SCE
+        invariant(childErrors.size() == 1u);
         _state = WriteOpState_Ready;
-    }
-
-    void WriteOp::noteWriteComplete( const TargetedWrite& targetedWrite ) {
-
-        const WriteOpRef& ref = targetedWrite.writeOpRef;
-        dassert( static_cast<size_t>( ref.second ) < _childOps.size() );
-        ChildWriteOp& childOp = *_childOps.at( ref.second );
-
-        childOp.pendingWrite = NULL;
-        childOp.endpoint.reset( new ShardEndpoint( targetedWrite.endpoint ) );
-        childOp.state = WriteOpState_Completed;
-        updateOpState();
-    }
-
-    void WriteOp::noteWriteError( const TargetedWrite& targetedWrite,
-                                  const WriteErrorDetail& error ) {
-
-        const WriteOpRef& ref = targetedWrite.writeOpRef;
-        ChildWriteOp& childOp = *_childOps.at( ref.second );
-
-        childOp.pendingWrite = NULL;
-        childOp.endpoint.reset( new ShardEndpoint( targetedWrite.endpoint ) );
-        childOp.error.reset( new WriteErrorDetail );
-        error.cloneTo( childOp.error.get() );
-        dassert( ref.first == _itemRef.getItemIndex() );
-        childOp.error->setIndex( _itemRef.getItemIndex() );
-        childOp.state = WriteOpState_Error;
-        updateOpState();
-    }
-
-    void WriteOp::setOpError( const WriteErrorDetail& error ) {
-        dassert( _state == WriteOpState_Ready );
-        _error.reset( new WriteErrorDetail );
-        error.cloneTo( _error.get() );
-        _error->setIndex( _itemRef.getItemIndex() );
+    } else if (!childErrors.empty()) {
+        _error.reset(new WriteErrorDetail);
+        combineOpErrors(childErrors, _error.get());
         _state = WriteOpState_Error;
-        // No need to updateOpState, set directly
+    } else {
+        _state = WriteOpState_Completed;
     }
 
+    invariant(_state != WriteOpState_Pending);
+    _childOps.clear();
 }
+
+void WriteOp::cancelWrites(const WriteErrorDetail* why) {
+    invariant(_state == WriteOpState_Pending || _state == WriteOpState_Ready);
+
+    for (auto& childOp : _childOps) {
+        if (childOp.state == WriteOpState_Pending) {
+            childOp.endpoint.reset(new ShardEndpoint(childOp.pendingWrite->endpoint));
+            if (why) {
+                childOp.error.reset(new WriteErrorDetail);
+                why->cloneTo(childOp.error.get());
+            }
+
+            childOp.state = WriteOpState_Cancelled;
+        }
+    }
+
+    _state = WriteOpState_Ready;
+    _childOps.clear();
+}
+
+void WriteOp::noteWriteComplete(const TargetedWrite& targetedWrite) {
+    const WriteOpRef& ref = targetedWrite.writeOpRef;
+    auto& childOp = _childOps[ref.second];
+
+    childOp.pendingWrite = NULL;
+    childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
+    childOp.state = WriteOpState_Completed;
+    _updateOpState();
+}
+
+void WriteOp::noteWriteError(const TargetedWrite& targetedWrite, const WriteErrorDetail& error) {
+    const WriteOpRef& ref = targetedWrite.writeOpRef;
+    auto& childOp = _childOps[ref.second];
+
+    childOp.pendingWrite = NULL;
+    childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
+    childOp.error.reset(new WriteErrorDetail);
+    error.cloneTo(childOp.error.get());
+    dassert(ref.first == _itemRef.getItemIndex());
+    childOp.error->setIndex(_itemRef.getItemIndex());
+    childOp.state = WriteOpState_Error;
+    _updateOpState();
+}
+
+void WriteOp::setOpError(const WriteErrorDetail& error) {
+    dassert(_state == WriteOpState_Ready);
+    _error.reset(new WriteErrorDetail);
+    error.cloneTo(_error.get());
+    _error->setIndex(_itemRef.getItemIndex());
+    _state = WriteOpState_Error;
+    // No need to updateOpState, set directly
+}
+
+}  // namespace mongo

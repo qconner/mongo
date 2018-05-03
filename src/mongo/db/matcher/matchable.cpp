@@ -28,18 +28,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matchable.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
 
-    BSONMatchableDocument::BSONMatchableDocument( const BSONObj& obj )
-        : _obj( obj ) {
-        _iteratorUsed = false;
-    }
+BSONMatchableDocument::BSONMatchableDocument(const BSONObj& obj) : _obj(obj) {
+    _iteratorUsed = false;
+}
 
-    BSONMatchableDocument::~BSONMatchableDocument() {
-    }
-
+BSONMatchableDocument::~BSONMatchableDocument() {}
 }

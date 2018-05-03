@@ -10,14 +10,23 @@
 /* Build the LevelDB API with Basho LevelDB support. */
 /* #undef HAVE_BASHOLEVELDB */
 
+/* LZ4 support automatically loaded. */
+/* #undef HAVE_BUILTIN_EXTENSION_LZ4 */
+
 /* Snappy support automatically loaded. */
 /* #undef HAVE_BUILTIN_EXTENSION_SNAPPY */
 
 /* Zlib support automatically loaded. */
 /* #undef HAVE_BUILTIN_EXTENSION_ZLIB */
 
+/* ZSTD support automatically loaded. */
+/* #undef HAVE_BUILTIN_EXTENSION_ZSTD */
+
 /* Define to 1 if you have the `clock_gettime' function. */
 /* #undef HAVE_CLOCK_GETTIME */
+
+/* Define to 1 to enable CRC32 hardware support. */
+/* #undef HAVE_CRC32_HARDWARE */
 
 /* Define to 1 for diagnostic tests. */
 /* #undef HAVE_DIAGNOSTIC */
@@ -28,14 +37,8 @@
 /* Define to 1 if you have the `fallocate' function. */
 /* #undef HAVE_FALLOCATE */
 
-/* Define to 1 if you have the `fcntl' function. */
-/* #undef HAVE_FCNTL 1  */
-
 /* Define to 1 if you have the `fdatasync' function. */
 /* #undef HAVE_FDATASYNC */
-
-/* Define to 1 if you have the `fread_unlocked' function. */
-/* #undef HAVE_FREAD_UNLOCKED */
 
 /* Define to 1 if you have the `ftruncate' function. */
 /* #undef HAVE_FTRUNCATE */
@@ -49,11 +52,11 @@
 /* Define to 1 if you have the <inttypes.h> header file. */
 #define HAVE_INTTYPES_H 1
 
-/* Define to 1 if you have the `bz2' library (-lbz2). */
-/* #undef HAVE_LIBBZ2 */
-
 /* Define to 1 if you have the `dl' library (-ldl). */
 /* #undef HAVE_LIBDL */
+
+/* Define to 1 if you have the `lz4' library (-llz4). */
+/* #undef HAVE_LIBLZ4 */
 
 /* Define to 1 if you have the `pthread' library (-lpthread). */
 /* #undef HAVE_LIBPTHREAD */
@@ -64,11 +67,20 @@
 /* Define to 1 if you have the `snappy' library (-lsnappy). */
 /* #undef HAVE_LIBSNAPPY */
 
+/* Define to 1 if you have the `tcmalloc' library (-ltcmalloc). */
+/* #undef HAVE_LIBTCMALLOC */
+
 /* Define to 1 if you have the `z' library (-lz). */
 /* #undef HAVE_LIBZ */
 
+/* Define to 1 if you have the `zstd' library (-lzstd). */
+/* #undef HAVE_LIBZSTD */
+
 /* Define to 1 if you have the <memory.h> header file. */
 /* #undef HAVE_MEMORY_H */
+
+/* Define to 1 if pthread condition variables support monotonic clocks. */
+/* #undef HAVE_PTHREAD_COND_MONOTONIC */
 
 /* Define to 1 if you have the `posix_fadvise' function. */
 /* #undef HAVE_POSIX_FADVISE */
@@ -81,9 +93,6 @@
 
 /* Define to 1 if you have the `posix_memalign' function. */
 /* #undef HAVE_POSIX_MEMALIGN */
-
-/* Define to 1 if you have the <pthread_np.h> header file. */
-/* #undef HAVE_PTHREAD_NP_H */
 
 /* Build the LevelDB API with RocksDB support. */
 /* #undef HAVE_ROCKSDB */
@@ -115,14 +124,17 @@
 /* Define to 1 if you have the <unistd.h> header file. */
 /* #undef HAVE_UNISTD_H */
 
-/* Enable verbose message configuration. */
-/* #undef HAVE_VERBOSE */
+/* Define to 1 if you have the <x86intrin.h> header file. */
+#define HAVE_X86INTRIN_H 1
 
 /* Spinlock type from mutex.h. */
 #define SPINLOCK_TYPE SPINLOCK_MSVC
 
 /* Define to 1 if you have the ANSI C header files. */
 #define STDC_HEADERS 1
+
+/* Size of a transaction timestamp in bytes */
+#define WT_TIMESTAMP_SIZE 8
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

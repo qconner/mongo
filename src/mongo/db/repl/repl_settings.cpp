@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2015 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -26,22 +26,85 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/repl_settings.h"
 
-#include "mongo/base/init.h"
-#include "mongo/base/status.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
 
-    MONGO_EXPORT_STARTUP_SERVER_PARAMETER(maxSyncSourceLagSecs, int, 30);
-    MONGO_INITIALIZER(maxSyncSourceLagSecsCheck) (InitializerContext*) {
-        if (maxSyncSourceLagSecs < 1) {
-            return Status(ErrorCodes::BadValue, "maxSyncSourceLagSecs must be > 0");
-        }
-        return Status::OK();
-    }
+std::string ReplSettings::ourSetName() const {
+    size_t sl = _replSetString.find('/');
+    if (sl == std::string::npos)
+        return _replSetString;
+    return _replSetString.substr(0, sl);
+}
 
+bool ReplSettings::usingReplSets() const {
+    return !_replSetString.empty();
 }
+
+/**
+ * Getters
+ */
+
+long long ReplSettings::getOplogSizeBytes() const {
+    return _oplogSizeBytes;
 }
+
+std::string ReplSettings::getReplSetString() const {
+    return _replSetString;
+}
+
+bool ReplSettings::getShouldRecoverFromOplogAsStandalone() const {
+    return _shouldRecoverFromOplogAsStandalone;
+}
+
+ReplSettings::IndexPrefetchConfig ReplSettings::getPrefetchIndexMode() const {
+    return _prefetchIndexMode;
+}
+
+bool ReplSettings::isPrefetchIndexModeSet() const {
+    return _prefetchIndexMode != IndexPrefetchConfig::UNINITIALIZED;
+}
+
+/**
+ * Setters
+ */
+
+void ReplSettings::setOplogSizeBytes(long long oplogSizeBytes) {
+    _oplogSizeBytes = oplogSizeBytes;
+}
+
+void ReplSettings::setReplSetString(std::string replSetString) {
+    _replSetString = replSetString;
+}
+
+void ReplSettings::setShouldRecoverFromOplogAsStandalone(bool shouldRecover) {
+    _shouldRecoverFromOplogAsStandalone = shouldRecover;
+}
+
+void ReplSettings::setPrefetchIndexMode(std::string prefetchIndexModeString) {
+    if (prefetchIndexModeString.empty()) {
+        _prefetchIndexMode = IndexPrefetchConfig::UNINITIALIZED;
+    } else {
+        if (prefetchIndexModeString == "none")
+            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_NONE;
+        else if (prefetchIndexModeString == "_id_only")
+            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_ID_ONLY;
+        else if (prefetchIndexModeString == "all")
+            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_ALL;
+        else {
+            _prefetchIndexMode = IndexPrefetchConfig::PREFETCH_ALL;
+            warning() << "unrecognized indexPrefetchMode setting \"" << prefetchIndexModeString
+                      << "\", defaulting to \"all\"";
+        }
+    }
+}
+
+}  // namespace repl
+}  // namespace mongo

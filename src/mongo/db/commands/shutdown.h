@@ -35,29 +35,31 @@
 
 namespace mongo {
 
-    class CmdShutdown : public Command {
-    public:
-        virtual bool requiresAuth() { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool localHostOnlyIfNoAuth(const BSONObj& cmdObj) { return true; }
-        virtual bool slaveOk() const {
-            return true;
-        }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out);
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( std::stringstream& help ) const;
-        CmdShutdown() : Command("shutdown") {}
-        bool run(OperationContext* txn, const std::string& dbname,
-                 BSONObj& cmdObj,
-                 int options,
-                 std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl);
-    private:
-        static void shutdownHelper();
-    };
+class CmdShutdown : public BasicCommand {
+public:
+    CmdShutdown() : BasicCommand("shutdown") {}
+
+    bool requiresAuth() const override {
+        return true;
+    }
+    virtual bool adminOnly() const {
+        return true;
+    }
+    bool localHostOnlyIfNoAuth() const override {
+        return true;
+    }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+protected:
+    static void shutdownHelper(const BSONObj& cmdObj);
+};
 
 }  // namespace mongo
-

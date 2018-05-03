@@ -28,7 +28,6 @@
 *    it in the license file.
 */
 
-#include <boost/shared_ptr.hpp>
 #include <set>
 #include <string>
 
@@ -37,49 +36,40 @@
 #include "mongo/base/init.h"
 #include "mongo/util/string_map.h"
 
-
-
 namespace mongo {
 
-    using boost::shared_ptr;
+namespace fts {
 
-    namespace fts {
+void loadStopWordMap(StringMap<std::set<std::string>>* m);
 
-        void loadStopWordMap( StringMap< std::set< std::string > >* m );
-
-        namespace {
-            StringMap< boost::shared_ptr<StopWords> > STOP_WORDS;
-            StopWords empty;
-        }
+namespace {
+StringMap<std::shared_ptr<StopWords>> StopWordsMap;
+StopWords empty;
+}
 
 
-        StopWords::StopWords(){
-        }
+StopWords::StopWords() {}
 
-        StopWords::StopWords( const std::set<std::string>& words ) {
-            for ( std::set<std::string>::const_iterator i = words.begin(); i != words.end(); ++i )
-                _words.insert( *i );
-        }
+StopWords::StopWords(const std::set<std::string>& words) {
+    for (std::set<std::string>::const_iterator i = words.begin(); i != words.end(); ++i)
+        _words[*i] = true;
+}
 
-        const StopWords* StopWords::getStopWords( const FTSLanguage& language ) {
-            StringMap< boost::shared_ptr<StopWords> >::const_iterator i = STOP_WORDS.find( language.str() );
-            if ( i == STOP_WORDS.end() )
-                return &empty;
-            return i->second.get();
-        }
+const StopWords* StopWords::getStopWords(const FTSLanguage* language) {
+    auto i = StopWordsMap.find(language->str());
+    if (i == StopWordsMap.end())
+        return &empty;
+    return i->second.get();
+}
 
 
-        MONGO_INITIALIZER(StopWords)(InitializerContext* context) {
-            StringMap< std::set< std::string > > raw;
-            loadStopWordMap( &raw );
-            for ( StringMap< std::set< std::string > >::const_iterator i = raw.begin();
-                  i != raw.end();
-                  ++i ) {
-                STOP_WORDS[i->first].reset(new StopWords( i->second ));
-            }
-            return Status::OK();
-        }
-
+MONGO_INITIALIZER(StopWords)(InitializerContext* context) {
+    StringMap<std::set<std::string>> raw;
+    loadStopWordMap(&raw);
+    for (StringMap<std::set<std::string>>::const_iterator i = raw.begin(); i != raw.end(); ++i) {
+        StopWordsMap[i->first].reset(new StopWords(i->second));
     }
-
+    return Status::OK();
+}
+}
 }

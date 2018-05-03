@@ -33,26 +33,41 @@
 
 namespace mongo {
 
-    /**
-     * @return the global fail point registry.
-     */
-    FailPointRegistry* getGlobalFailPointRegistry();
+class FailPoint;
 
-    /**
-     * Convenience macro for declaring a fail point. Must be used in global scope and never in a
-     * block with limited scope (ie, inside functions, loops, etc.).
-     *
-     * NOTE: Never use in header files, only sources.
-     */
-    #define MONGO_FP_DECLARE(fp) FailPoint fp; \
-        MONGO_INITIALIZER_GENERAL(fp, ("FailPointRegistry"), ("AllFailPointsRegistered")) \
-                (::mongo::InitializerContext* context) { \
-            return getGlobalFailPointRegistry()->addFailPoint(#fp, &fp); \
-        }
+/**
+ * @return the global fail point registry.
+ */
+FailPointRegistry* getGlobalFailPointRegistry();
 
-    /**
-     * Convenience macro for defining a fail point in a header scope.
-     */
-    #define MONGO_FP_FORWARD_DECLARE(fp) extern FailPoint fp;
+/**
+ * Convenience macro for declaring a fail point. Must be used in global scope and never in a
+ * block with limited scope (ie, inside functions, loops, etc.).
+ *
+ * NOTE: Never use in header files, only sources.
+ */
+#define MONGO_FP_DECLARE(fp)                                                          \
+    FailPoint fp;                                                                     \
+    MONGO_INITIALIZER_GENERAL(fp, ("FailPointRegistry"), ("AllFailPointsRegistered")) \
+    (::mongo::InitializerContext * context) {                                         \
+        return getGlobalFailPointRegistry()->addFailPoint(#fp, &fp);                  \
+    }
 
-}
+/**
+ * Convenience macro for defining a fail point in a header scope.
+ */
+#define MONGO_FP_FORWARD_DECLARE(fp) extern FailPoint fp;
+
+/**
+ * Convenience class for enabling a failpoint and disabling it as this goes out of scope.
+ */
+class FailPointEnableBlock {
+public:
+    FailPointEnableBlock(const std::string& failPointName);
+    ~FailPointEnableBlock();
+
+private:
+    FailPoint* _failPoint;
+};
+
+}  // namespace mongo

@@ -34,56 +34,64 @@
 
 namespace mongo {
 
-    class SnapshotId {
-        static const uint64_t kNullId = 0;
-    public:
-        SnapshotId()
-            : _id(kNullId) {
-        }
+class SnapshotId {
+    static const uint64_t kNullId = 0;
 
-        // 0 is NULL
-        explicit SnapshotId(uint64_t id)
-            : _id(id) {
-            invariant(id != kNullId);
-        }
+public:
+    SnapshotId() : _id(kNullId) {}
 
-        bool isNull() const { return _id == kNullId; }
+    // 0 is NULL
+    explicit SnapshotId(uint64_t id) : _id(id) {
+        invariant(id != kNullId);
+    }
 
-        bool operator==(const SnapshotId& other) const {
-            return _id == other._id;
-        }
+    bool isNull() const {
+        return _id == kNullId;
+    }
 
-        bool operator!=(const SnapshotId& other) const {
-            return _id != other._id;
-        }
+    bool operator==(const SnapshotId& other) const {
+        return _id == other._id;
+    }
 
-    private:
-        uint64_t _id;
-    };
+    bool operator!=(const SnapshotId& other) const {
+        return _id != other._id;
+    }
 
-    template<typename T>
-    class Snapshotted {
-    public:
-        Snapshotted()
-            : _id(), _value() {
-        }
+    std::string toString() const {
+        return std::to_string(_id);
+    }
 
-        Snapshotted(SnapshotId id, const T& value ) :
-            _id(id), _value(value) {
-        }
+private:
+    uint64_t _id;
+};
 
-        void reset() {
-            *this = Snapshotted();
-        }
+template <typename T>
+class Snapshotted {
+public:
+    Snapshotted() : _id(), _value() {}
 
-        void setValue(const T& t) { _value = t; }
+    Snapshotted(SnapshotId id, const T& value) : _id(id), _value(value) {}
 
-        SnapshotId snapshotId() const { return _id; }
-        const T& value() const { return _value; }
-        T& value() { return _value; }
+    void reset() {
+        *this = Snapshotted();
+    }
 
-    private:
-        SnapshotId _id;
-        T _value;
-    };
+    void setValue(const T& t) {
+        _value = t;
+    }
+
+    SnapshotId snapshotId() const {
+        return _id;
+    }
+    const T& value() const {
+        return _value;
+    }
+    T& value() {
+        return _value;
+    }
+
+private:
+    SnapshotId _id;
+    T _value;
+};
 }

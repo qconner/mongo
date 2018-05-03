@@ -32,47 +32,70 @@
 
 #include <exception>
 
+#include "mongo/base/string_data.h"
+#include "mongo/db/curop.h"
 #include "mongo/util/assert_util.h"
-
-#define MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN do { int wcr__Attempts = 0; do { try
-#define MONGO_WRITE_CONFLICT_RETRY_LOOP_END(PTXN, OPSTR, NSSTR)         \
-        catch (const ::mongo::WriteConflictException &wce) {            \
-            const OperationContext* ptxn = (PTXN);                      \
-            ++ptxn->getCurOp()->debug().writeConflicts;                 \
-            wce.logAndBackoff(wcr__Attempts, (OPSTR), (NSSTR));         \
-            ++wcr__Attempts;                                            \
-            ptxn->recoveryUnit()->commitAndRestart();                   \
-            continue;                                                   \
-        }                                                               \
-        break;                                                          \
-    } while (true); } while (false)
 
 namespace mongo {
 
+/**
+ * This is thrown if during a write, two or more operations conflict with each other.
+ * For example if two operations get the same version of a document, and then both try to
+ * modify that document, this exception will get thrown by one of them.
+ */
+class WriteConflictException final : public DBException {
+public:
+    WriteConflictException();
+
     /**
-     * This is thrown if during a write, two or more operations conflict with each other.
-     * For example if two operations get the same version of a document, and then both try to
-     * modify that document, this exception will get thrown by one of them.
+     * Will log a message if sensible and will do an exponential backoff to make sure
+     * we don't hammer the same doc over and over.
+     * @param attempt - what attempt is this, 1 based
+     * @param operation - e.g. "update"
      */
-    class WriteConflictException : public DBException {
-    public:
-        WriteConflictException();
+    static void logAndBackoff(int attempt, StringData operation, StringData ns);
 
-        /**
-         * Will log a message if sensible and will do an exponential backoff to make sure
-         * we don't hammer the same doc over and over.
-         * @param attempt - what attempt is this, 1 based
-         * @param operation - e.g. "update"
-         */
-        static void logAndBackoff(int attempt,
-                                  StringData operation,
-                                  StringData ns);
+    /**
+     * If true, will call printStackTrace on every WriteConflictException created.
+     * Can be set via setParameter named traceWriteConflictExceptions.
+     */
+    static AtomicBool trace;
 
-        /**
-         * If true, will call printStackTrace on every WriteConflictException created.
-         * Can be set via setParameter named traceWriteConflictExceptions.
-         */
-        static bool trace;
-    };
+private:
+    void defineOnlyInFinalSubclassToPreventSlicing() final {}
+};
 
+/**
+ * Runs the argument function f as many times as needed for f to complete or throw an exception
+ * other than WriteConflictException.  For each time f throws a WriteConflictException, logs the
+ * error, waits a spell, cleans up, and then tries f again.  Imposes no upper limit on the number
+ * of times to re-try f, so any required timeout behavior must be enforced within f.
+ *
+ * If we are already in a WriteUnitOfWork, we assume that we are being called within a
+ * WriteConflictException retry loop up the call stack. Hence, this retry loop is reduced to an
+ * invocation of the argument function f without any exception handling and retry logic.
+ */
+template <typename F>
+auto writeConflictRetry(OperationContext* opCtx, StringData opStr, StringData ns, F&& f) {
+    invariant(opCtx);
+    invariant(opCtx->lockState());
+    invariant(opCtx->recoveryUnit());
+
+    if (opCtx->lockState()->inAWriteUnitOfWork()) {
+        return f();
+    }
+
+    int attempts = 0;
+    while (true) {
+        try {
+            return f();
+        } catch (WriteConflictException const&) {
+            ++CurOp::get(opCtx)->debug().writeConflicts;
+            WriteConflictException::logAndBackoff(attempts, opStr, ns);
+            ++attempts;
+            opCtx->recoveryUnit()->abandonSnapshot();
+        }
+    }
 }
+
+}  // namespace mongo

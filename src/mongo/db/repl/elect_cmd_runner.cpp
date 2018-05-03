@@ -33,127 +33,119 @@
 #include "mongo/db/repl/elect_cmd_runner.h"
 
 #include "mongo/base/status.h"
-#include "mongo/db/repl/member_heartbeat_data.h"
-#include "mongo/db/repl/replica_set_config.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/scatter_gather_runner.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
 
-    ElectCmdRunner::Algorithm::Algorithm(
-            const ReplicaSetConfig& rsConfig,
-            int selfIndex,
-            const std::vector<HostAndPort>& targets,
-            OID round)
-        : _actualResponses(0),
-          _sufficientResponsesReceived(false),
-          _rsConfig(rsConfig),
-          _selfIndex(selfIndex),
-          _targets(targets),
-          _round(round) {
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
 
-        // Vote for ourselves, first.
-        _receivedVotes = _rsConfig.getMemberAt(_selfIndex).getNumVotes();
+ElectCmdRunner::Algorithm::Algorithm(const ReplSetConfig& rsConfig,
+                                     int selfIndex,
+                                     const std::vector<HostAndPort>& targets,
+                                     OID round)
+    : _actualResponses(0),
+      _sufficientResponsesReceived(false),
+      _rsConfig(rsConfig),
+      _selfIndex(selfIndex),
+      _targets(targets),
+      _round(round) {
+    // Vote for ourselves, first.
+    _receivedVotes = _rsConfig.getMemberAt(_selfIndex).getNumVotes();
+}
+
+ElectCmdRunner::Algorithm::~Algorithm() {}
+
+std::vector<RemoteCommandRequest> ElectCmdRunner::Algorithm::getRequests() const {
+    const MemberConfig& selfConfig = _rsConfig.getMemberAt(_selfIndex);
+    std::vector<RemoteCommandRequest> requests;
+    BSONObjBuilder electCmdBuilder;
+    electCmdBuilder.append("replSetElect", 1);
+    electCmdBuilder.append("set", _rsConfig.getReplSetName());
+    electCmdBuilder.append("who", selfConfig.getHostAndPort().toString());
+    electCmdBuilder.append("whoid", selfConfig.getId());
+    electCmdBuilder.appendIntOrLL("cfgver", _rsConfig.getConfigVersion());
+    electCmdBuilder.append("round", _round);
+    const BSONObj replSetElectCmd = electCmdBuilder.obj();
+
+    // Schedule a RemoteCommandRequest for each non-DOWN node
+    for (std::vector<HostAndPort>::const_iterator it = _targets.begin(); it != _targets.end();
+         ++it) {
+        invariant(*it != selfConfig.getHostAndPort());
+        requests.push_back(RemoteCommandRequest(
+            *it,
+            "admin",
+            replSetElectCmd,
+            nullptr,
+            Milliseconds(30 * 1000)));  // trying to match current Socket timeout
     }
 
-    ElectCmdRunner::Algorithm::~Algorithm() {}
+    return requests;
+}
 
-    std::vector<ReplicationExecutor::RemoteCommandRequest>
-    ElectCmdRunner::Algorithm::getRequests() const {
-
-        const MemberConfig& selfConfig = _rsConfig.getMemberAt(_selfIndex);
-        std::vector<ReplicationExecutor::RemoteCommandRequest> requests;
-        BSONObjBuilder electCmdBuilder;
-        electCmdBuilder.append("replSetElect", 1);
-        electCmdBuilder.append("set", _rsConfig.getReplSetName());
-        electCmdBuilder.append("who", selfConfig.getHostAndPort().toString());
-        electCmdBuilder.append("whoid", selfConfig.getId());
-        electCmdBuilder.appendIntOrLL("cfgver", _rsConfig.getConfigVersion());
-        electCmdBuilder.append("round", _round);
-        const BSONObj replSetElectCmd = electCmdBuilder.obj();
-
-        // Schedule a RemoteCommandRequest for each non-DOWN node
-        for (std::vector<HostAndPort>::const_iterator it = _targets.begin();
-             it != _targets.end();
-             ++it) {
-
-            invariant(*it != selfConfig.getHostAndPort());
-            requests.push_back(ReplicationExecutor::RemoteCommandRequest(
-                        *it,
-                        "admin",
-                        replSetElectCmd,
-                        Milliseconds(30*1000)));   // trying to match current Socket timeout
-        }
-
-        return requests;
+bool ElectCmdRunner::Algorithm::hasReceivedSufficientResponses() const {
+    if (_sufficientResponsesReceived) {
+        return true;
     }
-
-    bool ElectCmdRunner::Algorithm::hasReceivedSufficientResponses() const {
-        if (_sufficientResponsesReceived) {
-            return true;
-        }
-        if (_receivedVotes >= _rsConfig.getMajorityVoteCount()) {
-            return true;
-        }
-        if (_receivedVotes < 0) {
-            return true;
-        }
-        if (_actualResponses == _targets.size()) {
-            return true;
-        }
-        return false;
+    if (_receivedVotes >= _rsConfig.getMajorityVoteCount()) {
+        return true;
     }
+    if (_receivedVotes < 0) {
+        return true;
+    }
+    if (_actualResponses == _targets.size()) {
+        return true;
+    }
+    return false;
+}
 
-    void ElectCmdRunner::Algorithm::processResponse(
-            const ReplicationExecutor::RemoteCommandRequest& request,
-            const ResponseStatus& response) {
+void ElectCmdRunner::Algorithm::processResponse(const RemoteCommandRequest& request,
+                                                const RemoteCommandResponse& response) {
+    ++_actualResponses;
 
-        ++_actualResponses;
-
-        if (response.isOK()) {
-            BSONObj res = response.getValue().data;
-            LOG(1) << "elect res: " << res.toString();
-            BSONElement vote(res["vote"]); 
-            if (vote.type() != mongo::NumberInt) {
-                error() << "wrong type for vote argument in replSetElect command: " << 
-                    typeName(vote.type());
-                _sufficientResponsesReceived = true;
-                return;
-            }
-
-            _receivedVotes += vote._numberInt();
+    if (response.isOK()) {
+        BSONObj res = response.data;
+        log() << "received " << res["vote"] << " votes from " << request.target;
+        LOG(1) << "full elect res: " << res.toString();
+        BSONElement vote(res["vote"]);
+        if (vote.type() != mongo::NumberInt) {
+            error() << "wrong type for vote argument in replSetElect command: "
+                    << typeName(vote.type());
+            _sufficientResponsesReceived = true;
+            return;
         }
-        else {
-            warning() << "elect command to " << request.target << " failed: " <<
-                response.getStatus();
-        }
+
+        _receivedVotes += vote._numberInt();
+    } else {
+        warning() << "elect command to " << request.target << " failed: " << response.status;
     }
+}
 
-    ElectCmdRunner::ElectCmdRunner() : _isCanceled(false) {}
-    ElectCmdRunner::~ElectCmdRunner() {}
+ElectCmdRunner::ElectCmdRunner() : _isCanceled(false) {}
+ElectCmdRunner::~ElectCmdRunner() {}
 
-    StatusWith<ReplicationExecutor::EventHandle> ElectCmdRunner::start(
-            ReplicationExecutor* executor,
-            const ReplicaSetConfig& currentConfig,
-            int selfIndex,
-            const std::vector<HostAndPort>& targets,
-            const stdx::function<void ()>& onCompletion) {
+StatusWith<executor::TaskExecutor::EventHandle> ElectCmdRunner::start(
+    executor::TaskExecutor* executor,
+    const ReplSetConfig& currentConfig,
+    int selfIndex,
+    const std::vector<HostAndPort>& targets) {
+    _algorithm = std::make_shared<Algorithm>(currentConfig, selfIndex, targets, OID::gen());
+    _runner = stdx::make_unique<ScatterGatherRunner>(_algorithm, executor);
+    return _runner->start();
+}
 
-        _algorithm.reset(new Algorithm(currentConfig, selfIndex, targets, OID::gen()));
-        _runner.reset(new ScatterGatherRunner(_algorithm.get()));
-        return _runner->start(executor, onCompletion);
-    }
+void ElectCmdRunner::cancel() {
+    _isCanceled = true;
+    _runner->cancel();
+}
 
-    void ElectCmdRunner::cancel(ReplicationExecutor* executor) {
-        _isCanceled = true;
-        _runner->cancel(executor);
-    }
+int ElectCmdRunner::getReceivedVotes() const {
+    return _algorithm->getReceivedVotes();
+}
 
-    int ElectCmdRunner::getReceivedVotes() const {
-        return _algorithm->getReceivedVotes();
-    }
-
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

@@ -28,96 +28,153 @@
 *    it in the license file.
 */
 
-#include "mongo/db/catalog/database.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
+namespace {
+static const StringData kFilterField{"filter"};
+static const StringData kNameField{"name"};
+static const StringData kNameOnlyField{"nameOnly"};
+}  // namespace
 
-    using std::set;
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+using std::set;
+using std::string;
+using std::stringstream;
+using std::vector;
 
-    // XXX: remove and put into storage api
-    intmax_t dbSize( const string& database );
+// XXX: remove and put into storage api
+intmax_t dbSize(const string& database);
 
-    class CmdListDatabases : public Command {
-    public:
-        virtual bool slaveOk() const {
-            return false;
+class CmdListDatabases : public BasicCommand {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kOptIn;
+    }
+    bool adminOnly() const final {
+        return true;
+    }
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
+        return false;
+    }
+    std::string help() const final {
+        return "{ listDatabases:1, [filter: <filterObject>] [, nameOnly: true ] }\n"
+               "list databases on this server";
+    }
+
+    /* listDatabases is always authorized,
+     * however the results returned will be redacted
+     * based on read privileges if auth is enabled
+     * and the current user does not have listDatabases permisison.
+     */
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) const final {
+        return Status::OK();
+    }
+
+    CmdListDatabases() : BasicCommand("listDatabases") {}
+
+    bool run(OperationContext* opCtx,
+             const string& dbname,
+             const BSONObj& jsobj,
+             BSONObjBuilder& result) final {
+        // Parse the filter.
+        std::unique_ptr<MatchExpression> filter;
+        if (auto filterElt = jsobj[kFilterField]) {
+            if (filterElt.type() != BSONType::Object) {
+                return CommandHelpers::appendCommandStatus(
+                    result,
+                    {ErrorCodes::TypeMismatch,
+                     str::stream() << "Field '" << kFilterField << "' must be of type Object in: "
+                                   << jsobj});
+            }
+            // The collator is null because database metadata objects are compared using simple
+            // binary comparison.
+            const CollatorInterface* collator = nullptr;
+            boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
+            auto statusWithMatcher =
+                MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
+            if (!statusWithMatcher.isOK()) {
+                return CommandHelpers::appendCommandStatus(result, statusWithMatcher.getStatus());
+            }
+            filter = std::move(statusWithMatcher.getValue());
         }
-        virtual bool slaveOverrideOk() const {
-            return true;
-        }
-        virtual bool adminOnly() const {
-            return true;
-        }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( stringstream& help ) const { help << "list databases on this server"; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::listDatabases);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        bool nameOnly = jsobj[kNameOnlyField].trueValue();
+
+        vector<string> dbNames;
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+        {
+            Lock::GlobalLock lk(opCtx, MODE_IS);
+            storageEngine->listDatabases(&dbNames);
         }
 
-        CmdListDatabases() : Command("listDatabases" , true ) {}
+        vector<BSONObj> dbInfos;
 
-        bool run(OperationContext* txn,
-                 const string& dbname,
-                 BSONObj& jsobj,
-                 int,
-                 string& errmsg,
-                 BSONObjBuilder& result,
-                 bool /*fromRepl*/) {
+        // If we have ActionType::listDatabases,
+        // then we don't need to test each record in the output.
+        // Otherwise, we'll test the database names as we enumerate them.
+        const auto as = AuthorizationSession::get(opCtx->getClient());
+        const bool checkAuth = as &&
+            !as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::listDatabases);
 
-            vector< string > dbNames;
-            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
-            storageEngine->listDatabases( &dbNames );
-
-            vector< BSONObj > dbInfos;
-
-            set<string> seen;
-            intmax_t totalSize = 0;
-            for ( vector< string >::iterator i = dbNames.begin(); i != dbNames.end(); ++i ) {
-                const string& dbname = *i;
-
-                BSONObjBuilder b;
-                b.append( "name", dbname );
-
-                {
-                    ScopedTransaction transaction(txn, MODE_IS);
-                    Lock::DBLock dbLock(txn->lockState(), dbname, MODE_IS);
-
-                    Database* db = dbHolder().get( txn, dbname );
-                    if ( !db )
-                        continue;
-
-                    const DatabaseCatalogEntry* entry = db->getDatabaseCatalogEntry();
-                    invariant( entry );
-
-                    int64_t size = entry->sizeOnDisk( txn );
-                    b.append( "sizeOnDisk", static_cast<double>( size ) );
-                    totalSize += size;
-
-                    b.appendBool("empty", size == 0);
-                }
-
-                dbInfos.push_back( b.obj() );
-
-                seen.insert( i->c_str() );
+        const bool filterNameOnly = filter &&
+            filter->getCategory() == MatchExpression::MatchCategory::kLeaf &&
+            filter->path() == kNameField;
+        intmax_t totalSize = 0;
+        for (const auto& dbname : dbNames) {
+            if (checkAuth && as &&
+                !as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                      ActionType::find)) {
+                // We don't have listDatabases on the cluser or find on this database.
+                continue;
             }
 
-            result.append( "databases", dbInfos );
-            result.append( "totalSize", double( totalSize ) );
-            return true;
-        }
-    } cmdListDatabases;
+            BSONObjBuilder b;
+            b.append("name", dbname);
 
+            int64_t size = 0;
+            if (!nameOnly) {
+                // Filtering on name only should not require taking locks on filtered-out names.
+                if (filterNameOnly && !filter->matchesBSON(b.asTempObj()))
+                    continue;
+
+                AutoGetDb autoDb(opCtx, dbname, MODE_IS);
+                Database* const db = autoDb.getDb();
+                if (!db)
+                    continue;
+
+                const DatabaseCatalogEntry* entry = db->getDatabaseCatalogEntry();
+                invariant(entry);
+
+                size = entry->sizeOnDisk(opCtx);
+                b.append("sizeOnDisk", static_cast<double>(size));
+
+                b.appendBool("empty", entry->isEmpty());
+            }
+            BSONObj curDbObj = b.obj();
+
+            if (!filter || filter->matchesBSON(curDbObj)) {
+                totalSize += size;
+                dbInfos.push_back(curDbObj);
+            }
+        }
+
+        result.append("databases", dbInfos);
+        if (!nameOnly) {
+            result.append("totalSize", double(totalSize));
+        }
+        return true;
+    }
+} cmdListDatabases;
 }

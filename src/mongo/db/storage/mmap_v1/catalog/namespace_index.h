@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 #include <list>
 #include <string>
 
@@ -41,53 +40,61 @@
 
 namespace mongo {
 
-    class NamespaceDetails;
-    class NamespaceHashTable;
-    class OperationContext;
+class NamespaceDetails;
+class NamespaceHashTable;
+class OperationContext;
 
-    /* NamespaceIndex is the ".ns" file you see in the data directory.  It is the "system catalog"
-       if you will: at least the core parts.  (Additional info in system.* collections.)
-    */
-    class NamespaceIndex {
-        MONGO_DISALLOW_COPYING(NamespaceIndex);
-    public:
-        NamespaceIndex(const std::string& dir, const std::string& database);
-        ~NamespaceIndex();
+/* NamespaceIndex is the ".ns" file you see in the data directory.  It is the "system catalog"
+   if you will: at least the core parts.  (Additional info in system.* collections.)
+*/
+class NamespaceIndex {
+    MONGO_DISALLOW_COPYING(NamespaceIndex);
 
-        /* returns true if the file represented by this file exists on disk */
-        bool pathExists() const;
+public:
+    NamespaceIndex(OperationContext* opCtx, const std::string& dir, const std::string& database);
+    ~NamespaceIndex();
 
-        void init(OperationContext* txn);
+    /**
+     * Must be called before destruction.
+     */
+    void close(OperationContext* opCtx) {
+        LockMongoFilesExclusive lock(opCtx);
+        _f.close(opCtx);
+    }
 
-        void add_ns( OperationContext* txn,
-                     StringData ns, const DiskLoc& loc, bool capped);
-        void add_ns( OperationContext* txn,
-                     StringData ns, const NamespaceDetails* details );
-        void add_ns( OperationContext* txn,
-                     const Namespace& ns, const NamespaceDetails* details );
+    /* returns true if the file represented by this file exists on disk */
+    bool pathExists() const;
 
-        NamespaceDetails* details(StringData ns) const;
-        NamespaceDetails* details(const Namespace& ns) const;
+    void init(OperationContext* opCtx);
 
-        void kill_ns( OperationContext* txn,
-                      StringData ns);
+    void add_ns(OperationContext* opCtx, StringData ns, const DiskLoc& loc, bool capped);
+    void add_ns(OperationContext* opCtx, StringData ns, const NamespaceDetails* details);
+    void add_ns(OperationContext* opCtx, const Namespace& ns, const NamespaceDetails* details);
 
-        bool allocated() const { return _ht.get() != 0; }
+    NamespaceDetails* details(StringData ns) const;
+    NamespaceDetails* details(const Namespace& ns) const;
 
-        void getCollectionNamespaces( std::list<std::string>* tofill ) const;
+    void kill_ns(OperationContext* opCtx, StringData ns);
 
-        boost::filesystem::path path() const;
+    bool allocated() const {
+        return _ht.get() != 0;
+    }
 
-        unsigned long long fileLength() const { return _f.length(); }
+    void getCollectionNamespaces(std::list<std::string>* tofill) const;
 
-    private:
-        void maybeMkdir() const;
+    boost::filesystem::path path() const;
 
-        const std::string _dir;
-        const std::string _database;
+    unsigned long long fileLength() const {
+        return _f.length();
+    }
 
-        DurableMappedFile _f;
-        boost::scoped_ptr<NamespaceHashTable> _ht;
-    };
+private:
+    void maybeMkdir() const;
 
+    const std::string _dir;
+    const std::string _database;
+
+    DurableMappedFile _f;
+    std::unique_ptr<NamespaceHashTable> _ht;
+};
 }

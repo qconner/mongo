@@ -32,290 +32,337 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/config.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_internal.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/transport/message_compressor_registry.h"
+#include "mongo/transport/service_entry_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/listen.h"
+#include "mongo/util/net/hostname_canonicalization.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 
-    using std::endl;
-    using std::map;
-    using std::string;
-    using std::stringstream;
+using std::endl;
+using std::map;
+using std::string;
+using std::stringstream;
 
-    class CmdServerStatus : public Command {
-    public:
+class CmdServerStatus : public BasicCommand {
+public:
+    CmdServerStatus() : BasicCommand("serverStatus"), _started(Date_t::now()), _runCalled(false) {}
 
-        CmdServerStatus() 
-            : Command("serverStatus", true),
-              _started( curTimeMillis64() ),
-              _runCalled( false ) {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+    virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const override {
+        return false;
+    }
+    std::string help() const override {
+        return "returns lots of administrative server statistics";
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {
+        ActionSet actions;
+        actions.addAction(ActionType::serverStatus);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
+    bool run(OperationContext* opCtx,
+             const string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) {
+        _runCalled = true;
+
+        const auto service = opCtx->getServiceContext();
+        const auto clock = service->getFastClockSource();
+        const auto runStart = clock->now();
+        BSONObjBuilder timeBuilder(256);
+
+        const auto authSession = AuthorizationSession::get(Client::getCurrent());
+
+        // --- basic fields that are global
+
+        result.append("host", prettyHostName());
+        result.append("version", VersionInfoInterface::instance().version());
+        result.append("process", serverGlobalParams.binaryName);
+        result.append("pid", ProcessId::getCurrent().asLongLong());
+        result.append("uptime", (double)(time(0) - serverGlobalParams.started));
+        auto uptime = clock->now() - _started;
+        result.append("uptimeMillis", durationCount<Milliseconds>(uptime));
+        result.append("uptimeEstimate", durationCount<Seconds>(uptime));
+        result.appendDate("localTime", jsTime());
+
+        timeBuilder.appendNumber("after basic",
+                                 durationCount<Milliseconds>(clock->now() - runStart));
+
+        // --- all sections
+
+        for (SectionMap::const_iterator i = _sections.begin(); i != _sections.end(); ++i) {
+            ServerStatusSection* section = i->second;
+
+            std::vector<Privilege> requiredPrivileges;
+            section->addRequiredPrivileges(&requiredPrivileges);
+            if (!authSession->isAuthorizedForPrivileges(requiredPrivileges))
+                continue;
+
+            bool include = section->includeByDefault();
+            const auto& elem = cmdObj[section->getSectionName()];
+            if (elem.type()) {
+                include = elem.trueValue();
+            }
+
+            if (!include) {
+                continue;
+            }
+
+            section->appendSection(opCtx, elem, &result);
+            timeBuilder.appendNumber(
+                static_cast<string>(str::stream() << "after " << section->getSectionName()),
+                durationCount<Milliseconds>(clock->now() - runStart));
         }
-        
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return true; }
 
-        virtual void help( stringstream& help ) const {
-            help << "returns lots of administrative server statistics";
+        // --- counters
+        bool includeMetricTree = MetricTree::theMetricTree != NULL;
+        if (cmdObj["metrics"].type() && !cmdObj["metrics"].trueValue())
+            includeMetricTree = false;
+
+        if (includeMetricTree) {
+            MetricTree::theMetricTree->appendTo(result);
         }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::serverStatus);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            
-            _runCalled = true;
 
-            long long start = Listener::getElapsedTimeMillis();
-            BSONObjBuilder timeBuilder(256);
+        // --- some hard coded global things hard to pull out
 
-            const ClientBasic* myClientBasic = ClientBasic::getCurrent();
-            AuthorizationSession* authSession = myClientBasic->getAuthorizationSession();
-            
-            // --- basic fields that are global
-
-            result.append("host", prettyHostName() );
-            result.append("version", versionString);
-            result.append("process", serverGlobalParams.binaryName);
-            result.append("pid", ProcessId::getCurrent().asLongLong());
-            result.append("uptime", (double) (time(0) - serverGlobalParams.started));
-            result.append("uptimeMillis", (long long)(curTimeMillis64()-_started));
-            result.append("uptimeEstimate",(double) (start/1000));
-            result.appendDate( "localTime" , jsTime() );
-
-            timeBuilder.appendNumber( "after basic" , Listener::getElapsedTimeMillis() - start );
-            
-            // --- all sections
-            
-            for ( SectionMap::const_iterator i = _sections->begin(); i != _sections->end(); ++i ) {
-                ServerStatusSection* section = i->second;
-                
-                std::vector<Privilege> requiredPrivileges;
-                section->addRequiredPrivileges(&requiredPrivileges);
-                if (!authSession->isAuthorizedForPrivileges(requiredPrivileges))
-                    continue;
-
-                bool include = section->includeByDefault();
-                
-                BSONElement e = cmdObj[section->getSectionName()];
-                if ( e.type() ) {
-                    include = e.trueValue();
+        {
+            RamLog::LineIterator rl(RamLog::get("warnings"));
+            if (rl.lastWrite() >= time(0) - (10 * 60)) {  // only show warnings from last 10 minutes
+                BSONArrayBuilder arr(result.subarrayStart("warnings"));
+                while (rl.more()) {
+                    arr.append(rl.next());
                 }
-                
-                if ( ! include )
-                    continue;
-                
-                BSONObj data = section->generateSection(txn, e);
-                if ( data.isEmpty() )
-                    continue;
-
-                result.append( section->getSectionName(), data );
-                timeBuilder.appendNumber( static_cast<string>(str::stream() << "after " << section->getSectionName()), 
-                                          Listener::getElapsedTimeMillis() - start );
+                arr.done();
             }
-
-            // --- counters
-            bool includeMetricTree = MetricTree::theMetricTree != NULL;
-            if ( cmdObj["metrics"].type() && !cmdObj["metrics"].trueValue() )
-                includeMetricTree = false;
-
-            if ( includeMetricTree ) {
-                MetricTree::theMetricTree->appendTo( result );
-            }
-
-            // --- some hard coded global things hard to pull out
-
-            {
-                RamLog::LineIterator rl(RamLog::get("warnings"));
-                if (rl.lastWrite() >= time(0)-(10*60)){  // only show warnings from last 10 minutes
-                    BSONArrayBuilder arr(result.subarrayStart("warnings"));
-                    while (rl.more()) {
-                        arr.append(rl.next());
-                    }
-                    arr.done();
-                }
-            }
-
-            timeBuilder.appendNumber( "at end" , Listener::getElapsedTimeMillis() - start );
-            if ( Listener::getElapsedTimeMillis() - start > 1000 ) {
-                BSONObj t = timeBuilder.obj();
-                log() << "serverStatus was very slow: " << t << endl;
-                result.append( "timing" , t );
-            }
-
-            return true;
         }
 
-        void addSection( ServerStatusSection* section ) {
-            verify( ! _runCalled );
-            if ( _sections == 0 ) {
-                _sections = new SectionMap();
-            }
-            (*_sections)[section->getSectionName()] = section;
+        auto runElapsed = clock->now() - runStart;
+        timeBuilder.appendNumber("at end", durationCount<Milliseconds>(runElapsed));
+        if (runElapsed > Milliseconds(1000)) {
+            BSONObj t = timeBuilder.obj();
+            log() << "serverStatus was very slow: " << t;
+            result.append("timing", t);
         }
 
-    private:
-        const unsigned long long _started;
-        bool _runCalled;
-
-        typedef map< string , ServerStatusSection* > SectionMap;
-        static SectionMap* _sections;
-    } cmdServerStatus;
-
-
-    CmdServerStatus::SectionMap* CmdServerStatus::_sections = 0;
-
-    ServerStatusSection::ServerStatusSection( const string& sectionName )
-        : _sectionName( sectionName ) {
-        cmdServerStatus.addSection( this );
+        return true;
     }
 
-    OpCounterServerStatusSection::OpCounterServerStatusSection( const string& sectionName, OpCounters* counters )
-        : ServerStatusSection( sectionName ), _counters( counters ){
+    void addSection(ServerStatusSection* section) {
+        verify(!_runCalled);
+        _sections[section->getSectionName()] = section;
     }
 
-    BSONObj OpCounterServerStatusSection::generateSection(OperationContext* txn,
-                                                          const BSONElement& configElement) const {
-        return _counters->getObj();
-    }
-    
-    OpCounterServerStatusSection globalOpCounterServerStatusSection( "opcounters", &globalOpCounters );
+private:
+    const Date_t _started;
+    bool _runCalled;
 
+    typedef map<string, ServerStatusSection*> SectionMap;
+    SectionMap _sections;
+};
 
-    namespace {
-        
-        // some universal sections
-        
-        class Connections : public ServerStatusSection {
-        public:
-            Connections() : ServerStatusSection( "connections" ){}
-            virtual bool includeByDefault() const { return true; }
-            
-            BSONObj generateSection(OperationContext* txn,
-                                    const BSONElement& configElement) const {
+namespace {
 
-                BSONObjBuilder bb;
-                bb.append( "current" , Listener::globalTicketHolder.used() );
-                bb.append( "available" , Listener::globalTicketHolder.available() );
-                bb.append( "totalCreated" , Listener::globalConnectionNumber.load() );
-                return bb.obj();
-            }
+// This widget ensures that the serverStatus command is registered even if no
+// server status sections are registered.
 
-        } connections;
-
-        class ExtraInfo : public ServerStatusSection {
-        public:
-            ExtraInfo() : ServerStatusSection( "extra_info" ){}
-            virtual bool includeByDefault() const { return true; }
-            
-            BSONObj generateSection(OperationContext* txn,
-                                    const BSONElement& configElement) const {
-
-                BSONObjBuilder bb;
-                
-                bb.append("note", "fields vary by platform");
-                ProcessInfo p;
-                p.getExtraInfo(bb);
-                
-                return bb.obj();
-            }
-
-        } extraInfo;
-
-
-        class Asserts : public ServerStatusSection {
-        public:
-            Asserts() : ServerStatusSection( "asserts" ){}
-            virtual bool includeByDefault() const { return true; }
-            
-            BSONObj generateSection(OperationContext* txn,
-                                    const BSONElement& configElement) const {
-
-                BSONObjBuilder asserts;
-                asserts.append( "regular" , assertionCount.regular );
-                asserts.append( "warning" , assertionCount.warning );
-                asserts.append( "msg" , assertionCount.msg );
-                asserts.append( "user" , assertionCount.user );
-                asserts.append( "rollovers" , assertionCount.rollovers );
-                return asserts.obj();
-            }
-                
-        } asserts;
-
-
-        class Network : public ServerStatusSection {
-        public:
-            Network() : ServerStatusSection( "network" ){}
-            virtual bool includeByDefault() const { return true; }
-            
-            BSONObj generateSection(OperationContext* txn,
-                                    const BSONElement& configElement) const {
-
-                BSONObjBuilder b;
-                networkCounter.append( b );
-                return b.obj();
-            }
-                
-        } network;
-
-#ifdef MONGO_SSL
-        class Security : public ServerStatusSection {
-        public:
-            Security() : ServerStatusSection( "security" ) {}
-            virtual bool includeByDefault() const { return true; }
-
-            BSONObj generateSection(OperationContext* txn,
-                                    const BSONElement& configElement) const {
-                BSONObj result;
-                if (getSSLManager()) {
-                    result = getSSLManager()->getSSLConfiguration().getServerStatusBSON();
-                }
-
-                return result;
-            }
-        } security;
-#endif
-
-        class MemBase : public ServerStatusMetric {
-        public:
-            MemBase() : ServerStatusMetric(".mem.bits") {}
-            virtual void appendAtLeaf( BSONObjBuilder& b ) const {
-                b.append( "bits", sizeof(int*) == 4 ? 32 : 64 );
-
-                ProcessInfo p;
-                int v = 0;
-                if ( p.supported() ) {
-                    b.appendNumber( "resident" , p.getResidentSize() );
-                    v = p.getVirtualMemorySize();
-                    b.appendNumber( "virtual" , v );
-                    b.appendBool( "supported" , true );
-                }
-                else {
-                    b.append( "note" , "not all mem info support on this platform" );
-                    b.appendBool( "supported" , false );
-                }
-
-            }
-        } memBase;
+const struct CmdServerStatusInstantiator {
+    explicit CmdServerStatusInstantiator() {
+        getInstance();
     }
 
+    static CmdServerStatus& getInstance() {
+        static CmdServerStatus instance;
+        return instance;
+    }
+} kDoNotMentionThisVariable;
+
+}  // namespace
+
+ServerStatusSection::ServerStatusSection(const string& sectionName) : _sectionName(sectionName) {
+    CmdServerStatusInstantiator::getInstance().addSection(this);
 }
 
+OpCounterServerStatusSection::OpCounterServerStatusSection(const string& sectionName,
+                                                           OpCounters* counters)
+    : ServerStatusSection(sectionName), _counters(counters) {}
+
+BSONObj OpCounterServerStatusSection::generateSection(OperationContext* opCtx,
+                                                      const BSONElement& configElement) const {
+    return _counters->getObj();
+}
+
+OpCounterServerStatusSection globalOpCounterServerStatusSection("opcounters", &globalOpCounters);
+
+
+namespace {
+
+// some universal sections
+
+class Connections : public ServerStatusSection {
+public:
+    Connections() : ServerStatusSection("connections") {}
+    virtual bool includeByDefault() const {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+        BSONObjBuilder bb;
+
+        auto serviceEntryPoint = opCtx->getServiceContext()->getServiceEntryPoint();
+        invariant(serviceEntryPoint);
+
+        auto stats = serviceEntryPoint->sessionStats();
+        bb.append("current", static_cast<int>(stats.numOpenSessions));
+        bb.append("available", static_cast<int>(stats.numAvailableSessions));
+        bb.append("totalCreated", static_cast<int>(stats.numCreatedSessions));
+        return bb.obj();
+    }
+
+} connections;
+
+class ExtraInfo : public ServerStatusSection {
+public:
+    ExtraInfo() : ServerStatusSection("extra_info") {}
+    virtual bool includeByDefault() const {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+        BSONObjBuilder bb;
+
+        bb.append("note", "fields vary by platform");
+        ProcessInfo p;
+        p.getExtraInfo(bb);
+
+        return bb.obj();
+    }
+
+} extraInfo;
+
+
+class Asserts : public ServerStatusSection {
+public:
+    Asserts() : ServerStatusSection("asserts") {}
+    virtual bool includeByDefault() const {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+        BSONObjBuilder asserts;
+        asserts.append("regular", assertionCount.regular);
+        asserts.append("warning", assertionCount.warning);
+        asserts.append("msg", assertionCount.msg);
+        asserts.append("user", assertionCount.user);
+        asserts.append("rollovers", assertionCount.rollovers);
+        return asserts.obj();
+    }
+
+} asserts;
+
+
+class Network : public ServerStatusSection {
+public:
+    Network() : ServerStatusSection("network") {}
+    virtual bool includeByDefault() const {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+        BSONObjBuilder b;
+        networkCounter.append(b);
+        appendMessageCompressionStats(&b);
+        auto executor = opCtx->getServiceContext()->getServiceExecutor();
+        if (executor)
+            executor->appendStats(&b);
+
+        return b.obj();
+    }
+
+} network;
+
+#ifdef MONGO_CONFIG_SSL
+class Security : public ServerStatusSection {
+public:
+    Security() : ServerStatusSection("security") {}
+    virtual bool includeByDefault() const {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+        BSONObj result;
+        if (getSSLManager()) {
+            result = getSSLManager()->getSSLConfiguration().getServerStatusBSON();
+        }
+
+        return result;
+    }
+} security;
+#endif
+
+class MemBase : public ServerStatusMetric {
+public:
+    MemBase() : ServerStatusMetric(".mem.bits") {}
+    virtual void appendAtLeaf(BSONObjBuilder& b) const {
+        b.append("bits", sizeof(int*) == 4 ? 32 : 64);
+
+        ProcessInfo p;
+        int v = 0;
+        if (p.supported()) {
+            b.appendNumber("resident", p.getResidentSize());
+            v = p.getVirtualMemorySize();
+            b.appendNumber("virtual", v);
+            b.appendBool("supported", true);
+        } else {
+            b.append("note", "not all mem info support on this platform");
+            b.appendBool("supported", false);
+        }
+    }
+} memBase;
+
+class AdvisoryHostFQDNs final : public ServerStatusSection {
+public:
+    AdvisoryHostFQDNs() : ServerStatusSection("advisoryHostFQDNs") {}
+
+    bool includeByDefault() const override {
+        return false;
+    }
+
+    void appendSection(OperationContext* opCtx,
+                       const BSONElement& configElement,
+                       BSONObjBuilder* out) const override {
+        out->append(
+            "advisoryHostFQDNs",
+            getHostFQDNs(getHostNameCached(), HostnameCanonicalizationMode::kForwardAndReverse));
+    }
+} advisoryHostFQDNs;
+}  // namespace
+
+}  // namespace mongo

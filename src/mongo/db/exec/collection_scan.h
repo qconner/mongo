@@ -28,84 +28,100 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
 
-    class RecordIterator;
-    class WorkingSet;
-    class OperationContext;
+struct Record;
+class SeekableRecordCursor;
+class WorkingSet;
+class OperationContext;
+
+/**
+ * Scans over a collection, starting at the RecordId provided in params and continuing until
+ * there are no more records in the collection.
+ *
+ * Preconditions: Valid RecordId.
+ */
+class CollectionScan final : public PlanStage {
+public:
+    CollectionScan(OperationContext* opCtx,
+                   const CollectionScanParams& params,
+                   WorkingSet* workingSet,
+                   const MatchExpression* filter);
+
+    StageState doWork(WorkingSetID* out) final;
+    bool isEOF() final;
+
+    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+
+    StageType stageType() const final {
+        return STAGE_COLLSCAN;
+    }
+
+    Timestamp getLatestOplogTimestamp() const {
+        return _latestOplogEntryTimestamp;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static const char* kStageType;
+
+private:
+    /**
+     * If the member (with id memberID) passes our filter, set *out to memberID and return that
+     * ADVANCED.  Otherwise, free memberID and return NEED_TIME.
+     */
+    StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
     /**
-     * Scans over a collection, starting at the RecordId provided in params and continuing until
-     * there are no more records in the collection.
-     *
-     * Preconditions: Valid RecordId.
+     * Extracts the timestamp from the 'ts' field of 'record', and sets '_latestOplogEntryTimestamp'
+     * to that time if it isn't already greater.  Returns an error if the 'ts' field cannot be
+     * extracted.
      */
-    class CollectionScan : public PlanStage {
-    public:
-        CollectionScan(OperationContext* txn,
-                       const CollectionScanParams& params,
-                       WorkingSet* workingSet,
-                       const MatchExpression* filter);
+    Status setLatestOplogEntryTimestamp(const Record& record);
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
+    // WorkingSet is not owned by us.
+    WorkingSet* _workingSet;
 
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
+    // The filter is not owned by us.
+    const MatchExpression* _filter;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    // If a document does not pass '_filter' but passes '_endCondition', stop scanning and return
+    // IS_EOF.
+    BSONObj _endConditionBSON;
+    std::unique_ptr<GTEMatchExpression> _endCondition;
 
-        virtual StageType stageType() const { return STAGE_COLLSCAN; }
+    std::unique_ptr<SeekableRecordCursor> _cursor;
 
-        virtual PlanStageStats* getStats();
+    CollectionScanParams _params;
 
-        virtual const CommonStats* getCommonStats();
+    bool _isDead;
 
-        virtual const SpecificStats* getSpecificStats();
+    RecordId _lastSeenId;  // Null if nothing has been returned from _cursor yet.
 
-        static const char* kStageType;
+    // We allocate a working set member with this id on construction of the stage. It gets used for
+    // all fetch requests. This should only be used for passing up the Fetcher for a NEED_YIELD, and
+    // should remain in the INVALID state.
+    const WorkingSetID _wsidForFetch;
 
-    private:
-        /**
-         * If the member (with id memberID) passes our filter, set *out to memberID and return that
-         * ADVANCED.  Otherwise, free memberID and return NEED_TIME.
-         */
-        StageState returnIfMatches(WorkingSetMember* member,
-                                   WorkingSetID memberID,
-                                   WorkingSetID* out);
+    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog, the latest
+    // timestamp seen in the collection.  Otherwise, this is a null timestamp.
+    Timestamp _latestOplogEntryTimestamp;
 
-        // transactional context for read locks. Not owned by us
-        OperationContext* _txn;
-
-        // WorkingSet is not owned by us.
-        WorkingSet* _workingSet;
-
-        // The filter is not owned by us.
-        const MatchExpression* _filter;
-
-        boost::scoped_ptr<RecordIterator> _iter;
-
-        CollectionScanParams _params;
-
-        bool _isDead;
-
-        RecordId _lastSeenLoc;
-
-        // We allocate a working set member with this id on construction of the stage. It gets
-        // used for all fetch requests, changing the RecordId as appropriate.
-        const WorkingSetID _wsidForFetch;
-
-        // Stats
-        CommonStats _commonStats;
-        CollectionScanStats _specificStats;
-    };
+    // Stats
+    CollectionScanStats _specificStats;
+};
 
 }  // namespace mongo

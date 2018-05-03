@@ -1,5 +1,3 @@
-// sorted_data_interface_test_cursor.cpp
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -28,177 +26,145 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
-    using boost::scoped_ptr;
+// Verify that a forward cursor is positioned at EOF when the index is empty.
+TEST(SortedDataInterface, CursorIsEOFWhenEmpty) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
 
-    // Call getDirection() on a forward cursor and verify the result equals +1.
-    TEST( SortedDataInterface, GetCursorDirection ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
 
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
+
+        ASSERT(!cursor->seek(kMinBSONKey, true));
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->next());
+    }
+}
+
+// Verify that a reverse cursor is positioned at EOF when the index is empty.
+TEST(SortedDataInterface, CursorIsEOFWhenEmptyReversed) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(
+            sorted->newCursor(opCtx.get(), false));
+
+        ASSERT(!cursor->seek(kMaxBSONKey, true));
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->next());
+    }
+}
+
+// Call advance() on a forward cursor until it is exhausted.
+// When a cursor positioned at EOF is advanced, it stays at EOF.
+TEST(SortedDataInterface, ExhaustCursor) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-            ASSERT_EQUALS( 1, cursor->getDirection() );
+            WriteUnitOfWork uow(opCtx.get());
+            BSONObj key = BSON("" << i);
+            RecordId loc(42, i * 2);
+            ASSERT_OK(sorted->insert(opCtx.get(), key, loc, true));
+            uow.commit();
         }
     }
 
-    // Call getDirection() on a reverse cursor and verify the result equals -1.
-    TEST( SortedDataInterface, GetCursorDirectionReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
+    }
 
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
+        for (int i = 0; i < nToInsert; i++) {
+            auto entry = i == 0 ? cursor->seek(kMinBSONKey, true) : cursor->next();
+            ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
+        }
+        ASSERT(!cursor->next());
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->next());
+    }
+}
+
+// Call advance() on a reverse cursor until it is exhausted.
+// When a cursor positioned at EOF is advanced, it stays at EOF.
+TEST(SortedDataInterface, ExhaustCursorReversed) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-            ASSERT_EQUALS( -1, cursor->getDirection() );
+            WriteUnitOfWork uow(opCtx.get());
+            BSONObj key = BSON("" << i);
+            RecordId loc(42, i * 2);
+            ASSERT_OK(sorted->insert(opCtx.get(), key, loc, true));
+            uow.commit();
         }
     }
 
-    // Verify that a forward cursor is positioned at EOF when the index is empty.
-    TEST( SortedDataInterface, CursorIsEOFWhenEmpty ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-
-            ASSERT( !cursor->locate( minKey, RecordId::min() ) );
-            ASSERT( cursor->isEOF() );
-
-            // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
-        }
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
     }
 
-    // Verify that a reverse cursor is positioned at EOF when the index is empty.
-    TEST( SortedDataInterface, CursorIsEOFWhenEmptyReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(
+            sorted->newCursor(opCtx.get(), false));
+        for (int i = nToInsert - 1; i >= 0; i--) {
+            auto entry = (i == nToInsert - 1) ? cursor->seek(kMaxBSONKey, true) : cursor->next();
+            ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
         }
+        ASSERT(!cursor->next());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-
-            ASSERT( !cursor->locate( maxKey, RecordId::max() ) );
-            ASSERT( cursor->isEOF() );
-
-            // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
-        }
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->next());
     }
+}
 
-    // Call advance() on a forward cursor until it is exhausted.
-    // When a cursor positioned at EOF is advanced, it stays at EOF.
-    TEST( SortedDataInterface, ExhaustCursor ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        int nToInsert = 10;
-        for ( int i = 0; i < nToInsert; i++ ) {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                BSONObj key = BSON( "" << i );
-                RecordId loc( 42, i * 2 );
-                ASSERT_OK( sorted->insert( opCtx.get(), key, loc, true ) );
-                uow.commit();
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( nToInsert, sorted->numEntries( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-            ASSERT( !cursor->locate( minKey, RecordId::min() ) );
-            for ( int i = 0; i < nToInsert; i++ ) {
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( BSON( "" << i ), cursor->getKey() );
-                ASSERT_EQUALS( RecordId( 42, i * 2 ), cursor->getRecordId() );
-                cursor->advance();
-            }
-            ASSERT( cursor->isEOF() );
-
-            // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
-        }
-    }
-
-    // Call advance() on a reverse cursor until it is exhausted.
-    // When a cursor positioned at EOF is advanced, it stays at EOF.
-    TEST( SortedDataInterface, ExhaustCursorReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        int nToInsert = 10;
-        for ( int i = 0; i < nToInsert; i++ ) {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                BSONObj key = BSON( "" << i );
-                RecordId loc( 42, i * 2 );
-                ASSERT_OK( sorted->insert( opCtx.get(), key, loc, true ) );
-                uow.commit();
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( nToInsert, sorted->numEntries( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-            ASSERT( !cursor->locate( maxKey, RecordId::max() ) );
-            for ( int i = nToInsert - 1; i >= 0; i-- ) {
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( BSON( "" << i ), cursor->getKey() );
-                ASSERT_EQUALS( RecordId( 42, i * 2 ), cursor->getRecordId() );
-                cursor->advance();
-            }
-            ASSERT( cursor->isEOF() );
-
-            // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
-        }
-    }
-
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

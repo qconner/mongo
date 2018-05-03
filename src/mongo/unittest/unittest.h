@@ -37,17 +37,15 @@
 #include <cmath>
 #include <sstream>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
-
-#include <boost/config.hpp>
-#include <boost/noncopyable.hpp>
-#include <boost/scoped_ptr.hpp>
-#include <boost/shared_ptr.hpp>
 
 #include "mongo/base/status_with.h"
 #include "mongo/logger/logstream_builder.h"
 #include "mongo/logger/message_log_domain.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
@@ -60,7 +58,9 @@
 /**
  * Fails unless "EXPRESSION" is true.
  */
-#define ASSERT_TRUE(EXPRESSION) if (!(EXPRESSION)) FAIL("Expected: " #EXPRESSION)
+#define ASSERT_TRUE(EXPRESSION) \
+    if (!(EXPRESSION))          \
+    FAIL("Expected: " #EXPRESSION)
 #define ASSERT(EXPRESSION) ASSERT_TRUE(EXPRESSION)
 
 /**
@@ -81,8 +81,8 @@
 /*
  * Binary comparison assertions.
  */
-#define ASSERT_EQUALS(a,b) ASSERT_EQ(a, b)
-#define ASSERT_NOT_EQUALS(a,b) ASSERT_NE(a, b)
+#define ASSERT_EQUALS(a, b) ASSERT_EQ(a, b)
+#define ASSERT_NOT_EQUALS(a, b) ASSERT_NE(a, b)
 #define ASSERT_LESS_THAN(a, b) ASSERT_LT(a, b)
 #define ASSERT_NOT_LESS_THAN(a, b) ASSERT_GTE(a, b)
 #define ASSERT_GREATER_THAN(a, b) ASSERT_GT(a, b)
@@ -90,26 +90,26 @@
 #define ASSERT_LESS_THAN_OR_EQUALS(a, b) ASSERT_LTE(a, b)
 #define ASSERT_GREATER_THAN_OR_EQUALS(a, b) ASSERT_GTE(a, b)
 
-#define ASSERT_EQ(a,b) _ASSERT_COMPARISON(EQ, a, b)
-#define ASSERT_NE(a,b) _ASSERT_COMPARISON(NE, a, b)
-#define ASSERT_LT(a, b) _ASSERT_COMPARISON(LT, a, b)
-#define ASSERT_LTE(a, b) _ASSERT_COMPARISON(LTE, a, b)
-#define ASSERT_GT(a, b) _ASSERT_COMPARISON(GT, a, b)
-#define ASSERT_GTE(a, b) _ASSERT_COMPARISON(GTE, a, b)
+#define ASSERT_EQ(a, b) ASSERT_COMPARISON_(kEq, a, b)
+#define ASSERT_NE(a, b) ASSERT_COMPARISON_(kNe, a, b)
+#define ASSERT_LT(a, b) ASSERT_COMPARISON_(kLt, a, b)
+#define ASSERT_LTE(a, b) ASSERT_COMPARISON_(kLe, a, b)
+#define ASSERT_GT(a, b) ASSERT_COMPARISON_(kGt, a, b)
+#define ASSERT_GTE(a, b) ASSERT_COMPARISON_(kGe, a, b)
 
 /**
  * Binary comparison utility macro.  Do not use directly.
  */
-#define _ASSERT_COMPARISON(COMPARISON, a, b)                    \
-    if (::mongo::unittest::ComparisonAssertion_##COMPARISON ca = ::mongo::unittest::ComparisonAssertion_##COMPARISON(__FILE__, __LINE__, #a, #b, a, b)) \
-        ca.failure().stream()
+#define ASSERT_COMPARISON_(OP, a, b)                                                           \
+    if (auto ca = ::mongo::unittest::ComparisonAssertion<::mongo::unittest::ComparisonOp::OP>( \
+            __FILE__, __LINE__, #a, #b, a, b))                                                 \
+    ca.failure().stream()
 
 /**
  * Approximate equality assertion. Useful for comparisons on limited precision floating point
  * values.
  */
-#define ASSERT_APPROX_EQUAL(a, b, ABSOLUTE_ERR) \
-    ASSERT_LTE(std::abs((a) - (b)), ABSOLUTE_ERR)
+#define ASSERT_APPROX_EQUAL(a, b, ABSOLUTE_ERR) ASSERT_LTE(std::abs((a) - (b)), ABSOLUTE_ERR)
 
 /**
  * Verify that the evaluation of "EXPRESSION" throws an exception of type EXCEPTION_TYPE.
@@ -118,53 +118,65 @@
  * of a subtype of "EXCEPTION_TYPE", the test is considered a failure and further evaluation
  * halts.
  */
-#define ASSERT_THROWS(STATEMENT, EXCEPTION_TYPE)                        \
-    ASSERT_THROWS_PRED(STATEMENT,                                       \
-                       EXCEPTION_TYPE,                                  \
-                       ::mongo::stdx::bind(::mongo::unittest::alwaysTrue))
+#define ASSERT_THROWS(STATEMENT, EXCEPTION_TYPE) \
+    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([](const EXCEPTION_TYPE&) {}))
 
 /**
  * Behaves like ASSERT_THROWS, above, but also fails if calling what() on the thrown exception
  * does not return a string equal to EXPECTED_WHAT.
  */
-#define ASSERT_THROWS_WHAT(STATEMENT, EXCEPTION_TYPE, EXPECTED_WHAT) \
-    ASSERT_THROWS_PRED(STATEMENT, \
-                       EXCEPTION_TYPE, \
-                       ::mongo::stdx::bind(std::equal_to<std::string>(), (EXPECTED_WHAT), \
-                                           ::mongo::stdx::bind(&EXCEPTION_TYPE::what, \
-                                                               ::mongo::stdx::placeholders::_1)))
+#define ASSERT_THROWS_WHAT(STATEMENT, EXCEPTION_TYPE, EXPECTED_WHAT)                     \
+    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) { \
+                                 ASSERT_EQ(::mongo::StringData(ex.what()),               \
+                                           ::mongo::StringData(EXPECTED_WHAT));          \
+                             }))
 
 /**
- * Behaves like ASSERT_THROWS, above, but also fails if PREDICATE(ex) for the throw exception, ex,
- * is false.
+ * Behaves like ASSERT_THROWS, above, but also fails if calling getCode() on the thrown exception
+ * does not return an error code equal to EXPECTED_CODE.
  */
-#define ASSERT_THROWS_PRED(STATEMENT, EXCEPTION_TYPE, PREDICATE) do {   \
-        try {                                                           \
-            STATEMENT;                                                  \
-            FAIL("Expected statement " #STATEMENT                       \
-                 " to throw " #EXCEPTION_TYPE                           \
-                 " but it threw nothing.");                             \
-        } catch (const EXCEPTION_TYPE& ex) {                            \
-            if (!(PREDICATE(ex))) {                                     \
-                FAIL("Expected " #STATEMENT                             \
-                     " to throw an exception of type "                  \
-                     #EXCEPTION_TYPE                                    \
-                     " where " #PREDICATE                               \
-                     "(ex) was true, but it was false.");               \
-            }                                                           \
-        }                                                               \
+#define ASSERT_THROWS_CODE(STATEMENT, EXCEPTION_TYPE, EXPECTED_CODE)                     \
+    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) { \
+                                 ASSERT_EQ(ex.toStatus().code(), EXPECTED_CODE);         \
+                             }))
+
+/**
+ * Behaves like ASSERT_THROWS, above, but also fails if calling getCode() on the thrown exception
+ * does not return an error code equal to EXPECTED_CODE or if calling what() on the thrown exception
+ * does not return a string equal to EXPECTED_WHAT.
+ */
+#define ASSERT_THROWS_CODE_AND_WHAT(STATEMENT, EXCEPTION_TYPE, EXPECTED_CODE, EXPECTED_WHAT) \
+    ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, ([&](const EXCEPTION_TYPE& ex) {     \
+                                 ASSERT_EQ(ex.toStatus().code(), EXPECTED_CODE);             \
+                                 ASSERT_EQ(::mongo::StringData(ex.what()),                   \
+                                           ::mongo::StringData(EXPECTED_WHAT));              \
+                             }))
+
+/**
+ * Behaves like ASSERT_THROWS, above, but also calls CHECK(caughtException) which may contain
+ * additional assertions.
+ */
+#define ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, CHECK)             \
+    do {                                                                       \
+        try {                                                                  \
+            STATEMENT;                                                         \
+            FAIL("Expected statement " #STATEMENT " to throw " #EXCEPTION_TYPE \
+                 " but it threw nothing.");                                    \
+        } catch (const EXCEPTION_TYPE& ex) {                                   \
+            CHECK(ex);                                                         \
+        }                                                                      \
     } while (false)
 
-#define ASSERT_STRING_CONTAINS(BIG_STRING, CONTAINS ) do {              \
-        std::string myString( BIG_STRING );                             \
-        if ( myString.find(CONTAINS) == std::string::npos ) {           \
-            std::string err( "Expected " #BIG_STRING " (" );            \
-            err += myString;                                            \
-            err += std::string(") to contain " #CONTAINS );             \
-            ::mongo::unittest::TestAssertionFailure(__FILE__,           \
-                                                    __LINE__,           \
-                                                    err).stream();      \
-        }                                                               \
+#define ASSERT_STRING_CONTAINS(BIG_STRING, CONTAINS)                                            \
+    do {                                                                                        \
+        std::string myString(BIG_STRING);                                                       \
+        std::string myContains(CONTAINS);                                                       \
+        if (myString.find(myContains) == std::string::npos) {                                   \
+            ::mongoutils::str::stream err;                                                      \
+            err << "Expected to find " #CONTAINS " (" << myContains << ") in " #BIG_STRING " (" \
+                << myString << ")";                                                             \
+            ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream();          \
+        }                                                                                       \
     } while (false)
 
 /**
@@ -176,15 +188,15 @@
  *     ASSERT_EQUALS(error_success, foo(invalidValue));
  * }
  */
-#define TEST(CASE_NAME, TEST_NAME) \
-    class _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) : public ::mongo::unittest::Test { \
-    private:                                                            \
-        virtual void _doTest();                                         \
-                                                                        \
-        static const RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME) > _agent; \
-    };                                                                  \
-    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME) > \
-            _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_agent(#CASE_NAME, #TEST_NAME); \
+#define TEST(CASE_NAME, TEST_NAME)                                                          \
+    class _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) : public ::mongo::unittest::Test {          \
+    private:                                                                                \
+        virtual void _doTest();                                                             \
+                                                                                            \
+        static const RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)> _agent;       \
+    };                                                                                      \
+    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)> \
+        _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_agent(#CASE_NAME, #TEST_NAME);              \
     void _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_doTest()
 
 /**
@@ -203,320 +215,397 @@
  *     ASSERT_EQUALS(10, myVar);
  * }
  */
-#define TEST_F(FIXTURE_NAME, TEST_NAME) \
-    class _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME) : public FIXTURE_NAME { \
-    private:                                                            \
-        virtual void _doTest();                                         \
-                                                                        \
-        static const RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME) > _agent; \
-    };                                                                  \
-    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME) > \
-            _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_agent(#FIXTURE_NAME, #TEST_NAME); \
+#define TEST_F(FIXTURE_NAME, TEST_NAME)                                                        \
+    class _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME) : public FIXTURE_NAME {                     \
+    private:                                                                                   \
+        virtual void _doTest();                                                                \
+                                                                                               \
+        static const RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)> _agent;       \
+    };                                                                                         \
+    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)> \
+        _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_agent(#FIXTURE_NAME, #TEST_NAME);           \
     void _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_doTest()
 
 /**
  * Macro to construct a type name for a test, from its "CASE_NAME" and "TEST_NAME".
  * Do not use directly in test code.
  */
-#define _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)   \
-    UnitTest__##CASE_NAME##__##TEST_NAME
+#define _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) UnitTest__##CASE_NAME##__##TEST_NAME
 
 namespace mongo {
 
-    namespace unittest {
+namespace unittest {
 
-        class Result;
+class Result;
 
-        /**
-         * Gets a LogstreamBuilder for logging to the unittest log domain, which may have
-         * different target from the global log domain.
-         */
-        mongo::logger::LogstreamBuilder log();
+void setupTestLogger();
 
-        /**
-         * Type representing the function composing a test.
-         */
-        typedef stdx::function<void (void)> TestFunction;
+/**
+ * Gets a LogstreamBuilder for logging to the unittest log domain, which may have
+ * different target from the global log domain.
+ */
+mongo::logger::LogstreamBuilder log();
 
-        /**
-         * Container holding a test function and its name.  Suites
-         * contain lists of these.
-         */
-        class TestHolder : private boost::noncopyable {
-        public:
-            TestHolder(const std::string& name, const TestFunction& fn)
-                : _name(name), _fn(fn) {}
+/**
+ * Type representing the function composing a test.
+ */
+typedef stdx::function<void(void)> TestFunction;
 
-            ~TestHolder() {}
-            void run() const { _fn(); }
-            std::string getName() const { return _name; }
+/**
+ * Container holding a test function and its name.  Suites
+ * contain lists of these.
+ */
+class TestHolder {
+    MONGO_DISALLOW_COPYING(TestHolder);
 
-        private:
-            std::string _name;
-            TestFunction _fn;
-        };
+public:
+    TestHolder(const std::string& name, const TestFunction& fn) : _name(name), _fn(fn) {}
 
-        /**
-         * Base type for unit test fixtures.  Also, the default fixture type used
-         * by the TEST() macro.
-         */
-        class Test : private boost::noncopyable {
-        public:
-            Test();
-            virtual ~Test();
-
-            void run();
-
-        protected:
-            /**
-             * Registration agent for adding tests to suites, used by TEST macro.
-             */
-            template <typename T>
-            class RegistrationAgent : private boost::noncopyable {
-            public:
-                RegistrationAgent(const std::string& suiteName, const std::string& testName);
-            };
-
-            /**
-             * This exception class is used to exercise the testing framework itself. If a test
-             * case throws it, the framework would not consider it an error.
-             */
-            class FixtureExceptionForTesting : public std::exception {
-            };
-
-            /**
-             * Starts capturing messages logged by code under test.
-             *
-             * Log messages will still also go to their default destination; this
-             * code simply adds an additional sink for log messages.
-             *
-             * Clears any previously captured log lines.
-             */
-            void startCapturingLogMessages();
-
-            /**
-             * Stops capturing log messages logged by code under test.
-             */
-            void stopCapturingLogMessages();
-
-            /**
-             * Gets a vector of strings, one log line per string, captured since
-             * the last call to startCapturingLogMessages() in this test.
-             */
-            const std::vector<std::string>& getCapturedLogMessages() const {
-                return _capturedLogMessages;
-            }
-
-        private:
-            /**
-             * Called on the test object before running the test.
-             */
-            virtual void setUp();
-
-            /**
-             * Called on the test object after running the test.
-             */
-            virtual void tearDown();
-
-            /**
-             * The test itself.
-             */
-            virtual void _doTest() = 0;
-
-            bool _isCapturingLogMessages;
-            std::vector<std::string> _capturedLogMessages;
-            logger::MessageLogDomain::AppenderHandle _captureAppenderHandle;
-        };
-
-        /**
-         * Representation of a collection of tests.
-         *
-         * One suite is constructed for each "CASE_NAME" when using the TEST macro.
-         * Additionally, tests that are part of dbtests are manually assigned to suites
-         * by the programmer by overriding setupTests() in a subclass of Suite.  This
-         * approach is deprecated.
-         */
-        class Suite : private boost::noncopyable {
-        public:
-            Suite( const std::string& name );
-            virtual ~Suite();
-
-            template<class T>
-            void add() { add<T>(demangleName(typeid(T))); }
-
-            template<class T , typename A >
-            void add( const A& a ) {
-                add(demangleName(typeid(T)), stdx::bind(&Suite::runTestObjectWithArg<T, A>, a));
-            }
-
-            template<class T>
-            void add(const std::string& name) {
-                add(name, &Suite::runTestObject<T>);
-            }
-
-            void add(const std::string& name, const TestFunction& testFn);
-
-            Result * run( const std::string& filter , int runsPerTest );
-
-            static int run( const std::vector<std::string>& suites , const std::string& filter , int runsPerTest );
-
-            /**
-             * Get a suite with the given name, creating it if necessary.
-             *
-             * The implementation of this function must be safe to call during the global static
-             * initialization block before main() executes.
-             */
-            static Suite *getSuite(const std::string& name);
-
-        protected:
-            virtual void setupTests();
-
-        private:
-            // TODO(C++11): Make this hold unique_ptrs.
-            typedef std::vector< boost::shared_ptr<TestHolder> > TestHolderList;
-
-            template <typename T>
-            static void runTestObject() {
-                T testObj;
-                testObj.run();
-            }
-
-            template <typename T, typename A>
-            static void runTestObjectWithArg(const A& a) {
-                T testObj(a);
-                testObj.run();
-            }
-
-            std::string _name;
-            TestHolderList _tests;
-            bool _ran;
-
-            void registerSuite( const std::string& name , Suite* s );
-        };
-
-        // A type that makes it easy to declare a self registering suite for old style test
-        // declarations. Suites are self registering so this is *not* a memory leak.
-        template<typename T>
-        struct SuiteInstance {
-            SuiteInstance() {
-                new T;
-            }
-
-            template<typename U>
-            SuiteInstance(const U& u) {
-                new T(u);
-            }
-        };
-
-        /**
-         * Exception thrown when a test assertion fails.
-         *
-         * Typically thrown by helpers in the TestAssertion class and its ilk, below.
-         *
-         * NOTE(schwerin): This intentionally does _not_ extend std::exception, so that code under
-         * test that (foolishly?) catches std::exception won't swallow test failures.  Doesn't
-         * protect you from code that foolishly catches ..., but you do what you can.
-         */
-        class TestAssertionFailureException {
-        public:
-            TestAssertionFailureException(const std::string& theFile,
-                                          unsigned theLine,
-                                          const std::string& theMessage);
-
-            const std::string& getFile() const { return _file; }
-            unsigned getLine() const { return _line; }
-            const std::string& getMessage() const { return _message; }
-            void setMessage(const std::string& message) { _message = message; }
-
-            std::string toString() const;
-
-        private:
-            std::string _file;
-            unsigned _line;
-            std::string _message;
-        };
-
-        class TestAssertionFailure {
-        public:
-            TestAssertionFailure(
-                    const std::string& file, unsigned line, const std::string& message);
-            TestAssertionFailure(const TestAssertionFailure& other);
-            ~TestAssertionFailure() BOOST_NOEXCEPT_IF(false);
-
-            TestAssertionFailure& operator=(const TestAssertionFailure& other);
-
-            std::ostream& stream();
-        private:
-            TestAssertionFailureException _exception;
-            std::ostringstream _stream;
-            bool _enabled;
-        };
-
-#define DECLARE_COMPARISON_ASSERTION(NAME, OPERATOR)                    \
-        class ComparisonAssertion_##NAME  {                             \
-        typedef void (ComparisonAssertion_##NAME::*bool_type)() const;  \
-        public:                                                         \
-            template <typename A, typename B>                           \
-            ComparisonAssertion_##NAME(                                 \
-                    const std::string& theFile,                         \
-                    unsigned theLine,                                   \
-                    StringData aExpression,                             \
-                    StringData bExpression,                             \
-                    const A& a,                                         \
-                    const B& b)  {                                      \
-                if (a OPERATOR b) {                                     \
-                    return;                                             \
-                }                                                       \
-                std::ostringstream os;                                  \
-                os << "Expected " <<                                    \
-                    aExpression << " " #OPERATOR " " << bExpression <<  \
-                    " (" << a << " " #OPERATOR " " << b << ")";         \
-                _assertion.reset(new TestAssertionFailure(              \
-                                         theFile,                       \
-                                         theLine,                       \
-                                         os.str()));                    \
-            }                                                           \
-            operator bool_type() const {                                \
-                return _assertion.get() ? &ComparisonAssertion_##NAME::comparison_failed : NULL; \
-            }                                                           \
-            TestAssertionFailure failure() { return *_assertion; }     \
-        private:                                                        \
-            void comparison_failed() const {}                           \
-            boost::shared_ptr<TestAssertionFailure> _assertion;         \
+    ~TestHolder() {}
+    void run() const {
+        _fn();
+    }
+    std::string getName() const {
+        return _name;
     }
 
-DECLARE_COMPARISON_ASSERTION(EQ, ==);
-DECLARE_COMPARISON_ASSERTION(NE, !=);
-DECLARE_COMPARISON_ASSERTION(LT, <);
-DECLARE_COMPARISON_ASSERTION(LTE, <=);
-DECLARE_COMPARISON_ASSERTION(GT, >);
-DECLARE_COMPARISON_ASSERTION(GTE, >=);
-#undef DECLARE_COMPARISON_ASSERTION
+private:
+    std::string _name;
+    TestFunction _fn;
+};
 
-        /**
-         * Get the value out of a StatusWith<T>, or throw an exception if it is not OK.
-         */
-        template <typename T>
-        const T& assertGet(const StatusWith<T>& swt) {
-            ASSERT_OK(swt.getStatus());
-            return swt.getValue();
+/**
+ * Base type for unit test fixtures.  Also, the default fixture type used
+ * by the TEST() macro.
+ */
+class Test {
+    MONGO_DISALLOW_COPYING(Test);
+
+public:
+    Test();
+    virtual ~Test();
+
+    void run();
+
+protected:
+    /**
+     * Registration agent for adding tests to suites, used by TEST macro.
+     */
+    template <typename T>
+    class RegistrationAgent {
+        MONGO_DISALLOW_COPYING(RegistrationAgent);
+
+    public:
+        RegistrationAgent(const std::string& suiteName, const std::string& testName);
+        std::string getSuiteName() const;
+        std::string getTestName() const;
+
+    private:
+        const std::string _suiteName;
+        const std::string _testName;
+    };
+
+    /**
+     * This exception class is used to exercise the testing framework itself. If a test
+     * case throws it, the framework would not consider it an error.
+     */
+    class FixtureExceptionForTesting : public std::exception {};
+
+    /**
+     * Starts capturing messages logged by code under test.
+     *
+     * Log messages will still also go to their default destination; this
+     * code simply adds an additional sink for log messages.
+     *
+     * Clears any previously captured log lines.
+     */
+    void startCapturingLogMessages();
+
+    /**
+     * Stops capturing log messages logged by code under test.
+     */
+    void stopCapturingLogMessages();
+
+    /**
+     * Gets a vector of strings, one log line per string, captured since
+     * the last call to startCapturingLogMessages() in this test.
+     */
+    const std::vector<std::string>& getCapturedLogMessages() const {
+        return _capturedLogMessages;
+    }
+
+    /**
+     * Returns the number of collected log lines containing "needle".
+     */
+    int64_t countLogLinesContaining(const std::string& needle);
+
+    /**
+     * Prints the captured log lines.
+     */
+    void printCapturedLogLines() const;
+
+    /**
+     * Called on the test object before running the test.
+     */
+    virtual void setUp();
+
+    /**
+     * Called on the test object after running the test.
+     */
+    virtual void tearDown();
+
+private:
+    /**
+     * The test itself.
+     */
+    virtual void _doTest() = 0;
+
+    bool _isCapturingLogMessages;
+    std::vector<std::string> _capturedLogMessages;
+    logger::MessageLogDomain::AppenderHandle _captureAppenderHandle;
+    std::unique_ptr<logger::MessageLogDomain::EventAppender> _captureAppender;
+};
+
+/**
+ * Representation of a collection of tests.
+ *
+ * One suite is constructed for each "CASE_NAME" when using the TEST macro.
+ * Additionally, tests that are part of dbtests are manually assigned to suites
+ * by the programmer by overriding setupTests() in a subclass of Suite.  This
+ * approach is deprecated.
+ */
+class Suite {
+    MONGO_DISALLOW_COPYING(Suite);
+
+public:
+    Suite(const std::string& name);
+    virtual ~Suite();
+
+    template <class T>
+    void add() {
+        add<T>(demangleName(typeid(T)));
+    }
+
+    template <class T, class A>
+    void add(const A& a) {
+        add(demangleName(typeid(T)), [a] {
+            T testObj(a);
+            testObj.run();
+        });
+    }
+
+    template <class T>
+    void add(const std::string& name) {
+        add(name, [] {
+            T testObj;
+            testObj.run();
+        });
+    }
+
+    void add(const std::string& name, const TestFunction& testFn);
+
+    Result* run(const std::string& filter, int runsPerTest);
+
+    static int run(const std::vector<std::string>& suites,
+                   const std::string& filter,
+                   int runsPerTest);
+
+    /**
+     * Get a suite with the given name, creating it if necessary.
+     *
+     * The implementation of this function must be safe to call during the global static
+     * initialization block before main() executes.
+     */
+    static Suite* getSuite(const std::string& name);
+
+protected:
+    virtual void setupTests();
+
+private:
+    typedef std::vector<std::unique_ptr<TestHolder>> TestHolderList;
+
+    std::string _name;
+    TestHolderList _tests;
+    bool _ran;
+
+    void registerSuite(const std::string& name, Suite* s);
+};
+
+// A type that makes it easy to declare a self registering suite for old style test
+// declarations. Suites are self registering so this is *not* a memory leak.
+template <typename T>
+struct SuiteInstance {
+    SuiteInstance() {
+        new T;
+    }
+
+    template <typename U>
+    SuiteInstance(const U& u) {
+        new T(u);
+    }
+};
+
+/**
+ * Exception thrown when a test assertion fails.
+ *
+ * Typically thrown by helpers in the TestAssertion class and its ilk, below.
+ *
+ * NOTE(schwerin): This intentionally does _not_ extend std::exception, so that code under
+ * test that (foolishly?) catches std::exception won't swallow test failures.  Doesn't
+ * protect you from code that foolishly catches ..., but you do what you can.
+ */
+class TestAssertionFailureException {
+public:
+    TestAssertionFailureException(const std::string& theFile,
+                                  unsigned theLine,
+                                  const std::string& theMessage);
+
+    const std::string& getFile() const {
+        return _file;
+    }
+    unsigned getLine() const {
+        return _line;
+    }
+    const std::string& getMessage() const {
+        return _message;
+    }
+    void setMessage(const std::string& message) {
+        _message = message;
+    }
+
+    const std::string& what() const {
+        return getMessage();
+    }
+
+    std::string toString() const;
+
+    const std::string& getStacktrace() const {
+        return _stacktrace;
+    }
+
+private:
+    std::string _file;
+    unsigned _line;
+    std::string _message;
+    std::string _stacktrace;
+};
+
+class TestAssertionFailure {
+public:
+    TestAssertionFailure(const std::string& file, unsigned line, const std::string& message);
+    TestAssertionFailure(const TestAssertionFailure& other);
+    ~TestAssertionFailure() noexcept(false);
+
+    TestAssertionFailure& operator=(const TestAssertionFailure& other);
+
+    std::ostream& stream();
+
+private:
+    TestAssertionFailureException _exception;
+    std::ostringstream _stream;
+    bool _enabled;
+};
+
+enum class ComparisonOp { kEq, kNe, kLt, kLe, kGt, kGe };
+
+template <ComparisonOp op>
+class ComparisonAssertion {
+private:
+    template <ComparisonOp val>
+    using OpTag = std::integral_constant<ComparisonOp, val>;
+
+    static auto comparator(OpTag<ComparisonOp::kEq>) {
+        return [](auto&& a, auto&& b) { return a == b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kNe>) {
+        return [](auto&& a, auto&& b) { return a != b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kLt>) {
+        return [](auto&& a, auto&& b) { return a < b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kLe>) {
+        return [](auto&& a, auto&& b) { return a <= b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kGt>) {
+        return [](auto&& a, auto&& b) { return a > b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kGe>) {
+        return [](auto&& a, auto&& b) { return a >= b; };
+    }
+
+    static constexpr StringData name(OpTag<ComparisonOp::kEq>) {
+        return "=="_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kNe>) {
+        return "!="_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kLt>) {
+        return "<"_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kLe>) {
+        return "<="_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kGt>) {
+        return ">"_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kGe>) {
+        return ">="_sd;
+    }
+
+public:
+    template <typename A, typename B>
+    ComparisonAssertion(const std::string& theFile,
+                        unsigned theLine,
+                        StringData aExpression,
+                        StringData bExpression,
+                        const A& a,
+                        const B& b) {
+        if (comparator(OpTag<op>{})(a, b)) {
+            return;
         }
+        std::ostringstream os;
+        StringData opName = name(OpTag<op>{});
+        os << "Expected " << aExpression << " " << opName << " " << bExpression << " (" << a << " "
+           << opName << " " << b << ")";
+        _assertion = std::make_unique<TestAssertionFailure>(theFile, theLine, os.str());
+    }
+    explicit operator bool() const {
+        return static_cast<bool>(_assertion);
+    }
+    TestAssertionFailure failure() {
+        return *_assertion;
+    }
 
-        /**
-         * Hack to support the runaway test observer in dbtests.  This is a hook that
-         * unit test running harnesses (unittest_main and dbtests) must implement.
-         */
-        void onCurrentTestNameChange( const std::string& testName );
+private:
+    std::unique_ptr<TestAssertionFailure> _assertion;
+};
 
-        /**
-         * Return a list of suite names.
-         */
-        std::vector<std::string> getAllSuiteNames();
+/**
+ * Get the value out of a StatusWith<T>, or throw an exception if it is not OK.
+ */
+template <typename T>
+const T& assertGet(const StatusWith<T>& swt) {
+    ASSERT_OK(swt.getStatus());
+    return swt.getValue();
+}
+
+template <typename T>
+T assertGet(StatusWith<T>&& swt) {
+    ASSERT_OK(swt.getStatus());
+    return std::move(swt.getValue());
+}
+
+/**
+ * Return a list of suite names.
+ */
+std::vector<std::string> getAllSuiteNames();
 
 
-        inline bool alwaysTrue() { return true; }
+inline bool alwaysTrue() {
+    return true;
+}
 
-    }  // namespace unittest
+}  // namespace unittest
 }  // namespace mongo
 
 #include "mongo/unittest/unittest-inl.h"

@@ -35,146 +35,169 @@
 
 namespace mongo {
 
-    using std::set;
-    using std::string;
-    using std::vector;
+using std::set;
+using std::string;
+using std::vector;
 
-    namespace str = mongoutils::str;
+namespace str = mongoutils::str;
 
-    BSONObj DepsTracker::toProjection() const {
-        BSONObjBuilder bb;
+bool DepsTracker::_appendMetaProjections(BSONObjBuilder* projectionBuilder) const {
+    if (_needTextScore) {
+        projectionBuilder->append(Document::metaFieldTextScore,
+                                  BSON("$meta"
+                                       << "textScore"));
+    }
+    if (_needSortKey) {
+        projectionBuilder->append(Document::metaFieldSortKey,
+                                  BSON("$meta"
+                                       << "sortKey"));
+    }
+    return (_needTextScore || _needSortKey);
+}
 
-        if (needTextScore)
-            bb.append(Document::metaFieldTextScore, BSON("$meta" << "textScore"));
+BSONObj DepsTracker::toProjection() const {
+    BSONObjBuilder bb;
 
-        if (needWholeDocument)
-            return bb.obj();
+    const bool needsMetadata = _appendMetaProjections(&bb);
 
-        if (fields.empty()) {
-            // Projection language lacks good a way to say no fields needed. This fakes it.
-            bb.append("_id", 0);
-            bb.append("$noFieldsNeeded", 1);
-            return bb.obj();
-        }
-
-        bool needId = false;
-        string last;
-        for (set<string>::const_iterator it(fields.begin()), end(fields.end()); it!=end; ++it) {
-            if (str::startsWith(*it, "_id") && (it->size() == 3 || (*it)[3] == '.')) {
-                // _id and subfields are handled specially due in part to SERVER-7502
-                needId = true;
-                continue;
-            }
-
-            if (!last.empty() && str::startsWith(*it, last)) {
-                // we are including a parent of *it so we don't need to include this field
-                // explicitly. In fact, due to SERVER-6527 if we included this field, the parent
-                // wouldn't be fully included.  This logic relies on on set iterators going in
-                // lexicographic order so that a string is always directly before of all fields it
-                // prefixes.
-                continue;
-            }
-
-            last = *it + '.';
-            bb.append(*it, 1);
-        }
-
-        if (needId) // we are explicit either way
-            bb.append("_id", 1);
-        else
-            bb.append("_id", 0);
-
+    if (needWholeDocument) {
         return bb.obj();
     }
 
-    // ParsedDeps::_fields is a simple recursive look-up table. For each field:
-    //      If the value has type==Bool, the whole field is needed
-    //      If the value has type==Object, the fields in the subobject are needed
-    //      All other fields should be missing which means not needed
-    boost::optional<ParsedDeps> DepsTracker::toParsedDeps() const {
-        MutableDocument md;
-
-        if (needWholeDocument || needTextScore) {
-            // can't use ParsedDeps in this case
-            return boost::none;
+    if (fields.empty()) {
+        if (needsMetadata) {
+            // We only need metadata, but there is no easy way to express this in the query
+            // projection language. We use $noFieldsNeeded with a meta-projection since this is an
+            // inclusion projection which will exclude all existing fields but add the metadata.
+            bb.append("_id", 0);
+            bb.append("$noFieldsNeeded", 1);
         }
-
-        string last;
-        for (set<string>::const_iterator it(fields.begin()), end(fields.end()); it!=end; ++it) {
-            if (!last.empty() && str::startsWith(*it, last)) {
-                // we are including a parent of *it so we don't need to include this field
-                // explicitly. In fact, if we included this field, the parent wouldn't be fully
-                // included.  This logic relies on on set iterators going in lexicographic order so
-                // that a string is always directly before of all fields it prefixes.
-                continue;
-            }
-            last = *it + '.';
-            md.setNestedField(*it, Value(true));
-        }
-
-        return ParsedDeps(md.freeze());
+        // We either need nothing (as we would if this was logically a count), or only the metadata.
+        return bb.obj();
     }
+
+    bool needId = false;
+    string last;
+    for (set<string>::const_iterator it(fields.begin()), end(fields.end()); it != end; ++it) {
+        if (str::startsWith(*it, "_id") && (it->size() == 3 || (*it)[3] == '.')) {
+            // _id and subfields are handled specially due in part to SERVER-7502
+            needId = true;
+            continue;
+        }
+
+        if (!last.empty() && str::startsWith(*it, last)) {
+            // we are including a parent of *it so we don't need to include this field
+            // explicitly. In fact, due to SERVER-6527 if we included this field, the parent
+            // wouldn't be fully included.  This logic relies on on set iterators going in
+            // lexicographic order so that a string is always directly before of all fields it
+            // prefixes.
+            continue;
+        }
+
+        last = *it + '.';
+        bb.append(*it, 1);
+    }
+
+    if (needId)  // we are explicit either way
+        bb.append("_id", 1);
+    else
+        bb.append("_id", 0);
+
+    return bb.obj();
+}
+
+// ParsedDeps::_fields is a simple recursive look-up table. For each field:
+//      If the value has type==Bool, the whole field is needed
+//      If the value has type==Object, the fields in the subobject are needed
+//      All other fields should be missing which means not needed
+boost::optional<ParsedDeps> DepsTracker::toParsedDeps() const {
+    MutableDocument md;
+
+    if (needWholeDocument || _needTextScore) {
+        // can't use ParsedDeps in this case
+        return boost::none;
+    }
+
+    string last;
+    for (set<string>::const_iterator it(fields.begin()), end(fields.end()); it != end; ++it) {
+        if (!last.empty() && str::startsWith(*it, last)) {
+            // we are including a parent of *it so we don't need to include this field
+            // explicitly. In fact, if we included this field, the parent wouldn't be fully
+            // included.  This logic relies on on set iterators going in lexicographic order so
+            // that a string is always directly before of all fields it prefixes.
+            continue;
+        }
+        last = *it + '.';
+        md.setNestedField(*it, Value(true));
+    }
+
+    return ParsedDeps(md.freeze());
+}
 
 namespace {
-    // Mutually recursive with arrayHelper
-    Document documentHelper(const BSONObj& bson, const Document& neededFields);
+// Mutually recursive with arrayHelper
+Document documentHelper(const BSONObj& bson, const Document& neededFields, int nFieldsNeeded = -1);
 
-    // Handles array-typed values for ParsedDeps::extractFields
-    Value arrayHelper(const BSONObj& bson, const Document& neededFields) {
-        BSONObjIterator it(bson);
+// Handles array-typed values for ParsedDeps::extractFields
+Value arrayHelper(const BSONObj& bson, const Document& neededFields) {
+    BSONObjIterator it(bson);
 
-        vector<Value> values;
-        while (it.more()) {
-            BSONElement bsonElement(it.next());
-            if (bsonElement.type() == Object) {
-                Document sub = documentHelper(bsonElement.embeddedObject(), neededFields);
-                values.push_back(Value(sub));
-            }
-
-            if (bsonElement.type() == Array) {
-                values.push_back(arrayHelper(bsonElement.embeddedObject(), neededFields));
-            }
+    vector<Value> values;
+    while (it.more()) {
+        BSONElement bsonElement(it.next());
+        if (bsonElement.type() == Object) {
+            Document sub = documentHelper(bsonElement.embeddedObject(), neededFields);
+            values.push_back(Value(sub));
         }
 
-        return Value::consume(values);
+        if (bsonElement.type() == Array) {
+            values.push_back(arrayHelper(bsonElement.embeddedObject(), neededFields));
+        }
     }
 
-    // Handles object-typed values including the top-level for ParsedDeps::extractFields
-    Document documentHelper(const BSONObj& bson, const Document& neededFields) {
-        MutableDocument md(neededFields.size());
+    return Value(std::move(values));
+}
 
-        BSONObjIterator it(bson);
-        while (it.more()) {
-            BSONElement bsonElement (it.next());
-            StringData fieldName = bsonElement.fieldNameStringData();
-            Value isNeeded = neededFields[fieldName];
+// Handles object-typed values including the top-level for ParsedDeps::extractFields
+Document documentHelper(const BSONObj& bson, const Document& neededFields, int nFieldsNeeded) {
+    // We cache the number of top level fields, so don't need to re-compute it every time. For
+    // sub-documents, just scan for the number of fields.
+    if (nFieldsNeeded == -1) {
+        nFieldsNeeded = neededFields.size();
+    }
+    MutableDocument md(nFieldsNeeded);
 
-            if (isNeeded.missing())
-                continue;
+    BSONObjIterator it(bson);
+    while (it.more() && nFieldsNeeded > 0) {
+        auto bsonElement = it.next();
+        StringData fieldName = bsonElement.fieldNameStringData();
+        Value isNeeded = neededFields[fieldName];
 
-            if (isNeeded.getType() == Bool) {
-                md.addField(fieldName, Value(bsonElement));
-                continue;
-            }
+        if (isNeeded.missing())
+            continue;
 
+        --nFieldsNeeded;  // Found a needed field.
+        if (isNeeded.getType() == Bool) {
+            md.addField(fieldName, Value(bsonElement));
+        } else {
             dassert(isNeeded.getType() == Object);
 
-            if (bsonElement.type() == Object) {
-                Document sub = documentHelper(bsonElement.embeddedObject(), isNeeded.getDocument());
-                md.addField(fieldName, Value(sub));
-            }
-
-            if (bsonElement.type() == Array) {
-                md.addField(fieldName, arrayHelper(bsonElement.embeddedObject(),
-                                                   isNeeded.getDocument()));
+            if (bsonElement.type() == BSONType::Object) {
+                md.addField(
+                    fieldName,
+                    Value(documentHelper(bsonElement.embeddedObject(), isNeeded.getDocument())));
+            } else if (bsonElement.type() == BSONType::Array) {
+                md.addField(fieldName,
+                            arrayHelper(bsonElement.embeddedObject(), isNeeded.getDocument()));
             }
         }
-
-        return md.freeze();
     }
-} // namespace
 
-    Document ParsedDeps::extractFields(const BSONObj& input) const {
-        return documentHelper(input, _fields);
-    }
+    return md.freeze();
+}
+}  // namespace
+
+Document ParsedDeps::extractFields(const BSONObj& input) const {
+    return documentHelper(input, _fields, _nFields);
+}
 }

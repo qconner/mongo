@@ -46,11 +46,11 @@
 #if !defined(_WIN32_WINNT)
 // Can't use symbolic versions here, since we may not have seen sdkddkver.h yet.
 #if defined(_WIN64)
-// 64-bit builds default to Windows Server 2003 support.
-#define _WIN32_WINNT 0x0502
+// 64-bit builds default to Windows 7/Windows Server 2008 R2 support.
+#define _WIN32_WINNT 0x0601
 #else
-// 32-bit builds default to Windows XP support.
-#define _WIN32_WINNT 0x0501
+// 32-bit builds default to Windows 7/Windows Server 2008 R2 support.
+#define _WIN32_WINNT 0x0601
 #endif
 #endif
 
@@ -59,33 +59,55 @@
 #if !defined(NTDDI_VERSION)
 // Can't use symbolic versions here, since we may not have seen sdkddkver.h yet.
 #if defined(_WIN64)
-// 64-bit builds default to Windows Server 2003 SP 2 support.
-#define NTDDI_VERSION 0x05020200
+// 64-bit builds default to Windows 7/Windows Server 2008 R2 support.
+#define NTDDI_VERSION 0x06010000
 #else
-// 32-bit builds default to Windows XP SP 3 support.
-#define NTDDI_VERSION 0x05010300
+// 32-bit builds default to Windows 7/Windows Server 2008 R2 support.
+#define NTDDI_VERSION 0x06010000
 #endif
 #endif
 
 // No need to set WINVER, SdkDdkVer.h does that for us, we double check this below.
 
 // for rand_s() usage:
-# define _CRT_RAND_S
-# ifndef NOMINMAX
-#  define NOMINMAX
-# endif
+#define _CRT_RAND_S
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 // Do not complain that about standard library functions that Windows believes should have
 // underscores in front of them, such as unlink().
 #define _CRT_NONSTDC_NO_DEPRECATE
 
 // tell windows.h not to include a bunch of headers we don't need:
-# define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 
-# include <winsock2.h> //this must be included before the first windows.h include
-# include <ws2tcpip.h>
-# include <wspiapi.h>
-# include <windows.h>
+// Tell windows.h not to define any NT status codes, so that we can
+// get the definitions from ntstatus.h, which has a more complete list.
+#define WIN32_NO_STATUS
+
+#include <windows.h>
+#include <winsock2.h>  //this must be included before the first windows.h include
+#include <ws2tcpip.h>
+
+// We must define SECURITY_WIN32 before include sspi.h
+#define SECURITY_WIN32
+
+#include <sspi.h>
+
+#define CERT_CHAIN_PARA_HAS_EXTRA_FIELDS
+
+#include <schannel.h>
+
+#undef WIN32_NO_STATUS
+
+// Obtain a definition for the ntstatus type.
+#include <winternl.h>
+
+// Add back in the status definitions so that macro expansions for
+// things like STILL_ACTIVE and WAIT_OBJECT_O can be resolved (they
+// expand to STATUS_ codes).
+#include <ntstatus.h>
 
 // Should come either from the command line, or if not set there, the inclusion of sdkddkver.h
 // via windows.h above should set it based in _WIN32_WINNT, which is assuredly set by now.
@@ -97,12 +119,10 @@
 #error "Expected WINVER to have been defined and to equal _WIN32_WINNT"
 #endif
 
-#if defined(_WIN64)
-#if !defined(NTDDI_WS03SP2) || (NTDDI_VERSION < NTDDI_WS03SP2)
-#error "64 bit mongo does not support Windows versions older than Windows Server 2003 SP 2"
+#if !defined(NTDDI_WINBLUE)
+#error "MongoDB requires Windows SDK 8.1 or higher to build"
 #endif
-#else
-#if !defined(NTDDI_WINXPSP3) || (NTDDI_VERSION < NTDDI_WINXPSP3)
-#error "32 bit mongo does not support Windows versions older than XP Service Pack 3"
-#endif
+
+#if !defined(NTDDI_WIN7) || NTDDI_VERSION < NTDDI_WIN7
+#error "MongoDB does not support Windows versions older than Windows 7/Windows Server 2008 R2."
 #endif

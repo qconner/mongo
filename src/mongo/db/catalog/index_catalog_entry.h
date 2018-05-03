@@ -1,7 +1,5 @@
-// index_catalog_entry.h
-
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2017 10gen Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -30,134 +28,299 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/base/shim.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/kv/kv_prefix.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/debug_util.h"
 
 namespace mongo {
+class CollatorInterface;
+class CollectionCatalogEntry;
+class CollectionInfoCache;
+class HeadManager;
+class IndexAccessMethod;
+class IndexDescriptor;
+class MatchExpression;
+class OperationContext;
 
-    class CollectionCatalogEntry;
-    class CollectionInfoCache;
-    class HeadManager;
-    class IndexAccessMethod;
-    class IndexDescriptor;
-    class OperationContext;
-
-    class IndexCatalogEntry {
-        MONGO_DISALLOW_COPYING( IndexCatalogEntry );
+class IndexCatalogEntry {
+public:
+    // This class represents the internal vtable for the (potentially polymorphic) implementation of
+    // the `IndexCatalogEntry` class.  This allows us to expose an interface to this object without
+    // requiring a dependency upon the implementation's definition library.
+    class Impl {
     public:
-        IndexCatalogEntry( StringData ns,
-                           CollectionCatalogEntry* collection, // not owned
-                           IndexDescriptor* descriptor, // ownership passes to me
-                           CollectionInfoCache* infoCache ); // not owned, optional
+        virtual ~Impl() = 0;
 
-        ~IndexCatalogEntry();
+        virtual const std::string& ns() const = 0;
 
-        const std::string& ns() const { return _ns; }
+        virtual void init(std::unique_ptr<IndexAccessMethod> accessMethod) = 0;
 
-        void init( OperationContext* txn,
-                   IndexAccessMethod* accessMethod );
+        virtual IndexDescriptor* descriptor() = 0;
 
-        IndexDescriptor* descriptor() { return _descriptor; }
-        const IndexDescriptor* descriptor() const { return _descriptor; }
+        virtual const IndexDescriptor* descriptor() const = 0;
 
-        IndexAccessMethod* accessMethod() { return _accessMethod; }
-        const IndexAccessMethod* accessMethod() const { return _accessMethod; }
+        virtual IndexAccessMethod* accessMethod() = 0;
 
-        const Ordering& ordering() const { return _ordering; }
+        virtual const IndexAccessMethod* accessMethod() const = 0;
 
-        /// ---------------------
+        virtual const Ordering& ordering() const = 0;
 
-        const RecordId& head( OperationContext* txn ) const;
+        virtual const MatchExpression* getFilterExpression() const = 0;
 
-        void setHead( OperationContext* txn, RecordId newHead );
+        virtual const CollatorInterface* getCollator() const = 0;
 
-        void setIsReady( bool newIsReady );
+        virtual const RecordId& head(OperationContext* opCtx) const = 0;
 
-        HeadManager* headManager() const { return _headManager; }
+        virtual void setHead(OperationContext* opCtx, RecordId newHead) = 0;
 
-        // --
+        virtual void setIsReady(bool newIsReady) = 0;
 
-        bool isMultikey() const;
+        virtual HeadManager* headManager() const = 0;
 
-        void setMultikey( OperationContext* txn );
+        virtual bool isMultikey() const = 0;
 
-        // if this ready is ready for queries
-        bool isReady( OperationContext* txn ) const;
+        virtual MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const = 0;
 
-    private:
+        virtual void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) = 0;
 
-        class SetMultikeyChange;
-        class SetHeadChange;
+        virtual bool isReady(OperationContext* opCtx) const = 0;
 
-        bool _catalogIsReady( OperationContext* txn ) const;
-        RecordId _catalogHead( OperationContext* txn ) const;
-        bool _catalogIsMultikey( OperationContext* txn ) const;
+        virtual KVPrefix getPrefix() const = 0;
 
-        // -----
+        virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() = 0;
 
-        std::string _ns;
-
-        CollectionCatalogEntry* _collection; // not owned here
-
-        IndexDescriptor* _descriptor; // owned here
-
-        CollectionInfoCache* _infoCache; // not owned here
-
-        IndexAccessMethod* _accessMethod; // owned here
-
-        // Owned here.
-        HeadManager* _headManager;
-
-        // cached stuff
-
-        Ordering _ordering; // TODO: this might be b-tree specific
-        bool _isReady; // cache of NamespaceDetails info
-        RecordId _head; // cache of IndexDetails
-        bool _isMultikey; // cache of NamespaceDetails info
+        virtual void setMinimumVisibleSnapshot(Timestamp name) = 0;
     };
 
-    class IndexCatalogEntryContainer {
-    public:
+public:
+    static MONGO_DECLARE_SHIM((IndexCatalogEntry * this_,
+                               OperationContext* opCtx,
+                               StringData ns,
+                               CollectionCatalogEntry* collection,
+                               std::unique_ptr<IndexDescriptor> descriptor,
+                               CollectionInfoCache* infoCache,
+                               PrivateTo<IndexCatalogEntry>)
+                                  ->std::unique_ptr<Impl>) makeImpl;
 
-        typedef std::vector<IndexCatalogEntry*>::const_iterator const_iterator;
-        typedef std::vector<IndexCatalogEntry*>::const_iterator iterator;
+    explicit IndexCatalogEntry(
+        OperationContext* opCtx,
+        StringData ns,
+        CollectionCatalogEntry* collection,           // not owned
+        std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
+        CollectionInfoCache* infoCache);              // not owned, optional
 
-        const_iterator begin() const { return _entries.vector().begin(); }
-        const_iterator end() const { return _entries.vector().end(); }
+    // Do not call this function.  It exists for use with test drivers that need to inject
+    // alternative implementations.
+    explicit IndexCatalogEntry(std::unique_ptr<Impl> impl) : _pimpl(std::move(impl)) {}
 
-        iterator begin() { return _entries.vector().begin(); }
-        iterator end() { return _entries.vector().end(); }
+    inline ~IndexCatalogEntry() = default;
 
-        // TODO: these have to be SUPER SUPER FAST
-        // maybe even some pointer trickery is in order
-        const IndexCatalogEntry* find( const IndexDescriptor* desc ) const;
-        IndexCatalogEntry* find( const IndexDescriptor* desc );
+    inline IndexCatalogEntry(IndexCatalogEntry&&) = delete;
+    inline IndexCatalogEntry& operator=(IndexCatalogEntry&&) = delete;
 
-        IndexCatalogEntry* find( const std::string& name );
+    inline const std::string& ns() const {
+        return this->_impl().ns();
+    }
 
+    void init(std::unique_ptr<IndexAccessMethod> accessMethod);
 
-        unsigned size() const { return _entries.size(); }
-        // -----------------
+    inline IndexDescriptor* descriptor() {
+        return this->_impl().descriptor();
+    }
 
-        /**
-         * Removes from _entries and returns the matching entry or NULL if none matches.
-         */
-        IndexCatalogEntry* release( const IndexDescriptor* desc );
+    inline const IndexDescriptor* descriptor() const {
+        return this->_impl().descriptor();
+    }
 
-        bool remove( const IndexDescriptor* desc ) {
-            IndexCatalogEntry* entry = release(desc);
-            delete entry;
-            return entry;
+    inline IndexAccessMethod* accessMethod() {
+        return this->_impl().accessMethod();
+    }
+
+    inline const IndexAccessMethod* accessMethod() const {
+        return this->_impl().accessMethod();
+    }
+
+    inline const Ordering& ordering() const {
+        return this->_impl().ordering();
+    }
+
+    inline const MatchExpression* getFilterExpression() const {
+        return this->_impl().getFilterExpression();
+    }
+
+    inline const CollatorInterface* getCollator() const {
+        return this->_impl().getCollator();
+    }
+
+    /// ---------------------
+
+    inline const RecordId& head(OperationContext* const opCtx) const {
+        return this->_impl().head(opCtx);
+    }
+
+    inline void setHead(OperationContext* const opCtx, const RecordId newHead) {
+        return this->_impl().setHead(opCtx, newHead);
+    }
+
+    inline void setIsReady(const bool newIsReady) {
+        return this->_impl().setIsReady(newIsReady);
+    }
+
+    inline HeadManager* headManager() const {
+        return this->_impl().headManager();
+    }
+
+    // --
+
+    /**
+     * Returns true if this index is multikey and false otherwise.
+     */
+    inline bool isMultikey() const {
+        return this->_impl().isMultikey();
+    }
+
+    /**
+     * Returns the path components that cause this index to be multikey if this index supports
+     * path-level multikey tracking, and returns an empty vector if path-level multikey tracking
+     * isn't supported.
+     *
+     * If this index supports path-level multikey tracking but isn't multikey, then this function
+     * returns a vector with size equal to the number of elements in the index key pattern where
+     * each element in the vector is an empty set.
+     */
+    inline MultikeyPaths getMultikeyPaths(OperationContext* const opCtx) const {
+        return this->_impl().getMultikeyPaths(opCtx);
+    }
+
+    /**
+     * Sets this index to be multikey. Information regarding which newly detected path components
+     * cause this index to be multikey can also be specified.
+     *
+     * If this index doesn't support path-level multikey tracking, then 'multikeyPaths' is ignored.
+     *
+     * If this index supports path-level multikey tracking, then 'multikeyPaths' must be a vector
+     * with size equal to the number of elements in the index key pattern. Additionally, at least
+     * one path component of the indexed fields must cause this index to be multikey.
+     *
+     * If isTrackingMultikeyPathInfo() is set on the OperationContext's MultikeyPathTracker,
+     * then after we confirm that we actually need to set the index as multikey, we will save the
+     * namespace, index name, and multikey paths on the OperationContext rather than set the index
+     * as multikey here.
+     */
+    void setMultikey(OperationContext* const opCtx, const MultikeyPaths& multikeyPaths) {
+        return this->_impl().setMultikey(opCtx, multikeyPaths);
+    }
+
+    // if this ready is ready for queries
+    bool isReady(OperationContext* const opCtx) const {
+        return this->_impl().isReady(opCtx);
+    }
+
+    KVPrefix getPrefix() const {
+        return this->_impl().getPrefix();
+    }
+
+    /**
+     * If return value is not boost::none, reads with majority read concern using an older snapshot
+     * must treat this index as unfinished.
+     */
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() {
+        return this->_impl().getMinimumVisibleSnapshot();
+    }
+
+    void setMinimumVisibleSnapshot(const Timestamp name) {
+        return this->_impl().setMinimumVisibleSnapshot(name);
+    }
+
+private:
+    // This structure exists to give us a customization point to decide how to force users of this
+    // class to depend upon the corresponding `index_catalog_entry.cpp` Translation Unit (TU).  All
+    // public forwarding functions call `_impl(), and `_impl` creates an instance of this structure.
+    struct TUHook {
+        static void hook() noexcept;
+
+        explicit inline TUHook() noexcept {
+            if (kDebugBuild)
+                this->hook();
         }
-
-        // pass ownership to EntryContainer
-        void add( IndexCatalogEntry* entry ) { _entries.mutableVector().push_back( entry ); }
-
-    private:
-        OwnedPointerVector<IndexCatalogEntry> _entries;
     };
 
-}
+    inline const Impl& _impl() const {
+        TUHook{};
+        return *this->_pimpl;
+    }
+
+    inline Impl& _impl() {
+        TUHook{};
+        return *this->_pimpl;
+    }
+
+    std::unique_ptr<Impl> _pimpl;
+};
+
+class IndexCatalogEntryContainer {
+public:
+    typedef std::vector<std::unique_ptr<IndexCatalogEntry>>::const_iterator const_iterator;
+    typedef std::vector<std::unique_ptr<IndexCatalogEntry>>::const_iterator iterator;
+
+    const_iterator begin() const {
+        return _entries.begin();
+    }
+
+    const_iterator end() const {
+        return _entries.end();
+    }
+
+    iterator begin() {
+        return _entries.begin();
+    }
+
+    iterator end() {
+        return _entries.end();
+    }
+
+    // TODO: these have to be SUPER SUPER FAST
+    // maybe even some pointer trickery is in order
+    const IndexCatalogEntry* find(const IndexDescriptor* desc) const;
+    IndexCatalogEntry* find(const IndexDescriptor* desc);
+
+    IndexCatalogEntry* find(const std::string& name);
+
+
+    unsigned size() const {
+        return _entries.size();
+    }
+
+    // -----------------
+
+    /**
+     * Removes from _entries and returns the matching entry or NULL if none matches.
+     */
+    IndexCatalogEntry* release(const IndexDescriptor* desc);
+
+    bool remove(const IndexDescriptor* desc) {
+        IndexCatalogEntry* entry = release(desc);
+        delete entry;
+        return entry;
+    }
+
+    // pass ownership to EntryContainer
+    void add(IndexCatalogEntry* entry) {
+        _entries.push_back(std::unique_ptr<IndexCatalogEntry>{entry});
+    }
+
+private:
+    std::vector<std::unique_ptr<IndexCatalogEntry>> _entries;
+};
+}  // namespace mongo

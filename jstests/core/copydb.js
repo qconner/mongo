@@ -1,3 +1,11 @@
+// @tags: [
+//     requires_non_retryable_commands,
+//     requires_fastcount,
+//
+//     # copyDatabase is not available on embedded
+//     incompatible_with_embedded
+// ]
+
 // Basic tests for the copydb command.  These only test copying from the same server; these do not
 // test the ability of copydb to pull a database from another server (with or without auth).
 
@@ -16,6 +24,5 @@ assert.eq(1, db2.foo.count(), "D");
 assert.eq(db1.foo.getIndexes().length, db2.foo.getIndexes().length);
 
 // Test command input validation.
-assert.commandFailed(db1.adminCommand({copydb: 1,
-                                       fromdb: db1.getName(),
-                                       todb: "copydb.invalid"})); // Name can't contain dot.
+assert.commandFailed(db1.adminCommand(
+    {copydb: 1, fromdb: db1.getName(), todb: "copydb.invalid"}));  // Name can't contain dot.

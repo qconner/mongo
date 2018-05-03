@@ -32,66 +32,59 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
-    /**
-     * This stage outputs the union of its children.  It optionally deduplicates on RecordId.
-     *
-     * Preconditions: Valid RecordId.
-     *
-     * If we're deduping, we may fail to dedup any invalidated RecordId properly.
-     */
-    class OrStage : public PlanStage {
-    public:
-        OrStage(WorkingSet* ws, bool dedup, const MatchExpression* filter);
-        virtual ~OrStage();
+/**
+ * This stage outputs the union of its children.  It optionally deduplicates on RecordId.
+ *
+ * Preconditions: Valid RecordId.
+ *
+ * If we're deduping, we may fail to dedup any invalidated RecordId properly.
+ */
+class OrStage final : public PlanStage {
+public:
+    OrStage(OperationContext* opCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter);
 
-        void addChild(PlanStage* child);
+    void addChild(PlanStage* child);
 
-        virtual bool isEOF();
+    void addChildren(Children childrenToAdd);
 
-        virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    StageState doWork(WorkingSetID* out) final;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
-        virtual StageType stageType() const { return STAGE_OR; }
+    StageType stageType() const final {
+        return STAGE_OR;
+    }
 
-        virtual PlanStageStats* getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual const CommonStats* getCommonStats();
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual const SpecificStats* getSpecificStats();
+    static const char* kStageType;
 
-        static const char* kStageType;
+private:
+    // Not owned by us.
+    WorkingSet* _ws;
 
-    private:
-        // Not owned by us.
-        WorkingSet* _ws;
+    // The filter is not owned by us.
+    const MatchExpression* _filter;
 
-        // The filter is not owned by us.
-        const MatchExpression* _filter;
+    // Which of _children are we calling work(...) on now?
+    size_t _currentChild;
 
-        // Owned by us.
-        std::vector<PlanStage*> _children;
+    // True if we dedup on RecordId, false otherwise.
+    bool _dedup;
 
-        // Which of _children are we calling work(...) on now?
-        size_t _currentChild;
+    // Which RecordIds have we returned?
+    stdx::unordered_set<RecordId, RecordId::Hasher> _seen;
 
-        // True if we dedup on RecordId, false otherwise.
-        bool _dedup;
-
-        // Which RecordIds have we returned?
-        unordered_set<RecordId, RecordId::Hasher> _seen;
-
-        // Stats
-        CommonStats _commonStats;
-        OrStats _specificStats;
-    };
+    // Stats
+    OrStats _specificStats;
+};
 
 }  // namespace mongo

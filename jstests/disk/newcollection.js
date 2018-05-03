@@ -1,36 +1,39 @@
 // SERVER-594 test
 
-port = allocatePorts( 1 )[ 0 ]
+// When `capped: false`, the `size` option on `createCollection` is only considered by mmapv1.
+// @tags: [requires_mmapv1]
+
 var baseName = "jstests_disk_newcollection";
-var m = startMongod( "--noprealloc", "--smallfiles", "--port", port, "--dbpath", MongoRunner.dataPath + baseName );
-//var m = db.getMongo();
-db = m.getDB( "test" );
+var m = MongoRunner.runMongod({noprealloc: "", smallfiles: ""});
+db = m.getDB("test");
 
 var t = db[baseName];
-var getTotalNonLocalSize = function() {
-    var totalNonLocalDBSize = 0;
-    m.getDBs().databases.forEach( function(dbStats) {
-        // We accept the local database's space overhead.
-        if (dbStats.name == "local") return;
+var getTotalNonLocalNonAdminSize = function() {
+    var totalNonLocalNonAdminDBSize = 0;
+    m.getDBs().databases.forEach(function(dbStats) {
+        // We accept the local database's and admin database's space overhead.
+        if (dbStats.name == "local" || dbStats.name == "admin")
+            return;
 
         // Databases with "sizeOnDisk=1" and "empty=true" dont' actually take up space o disk.
         // See SERVER-11051.
-        if (dbStats.sizeOnDisk == 1 && dbStats.empty) return;
-        totalNonLocalDBSize += dbStats.sizeOnDisk;
+        if (dbStats.sizeOnDisk == 1 && dbStats.empty)
+            return;
+        totalNonLocalNonAdminDBSize += dbStats.sizeOnDisk;
     });
-    return totalNonLocalDBSize;
-}
+    return totalNonLocalNonAdminDBSize;
+};
 
 for (var pass = 0; pass <= 1; pass++) {
-
-    db.createCollection(baseName, { size: 15.8 * 1024 * 1024 });
-    if( pass == 0 )
+    db.createCollection(baseName, {size: 15.8 * 1024 * 1024});
+    if (pass == 0)
         t.drop();
 
-    size = getTotalNonLocalSize();
+    size = getTotalNonLocalNonAdminSize();
     t.save({});
-    assert.eq(size, getTotalNonLocalSize());
+    assert.eq(size, getTotalNonLocalNonAdminSize());
     assert(size <= 32 * 1024 * 1024);
 
     t.drop();
 }
+MongoRunner.stopMongod(m);

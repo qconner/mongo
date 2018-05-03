@@ -28,6 +28,7 @@
 #include "mongo/db/auth/user_name.h"
 
 #include <algorithm>
+#include <iostream>
 #include <string>
 
 #include "mongo/base/string_data.h"
@@ -35,20 +36,34 @@
 
 namespace mongo {
 
-    UserName::UserName(StringData user, StringData dbname) {
-        _fullName.resize(user.size() + dbname.size() + 1);
-        std::string::iterator iter = std::copy(user.rawData(),
-                                               user.rawData() + user.size(),
-                                               _fullName.begin());
-        *iter = '@';
-        ++iter;
-        iter = std::copy(dbname.rawData(), dbname.rawData() + dbname.size(), iter);
-        dassert(iter == _fullName.end());
-        _splitPoint = user.size();
+UserName::UserName(StringData user, StringData dbname) {
+    _fullName.resize(user.size() + dbname.size() + 1);
+    std::string::iterator iter =
+        std::copy(user.rawData(), user.rawData() + user.size(), _fullName.begin());
+    *iter = '@';
+    ++iter;
+    iter = std::copy(dbname.rawData(), dbname.rawData() + dbname.size(), iter);
+    dassert(iter == _fullName.end());
+    _splitPoint = user.size();
+}
+
+
+StatusWith<UserName> UserName::parse(StringData userNameStr) {
+    size_t splitPoint = userNameStr.find('.');
+
+    if (splitPoint == std::string::npos) {
+        return Status(ErrorCodes::BadValue,
+                      "username must contain a '.' separated database.user pair");
     }
 
-    std::ostream& operator<<(std::ostream& os, const UserName& name) {
-        return os << name.getFullName();
-    }
+    StringData userDBPortion = userNameStr.substr(0, splitPoint);
+    StringData userNamePortion = userNameStr.substr(splitPoint + 1);
+
+    return UserName(userNamePortion, userDBPortion);
+}
+
+std::ostream& operator<<(std::ostream& os, const UserName& name) {
+    return os << name.getFullName();
+}
 
 }  // namespace mongo

@@ -26,33 +26,38 @@
 *    it in the license file.
 */
 
+#include "mongo/db/index/hash_access_method.h"
+
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
-#include "mongo/db/index/hash_access_method.h"
 
 namespace mongo {
 
-    HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-        : BtreeBasedAccessMethod(btreeState, btree) {
+HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
+    : IndexAccessMethod(btreeState, btree) {
+    const IndexDescriptor* descriptor = btreeState->descriptor();
 
-        const IndexDescriptor* descriptor = btreeState->descriptor();
+    // We can change these if the single-field limitation is lifted later.
+    uassert(16763,
+            "Currently only single field hashed index supported.",
+            1 == descriptor->getNumFields());
 
-        // We can change these if the single-field limitation is lifted later.
-        uassert(16763, "Currently only single field hashed index supported.",
-                1 == descriptor->getNumFields());
+    uassert(16764,
+            "Currently hashed indexes cannot guarantee uniqueness. Use a regular index.",
+            !descriptor->unique());
 
-        uassert(16764, "Currently hashed indexes cannot guarantee uniqueness. Use a regular index.",
-                !descriptor->unique());
+    ExpressionParams::parseHashParams(descriptor->infoObj(), &_seed, &_hashVersion, &_hashedField);
 
-        ExpressionParams::parseHashParams(descriptor->infoObj(),
-                                          &_seed,
-                                          &_hashVersion,
-                                          &_hashedField);
-    }
+    _collator = btreeState->getCollator();
+}
 
-    void HashAccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) const {
-        ExpressionKeysPrivate::getHashKeys(obj, _hashedField, _seed, _hashVersion, _descriptor->isSparse(), keys);
-    }
+void HashAccessMethod::doGetKeys(const BSONObj& obj,
+                                 BSONObjSet* keys,
+                                 MultikeyPaths* multikeyPaths) const {
+    ExpressionKeysPrivate::getHashKeys(
+        obj, _hashedField, _seed, _hashVersion, _descriptor->isSparse(), _collator, keys);
+}
 
 }  // namespace mongo

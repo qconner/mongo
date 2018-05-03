@@ -28,26 +28,32 @@
 
 #pragma once
 
+#include "mongo/db/namespace_string.h"
+#include "mongo/stdx/functional.h"
+
 namespace mongo {
 
-    class OperationContext;
-    class RecordFetcher;
+class OperationContext;
+class RecordFetcher;
 
+/**
+ * See the documentation for yieldAllLocks(...).
+ */
+class QueryYield {
+    QueryYield();
+
+public:
     /**
-     * See the documentation for yieldAllLocks(...).
+     * If not in a nested context, unlocks all locks, suggests to the operating system to
+     * switch to another thread, and then reacquires all locks.
+     *
+     * If in a nested context (eg DBDirectClient), does nothing.
+     *
+     * The whileYieldingFn will be executed after unlocking the locks and before re-acquiring them.
      */
-    class QueryYield {
-        QueryYield();
+    static void yieldAllLocks(OperationContext* opCtx,
+                              stdx::function<void()> whileYieldingFn,
+                              const NamespaceString& planExecNS);
+};
 
-    public:
-
-        /**
-         * If not in a nested context, unlocks all locks, suggests to the operating system to
-         * switch to another thread, and then reacquires all locks.
-         *
-         * If in a nested context (eg DBDirectClient), does nothing.
-         */
-        static void yieldAllLocks(OperationContext* txn, RecordFetcher* fetcher);
-    };
-
-} // namespace mongo
+}  // namespace mongo

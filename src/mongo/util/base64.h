@@ -29,57 +29,30 @@
 
 #pragma once
 
-#include <boost/scoped_array.hpp>
+#include <sstream>
+#include <string>
 
-#include "mongo/util/assert_util.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo {
-    namespace base64 {
+namespace base64 {
 
-        class Alphabet {
-        public:
-            Alphabet()
-                : encode((unsigned char*)
-                         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                         "abcdefghijklmnopqrstuvwxyz"
-                         "0123456789"
-                         "+/")
-                , decode(new unsigned char[257]) {
-                memset( decode.get() , 0 , 256 );
-                for ( int i=0; i<64; i++ ) {
-                    decode[ encode[i] ] = i;
-                }
+void encode(std::stringstream& ss, const char* data, int size);
+std::string encode(const char* data, int size);
+std::string encode(const std::string& s);
 
-                test();
-            }
-            void test() {
-                verify( strlen( (char*)encode ) == 64 );
-                for ( int i=0; i<26; i++ )
-                    verify( encode[i] == toupper( encode[i+26] ) );
-            }
+void decode(std::stringstream& ss, const std::string& s);
+std::string decode(const std::string& s);
 
-            char e( int x ) {
-                return encode[x&0x3f];
-            }
+bool validate(StringData);
 
-        private:
-            const unsigned char * encode;
-        public:
-            boost::scoped_array<unsigned char> decode;
-        };
-
-        extern Alphabet alphabet;
-
-
-        void encode( std::stringstream& ss , const char * data , int size );
-        std::string encode( const char * data , int size );
-        std::string encode( const std::string& s );
-
-        void decode( std::stringstream& ss , const std::string& s );
-        std::string decode( const std::string& s );
-
-        extern const char* chars;
-
-        void testAlphabet();
-    }
+/**
+ * Calculate how large a given input would expand to.
+ * Effectively: ceil(inLen * 4 / 3)
+ */
+constexpr size_t encodedLength(size_t inLen) {
+    return static_cast<size_t>((inLen + 2.5) / 3) * 4;
 }
+
+}  // namespace base64
+}  // namespace mongo

@@ -28,18 +28,19 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/stop_words.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
-    namespace fts {
+namespace fts {
 
-        TEST( English, Basic1 ) {
-            const StopWords* englishStopWords = StopWords::getStopWords( languageEnglishV2 );
-            ASSERT( englishStopWords->isStopWord( "the" ) );
-            ASSERT( !englishStopWords->isStopWord( "computer" ) );
-        }
-
-    }
+TEST(English, Basic1) {
+    const StopWords* englishStopWords = StopWords::getStopWords(&languageEnglishV2);
+    ASSERT(englishStopWords->isStopWord("the"));
+    ASSERT(!englishStopWords->isStopWord("computer"));
+}
+}
 }

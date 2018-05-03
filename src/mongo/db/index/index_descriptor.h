@@ -30,185 +30,270 @@
 
 #pragma once
 
+#include <set>
 #include <string>
 
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/catalog/collection.h"
-
+#include "mongo/db/server_options.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
 
-    class IndexCatalog;
-    class IndexCatalogEntry;
-    class IndexCatalogEntryContainer;
+class Collection;
+class IndexCatalog;
+class IndexCatalogEntry;
+class IndexCatalogEntryContainer;
+class OperationContext;
+
+/**
+ * A cache of information computed from the memory-mapped per-index data (OnDiskIndexData).
+ * Contains accessors for the various immutable index parameters, and an accessor for the
+ * mutable "head" pointer which is index-specific.
+ *
+ * All synchronization is the responsibility of the caller.
+ */
+class IndexDescriptor {
+public:
+    enum class IndexVersion { kV0 = 0, kV1 = 1, kV2 = 2 };
+    static constexpr IndexVersion kLatestIndexVersion = IndexVersion::kV2;
+
+    static constexpr StringData k2dIndexBitsFieldName = "bits"_sd;
+    static constexpr StringData k2dIndexMinFieldName = "min"_sd;
+    static constexpr StringData k2dIndexMaxFieldName = "max"_sd;
+    static constexpr StringData k2dsphereCoarsestIndexedLevel = "coarsestIndexedLevel"_sd;
+    static constexpr StringData k2dsphereFinestIndexedLevel = "finestIndexedLevel"_sd;
+    static constexpr StringData k2dsphereVersionFieldName = "2dsphereIndexVersion"_sd;
+    static constexpr StringData kBackgroundFieldName = "background"_sd;
+    static constexpr StringData kCollationFieldName = "collation"_sd;
+    static constexpr StringData kDefaultLanguageFieldName = "default_language"_sd;
+    static constexpr StringData kDropDuplicatesFieldName = "dropDups"_sd;
+    static constexpr StringData kExpireAfterSecondsFieldName = "expireAfterSeconds"_sd;
+    static constexpr StringData kGeoHaystackBucketSize = "bucketSize"_sd;
+    static constexpr StringData kIndexNameFieldName = "name"_sd;
+    static constexpr StringData kIndexVersionFieldName = "v"_sd;
+    static constexpr StringData kKeyPatternFieldName = "key"_sd;
+    static constexpr StringData kLanguageOverrideFieldName = "language_override"_sd;
+    static constexpr StringData kNamespaceFieldName = "ns"_sd;
+    static constexpr StringData kPartialFilterExprFieldName = "partialFilterExpression"_sd;
+    static constexpr StringData kSparseFieldName = "sparse"_sd;
+    static constexpr StringData kStorageEngineFieldName = "storageEngine"_sd;
+    static constexpr StringData kTextVersionFieldName = "textIndexVersion"_sd;
+    static constexpr StringData kUniqueFieldName = "unique"_sd;
+    static constexpr StringData kWeightsFieldName = "weights"_sd;
 
     /**
-     * A cache of information computed from the memory-mapped per-index data (OnDiskIndexData).
-     * Contains accessors for the various immutable index parameters, and an accessor for the
-     * mutable "head" pointer which is index-specific.
-     *
-     * All synchronization is the responsibility of the caller.
+     * OnDiskIndexData is a pointer to the memory mapped per-index data.
+     * infoObj is a copy of the index-describing BSONObj contained in the OnDiskIndexData.
      */
-    class IndexDescriptor {
-    public:
-        /**
-         * OnDiskIndexData is a pointer to the memory mapped per-index data.
-         * infoObj is a copy of the index-describing BSONObj contained in the OnDiskIndexData.
-         */
-        IndexDescriptor(Collection* collection, const std::string& accessMethodName, BSONObj infoObj)
-            : _magic(123987),
-              _collection(collection),
-              _accessMethodName(accessMethodName),
-              _infoObj(infoObj.getOwned()),
-              _numFields(infoObj.getObjectField("key").nFields()),
-              _keyPattern(infoObj.getObjectField("key").getOwned()),
-              _indexName(infoObj.getStringField("name")),
-              _parentNS(infoObj.getStringField("ns")),
-              _isIdIndex(isIdIndexPattern( _keyPattern )),
-              _sparse(infoObj["sparse"].trueValue()),
-              _unique( _isIdIndex || infoObj["unique"].trueValue() ),
-              _cachedEntry( NULL )
-        {
-            _indexNamespace = makeIndexNamespace( _parentNS, _indexName );
+    IndexDescriptor(Collection* collection, const std::string& accessMethodName, BSONObj infoObj)
+        : _collection(collection),
+          _accessMethodName(accessMethodName),
+          _infoObj(infoObj.getOwned()),
+          _numFields(infoObj.getObjectField(IndexDescriptor::kKeyPatternFieldName).nFields()),
+          _keyPattern(infoObj.getObjectField(IndexDescriptor::kKeyPatternFieldName).getOwned()),
+          _indexName(infoObj.getStringField(IndexDescriptor::kIndexNameFieldName)),
+          _parentNS(infoObj.getStringField(IndexDescriptor::kNamespaceFieldName)),
+          _isIdIndex(isIdIndexPattern(_keyPattern)),
+          _sparse(infoObj[IndexDescriptor::kSparseFieldName].trueValue()),
+          _unique(_isIdIndex || infoObj[kUniqueFieldName].trueValue()),
+          _partial(!infoObj[kPartialFilterExprFieldName].eoo()),
+          _cachedEntry(NULL) {
+        _indexNamespace = makeIndexNamespace(_parentNS, _indexName);
 
-            _version = 0;
-            BSONElement e = _infoObj["v"];
-            if ( e.isNumber() ) {
-                _version = e.numberInt();
-            }
+        _version = IndexVersion::kV0;
+        BSONElement e = _infoObj[IndexDescriptor::kIndexVersionFieldName];
+        if (e.isNumber()) {
+            _version = static_cast<IndexVersion>(e.numberInt());
         }
+    }
 
-        ~IndexDescriptor() {
-            _magic = 555;
-        }
 
-        //
-        // Information about the key pattern.
-        //
+    /**
+     * Returns true if the specified index version is supported, and returns false otherwise.
+     */
+    static bool isIndexVersionSupported(IndexVersion indexVersion);
 
-        /**
-         * Return the user-provided index key pattern.
-         * Example: {geo: "2dsphere", nonGeo: 1}
-         * Example: {foo: 1, bar: -1}
-         */
-        const BSONObj& keyPattern() const { _checkOk(); return _keyPattern; }
+    /**
+     * Returns a set of the currently supported index versions.
+     */
+    static std::set<IndexVersion> getSupportedIndexVersions();
 
-        // How many fields do we index / are in the key pattern?
-        int getNumFields() const { _checkOk(); return _numFields; }
+    /**
+     * Returns Status::OK() if indexes of version 'indexVersion' are allowed to be created, and
+     * returns ErrorCodes::CannotCreateIndex otherwise.
+     */
+    static Status isIndexVersionAllowedForCreation(
+        IndexVersion indexVersion,
+        const ServerGlobalParams::FeatureCompatibility& featureCompatibility,
+        const BSONObj& indexSpec);
 
-        //
-        // Information about the index's namespace / collection.
-        //
+    /**
+     * Returns the index version to use if it isn't specified in the index specification.
+     */
+    static IndexVersion getDefaultIndexVersion();
 
-        // Return the name of the index.
-        const std::string& indexName() const { _checkOk(); return _indexName; }
+    //
+    // Information about the key pattern.
+    //
 
-        // Return the name of the indexed collection.
-        const std::string& parentNS() const { return _parentNS; }
+    /**
+     * Return the user-provided index key pattern.
+     * Example: {geo: "2dsphere", nonGeo: 1}
+     * Example: {foo: 1, bar: -1}
+     */
+    const BSONObj& keyPattern() const {
+        return _keyPattern;
+    }
 
-        // Return the name of this index's storage area (database.table.$index)
-        const std::string& indexNamespace() const { return _indexNamespace; }
+    /**
+     * Test only command for testing behavior resulting from an incorrect key
+     * pattern.
+     */
+    void setKeyPatternForTest(BSONObj newKeyPattern) {
+        _keyPattern = newKeyPattern;
+    }
 
-        // Return the name of the access method we must use to access this index's data.
-        const std::string& getAccessMethodName() const { return _accessMethodName; }
+    // How many fields do we index / are in the key pattern?
+    int getNumFields() const {
+        return _numFields;
+    }
 
-        //
-        // Properties every index has
-        //
+    //
+    // Information about the index's namespace / collection.
+    //
 
-        // Return what version of index this is.
-        int version() const { return _version; }
+    // Return the name of the index.
+    const std::string& indexName() const {
+        return _indexName;
+    }
 
-        // May each key only occur once?
-        bool unique() const { return _unique; }
+    // Return the name of the indexed collection.
+    const std::string& parentNS() const {
+        return _parentNS;
+    }
 
-        // Is this index sparse?
-        bool isSparse() const { return _sparse; }
+    // Return the name of this index's storage area (database.table.$index)
+    const std::string& indexNamespace() const {
+        return _indexNamespace;
+    }
 
-        // Is this index multikey?
-        bool isMultikey( OperationContext* txn ) const {
-            _checkOk();
-            return _collection->getIndexCatalog()->isMultikey( txn, this );
-        }
+    // Return the name of the access method we must use to access this index's data.
+    const std::string& getAccessMethodName() const {
+        return _accessMethodName;
+    }
 
-        bool isIdIndex() const { _checkOk(); return _isIdIndex; }
+    //
+    // Properties every index has
+    //
 
-        //
-        // Properties that are Index-specific.
-        //
+    // Return what version of index this is.
+    IndexVersion version() const {
+        return _version;
+    }
 
-        // Allow access to arbitrary fields in the per-index info object.  Some indices stash
-        // index-specific data there.
-        BSONElement getInfoElement(const std::string& name) const { return _infoObj[name]; }
+    // May each key only occur once?
+    bool unique() const {
+        return _unique;
+    }
 
-        //
-        // "Internals" of accessing the index, used by IndexAccessMethod(s).
-        //
+    // Is this index sparse?
+    bool isSparse() const {
+        return _sparse;
+    }
 
-        // Return a (rather compact) std::string representation.
-        std::string toString() const { _checkOk(); return _infoObj.toString(); }
+    // Is this a partial index?
+    bool isPartial() const {
+        return _partial;
+    }
 
-        // Return the info object.
-        const BSONObj& infoObj() const { _checkOk(); return _infoObj; }
+    // Is this index multikey?
+    bool isMultikey(OperationContext* opCtx) const;
 
-        // Both the collection and the catalog must outlive the IndexDescriptor
-        const Collection* getCollection() const { return _collection; }
-        const IndexCatalog* getIndexCatalog() const { return _collection->getIndexCatalog(); }
+    MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const;
 
-        bool areIndexOptionsEquivalent( const IndexDescriptor* other ) const;
+    bool isIdIndex() const {
+        return _isIdIndex;
+    }
 
-        static bool isIdIndexPattern( const BSONObj &pattern ) {
-            BSONObjIterator i(pattern);
-            BSONElement e = i.next();
-            //_id index must have form exactly {_id : 1} or {_id : -1}.
-            //Allows an index of form {_id : "hashed"} to exist but
-            //do not consider it to be the primary _id index
-            if(! ( strcmp(e.fieldName(), "_id") == 0
-                   && (e.numberInt() == 1 || e.numberInt() == -1)))
-                return false;
-             return i.next().eoo();
-        }
+    //
+    // Properties that are Index-specific.
+    //
 
-        static std::string makeIndexNamespace( StringData ns,
-                                               StringData name ) {
-            return ns.toString() + ".$" + name.toString();
-        }
+    // Allow access to arbitrary fields in the per-index info object.  Some indices stash
+    // index-specific data there.
+    BSONElement getInfoElement(const std::string& name) const {
+        return _infoObj[name];
+    }
 
-    private:
+    //
+    // "Internals" of accessing the index, used by IndexAccessMethod(s).
+    //
 
-        void _checkOk() const;
+    // Return a (rather compact) std::string representation.
+    std::string toString() const {
+        return _infoObj.toString();
+    }
 
-        int _magic;
+    // Return the info object.
+    const BSONObj& infoObj() const {
+        return _infoObj;
+    }
 
-        // Related catalog information of the parent collection
-        Collection* _collection;
+    // Both the collection and the catalog must outlive the IndexDescriptor
+    const Collection* getCollection() const {
+        return _collection;
+    }
+    const IndexCatalog* getIndexCatalog() const;
 
-        // What access method should we use for this index?
-        std::string _accessMethodName;
+    bool areIndexOptionsEquivalent(const IndexDescriptor* other) const;
 
-        // The BSONObj describing the index.  Accessed through the various members above.
-        const BSONObj _infoObj;
+    static bool isIdIndexPattern(const BSONObj& pattern) {
+        BSONObjIterator i(pattern);
+        BSONElement e = i.next();
+        //_id index must have form exactly {_id : 1} or {_id : -1}.
+        // Allows an index of form {_id : "hashed"} to exist but
+        // do not consider it to be the primary _id index
+        if (!(strcmp(e.fieldName(), "_id") == 0 && (e.numberInt() == 1 || e.numberInt() == -1)))
+            return false;
+        return i.next().eoo();
+    }
 
-        // --- cached data from _infoObj
+    static std::string makeIndexNamespace(StringData ns, StringData name) {
+        return ns.toString() + ".$" + name.toString();
+    }
 
-        int64_t _numFields; // How many fields are indexed?
-        BSONObj _keyPattern;
-        std::string _indexName;
-        std::string _parentNS;
-        std::string _indexNamespace;
-        bool _isIdIndex;
-        bool _sparse;
-        bool _unique;
-        int _version;
+private:
+    // Related catalog information of the parent collection
+    Collection* _collection;
 
-        // only used by IndexCatalogEntryContainer to do caching for perf
-        // users not allowed to touch, and not part of API
-        IndexCatalogEntry* _cachedEntry;
+    // What access method should we use for this index?
+    std::string _accessMethodName;
 
-        friend class IndexCatalog;
-        friend class IndexCatalogEntry;
-        friend class IndexCatalogEntryContainer;
-    };
+    // The BSONObj describing the index.  Accessed through the various members above.
+    const BSONObj _infoObj;
+
+    // --- cached data from _infoObj
+
+    int64_t _numFields;  // How many fields are indexed?
+    BSONObj _keyPattern;
+    std::string _indexName;
+    std::string _parentNS;
+    std::string _indexNamespace;
+    bool _isIdIndex;
+    bool _sparse;
+    bool _unique;
+    bool _partial;
+    IndexVersion _version;
+
+    // only used by IndexCatalogEntryContainer to do caching for perf
+    // users not allowed to touch, and not part of API
+    IndexCatalogEntry* _cachedEntry;
+
+    friend class IndexCatalog;
+    friend class IndexCatalogEntryImpl;
+    friend class IndexCatalogEntryContainer;
+};
 
 }  // namespace mongo

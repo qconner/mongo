@@ -1,0 +1,33 @@
+# -*- mode: python; -*-
+
+Import('env')
+Import('get_option')
+
+env = env.Clone()
+
+mongobridge = env.Program(
+    target="mongobridge",
+    source=[
+        "bridge.cpp",
+        "bridge_commands.cpp",
+        "mongobridge_options.cpp",
+        "mongobridge_options_init.cpp"
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/dbmessage',
+        '$BUILD_DIR/mongo/rpc/rpc',
+        '$BUILD_DIR/mongo/transport/service_entry_point',
+        '$BUILD_DIR/mongo/transport/service_executor',
+        '$BUILD_DIR/mongo/transport/transport_layer',
+        '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
+        '$BUILD_DIR/mongo/util/signal_handlers',
+    ],
+    INSTALL_ALIAS=[
+        'tools'
+    ],
+)
+
+hygienic = get_option('install-mode') == 'hygienic'
+if not hygienic:
+    env.Install("#/", mongobridge)

@@ -36,300 +36,196 @@
 #include <vector>
 
 #include "mongo/db/background.h"
-#include "mongo/db/client.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/dbdirectclient.h"
-#include "mongo/db/index_builder.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builder.h"
+#include "mongo/db/op_observer.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    using std::endl;
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+using std::endl;
+using std::string;
+using std::stringstream;
+using std::vector;
 
-    /* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
-    class CmdDropIndexes : public Command {
-    public:
-        virtual bool slaveOk() const {
-            return false;
-        }
-        virtual bool isWriteCommandForConfigServer() const { return true; }
-        virtual void help( stringstream& help ) const {
-            help << "drop indexes for a collection";
-        }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::dropIndex);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-        }
+/* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
+class CmdDropIndexes : public BasicCommand {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+    std::string help() const override {
+        return "drop indexes for a collection";
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {
+        ActionSet actions;
+        actions.addAction(ActionType::dropIndex);
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db, 
-                                                     const BSONObj& cmdObj) {
-            const std::string toDeleteNs = parseNsCollectionRequired(db->name(), cmdObj);
-            Collection* collection = db->getCollection(toDeleteNs);
-            IndexCatalog::IndexKillCriteria criteria;
+    CmdDropIndexes() : BasicCommand("dropIndexes", "deleteIndexes") {}
+    bool run(OperationContext* opCtx,
+             const string& dbname,
+             const BSONObj& jsobj,
+             BSONObjBuilder& result) {
+        const NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbname, jsobj);
+        return CommandHelpers::appendCommandStatus(result, dropIndexes(opCtx, nss, jsobj, &result));
+    }
 
-            // Get index name to drop
-            BSONElement toDrop = cmdObj.getField("index");
+} cmdDropIndexes;
 
-            if (toDrop.type() == String) {
-                // Kill all in-progress indexes
-                if (strcmp("*", toDrop.valuestr()) == 0) {
-                    criteria.ns = toDeleteNs;
-                    return IndexBuilder::killMatchingIndexBuilds(collection, criteria);
-                }
-                // Kill an in-progress index by name
-                else {
-                    criteria.name = toDrop.valuestr();
-                    return IndexBuilder::killMatchingIndexBuilds(collection, criteria);
-                }
-            }
-            // Kill an in-progress index build by index key
-            else if (toDrop.type() == Object) {
-                criteria.key = toDrop.Obj();
-                return IndexBuilder::killMatchingIndexBuilds(collection, criteria);
-            }
+class CmdReIndex : public ErrmsgCommandDeprecated {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;  // can reindex on a secondary
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    std::string help() const override {
+        return "re-index a collection";
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {
+        ActionSet actions;
+        actions.addAction(ActionType::reIndex);
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+    CmdReIndex() : ErrmsgCommandDeprecated("reIndex") {}
 
-            return std::vector<BSONObj>();
-        }
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& jsobj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        DBDirectClient db(opCtx);
 
-        CmdDropIndexes() : Command("dropIndexes", false, "deleteIndexes") { }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg,
-                 BSONObjBuilder& result, bool fromRepl) {
-            const std::string ns = parseNsCollectionRequired(dbname, jsobj);
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                ScopedTransaction transaction(txn, MODE_IX);
-                AutoGetDb autoDb(txn, dbname, MODE_X);
+        const NamespaceString toReIndexNss =
+            CommandHelpers::parseNsCollectionRequired(dbname, jsobj);
 
-                if (!fromRepl &&
-                    !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
-                    return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
-                        << "Not primary while dropping indexes in " << ns));
-                }
+        LOG(0) << "CMD: reIndex " << toReIndexNss;
 
-                WriteUnitOfWork wunit(txn);
-                bool ok = wrappedRun(txn, dbname, ns, autoDb.getDb(), jsobj, errmsg, result);
-                if (!ok) {
-                    return false;
-                }
-                if (!fromRepl) {
-                    repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), jsobj);
-                }
-                wunit.commit();
-            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "dropIndexes", dbname);
-            return true;
+        AutoGetOrCreateDb autoDb(opCtx, dbname, MODE_X);
+        Collection* collection = autoDb.getDb()->getCollection(opCtx, toReIndexNss);
+        if (!collection) {
+            if (autoDb.getDb()->getViewCatalog()->lookup(opCtx, toReIndexNss.ns()))
+                return CommandHelpers::appendCommandStatus(
+                    result, {ErrorCodes::CommandNotSupportedOnView, "can't re-index a view"});
+            else
+                return CommandHelpers::appendCommandStatus(
+                    result, {ErrorCodes::NamespaceNotFound, "collection does not exist"});
         }
 
-        bool wrappedRun(OperationContext* txn,
-                        const string& dbname,
-                        const std::string& toDeleteNs,
-                        Database* const db,
-                        BSONObj& jsobj,
-                        string& errmsg,
-                        BSONObjBuilder& anObjBuilder) {
-            if (!serverGlobalParams.quiet) {
-                LOG(0) << "CMD: dropIndexes " << toDeleteNs << endl;
-            }
-            Collection* collection = db ? db->getCollection(toDeleteNs) : NULL;
+        BackgroundOperation::assertNoBgOpInProgForNs(toReIndexNss.ns());
 
-            // If db/collection does not exist, short circuit and return.
-            if ( !db || !collection ) {
-                errmsg = "ns not found";
-                return false;
-            }
+        // This is necessary to set up CurOp and update the Top stats.
+        OldClientContext ctx(opCtx, toReIndexNss.ns());
 
-            Client::Context ctx(txn, toDeleteNs);
-            stopIndexBuilds(txn, db, jsobj);
+        const auto defaultIndexVersion = IndexDescriptor::getDefaultIndexVersion();
 
-            IndexCatalog* indexCatalog = collection->getIndexCatalog();
-            anObjBuilder.appendNumber("nIndexesWas", indexCatalog->numIndexesTotal(txn) );
+        vector<BSONObj> all;
+        {
+            vector<string> indexNames;
+            collection->getCatalogEntry()->getAllIndexes(opCtx, &indexNames);
+            all.reserve(indexNames.size());
 
+            for (size_t i = 0; i < indexNames.size(); i++) {
+                const string& name = indexNames[i];
+                BSONObj spec = collection->getCatalogEntry()->getIndexSpec(opCtx, name);
 
-            BSONElement f = jsobj.getField("index");
-            if ( f.type() == String ) {
+                {
+                    BSONObjBuilder bob;
 
-                string indexToDelete = f.valuestr();
-
-                if ( indexToDelete == "*" ) {
-                    Status s = indexCatalog->dropAllIndexes(txn, false);
-                    if ( !s.isOK() ) {
-                        appendCommandStatus( anObjBuilder, s );
-                        return false;
+                    for (auto&& indexSpecElem : spec) {
+                        auto indexSpecElemFieldName = indexSpecElem.fieldNameStringData();
+                        if (IndexDescriptor::kIndexVersionFieldName == indexSpecElemFieldName) {
+                            // We create a new index specification with the 'v' field set as
+                            // 'defaultIndexVersion'.
+                            bob.append(IndexDescriptor::kIndexVersionFieldName,
+                                       static_cast<int>(defaultIndexVersion));
+                        } else {
+                            bob.append(indexSpecElem);
+                        }
                     }
-                    anObjBuilder.append("msg", "non-_id indexes dropped for collection");
-                    return true;
+
+                    all.push_back(bob.obj());
                 }
 
-                IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName( txn,
-                                                                                        indexToDelete );
-                if ( desc == NULL ) {
-                    errmsg = str::stream() << "index not found with name [" << indexToDelete << "]";
+                const BSONObj key = spec.getObjectField("key");
+                const Status keyStatus =
+                    index_key_validate::validateKeyPattern(key, defaultIndexVersion);
+                if (!keyStatus.isOK()) {
+                    errmsg = str::stream()
+                        << "Cannot rebuild index " << spec << ": " << keyStatus.reason()
+                        << " For more info see http://dochub.mongodb.org/core/index-validation";
                     return false;
                 }
-
-                if ( desc->isIdIndex() ) {
-                    errmsg = "cannot drop _id index";
-                    return false;
-                }
-
-                Status s = indexCatalog->dropIndex(txn, desc);
-                if ( !s.isOK() ) {
-                    appendCommandStatus( anObjBuilder, s );
-                    return false;
-                }
-
-                return true;
             }
-
-            if ( f.type() == Object ) {
-                IndexDescriptor* desc =
-                    collection->getIndexCatalog()->findIndexByKeyPattern( txn, f.embeddedObject() );
-                if ( desc == NULL ) {
-                    errmsg = "can't find index with key:";
-                    errmsg += f.embeddedObject().toString();
-                    return false;
-                }
-
-                if ( desc->isIdIndex() ) {
-                    errmsg = "cannot drop _id index";
-                    return false;
-                }
-
-                Status s = indexCatalog->dropIndex(txn, desc);
-                if ( !s.isOK() ) {
-                    appendCommandStatus( anObjBuilder, s );
-                    return false;
-                }
-
-                return true;
-            }
-
-            errmsg = "invalid index name spec";
-            return false;
         }
 
-    } cmdDropIndexes;
+        result.appendNumber("nIndexesWas", all.size());
 
-    class CmdReIndex : public Command {
-    public:
-        virtual bool slaveOk() const { return true; }    // can reindex on a secondary
-        virtual bool isWriteCommandForConfigServer() const { return true; }
-        virtual void help( stringstream& help ) const {
-            help << "re-index a collection";
-        }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::reIndex);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-        }
-        CmdReIndex() : Command("reIndex") { }
+        std::unique_ptr<MultiIndexBlock> indexer;
+        StatusWith<std::vector<BSONObj>> swIndexesToRebuild(ErrorCodes::UnknownError,
+                                                            "Uninitialized");
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db,
-                                                     const BSONObj& cmdObj) {
-            const std::string ns = parseNsCollectionRequired(db->name(), cmdObj);
-            IndexCatalog::IndexKillCriteria criteria;
-            criteria.ns = ns;
-            return IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
+        {
+            WriteUnitOfWork wunit(opCtx);
+            collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
+
+            indexer = stdx::make_unique<MultiIndexBlock>(opCtx, collection);
+
+            swIndexesToRebuild = indexer->init(all);
+            if (!swIndexesToRebuild.isOK()) {
+                return CommandHelpers::appendCommandStatus(result, swIndexesToRebuild.getStatus());
+            }
+            wunit.commit();
         }
 
-        bool run(OperationContext* txn, const string& dbname , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
-            DBDirectClient db(txn);
-
-            const std::string toDeleteNs = parseNsCollectionRequired(dbname, jsobj);
-
-            LOG(0) << "CMD: reIndex " << toDeleteNs << endl;
-
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            Client::Context ctx(txn, toDeleteNs);
-
-            Collection* collection = ctx.db()->getCollection( toDeleteNs );
-
-            if ( !collection ) {
-                errmsg = "ns not found";
-                return false;
-            }
-
-            BackgroundOperation::assertNoBgOpInProgForNs( toDeleteNs );
-
-            std::vector<BSONObj> indexesInProg = stopIndexBuilds(txn, ctx.db(), jsobj);
-
-            vector<BSONObj> all;
-            {
-                vector<string> indexNames;
-                collection->getCatalogEntry()->getAllIndexes( txn, &indexNames );
-                for ( size_t i = 0; i < indexNames.size(); i++ ) {
-                    const string& name = indexNames[i];
-                    BSONObj spec = collection->getCatalogEntry()->getIndexSpec( txn, name );
-                    all.push_back(spec.removeField("v").getOwned());
-
-                    const BSONObj key = spec.getObjectField("key");
-                    const Status keyStatus = validateKeyPattern(key);
-                    if (!keyStatus.isOK()) {
-                        errmsg = str::stream()
-                            << "Cannot rebuild index " << spec << ": " << keyStatus.reason()
-                            << " For more info see http://dochub.mongodb.org/core/index-validation";
-                        return false;
-                    }
-                }
-            }
-
-            result.appendNumber( "nIndexesWas", all.size() );
-
-            {
-                WriteUnitOfWork wunit(txn);
-                Status s = collection->getIndexCatalog()->dropAllIndexes(txn, true);
-                if ( !s.isOK() ) {
-                    errmsg = "dropIndexes failed";
-                    return appendCommandStatus( result, s );
-                }
-                wunit.commit();
-            }
-
-            MultiIndexBlock indexer(txn, collection);
-            // do not want interruption as that will leave us without indexes.
-
-            Status status = indexer.init(all);
-            if (!status.isOK())
-                return appendCommandStatus( result, status );
-
-            status = indexer.insertAllDocumentsInCollection();
-            if (!status.isOK())
-                return appendCommandStatus( result, status );
-
-            {
-                WriteUnitOfWork wunit(txn);
-                indexer.commit();
-                wunit.commit();
-            }
-
-            result.append( "nIndexes", (int)all.size() );
-            result.append( "indexes", all );
-
-            IndexBuilder::restoreIndexes(txn, indexesInProg);
-            return true;
+        auto status = indexer->insertAllDocumentsInCollection();
+        if (!status.isOK()) {
+            return CommandHelpers::appendCommandStatus(result, status);
         }
-    } cmdReIndex;
 
+        {
+            WriteUnitOfWork wunit(opCtx);
+            indexer->commit();
+            wunit.commit();
+        }
 
+        // Do not allow majority reads from this collection until all original indexes are visible.
+        // This was also done when dropAllIndexes() committed, but we need to ensure that no one
+        // tries to read in the intermediate state where all indexes are newer than the current
+        // snapshot so are unable to be used.
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        auto snapshotName = replCoord->getMinimumVisibleSnapshot(opCtx);
+        collection->setMinimumVisibleSnapshot(snapshotName);
+
+        result.append("nIndexes", static_cast<int>(swIndexesToRebuild.getValue().size()));
+        result.append("indexes", swIndexesToRebuild.getValue());
+
+        return true;
+    }
+} cmdReIndex;
 }

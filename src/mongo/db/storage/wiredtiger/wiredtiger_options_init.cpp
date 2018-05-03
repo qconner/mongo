@@ -28,31 +28,33 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/util/options_parser/startup_option_init.h"
 
 #include <iostream>
 
-#include "mongo/util/options_parser/startup_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/options_parser/startup_options.h"
 
 namespace mongo {
 
-    MONGO_MODULE_STARTUP_OPTIONS_REGISTER(WiredTigerOptions)(InitializerContext* context) {
-        return wiredTigerGlobalOptions.add(&moe::startupOptions);
-    }
+MONGO_MODULE_STARTUP_OPTIONS_REGISTER(WiredTigerOptions)(InitializerContext* context) {
+    return wiredTigerGlobalOptions.add(&moe::startupOptions);
+}
 
-    MONGO_STARTUP_OPTIONS_VALIDATE(WiredTigerOptions)(InitializerContext* context) {
-        return Status::OK();
-    }
+MONGO_STARTUP_OPTIONS_VALIDATE(WiredTigerOptions)(InitializerContext* context) {
+    return Status::OK();
+}
 
-    MONGO_STARTUP_OPTIONS_STORE(WiredTigerOptions)(InitializerContext* context) {
-        Status ret = wiredTigerGlobalOptions.store(moe::startupOptionsParsed, context->args());
-        if (!ret.isOK()) {
-            std::cerr << ret.toString() << std::endl;
-            std::cerr << "try '" << context->args()[0] << " --help' for more information"
-                      << std::endl;
-            ::_exit(EXIT_BADOPTIONS);
-        }
-        return Status::OK();
+MONGO_STARTUP_OPTIONS_STORE(WiredTigerOptions)(InitializerContext* context) {
+    Status ret = wiredTigerGlobalOptions.store(moe::startupOptionsParsed, context->args());
+    if (!ret.isOK()) {
+        std::cerr << ret.toString() << std::endl;
+        std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;
+        ::_exit(EXIT_BADOPTIONS);
     }
+    return Status::OK();
+}
 }

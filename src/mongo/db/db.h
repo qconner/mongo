@@ -1,3 +1,4 @@
+
 /**
 *    Copyright (C) 2008 10gen Inc.
 *
@@ -30,17 +31,15 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 
 namespace repl {
-    class ReplSettings;
-} // namespace repl
+class ReplSettings;
+}  // namespace repl
 
-    extern void (*snmpInit)();
-
-} // namespace mongo
+}  // namespace mongo

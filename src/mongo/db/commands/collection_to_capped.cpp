@@ -30,278 +30,159 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/query/find.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
 
-    using boost::scoped_ptr;
-    using std::string;
-    using std::stringstream;
+using std::unique_ptr;
+using std::string;
+using std::stringstream;
 
-namespace {
+class CmdCloneCollectionAsCapped : public ErrmsgCommandDeprecated {
+public:
+    CmdCloneCollectionAsCapped() : ErrmsgCommandDeprecated("cloneCollectionAsCapped") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+    std::string help() const override {
+        return "{ cloneCollectionAsCapped:<fromName>, toCollection:<toName>, size:<sizeInBytes> }";
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {
+        ActionSet sourceActions;
+        sourceActions.addAction(ActionType::find);
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), sourceActions));
 
-    Status cloneCollectionAsCapped( OperationContext* txn,
-                                    Database* db,
-                                    const string& shortFrom,
-                                    const string& shortTo,
-                                    double size,
-                                    bool temp,
-                                    bool logForReplication ) {
+        ActionSet targetActions;
+        targetActions.addAction(ActionType::insert);
+        targetActions.addAction(ActionType::createIndex);
+        targetActions.addAction(ActionType::convertToCapped);
 
-        string fromNs = db->name() + "." + shortFrom;
-        string toNs = db->name() + "." + shortTo;
+        const auto nssElt = cmdObj["toCollection"];
+        uassert(ErrorCodes::TypeMismatch,
+                "'toCollection' must be of type String",
+                nssElt.type() == BSONType::String);
+        const NamespaceString nss(dbname, nssElt.valueStringData());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid target namespace: " << nss.ns(),
+                nss.isValid());
 
-        Collection* fromCollection = db->getCollection( fromNs );
-        if ( !fromCollection )
-            return Status( ErrorCodes::NamespaceNotFound,
-                           str::stream() << "source collection " << fromNs <<  " does not exist" );
+        out->push_back(Privilege(ResourcePattern::forExactNamespace(nss), targetActions));
+    }
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& jsobj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        const auto fromElt = jsobj["cloneCollectionAsCapped"];
+        const auto toElt = jsobj["toCollection"];
 
-        if ( db->getCollection( toNs ) )
-            return Status( ErrorCodes::NamespaceExists, "to collection already exists" );
+        uassert(ErrorCodes::TypeMismatch,
+                "'cloneCollectionAsCapped' must be of type String",
+                fromElt.type() == BSONType::String);
+        uassert(ErrorCodes::TypeMismatch,
+                "'toCollection' must be of type String",
+                toElt.type() == BSONType::String);
 
-        // create new collection
-        {
-            Client::Context ctx(txn,  toNs );
-            BSONObjBuilder spec;
-            spec.appendBool( "capped", true );
-            spec.append( "size", size );
-            if ( temp )
-                spec.appendBool( "temp", true );
+        const StringData from(fromElt.valueStringData());
+        const StringData to(toElt.valueStringData());
 
-            WriteUnitOfWork wunit(txn);
-            Status status = userCreateNS( txn, ctx.db(), toNs, spec.done(), logForReplication );
-            if ( !status.isOK() )
-                return status;
-            wunit.commit();
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid source collection name: " << from,
+                NamespaceString::validCollectionName(from));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid target collection name: " << to,
+                NamespaceString::validCollectionName(to));
+
+        double size = jsobj.getField("size").number();
+        bool temp = jsobj.getField("temp").trueValue();
+
+        if (size == 0) {
+            errmsg = "invalid command spec";
+            return false;
         }
 
-        Collection* toCollection = db->getCollection( toNs );
-        invariant( toCollection ); // we created above
+        AutoGetDb autoDb(opCtx, dbname, MODE_X);
 
-        // how much data to ignore because it won't fit anyway
-        // datasize and extentSize can't be compared exactly, so add some padding to 'size'
-
-        long long allocatedSpaceGuess =
-            std::max( static_cast<long long>(size * 2),
-                      static_cast<long long>(toCollection->getRecordStore()->storageSize(txn) * 2));
-
-        long long excessSize = fromCollection->dataSize(txn) - allocatedSpaceGuess;
-
-        scoped_ptr<PlanExecutor> exec( InternalPlanner::collectionScan(txn,
-                                                                       fromNs,
-                                                                       fromCollection,
-                                                                       InternalPlanner::FORWARD ) );
-
-
-        while ( true ) {
-            BSONObj obj;
-            PlanExecutor::ExecState state = exec->getNext(&obj, NULL);
-
-            switch( state ) {
-            case PlanExecutor::IS_EOF:
-                return Status::OK();
-            case PlanExecutor::DEAD:
-                db->dropCollection( txn, toNs );
-                return Status( ErrorCodes::InternalError, "executor turned dead while iterating" );
-            case PlanExecutor::FAILURE:
-                return Status( ErrorCodes::InternalError, "executor error while iterating" );
-            case PlanExecutor::ADVANCED:
-                if ( excessSize > 0 ) {
-                    excessSize -= ( 4 * obj.objsize() ); // 4x is for padding, power of 2, etc...
-                    continue;
-                }
-
-                WriteUnitOfWork wunit(txn);
-                toCollection->insertDocument( txn, obj, true );
-                if ( logForReplication )
-                    repl::logOp(txn, "i", toNs.c_str(), obj);
-                wunit.commit();
-            }
+        NamespaceString nss(dbname, to);
+        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
+            return CommandHelpers::appendCommandStatus(
+                result,
+                Status(ErrorCodes::NotMaster,
+                       str::stream() << "Not primary while cloning collection " << from << " to "
+                                     << to
+                                     << " (as capped)"));
         }
 
-        invariant( false ); // unreachable
+        Database* const db = autoDb.getDb();
+        if (!db) {
+            return CommandHelpers::appendCommandStatus(
+                result,
+                Status(ErrorCodes::NamespaceNotFound,
+                       str::stream() << "database " << dbname << " not found"));
+        }
+
+        Status status =
+            cloneCollectionAsCapped(opCtx, db, from.toString(), to.toString(), size, temp);
+        return CommandHelpers::appendCommandStatus(result, status);
+    }
+} cmdCloneCollectionAsCapped;
+
+/* jan2010:
+   Converts the given collection to a capped collection w/ the specified size.
+   This command is not highly used, and is not currently supported with sharded
+   environments.
+   */
+class CmdConvertToCapped : public ErrmsgCommandDeprecated {
+public:
+    CmdConvertToCapped() : ErrmsgCommandDeprecated("convertToCapped") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+    std::string help() const override {
+        return "{ convertToCapped:<fromCollectionName>, size:<sizeInBytes> }";
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {
+        ActionSet actions;
+        actions.addAction(ActionType::convertToCapped);
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-} // namespace
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& jsobj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, jsobj));
+        double size = jsobj.getField("size").number();
 
-    /* convertToCapped seems to use this */
-    class CmdCloneCollectionAsCapped : public Command {
-    public:
-        CmdCloneCollectionAsCapped() : Command( "cloneCollectionAsCapped" ) {}
-        virtual bool slaveOk() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return true; }
-        virtual void help( stringstream &help ) const {
-            help << "{ cloneCollectionAsCapped:<fromName>, toCollection:<toName>, size:<sizeInBytes> }";
-        }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet sourceActions;
-            sourceActions.addAction(ActionType::find);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), sourceActions));
-
-            ActionSet targetActions;
-            targetActions.addAction(ActionType::insert);
-            targetActions.addAction(ActionType::createIndex);
-            targetActions.addAction(ActionType::convertToCapped);
-            std::string collection = cmdObj.getStringField("toCollection");
-            uassert(16708, "bad 'toCollection' value", !collection.empty());
-
-            out->push_back(Privilege(ResourcePattern::forExactNamespace(
-                                             NamespaceString(dbname, collection)),
-                                     targetActions));
-        }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            string from = jsobj.getStringField( "cloneCollectionAsCapped" );
-            string to = jsobj.getStringField( "toCollection" );
-            double size = jsobj.getField( "size" ).number();
-            bool temp = jsobj.getField( "temp" ).trueValue();
-
-            if ( from.empty() || to.empty() || size == 0 ) {
-                errmsg = "invalid command spec";
-                return false;
-            }
-
-            ScopedTransaction transaction(txn, MODE_IX);
-            AutoGetDb autoDb(txn, dbname, MODE_X);
-
-            if (!fromRepl &&
-                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
-                return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
-                    << "Not primary while cloning collection " << from << " to " << to
-                    << " (as capped)"));
-            }
-
-            Database* const db = autoDb.getDb();
-
-            if (!db) {
-                return appendCommandStatus(result,
-                                           Status(ErrorCodes::NamespaceNotFound,
-                                                  str::stream() << "source database "
-                                                  << dbname << " does not exist"));
-            }
-
-            Status status = cloneCollectionAsCapped(txn, db, from, to, size, temp, true);
-            return appendCommandStatus( result, status );
-        }
-    } cmdCloneCollectionAsCapped;
-
-    /* jan2010:
-       Converts the given collection to a capped collection w/ the specified size.
-       This command is not highly used, and is not currently supported with sharded
-       environments.
-       */
-    class CmdConvertToCapped : public Command {
-    public:
-        CmdConvertToCapped() : Command( "convertToCapped" ) {}
-        virtual bool slaveOk() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return true; }
-        virtual void help( stringstream &help ) const {
-            help << "{ convertToCapped:<fromCollectionName>, size:<sizeInBytes> }";
-        }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::convertToCapped);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+        if (size == 0) {
+            errmsg = "invalid command spec";
+            return false;
         }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db,
-                                                     const BSONObj& cmdObj) {
-            const std::string ns = parseNsCollectionRequired(db->name(), cmdObj);
+        return CommandHelpers::appendCommandStatus(result, convertToCapped(opCtx, nss, size));
+    }
 
-            IndexCatalog::IndexKillCriteria criteria;
-            criteria.ns = ns;
-            Collection* coll = db->getCollection(ns);
-            if (coll) {
-                return IndexBuilder::killMatchingIndexBuilds(coll, criteria);
-            }
-            return std::vector<BSONObj>();
-        }
-
-        bool run(OperationContext* txn,
-                 const string& dbname,
-                 BSONObj& jsobj,
-                 int,
-                 string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl ) {
-
-            const std::string ns = parseNsCollectionRequired(dbname, jsobj);
-
-            ScopedTransaction transaction(txn, MODE_IX);
-            AutoGetDb autoDb(txn, dbname, MODE_X);
-
-            if (!fromRepl &&
-                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
-                return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
-                    << "Not primary while converting " << ns << " to a capped collection"));
-            }
-
-            Database* const db = autoDb.getDb();
-            if (!db) {
-                return appendCommandStatus(
-                            result,
-                            Status(ErrorCodes::NamespaceNotFound,
-                                   str::stream() << "source database "
-                                                 << dbname << " does not exist"));
-            }
-
-            stopIndexBuilds(txn, db, jsobj);
-            BackgroundOperation::assertNoBgOpInProgForDb(dbname.c_str());
-
-            string shortSource = jsobj.getStringField( "convertToCapped" );
-            string longSource = dbname + "." + shortSource;
-            double size = jsobj.getField( "size" ).number();
-
-            if ( shortSource.empty() || size == 0 ) {
-                errmsg = "invalid command spec";
-                return false;
-            }
-
-            string shortTmpName = str::stream() << "tmp.convertToCapped." << shortSource;
-            string longTmpName = str::stream() << dbname << "." << shortTmpName;
-
-            if ( db->getCollection( longTmpName ) ) {
-                Status status = db->dropCollection( txn, longTmpName );
-                if ( !status.isOK() )
-                    return appendCommandStatus( result, status );
-            }
-
-            Status status = cloneCollectionAsCapped( txn, db, shortSource, shortTmpName, size, true, false );
-
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            verify( db->getCollection( longTmpName ) );
-
-            WriteUnitOfWork wunit(txn);
-            status = db->dropCollection( txn, longSource );
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            status = db->renameCollection( txn, longTmpName, longSource, false );
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            if (!fromRepl)
-                repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), jsobj);
-
-            wunit.commit();
-            return true;
-        }
-    } cmdConvertToCapped;
-
+} cmdConvertToCapped;
 }

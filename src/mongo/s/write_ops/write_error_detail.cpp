@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/write_ops/write_error_detail.h"
 
 #include "mongo/db/field_parser.h"
@@ -33,186 +35,151 @@
 
 namespace mongo {
 
-    using std::string;
+using std::string;
 
-    using mongoutils::str::stream;
-        const BSONField<int> WriteErrorDetail::index("index");
-        const BSONField<int> WriteErrorDetail::errCode("code");
-        const BSONField<BSONObj> WriteErrorDetail::errInfo("errInfo");
-        const BSONField<std::string> WriteErrorDetail::errMessage("errmsg");
+const BSONField<int> WriteErrorDetail::index("index");
+const BSONField<int> WriteErrorDetail::errCode("code");
+const BSONField<std::string> WriteErrorDetail::errCodeName("codeName");
+const BSONField<BSONObj> WriteErrorDetail::errInfo("errInfo");
+const BSONField<std::string> WriteErrorDetail::errMessage("errmsg");
 
-    WriteErrorDetail::WriteErrorDetail() {
-        clear();
+WriteErrorDetail::WriteErrorDetail() {
+    clear();
+}
+
+bool WriteErrorDetail::isValid(std::string* errMsg) const {
+    std::string dummy;
+    if (errMsg == NULL) {
+        errMsg = &dummy;
     }
 
-    WriteErrorDetail::~WriteErrorDetail() {
+    // All the mandatory fields must be present.
+    if (!_isIndexSet) {
+        *errMsg = str::stream() << "missing " << index.name() << " field";
+        return false;
     }
 
-    bool WriteErrorDetail::isValid(std::string* errMsg) const {
-        std::string dummy;
-        if (errMsg == NULL) {
-            errMsg = &dummy;
-        }
-
-        // All the mandatory fields must be present.
-        if (!_isIndexSet) {
-            *errMsg = stream() << "missing " << index.name() << " field";
-            return false;
-        }
-
-        if (!_isErrCodeSet) {
-            *errMsg = stream() << "missing " << errCode.name() << " field";
-            return false;
-        }
-
-        return true;
+    // This object only makes sense when the status isn't OK
+    if (_status.isOK()) {
+        *errMsg = "WriteErrorDetail shouldn't have OK status.";
+        return false;
     }
 
-    BSONObj WriteErrorDetail::toBSON() const {
-        BSONObjBuilder builder;
+    return true;
+}
 
-        if (_isIndexSet) builder.append(index(), _index);
+BSONObj WriteErrorDetail::toBSON() const {
+    BSONObjBuilder builder;
 
-        if (_isErrCodeSet) builder.append(errCode(), _errCode);
+    if (_isIndexSet)
+        builder.append(index(), _index);
 
-        if (_isErrInfoSet) builder.append(errInfo(), _errInfo);
+    invariant(!_status.isOK());
+    builder.append(errCode(), _status.code());
+    builder.append(errCodeName(), _status.codeString());
+    builder.append(errMessage(), _status.reason());
+    if (auto extra = _status.extraInfo())
+        extra->serialize(&builder);
 
-        if (_isErrMessageSet) builder.append(errMessage(), _errMessage);
+    if (_isErrInfoSet)
+        builder.append(errInfo(), _errInfo);
 
-        return builder.obj();
+    return builder.obj();
+}
+
+bool WriteErrorDetail::parseBSON(const BSONObj& source, string* errMsg) {
+    clear();
+
+    std::string dummy;
+    if (!errMsg)
+        errMsg = &dummy;
+
+    FieldParser::FieldState fieldState;
+    fieldState = FieldParser::extract(source, index, &_index, errMsg);
+    if (fieldState == FieldParser::FIELD_INVALID)
+        return false;
+    _isIndexSet = fieldState == FieldParser::FIELD_SET;
+
+    int errCodeValue;
+    fieldState = FieldParser::extract(source, errCode, &errCodeValue, errMsg);
+    if (fieldState == FieldParser::FIELD_INVALID)
+        return false;
+    bool haveStatus = fieldState == FieldParser::FIELD_SET;
+    std::string errMsgValue;
+    fieldState = FieldParser::extract(source, errMessage, &errMsgValue, errMsg);
+    if (fieldState == FieldParser::FIELD_INVALID)
+        return false;
+    haveStatus = haveStatus && fieldState == FieldParser::FIELD_SET;
+    if (!haveStatus) {
+        *errMsg = "missing code or errmsg field";
+        return false;
     }
+    _status = Status(ErrorCodes::Error(errCodeValue), errMsgValue, source);
 
-    bool WriteErrorDetail::parseBSON(const BSONObj& source, string* errMsg) {
-        clear();
+    fieldState = FieldParser::extract(source, errInfo, &_errInfo, errMsg);
+    if (fieldState == FieldParser::FIELD_INVALID)
+        return false;
+    _isErrInfoSet = fieldState == FieldParser::FIELD_SET;
 
-        std::string dummy;
-        if (!errMsg) errMsg = &dummy;
+    return true;
+}
 
-        FieldParser::FieldState fieldState;
-        fieldState = FieldParser::extract(source, index, &_index, errMsg);
-        if (fieldState == FieldParser::FIELD_INVALID) return false;
-        _isIndexSet = fieldState == FieldParser::FIELD_SET;
+void WriteErrorDetail::clear() {
+    _index = 0;
+    _isIndexSet = false;
 
-        fieldState = FieldParser::extract(source, errCode, &_errCode, errMsg);
-        if (fieldState == FieldParser::FIELD_INVALID) return false;
-        _isErrCodeSet = fieldState == FieldParser::FIELD_SET;
+    _status = Status::OK();
 
-        fieldState = FieldParser::extract(source, errInfo, &_errInfo, errMsg);
-        if (fieldState == FieldParser::FIELD_INVALID) return false;
-        _isErrInfoSet = fieldState == FieldParser::FIELD_SET;
+    _errInfo = BSONObj();
+    _isErrInfoSet = false;
+}
 
-        fieldState = FieldParser::extract(source, errMessage, &_errMessage, errMsg);
-        if (fieldState == FieldParser::FIELD_INVALID) return false;
-        _isErrMessageSet = fieldState == FieldParser::FIELD_SET;
+void WriteErrorDetail::cloneTo(WriteErrorDetail* other) const {
+    other->clear();
 
-        return true;
-    }
+    other->_index = _index;
+    other->_isIndexSet = _isIndexSet;
 
-    void WriteErrorDetail::clear() {
-        _index = 0;
-        _isIndexSet = false;
+    other->_status = _status;
 
-        _errCode = 0;
-        _isErrCodeSet = false;
+    other->_errInfo = _errInfo;
+    other->_isErrInfoSet = _isErrInfoSet;
+}
 
-        _errInfo = BSONObj();
-        _isErrInfoSet = false;
+std::string WriteErrorDetail::toString() const {
+    return "implement me";
+}
 
-        _errMessage.clear();
-        _isErrMessageSet = false;
+void WriteErrorDetail::setIndex(int index) {
+    _index = index;
+    _isIndexSet = true;
+}
 
-    }
+bool WriteErrorDetail::isIndexSet() const {
+    return _isIndexSet;
+}
 
-    void WriteErrorDetail::cloneTo(WriteErrorDetail* other) const {
-        other->clear();
+int WriteErrorDetail::getIndex() const {
+    dassert(_isIndexSet);
+    return _index;
+}
 
-        other->_index = _index;
-        other->_isIndexSet = _isIndexSet;
+Status WriteErrorDetail::toStatus() const {
+    return _status;
+}
 
-        other->_errCode = _errCode;
-        other->_isErrCodeSet = _isErrCodeSet;
+void WriteErrorDetail::setErrInfo(const BSONObj& errInfo) {
+    _errInfo = errInfo.getOwned();
+    _isErrInfoSet = true;
+}
 
-        other->_errInfo = _errInfo;
-        other->_isErrInfoSet = _isErrInfoSet;
+bool WriteErrorDetail::isErrInfoSet() const {
+    return _isErrInfoSet;
+}
 
-        other->_errMessage = _errMessage;
-        other->_isErrMessageSet = _isErrMessageSet;
-    }
+const BSONObj& WriteErrorDetail::getErrInfo() const {
+    dassert(_isErrInfoSet);
+    return _errInfo;
+}
 
-    std::string WriteErrorDetail::toString() const {
-        return "implement me";
-    }
-
-    void WriteErrorDetail::setIndex(int index) {
-        _index = index;
-        _isIndexSet = true;
-    }
-
-    void WriteErrorDetail::unsetIndex() {
-         _isIndexSet = false;
-     }
-
-    bool WriteErrorDetail::isIndexSet() const {
-         return _isIndexSet;
-    }
-
-    int WriteErrorDetail::getIndex() const {
-        dassert(_isIndexSet);
-        return _index;
-    }
-
-    void WriteErrorDetail::setErrCode(int errCode) {
-        _errCode = errCode;
-        _isErrCodeSet = true;
-    }
-
-    void WriteErrorDetail::unsetErrCode() {
-         _isErrCodeSet = false;
-     }
-
-    bool WriteErrorDetail::isErrCodeSet() const {
-         return _isErrCodeSet;
-    }
-
-    int WriteErrorDetail::getErrCode() const {
-        dassert(_isErrCodeSet);
-        return _errCode;
-    }
-
-    void WriteErrorDetail::setErrInfo(const BSONObj& errInfo) {
-        _errInfo = errInfo.getOwned();
-        _isErrInfoSet = true;
-    }
-
-    void WriteErrorDetail::unsetErrInfo() {
-         _isErrInfoSet = false;
-     }
-
-    bool WriteErrorDetail::isErrInfoSet() const {
-         return _isErrInfoSet;
-    }
-
-    const BSONObj& WriteErrorDetail::getErrInfo() const {
-        dassert(_isErrInfoSet);
-        return _errInfo;
-    }
-
-    void WriteErrorDetail::setErrMessage(StringData errMessage) {
-        _errMessage = errMessage.toString();
-        _isErrMessageSet = true;
-    }
-
-    void WriteErrorDetail::unsetErrMessage() {
-         _isErrMessageSet = false;
-     }
-
-    bool WriteErrorDetail::isErrMessageSet() const {
-         return _isErrMessageSet;
-    }
-
-    const std::string& WriteErrorDetail::getErrMessage() const {
-        dassert(_isErrMessageSet);
-        return _errMessage;
-    }
-
-} // namespace mongo
+}  // namespace mongo

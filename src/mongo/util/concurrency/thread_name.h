@@ -30,19 +30,19 @@
 #include <string>
 
 #include "mongo/base/string_data.h"
-#include "mongo/client/export_macros.h"
 
 namespace mongo {
 
-    /**
-     * Sets the name of the current thread to "name".
-     */
-    void setThreadName(StringData name);
+/**
+ * Sets the name of the current thread.
+ */
+void setThreadName(StringData name);
 
-    /**
-     * Retrieves the name of the current thread, as previously set, or "" if no name was previously
-     * set.
-     */
-    MONGO_CLIENT_API const std::string& getThreadName();
+/**
+ * Retrieves the name of the current thread, as previously set, or "thread#" if no name was
+ * previously set. The returned StringData is always null terminated so it is safe to pass to APIs
+ * that expect c-strings.
+ */
+StringData getThreadName();
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -8,59 +8,34 @@
 
 #include "util.h"
 
-static int copy(const char *, const char *);
+static int copy(WT_SESSION *, const char *, const char *);
 static int usage(void);
-
-#define	CBUF_LEN	(128 * 1024)		/* Copy buffer and size. */
-static char *cbuf;
-
-/*
- * append_target --
- *	Build a list of comma-separated targets.
- */
-static int
-append_target(const char *target, char **bufp)
-{
-	static int first = 1;
-	static size_t len = 0, remain = 0;
-	static char *buf = NULL;
-
-						/* 20 bytes of slop */
-	if (remain < strlen(target) + 20) {
-		len += strlen(target) + 512;
-		remain += strlen(target) + 512;
-		if ((buf = realloc(buf, len)) == NULL)
-			return (util_err(errno, NULL));
-		*bufp = buf;
-	}
-	if (first) {
-		first = 0;
-		strcpy(buf, "target=(");
-	} else
-		buf[strlen(buf) - 1] = ',';	/* overwrite previous ")" */
-	strcat(buf, "\"");
-	strcat(buf, target);
-	strcat(buf, "\")");
-	remain -= strlen(target) + 1;
-
-	return (0);
-}
 
 int
 util_backup(WT_SESSION *session, int argc, char *argv[])
 {
 	WT_CURSOR *cursor;
+	WT_DECL_ITEM(tmp);
 	WT_DECL_RET;
+	WT_SESSION_IMPL *session_impl;
 	int ch;
-	char *config;
 	const char *directory, *name;
+	bool target;
 
-	config = NULL;
+	session_impl = (WT_SESSION_IMPL *)session;
+
+	target = false;
 	while ((ch = __wt_getopt(progname, argc, argv, "t:")) != EOF)
 		switch (ch) {
 		case 't':
-			if (append_target(__wt_optarg, &config))
-				return (1);
+			if (!target) {
+				WT_ERR(__wt_scr_alloc(session_impl, 0, &tmp));
+				WT_ERR(__wt_buf_fmt(
+				    session_impl, tmp, "%s", "target=("));
+			}
+			WT_ERR(__wt_buf_catfmt(session_impl, tmp,
+			    "%s\"%s\"", target ? "," : "", __wt_optarg));
+			target = true;
 			break;
 		case '?':
 		default:
@@ -75,10 +50,14 @@ util_backup(WT_SESSION *session, int argc, char *argv[])
 	}
 	directory = *argv;
 
-	if ((ret = session->open_cursor(
-	    session, "backup:", NULL, config, &cursor)) != 0) {
+	/* Terminate any target. */
+	if (target)
+		WT_ERR(__wt_buf_catfmt(session_impl, tmp, "%s", ")"));
+
+	if ((ret = session->open_cursor(session, "backup:",
+	    NULL, target ? (char *)tmp->data : NULL, &cursor)) != 0) {
 		fprintf(stderr, "%s: cursor open(backup:) failed: %s\n",
-		    progname, wiredtiger_strerror(ret));
+		    progname, session->strerror(session, ret));
 		goto err;
 	}
 
@@ -86,112 +65,55 @@ util_backup(WT_SESSION *session, int argc, char *argv[])
 	while (
 	    (ret = cursor->next(cursor)) == 0 &&
 	    (ret = cursor->get_key(cursor, &name)) == 0)
-		if ((ret = copy(name, directory)) != 0)
+		if ((ret = copy(session, directory, name)) != 0)
 			goto err;
 	if (ret == WT_NOTFOUND)
 		ret = 0;
 
 	if (ret != 0) {
 		fprintf(stderr, "%s: cursor next(backup:) failed: %s\n",
-		    progname, wiredtiger_strerror(ret));
+		    progname, session->strerror(session, ret));
 		goto err;
 	}
 
-err:	if (config != NULL)
-		free(config);
-	if (cbuf != NULL)
-		free(cbuf);
-
+err:	__wt_scr_free(session_impl, &tmp);
 	return (ret);
 }
 
 static int
-copy(const char *name, const char *directory)
+copy(WT_SESSION *session, const char *directory, const char *name)
 {
 	WT_DECL_RET;
-	ssize_t n;
-	int ifd, ofd;
+	size_t len;
+	char *to;
 
-	ret = 1;
-	ifd = ofd = -1;
+	to = NULL;
 
-	if (verbose &&
-	    printf("Backing up %s/%s to %s\n", home, name, directory) < 0) {
+	/* Build the target pathname. */
+	len = strlen(directory) + strlen(name) + 2;
+	if ((to = malloc(len)) == NULL) {
 		fprintf(stderr, "%s: %s\n", progname, strerror(errno));
 		return (1);
 	}
+	if ((ret = __wt_snprintf(to, len, "%s/%s", directory, name)) != 0) {
+		fprintf(stderr, "%s: %s\n", progname, strerror(ret));
+		goto err;
+	}
 
-	/* Allocate a large copy buffer (use it to build pathnames as well. */
-	if (cbuf == NULL && (cbuf = malloc(CBUF_LEN)) == NULL)
-		goto memerr;
-
-	/* Open the read file. */
-	if (snprintf(cbuf, CBUF_LEN, "%s/%s", home, name) >= CBUF_LEN)
-		goto memerr;
-	if ((ifd = open(cbuf, O_BINARY | O_RDONLY, 0)) < 0)
-		goto readerr;
-
-	/* Open the write file. */
-	if (snprintf(cbuf, CBUF_LEN, "%s/%s", directory, name) >= CBUF_LEN)
-		goto memerr;
-	if ((ofd = open(
-	    cbuf, O_BINARY | O_CREAT | O_WRONLY | O_TRUNC, 0666)) < 0)
-		goto writerr;
-
-	/* Copy the file. */
-	while ((n = read(ifd, cbuf, CBUF_LEN)) > 0)
-		if (write(ofd, cbuf, (size_t)n) != n)
-			goto writerr;
-	if (n != 0)
-		goto readerr;
+	if (verbose && printf("Backing up %s/%s to %s\n", home, name, to) < 0) {
+		fprintf(stderr, "%s: %s\n", progname, strerror(EIO));
+		goto err;
+	}
 
 	/*
-	 * Close file descriptors (forcing a flush on the write side), and
-	 * check for any errors.
+	 * Use WiredTiger to copy the file: ensuring stability of the copied
+	 * file on disk requires care, and WiredTiger knows how to do it.
 	 */
-	ret = close(ifd);
-	ifd = -1;
-	if (ret != 0)
-		goto readerr;
+	if ((ret = __wt_copy_and_sync(session, name, to)) != 0)
+		fprintf(stderr, "%s/%s to %s: backup copy: %s\n",
+		    home, name, to, session->strerror(session, ret));
 
-	/*
-	 * We need to know this file was successfully written, it's a backup.
-	 */
-#ifdef _WIN32
-	if (FlushFileBuffers((HANDLE)_get_osfhandle(ofd)) == 0) {
-		DWORD err = GetLastError();
-		ret = err;
-		goto writerr;
-	}
-#else
-	if (fsync(ofd))
-		goto writerr;
-#endif
-	ret = close(ofd);
-	ofd = -1;
-	if (ret != 0)
-		goto writerr;
-
-	/* Success. */
-	ret = 0;
-
-	if (0) {
-readerr:	fprintf(stderr,
-		    "%s: %s/%s: %s\n", progname, home, name, strerror(errno));
-	}
-	if (0) {
-writerr:	fprintf(stderr, "%s: %s/%s: %s\n",
-		    progname, directory, name, strerror(errno));
-	}
-	if (0) {
-memerr:		fprintf(stderr, "%s: %s\n", progname, strerror(errno));
-	}
-
-	if (ifd >= 0)
-		(void)close(ifd);
-	if (ofd >= 0)
-		(void)close(ofd);
-
+err:	free(to);
 	return (ret);
 }
 

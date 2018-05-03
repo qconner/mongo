@@ -30,34 +30,33 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/update_result.h"
 
 namespace mongo {
 
-    class CanonicalQuery;
-    class Database;
-    class OperationContext;
-    class UpdateDriver;
+class CanonicalQuery;
+class Database;
+class OperationContext;
+class UpdateDriver;
 
-    /**
-     * Utility method to execute an update described by "request".
-     *
-     * Caller must hold the appropriate database locks.
-     */
-    UpdateResult update(OperationContext* txn,
-                        Database* db, 
-                        const UpdateRequest& request, 
-                        OpDebug* opDebug);
+/**
+ * Utility method to execute an update described by "request".
+ *
+ * Caller must hold the appropriate database locks.
+ */
+UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& request);
 
-    /**
-     * takes the from document and returns a new document
-     * after apply all the operators
-     * e.g.
-     *   applyUpdateOperators( BSON( "x" << 1 ) , BSON( "$inc" << BSON( "x" << 1 ) ) );
-     *   returns: { x : 2 }
-     */
-    BSONObj applyUpdateOperators( const BSONObj& from, const BSONObj& operators );
+/**
+ * Takes the 'from' document and returns a new document after applying 'operators'. arrayFilters are
+ * not supported.
+ * e.g.
+ *   applyUpdateOperators( BSON( "x" << 1 ) , BSON( "$inc" << BSON( "x" << 1 ) ) );
+ *   returns: { x : 2 }
+ */
+BSONObj applyUpdateOperators(OperationContext* opCtx,
+                             const BSONObj& from,
+                             const BSONObj& operators);
 }  // namespace mongo

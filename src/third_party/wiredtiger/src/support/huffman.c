@@ -1,9 +1,31 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
- * See the file LICENSE for redistribution information.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 4. Neither the name MongoDB or the name WiredTiger
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY MONGODB INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
 
 #include "wt_internal.h"
@@ -96,8 +118,8 @@ typedef struct __indexed_byte {
 	uint32_t frequency;
 } INDEXED_SYMBOL;
 
-static int  indexed_freq_compare(const void *, const void *);
-static int  indexed_symbol_compare(const void *, const void *);
+static int WT_CDECL indexed_freq_compare(const void *, const void *);
+static int WT_CDECL indexed_symbol_compare(const void *, const void *);
 static void make_table(
 	WT_SESSION_IMPL *, uint8_t *, uint16_t, WT_HUFFMAN_CODE *, u_int);
 static void node_queue_close(WT_SESSION_IMPL *, NODE_QUEUE *);
@@ -117,7 +139,7 @@ static void set_codes(WT_FREQTREE_NODE *, WT_HUFFMAN_CODE *, uint16_t, uint8_t);
  * indexed_symbol_compare --
  *	Qsort comparator to order the table by symbol, lowest to highest.
  */
-static int
+static int WT_CDECL
 indexed_symbol_compare(const void *a, const void *b)
 {
 	return (((INDEXED_SYMBOL *)a)->symbol >
@@ -131,7 +153,7 @@ indexed_symbol_compare(const void *a, const void *b)
  *	Qsort comparator to order the table by frequency (the most frequent
  * symbols will be at the end of the array).
  */
-static int
+static int WT_CDECL
 indexed_freq_compare(const void *a, const void *b)
 {
 	return (((INDEXED_SYMBOL *)a)->frequency >
@@ -208,19 +230,19 @@ set_codes(WT_FREQTREE_NODE *node,
 		 * lower-order bits for consecutive numbering.
 		 */
 		if (len < MAX_CODE_LENGTH &&
-		    ((half = 1 << (remaining - 1)) < node->left->weight ||
-		    half < node->right->weight)) {
-			pattern = pattern << remaining;
+		    ((half = (uint16_t)(1 << (remaining - 1))) <
+		    node->left->weight || half < node->right->weight)) {
+			pattern = (uint16_t)(pattern << remaining);
 			len = MAX_CODE_LENGTH;
 		}
 
 		if (len < MAX_CODE_LENGTH) {
-			patternleft = (pattern << 1) | 0;
-			patternright = (pattern << 1) | 1;
+			patternleft = (uint16_t)((pattern << 1) | 0);
+			patternright = (uint16_t)((pattern << 1) | 1);
 			len++;
 		} else {			/* "low bit mode" */
 			patternleft = pattern;
-			patternright = pattern + node->left->weight;
+			patternright = (uint16_t)(pattern + node->left->weight);
 						/* len unchanged */
 		}
 
@@ -262,12 +284,12 @@ make_table(WT_SESSION_IMPL *session, uint8_t *code2symbol,
 		 * than necessary, we allocate (2 ^ max-code-length) of them.
 		 */
 		c = codes[i].pattern;
-		shift = max_depth - len;
+		shift = (uint8_t)(max_depth - len);
 		c1 = (uint32_t)c << shift;
 		c2 = (uint32_t)(c + 1) << shift;
 		for (j = c1; j < c2; j++) {
 			WT_ASSERT(session, code2symbol[j] == 0);
-			code2symbol[j] = i;
+			code2symbol[j] = (uint8_t)i;
 		}
 	}
 }
@@ -302,8 +324,7 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	uint64_t w1, w2;
 	uint16_t i;
 
-	indexed_freqs = symbol_frequency_array;
-
+	indexed_freqs = NULL;
 	combined_nodes = leaves = NULL;
 	node = node2 = tempnode = NULL;
 
@@ -330,26 +351,24 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	 * Order the array by symbol and check for invalid symbols and
 	 * duplicates.
 	 */
-	qsort((void *)indexed_freqs,
-	    symcnt, sizeof(INDEXED_SYMBOL), indexed_symbol_compare);
+	sym = symbol_frequency_array;
+	qsort(sym, symcnt, sizeof(INDEXED_SYMBOL), indexed_symbol_compare);
 	for (i = 0; i < symcnt; ++i) {
-		if (i > 0 &&
-		    indexed_freqs[i].symbol == indexed_freqs[i - 1].symbol)
+		if (i > 0 && sym[i].symbol == sym[i - 1].symbol)
 			WT_ERR_MSG(session, EINVAL,
-			    "duplicate symbol %" PRIx32
-			    " specified in a huffman table",
-			    indexed_freqs[i].symbol);
-		if (indexed_freqs[i].symbol > huffman->numSymbols)
+			    "duplicate symbol %" PRIu32 " (%#" PRIx32 ") "
+			    "specified in a huffman table",
+			    sym[i].symbol, sym[i].symbol);
+		if (sym[i].symbol > huffman->numSymbols)
 			WT_ERR_MSG(session, EINVAL,
-			    "illegal symbol %" PRIx32
-			    " specified in a huffman table",
-			    indexed_freqs[i].symbol);
+			    "out-of-range symbol %" PRIu32 " (%#" PRIx32 ") "
+			    "specified in a huffman table",
+			    sym[i].symbol, sym[i].symbol);
 	}
 
 	/*
 	 * Massage frequencies.
 	 */
-	indexed_freqs = NULL;
 	WT_ERR(__wt_calloc_def(session, 256, &indexed_freqs));
 
 	/*
@@ -451,7 +470,7 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 
 	/*
 	 * The remaining node is in the node variable, this is the root of the
-	 * tree.   Calculate how many bytes it takes to hold numSymbols bytes
+	 * tree. Calculate how many bytes it takes to hold numSymbols bytes
 	 * bits.
 	 */
 	huffman->max_depth = 0;
@@ -464,7 +483,7 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	set_codes(node, huffman->codes, 0, 0);
 
 	WT_ERR(__wt_calloc_def(
-	    session, 1U << huffman->max_depth, &huffman->code2symbol));
+	    session, (size_t)1U << huffman->max_depth, &huffman->code2symbol));
 	make_table(session, huffman->code2symbol,
 	    huffman->max_depth, huffman->codes, huffman->numSymbols);
 
@@ -473,11 +492,12 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	uint8_t symbol;
 	uint32_t weighted_length;
 
-	printf("leaf depth %" PRIu16 "..%" PRIu16 ", memory use: "
-	    "codes %u# * %uB  + code2symbol %u# * %uB\n",
+	printf("leaf depth %" PRIu16 "..%" PRIu16
+	    ", memory use: codes %u# * %" WT_SIZET_FMT
+	    "B + code2symbol %u# * %" WT_SIZET_FMT "B\n",
 	    huffman->min_depth, huffman->max_depth,
-	    huffman->numSymbols, (u_int)sizeof(WT_HUFFMAN_CODE),
-	    1U << huffman->max_depth, (u_int)sizeof(uint16_t));
+	    huffman->numSymbols, sizeof(WT_HUFFMAN_CODE),
+	    1U << huffman->max_depth, sizeof(uint16_t));
 
 	/*
 	 * measure quality of computed Huffman codes, for different max bit
@@ -540,7 +560,7 @@ __wt_huffman_close(WT_SESSION_IMPL *session, void *huffman_arg)
  * __wt_print_huffman_code --
  *	Prints a symbol's Huffman code.
  */
-int
+void
 __wt_print_huffman_code(void *huffman_arg, uint16_t symbol)
 {
 	WT_HUFFMAN_CODE code;
@@ -563,8 +583,6 @@ __wt_print_huffman_code(void *huffman_arg, uint16_t symbol)
 			    "%" PRIx16 ", length %" PRIu8 "\n",
 				symbol, code.pattern, code.length);
 	}
-
-	return (0);
 }
 #endif
 
@@ -668,13 +686,13 @@ __wt_huffman_encode(WT_SESSION_IMPL *session, void *huffman_arg,
 	/*
 	 * At this point, bitpos is the total number of used bits (including
 	 * the 3 bits at the beginning of the buffer, which we'll set now to
-	 * the number of bits used in the last byte).   Note if the number of
+	 * the number of bits used in the last byte). Note if the number of
 	 * bits used in the last byte is 8, we set the 3 bits to 0, in other
 	 * words, the first 3 bits of the encoded value are the number of bits
 	 * used in the last byte, unless they're 0, in which case there are 8
 	 * bits used in the last byte.
 	 */
-	padding_info = (bitpos % 8) << (8 - WT_HUFFMAN_HEADER);
+	padding_info = (uint8_t)((bitpos % 8) << (8 - WT_HUFFMAN_HEADER));
 	((uint8_t *)tmp->mem)[0] |= padding_info;
 
 	/* Copy result of exact known size into caller's buffer. */
@@ -728,8 +746,8 @@ __wt_huffman_decode(WT_SESSION_IMPL *session, void *huffman_arg,
     const uint8_t *from_arg, size_t from_len, WT_ITEM *to_buf)
 {
 	WT_DECL_RET;
-	WT_ITEM *tmp;
 	WT_HUFFMAN_OBJ *huffman;
+	WT_ITEM *tmp;
 	size_t from_bytes, len, max_len, outlen;
 	uint64_t from_len_bits;
 	uint32_t bits, mask, max;
@@ -788,12 +806,25 @@ __wt_huffman_decode(WT_SESSION_IMPL *session, void *huffman_arg,
 			valid += 8;
 			from_bytes--;
 		}
-		pattern = valid >= max ?	/* short patterns near end */
-		    (bits >> (valid - max)) : (bits << (max - valid));
+		pattern = (uint16_t)
+		    (valid >= max ?	/* short patterns near end */
+		    (bits >> (valid - max)) : (bits << (max - valid)));
 		symbol = huffman->code2symbol[pattern & mask];
 		len = huffman->codes[symbol].length;
-		valid -= len;
-		WT_ASSERT(session, from_len_bits >= len);
+		valid -= (uint8_t)len;
+
+		/*
+		 * from_len_bits is the total number of input bits, reduced by
+		 * the number of bits we consume from input at each step.  For
+		 * all but the last step from_len_bits > len, then at the last
+		 * step from_len_bits == len (in other words, from_len_bits -
+		 * len = 0 input bits remaining). Generally, we cannot detect
+		 * corruption during huffman decompression, this is one place
+		 * where that's not true.
+		 */
+		if (from_len_bits < len)	/* corrupted */
+			WT_ERR_MSG(session, EINVAL,
+			    "huffman decompression detected input corruption");
 		from_len_bits -= len;
 
 		WT_ASSERT(session,

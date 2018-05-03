@@ -31,52 +31,89 @@
 #include <string>
 
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/dbmessage.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 
-    class OperationContext;
+class NamespaceString;
+class OperationContext;
 
-    /**
-     * Constructs a PlanExecutor for a query with the oplogReplay option set to true,
-     * for the query 'cq' over the collection 'collection'. The PlanExecutor will
-     * wrap a singleton OplogStart stage.
-     *
-     * The oplog start finding hack requires that 'cq' has a $gt or $gte predicate over
-     * a field named 'ts'.
-     *
-     * On success, caller takes ownership of *execOut.
-     */
-    Status getOplogStartHack(OperationContext* txn,
-                             Collection* collection,
-                             CanonicalQuery* cq,
-                             PlanExecutor** execOut);
+/**
+ * Returns true if we should keep a cursor around because we're expecting to return more query
+ * results.
+ *
+ * If false, the caller should close the cursor and indicate this to the client by sending back
+ * a cursor ID of 0.
+ */
+bool shouldSaveCursor(OperationContext* opCtx,
+                      const Collection* collection,
+                      PlanExecutor::ExecState finalState,
+                      PlanExecutor* exec);
 
-    /**
-     * Called from the getMore entry point in ops/query.cpp.
-     */
-    QueryResult::View getMore(OperationContext* txn,
-                              const char* ns,
-                              int ntoreturn,
-                              long long cursorid,
-                              CurOp& curop,
-                              int pass,
-                              bool& exhaust,
-                              bool* isCursorAuthorized,
-                              bool fromDBDirectClient);
+/**
+ * Similar to shouldSaveCursor(), but used in getMore to determine whether we should keep
+ * the cursor around for additional getMores().
+ *
+ * If false, the caller should close the cursor and indicate this to the client by sending back
+ * a cursor ID of 0.
+ */
+bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
+                             PlanExecutor* exec,
+                             bool isTailable);
 
-    /**
-     * Run the query 'q' and place the result in 'result'.
-     */
-    std::string runQuery(OperationContext* txn,
-                         Message& m,
-                         QueryMessage& q,
-                         const NamespaceString& ns,
-                         CurOp& curop,
-                         Message &result,
-                         bool fromDBDirectClient);
+/**
+ * Fills out the CurOp for "opCtx" with information about this query.
+ */
+void beginQueryOp(OperationContext* opCtx,
+                  const NamespaceString& nss,
+                  const BSONObj& queryObj,
+                  long long ntoreturn,
+                  long long ntoskip);
+
+/**
+ * 1) Fills out CurOp for "opCtx" with information regarding this query's execution.
+ * 2) Reports index usage to the CollectionInfoCache.
+ *
+ * Uses explain functionality to extract stats from 'exec'.
+ */
+void endQueryOp(OperationContext* opCtx,
+                Collection* collection,
+                const PlanExecutor& exec,
+                long long numResults,
+                CursorId cursorId);
+
+/**
+ * Constructs a PlanExecutor for a query with the oplogReplay option set to true,
+ * for the query 'cq' over the collection 'collection'. The PlanExecutor will
+ * wrap a singleton OplogStart stage.
+ *
+ * The oplog start finding hack requires that 'cq' has a $gt or $gte predicate over
+ * a field named 'ts'.
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getOplogStartHack(OperationContext* opCtx,
+                                                            Collection* collection,
+                                                            std::unique_ptr<CanonicalQuery> cq);
+
+/**
+ * Called from the getMore entry point in ops/query.cpp.
+ * Returned buffer is the message to return to the client.
+ */
+Message getMore(OperationContext* opCtx,
+                const char* ns,
+                int ntoreturn,
+                long long cursorid,
+                bool* exhaust,
+                bool* isCursorAuthorized);
+
+/**
+ * Run the query 'q' and place the result in 'result'.
+ */
+std::string runQuery(OperationContext* opCtx,
+                     QueryMessage& q,
+                     const NamespaceString& ns,
+                     Message& result);
 
 }  // namespace mongo

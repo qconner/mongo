@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -19,8 +19,8 @@ __wt_schema_project_in(WT_SESSION_IMPL *session,
 {
 	WT_CURSOR *c;
 	WT_DECL_ITEM(buf);
-	WT_DECL_PACK_VALUE(pv);
 	WT_DECL_PACK(pack);
+	WT_DECL_PACK_VALUE(pv);
 	WT_PACK_VALUE old_pv;
 	size_t len, offset, old_len;
 	u_long arg;
@@ -92,7 +92,7 @@ __wt_schema_project_in(WT_SESSION_IMPL *session,
 					if (pv.type == 'S' || pv.type == 's')
 						pv.u.s = "";
 
-					len = __pack_size(session, &pv);
+					WT_RET(__pack_size(session, &pv, &len));
 					WT_RET(__wt_buf_grow(session,
 					    buf, buf->size + len));
 					p = (uint8_t *)buf->mem + buf->size;
@@ -121,7 +121,7 @@ __wt_schema_project_in(WT_SESSION_IMPL *session,
 				}
 				old_len = (size_t)(next - p);
 
-				len = __pack_size(session, &pv);
+				WT_RET(__pack_size(session, &pv, &len));
 				offset = WT_PTRDIFF(p, buf->mem);
 				WT_RET(__wt_buf_grow(session,
 				    buf, buf->size + len));
@@ -220,7 +220,7 @@ __wt_schema_project_out(WT_SESSION_IMPL *session,
  */
 int
 __wt_schema_project_slice(WT_SESSION_IMPL *session, WT_CURSOR **cp,
-    const char *proj_arg, int key_only, const char *vformat, WT_ITEM *value)
+    const char *proj_arg, bool key_only, const char *vformat, WT_ITEM *value)
 {
 	WT_CURSOR *c;
 	WT_DECL_ITEM(buf);
@@ -233,7 +233,7 @@ __wt_schema_project_slice(WT_SESSION_IMPL *session, WT_CURSOR **cp,
 	uint8_t *end, *p;
 	const uint8_t *next, *vp, *vend;
 	size_t len, offset, old_len;
-	int skip;
+	bool skip;
 
 	p = end = NULL;		/* -Wuninitialized */
 
@@ -259,7 +259,7 @@ __wt_schema_project_slice(WT_SESSION_IMPL *session, WT_CURSOR **cp,
 
 		switch (*proj) {
 		case WT_PROJ_KEY:
-			skip = 0;
+			skip = false;
 			c = cp[arg];
 			if (WT_CURSOR_RECNO(c)) {
 				c->key.data = &c->recno;
@@ -274,7 +274,8 @@ __wt_schema_project_slice(WT_SESSION_IMPL *session, WT_CURSOR **cp,
 			continue;
 
 		case WT_PROJ_VALUE:
-			if ((skip = key_only) != 0)
+			skip = key_only;
+			if (skip)
 				continue;
 			c = cp[arg];
 			WT_RET(__pack_init(session, &pack, c->value_format));
@@ -309,7 +310,7 @@ __wt_schema_project_slice(WT_SESSION_IMPL *session, WT_CURSOR **cp,
 					if (pv.type == 'S' || pv.type == 's')
 						pv.u.s = "";
 
-					len = __pack_size(session, &pv);
+					WT_RET(__pack_size(session, &pv, &len));
 					WT_RET(__wt_buf_grow(session,
 					    buf, buf->size + len));
 					p = (uint8_t *)buf->data + buf->size;
@@ -352,10 +353,11 @@ __wt_schema_project_slice(WT_SESSION_IMPL *session, WT_CURSOR **cp,
 
 				/* Make sure the types are compatible. */
 				WT_ASSERT(session,
-				    tolower(pv.type) == tolower(vpv.type));
+				    __wt_tolower((u_char)pv.type) ==
+				    __wt_tolower((u_char)vpv.type));
 				pv.u = vpv.u;
 
-				len = __pack_size(session, &pv);
+				WT_RET(__pack_size(session, &pv, &len));
 				offset = WT_PTRDIFF(p, buf->data);
 				/*
 				 * Avoid growing the buffer if the value fits.
@@ -396,10 +398,10 @@ __wt_schema_project_merge(WT_SESSION_IMPL *session,
     WT_CURSOR **cp, const char *proj_arg, const char *vformat, WT_ITEM *value)
 {
 	WT_CURSOR *c;
-	WT_ITEM *buf;
 	WT_DECL_PACK(pack);
 	WT_DECL_PACK_VALUE(pv);
 	WT_DECL_PACK_VALUE(vpv);
+	WT_ITEM *buf;
 	WT_PACK vpack;
 	u_long arg;
 	char *proj;
@@ -458,9 +460,10 @@ __wt_schema_project_merge(WT_SESSION_IMPL *session,
 				WT_RET(__pack_next(&vpack, &vpv));
 				/* Make sure the types are compatible. */
 				WT_ASSERT(session,
-				    tolower(pv.type) == tolower(vpv.type));
+				    __wt_tolower((u_char)pv.type) ==
+				    __wt_tolower((u_char)vpv.type));
 				vpv.u = pv.u;
-				len = __pack_size(session, &vpv);
+				WT_RET(__pack_size(session, &vpv, &len));
 				WT_RET(__wt_buf_grow(session,
 				    value, value->size + len));
 				vp = (uint8_t *)value->mem + value->size;

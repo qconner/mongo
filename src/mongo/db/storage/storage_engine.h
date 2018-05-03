@@ -35,169 +35,375 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    class DatabaseCatalogEntry;
-    class OperationContext;
-    class RecoveryUnit;
-    struct StorageGlobalParams;
-    class StorageEngineLockFile;
-    class StorageEngineMetadata;
+class DatabaseCatalogEntry;
+class JournalListener;
+class OperationContext;
+class RecoveryUnit;
+class SnapshotManager;
+struct StorageGlobalParams;
+class StorageEngineLockFile;
+class StorageEngineMetadata;
+
+/**
+ * The StorageEngine class is the top level interface for creating a new storage
+ * engine.  All StorageEngine(s) must be registered by calling registerFactory in order
+ * to possibly be activated.
+ */
+class StorageEngine {
+public:
+    /**
+     * The interface for creating new instances of storage engines.
+     *
+     * A storage engine provides an instance of this class (along with an associated
+     * name) to the global environment, which then sets the global storage engine
+     * according to the provided configuration parameter.
+     */
+    class Factory {
+    public:
+        virtual ~Factory() {}
+
+        /**
+         * Return a new instance of the StorageEngine. The lockFile parameter may be null if
+         * params.readOnly is set. Caller owns the returned pointer.
+         */
+        virtual StorageEngine* create(const StorageGlobalParams& params,
+                                      const StorageEngineLockFile* lockFile) const = 0;
+
+        /**
+         * Returns the name of the storage engine.
+         *
+         * Implementations that change the value of the returned string can cause
+         * data file incompatibilities.
+         */
+        virtual StringData getCanonicalName() const = 0;
+
+        /**
+         * Validates creation options for a collection in the StorageEngine.
+         * Returns an error if the creation options are not valid.
+         *
+         * Default implementation only accepts empty objects (no options).
+         */
+        virtual Status validateCollectionStorageOptions(const BSONObj& options) const {
+            if (options.isEmpty())
+                return Status::OK();
+            return Status(ErrorCodes::InvalidOptions,
+                          str::stream() << "storage engine " << getCanonicalName()
+                                        << " does not support any collection storage options");
+        }
+
+        /**
+         * Validates creation options for an index in the StorageEngine.
+         * Returns an error if the creation options are not valid.
+         *
+         * Default implementation only accepts empty objects (no options).
+         */
+        virtual Status validateIndexStorageOptions(const BSONObj& options) const {
+            if (options.isEmpty())
+                return Status::OK();
+            return Status(ErrorCodes::InvalidOptions,
+                          str::stream() << "storage engine " << getCanonicalName()
+                                        << " does not support any index storage options");
+        }
+
+        /**
+         * Validates existing metadata in the data directory against startup options.
+         * Returns an error if the storage engine initialization should not proceed
+         * due to any inconsistencies between the current startup options and the creation
+         * options stored in the metadata.
+         */
+        virtual Status validateMetadata(const StorageEngineMetadata& metadata,
+                                        const StorageGlobalParams& params) const = 0;
+
+        /**
+         * Returns a new document suitable for storing in the data directory metadata.
+         * This document will be used by validateMetadata() to check startup options
+         * on restart.
+         */
+        virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const = 0;
+
+        /**
+         * Returns whether the engine supports read-only mode. If read-only mode is enabled, the
+         * engine may be started on a read-only filesystem (either mounted read-only or with
+         * read-only permissions). If readOnly mode is enabled, it is undefined behavior to call
+         * methods that write data (e.g. insertRecord). This method is provided on the Factory
+         * because it must be called before the storageEngine is instantiated.
+         */
+        virtual bool supportsReadOnly() const {
+            return false;
+        }
+    };
 
     /**
-     * The StorageEngine class is the top level interface for creating a new storage
-     * engine.  All StorageEngine(s) must be registered by calling registerFactory in order
-     * to possibly be activated.
+    * The destructor should only be called if we are tearing down but not exiting the process.
+    */
+    virtual ~StorageEngine() {}
+
+    /**
+     * Called after the globalStorageEngine pointer has been set up, before any other methods
+     * are called. Any initialization work that requires the ability to create OperationContexts
+     * should be done here rather than in the constructor.
      */
-    class StorageEngine {
-    public:
+    virtual void finishInit() {}
 
-        /**
-         * The interface for creating new instances of storage engines.
-         *
-         * A storage engine provides an instance of this class (along with an associated
-         * name) to the global environment, which then sets the global storage engine
-         * according to the provided configuration parameter.
-         */
-        class Factory {
-        public:
-            virtual ~Factory() { }
+    /**
+     * Returns a new interface to the storage engine's recovery unit.  The recovery
+     * unit is the durability interface.  For details, see recovery_unit.h
+     *
+     * Caller owns the returned pointer.
+     */
+    virtual RecoveryUnit* newRecoveryUnit() = 0;
 
-            /**
-             * Return a new instance of the StorageEngine.  Caller owns the returned pointer.
-             */
-            virtual StorageEngine* create(const StorageGlobalParams& params,
-                                          const StorageEngineLockFile& lockFile) const = 0;
+    /**
+     * List the databases stored in this storage engine.
+     *
+     * XXX: why doesn't this take OpCtx?
+     */
+    virtual void listDatabases(std::vector<std::string>* out) const = 0;
 
-            /**
-             * Returns the name of the storage engine.
-             *
-             * Implementations that change the value of the returned string can cause
-             * data file incompatibilities.
-             */
-            virtual StringData getCanonicalName() const = 0;
+    /**
+     * Return the DatabaseCatalogEntry that describes the database indicated by 'db'.
+     *
+     * StorageEngine owns returned pointer.
+     * It should not be deleted by any caller.
+     */
+    virtual DatabaseCatalogEntry* getDatabaseCatalogEntry(OperationContext* opCtx,
+                                                          StringData db) = 0;
 
-            /**
-             * Validates creation options for a collection in the StorageEngine.
-             * Returns an error if the creation options are not valid.
-             */
-            virtual Status validateCollectionStorageOptions(const BSONObj& options) const = 0;
+    /**
+     * Returns whether the storage engine supports its own locking locking below the collection
+     * level. If the engine returns true, MongoDB will acquire intent locks down to the
+     * collection level and will assume that the engine will ensure consistency at the level of
+     * documents. If false, MongoDB will lock the entire collection in Shared/Exclusive mode
+     * for read/write operations respectively.
+     */
+    virtual bool supportsDocLocking() const = 0;
 
-            /**
-             * Validates creation options for an index in the StorageEngine.
-             * Returns an error if the creation options are not valid.
-             */
-             virtual Status validateIndexStorageOptions(const BSONObj& options) const = 0;
+    /**
+     * Returns whether the storage engine supports locking at a database level.
+     */
+    virtual bool supportsDBLocking() const {
+        return true;
+    }
 
-             /**
-              * Validates existing metadata in the data directory against startup options.
-              * Returns an error if the storage engine initialization should not proceed
-              * due to any inconsistencies between the current startup options and the creation
-              * options stored in the metadata.
-              */
-             virtual Status validateMetadata(const StorageEngineMetadata& metadata,
-                                             const StorageGlobalParams& params) const = 0;
+    /**
+     * Returns whether the engine supports a journalling concept or not.
+     */
+    virtual bool isDurable() const = 0;
 
-             /**
-              * Returns a new document suitable for storing in the data directory metadata.
-              * This document will be used by validateMetadata() to check startup options
-              * on restart.
-              */
-             virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const = 0;
-        };
+    /**
+     * Returns true if the engine does not persist data to disk; false otherwise.
+     */
+    virtual bool isEphemeral() const = 0;
 
-        /**
-         * Called after the globalStorageEngine pointer has been set up, before any other methods
-         * are called. Any initialization work that requires the ability to create OperationContexts
-         * should be done here rather than in the constructor.
-         */
-        virtual void finishInit() {}
+    /**
+     * Only MMAPv1 should override this and return true to trigger MMAPv1-specific behavior.
+     */
+    virtual bool isMmapV1() const {
+        return false;
+    }
 
-        /**
-         * Returns a new interface to the storage engine's recovery unit.  The recovery
-         * unit is the durability interface.  For details, see recovery_unit.h
-         *
-         * Caller owns the returned pointer.
-         */
-        virtual RecoveryUnit* newRecoveryUnit() = 0;
+    /**
+     * Populates and tears down in-memory data structures, respectively. Only required for storage
+     * engines that support recoverToStableTimestamp().
+     *
+     * Must be called with the global lock acquired in exclusive mode.
+     */
+    virtual void loadCatalog(OperationContext* opCtx) {}
+    virtual void closeCatalog(OperationContext* opCtx) {}
 
-        /**
-         * List the databases stored in this storage engine.
-         *
-         * XXX: why doesn't this take OpCtx?
-         */
-        virtual void listDatabases( std::vector<std::string>* out ) const = 0;
+    /**
+     * Closes all file handles associated with a database.
+     */
+    virtual Status closeDatabase(OperationContext* opCtx, StringData db) = 0;
 
-        /**
-         * Return the DatabaseCatalogEntry that describes the database indicated by 'db'.
-         *
-         * StorageEngine owns returned pointer.
-         * It should not be deleted by any caller.
-         */
-        virtual DatabaseCatalogEntry* getDatabaseCatalogEntry( OperationContext* opCtx,
-                                                               StringData db ) = 0;
+    /**
+     * Deletes all data and metadata for a database.
+     */
+    virtual Status dropDatabase(OperationContext* opCtx, StringData db) = 0;
 
-        /**
-         * Returns whether the storage engine supports its own locking locking below the collection
-         * level. If the engine returns true, MongoDB will acquire intent locks down to the
-         * collection level and will assume that the engine will ensure consistency at the level of
-         * documents. If false, MongoDB will lock the entire collection in Shared/Exclusive mode
-         * for read/write operations respectively.
-         */
-        virtual bool supportsDocLocking() const = 0;
+    /**
+     * @return number of files flushed
+     */
+    virtual int flushAllFiles(OperationContext* opCtx, bool sync) = 0;
 
-        /**
-         * Returns if the engine supports a journalling concept.
-         * This controls whether awaitCommit gets called or fsync to ensure data is on disk.
-         */
-        virtual bool isDurable() const = 0;
+    /**
+     * Transitions the storage engine into backup mode.
+     *
+     * During backup mode the storage engine must stabilize its on-disk files, and avoid
+     * any internal processing that may involve file I/O, such as online compaction, so
+     * a filesystem level backup may be performed.
+     *
+     * Storage engines that do not support this feature should use the default implementation.
+     * Storage engines that implement this must also implement endBackup().
+     *
+     * For Storage engines that implement beginBackup the _inBackupMode variable is provided
+     * to avoid multiple instance enterting/leaving backup concurrently.
+     *
+     * If this function returns an OK status, MongoDB can call endBackup to signal the storage
+     * engine that filesystem writes may continue. This function should return a non-OK status if
+     * filesystem changes cannot be stopped to allow for online backup. If the function should be
+     * retried, returns a non-OK status. This function may throw a WriteConflictException, which
+     * should trigger a retry by the caller. All other exceptions should be treated as errors.
+     */
+    virtual Status beginBackup(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
 
-        /**
-         * Only MMAPv1 should override this and return true to trigger MMAPv1-specific behavior.
-         */
-        virtual bool isMmapV1() const { return false; }
+    /**
+     * Transitions the storage engine out of backup mode.
+     *
+     * Storage engines that do not support this feature should use the default implementation.
+     *
+     * Storage engines implementing this feature should fassert when unable to leave backup mode.
+     */
+    virtual void endBackup(OperationContext* opCtx) {
+        return;
+    }
 
-        /**
-         * Closes all file handles associated with a database.
-         */
-        virtual Status closeDatabase( OperationContext* txn, StringData db ) = 0;
+    /**
+     * Recover as much data as possible from a potentially corrupt RecordStore.
+     * This only recovers the record data, not indexes or anything else.
+     *
+     * Generally, this method should not be called directly except by the repairDatabase()
+     * free function.
+     *
+     * NOTE: MMAPv1 does not support this method and has its own repairDatabase() method.
+     */
+    virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
 
-        /**
-         * Deletes all data and metadata for a database.
-         */
-        virtual Status dropDatabase( OperationContext* txn, StringData db ) = 0;
+    /**
+     * This method will be called before there is a clean shutdown.  Storage engines should
+     * override this method if they have clean-up to do that is different from unclean shutdown.
+     * MongoDB will not call into the storage subsystem after calling this function.
+     *
+     * On error, the storage engine should assert and crash.
+     * There is intentionally no uncleanShutdown().
+     */
+    virtual void cleanShutdown() = 0;
 
-        /**
-         * @return number of files flushed
-         */
-        virtual int flushAllFiles( bool sync ) = 0;
+    /**
+     * Returns the SnapshotManager for this StorageEngine or NULL if not supported.
+     *
+     * Pointer remains owned by the StorageEngine, not the caller.
+     */
+    virtual SnapshotManager* getSnapshotManager() const {
+        return nullptr;
+    }
 
-        /**
-         * Recover as much data as possible from a potentially corrupt RecordStore.
-         * This only recovers the record data, not indexes or anything else.
-         *
-         * Generally, this method should not be called directly except by the repairDatabase()
-         * free function.
-         *
-         * NOTE: MMAPv1 does not support this method and has its own repairDatabase() method.
-         */
-        virtual Status repairRecordStore(OperationContext* txn, const std::string& ns) = 0;
+    /**
+     * Sets a new JournalListener, which is used by the storage engine to alert the rest of the
+     * system about journaled write progress.
+     */
+    virtual void setJournalListener(JournalListener* jl) = 0;
 
-        /**
-         * This method will be called before there is a clean shutdown.  Storage engines should
-         * override this method if they have clean-up to do that is different from unclean shutdown.
-         * MongoDB will not call into the storage subsystem after calling this function.
-         *
-         * There is intentionally no uncleanShutdown().
-         */
-        virtual void cleanShutdown() = 0;
+    /**
+     * Returns whether the storage engine supports "recover to stable timestamp". Returns true
+     * if the storage engine supports "recover to stable timestamp" but does not currently have
+     * a stable timestamp. In that case StorageEngine::recoverToStableTimestamp() will return
+     * a bad status.
+     */
+    virtual bool supportsRecoverToStableTimestamp() const {
+        return false;
+    }
 
-    protected:
-        /**
-         * The destructor will never be called. See cleanShutdown instead.
-         */
-        virtual ~StorageEngine() {}
+    /**
+     * Returns true if the storage engine supports the readConcern level "snapshot".
+     */
+    virtual bool supportsReadConcernSnapshot() const {
+        return false;
+    }
+
+    /**
+     * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
+     * refers to a timestamp that is guaranteed to never be rolled back. The stable timestamp
+     * used should be one provided by StorageEngine::setStableTimestamp().
+     *
+     * The "local" database is exempt and should not roll back any state except for
+     * "local.replset.minvalid" which must roll back to the last stable timestamp.
+     *
+     * If successful, returns the timestamp that the storage engine recovered to.
+     *
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return
+     * false. Returns a bad status if there is no stable timestamp to recover to.
+     *
+     * It is illegal to call this concurrently with `setStableTimestamp` or
+     * `setInitialDataTimestamp`.
+     */
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) {
+        fassertFailed(40547);
+    }
+
+    /**
+     * Returns the stable timestamp that the storage engine recovered to on startup. If the
+     * recovery point was not stable, returns "none".
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Returns a timestamp that is guaranteed to be persisted to disk in a checkpoint. Returns
+     * boost::none if there is no stable checkpoint. This method should return at least the value of
+     * `getRecoveryTimestamp` if the node started from a stable checkpoint. fasserts if
+     * StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
+     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     */
+    virtual void setStableTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Tells the storage engine the timestamp of the data at startup. This is necessary because
+     * timestamps are not persisted in the storage layer.
+     */
+    virtual void setInitialDataTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Sets the oldest timestamp for which the storage engine must maintain snapshot history
+     * through. Additionally, all future writes must be newer or equal to this value.
+     */
+    virtual void setOldestTimestamp(Timestamp timestampa) {}
+
+    /**
+     *  Notifies the storage engine that a replication batch has completed.
+     *  This means that all the writes associated with the oplog entries in the batch are
+     *  finished and no new writes with timestamps associated with those oplog entries will show
+     *  up in the future.
+     *  This function can be used to ensure oplog visibility rules are not broken, for example.
+     */
+    virtual void replicationBatchIsComplete() const {};
+
+    // (CollectionName, IndexName)
+    typedef std::pair<std::string, std::string> CollectionIndexNamePair;
+
+    /**
+     * Drop abandoned idents. In the successful case, returns a list of collection, index name
+     * pairs to rebuild.
+     */
+    virtual StatusWith<std::vector<CollectionIndexNamePair>> reconcileCatalogAndIdents(
+        OperationContext* opCtx) {
+        return std::vector<CollectionIndexNamePair>();
     };
+
+    /**
+     * Returns the all committed timestamp. All transactions with timestamps earlier than the
+     * all committed timestamp are committed. Only storage engines that support document level
+     * locking must provide an implementation. Other storage engines may provide a no-op
+     * implementation.
+     */
+    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const = 0;
+};
 
 }  // namespace mongo

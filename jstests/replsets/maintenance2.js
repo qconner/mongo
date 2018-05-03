@@ -5,7 +5,7 @@
 
     // Replica set testing API
     // Create a new replica set test. Specify set name and the number of nodes you want.
-    var replTest = new ReplSetTest( {name: 'testSet', nodes: 3} );
+    var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
 
     // call startSet() to start each mongod in the replica set
     // this returns a list of nodes
@@ -15,12 +15,12 @@
     // This will wait for initiation
     replTest.initiate();
 
-    // Call getMaster to return a reference to the node that's been
+    // Call getPrimary to return a reference to the node that's been
     // elected master.
-    var master = replTest.getMaster();
+    var master = replTest.getPrimary();
 
     // save some records
-    var len = 100
+    var len = 100;
     for (var i = 0; i < len; ++i) {
         master.getDB("foo").foo.save({a: i});
     }
@@ -29,20 +29,27 @@
     // and slaves in the set and wait until the change has replicated.
     // replTest.awaitReplication();
 
-    var slaves = replTest.liveNodes.slaves;
+    var slaves = replTest._slaves;
     assert.eq(2, slaves.length, "Expected 2 slaves but length was " + slaves.length);
 
     slaves.forEach(function(slave) {
         // put slave into maintenance (recovery) mode
-        slave.getDB("foo").adminCommand({replSetMaintenance:1});
+        slave.getDB("foo").adminCommand({replSetMaintenance: 1});
 
-        var stats = slave.getDB("foo").adminCommand({replSetGetStatus:1});
+        var stats = slave.getDB("foo").adminCommand({replSetGetStatus: 1});
         assert.eq(stats.myState, 3, "Slave should be in recovering state.");
 
         print("group should fail in recovering state...");
         slave.slaveOk = true;
-        assert.commandFailed(slave.getDB("foo").foo.runCommand(
-                {group: {ns: "foo", initial: {n:0}, $reduce: function(obj,out){out.n++;}}}));
+        assert.commandFailed(slave.getDB("foo").foo.runCommand({
+            group: {
+                ns: "foo",
+                initial: {n: 0},
+                $reduce: function(obj, out) {
+                    out.n++;
+                }
+            }
+        }));
 
         print("count should fail in recovering state...");
         slave.slaveOk = true;

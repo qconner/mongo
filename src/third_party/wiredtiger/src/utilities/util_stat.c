@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -16,11 +16,12 @@ util_stat(WT_SESSION *session, int argc, char *argv[])
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	size_t urilen;
-	int ch, objname_free;
-	const char *config, *pval, *desc;
+	int ch;
+	const char *config, *desc, *pval;
 	char *objname, *uri;
+	bool objname_free;
 
-	objname_free = 0;
+	objname_free = false;
 	objname = uri = NULL;
 	config = NULL;
 	while ((ch = __wt_getopt(progname, argc, argv, "af")) != EOF)
@@ -54,9 +55,9 @@ util_stat(WT_SESSION *session, int argc, char *argv[])
 		objname = (char *)"";
 		break;
 	case 1:
-		if ((objname = util_name(*argv, "table")) == NULL)
+		if ((objname = util_uri(session, *argv, "table")) == NULL)
 			return (1);
-		objname_free = 1;
+		objname_free = true;
 		break;
 	default:
 		return (usage());
@@ -67,13 +68,15 @@ util_stat(WT_SESSION *session, int argc, char *argv[])
 		fprintf(stderr, "%s: %s\n", progname, strerror(errno));
 		goto err;
 	}
-	snprintf(uri, urilen, "statistics:%s", objname);
+	if ((ret = __wt_snprintf(uri, urilen, "statistics:%s", objname)) != 0) {
+		fprintf(stderr, "%s: %s\n", progname, strerror(ret));
+		goto err;
+	}
 
-	
 	if ((ret =
 	    session->open_cursor(session, uri, NULL, config, &cursor)) != 0) {
 		fprintf(stderr, "%s: cursor open(%s) failed: %s\n",
-		    progname, uri, wiredtiger_strerror(ret));
+		    progname, uri, session->strerror(session, ret));
 		goto err;
 	}
 
@@ -82,15 +85,15 @@ util_stat(WT_SESSION *session, int argc, char *argv[])
 	    (ret = cursor->next(cursor)) == 0 &&
 	    (ret = cursor->get_value(cursor, &desc, &pval, NULL)) == 0)
 		if (printf("%s=%s\n", desc, pval) < 0) {
-			ret = errno;
-			break;
+			(void)util_err(session, errno, "printf");
+			goto err;
 		}
 	if (ret == WT_NOTFOUND)
 		ret = 0;
 
 	if (ret != 0) {
 		fprintf(stderr, "%s: cursor get(%s) failed: %s\n",
-		    progname, objname, wiredtiger_strerror(ret));
+		    progname, objname, session->strerror(session, ret));
 		goto err;
 	}
 

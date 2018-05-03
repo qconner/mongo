@@ -29,6 +29,7 @@
 #include "mongo/db/auth/role_name.h"
 
 #include <algorithm>
+#include <iostream>
 #include <string>
 
 #include "mongo/base/string_data.h"
@@ -36,20 +37,19 @@
 
 namespace mongo {
 
-    RoleName::RoleName(StringData role, StringData dbname) {
-        _fullName.resize(role.size() + dbname.size() + 1);
-        std::string::iterator iter = std::copy(role.rawData(),
-                                               role.rawData() + role.size(),
-                                               _fullName.begin());
-        *iter = '@';
-        ++iter;
-        iter = std::copy(dbname.rawData(), dbname.rawData() + dbname.size(), iter);
-        dassert(iter == _fullName.end());
-        _splitPoint = role.size();
-    }
+RoleName::RoleName(StringData role, StringData dbname) {
+    _fullName.resize(role.size() + dbname.size() + 1);
+    std::string::iterator iter =
+        std::copy(role.rawData(), role.rawData() + role.size(), _fullName.begin());
+    *iter = '@';
+    ++iter;
+    iter = std::copy(dbname.rawData(), dbname.rawData() + dbname.size(), iter);
+    dassert(iter == _fullName.end());
+    _splitPoint = role.size();
+}
 
-    std::ostream& operator<<(std::ostream& os, const RoleName& name) {
-        return os << name.getFullName();
-    }
+std::ostream& operator<<(std::ostream& os, const RoleName& name) {
+    return os << name.getFullName();
+}
 
 }  // namespace mongo

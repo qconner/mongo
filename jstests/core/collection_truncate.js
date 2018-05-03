@@ -1,3 +1,5 @@
+// @tags: [requires_non_retryable_commands, requires_collstats]
+
 // SERVER-15033 truncate on a regular collection
 
 var t = db.getCollection('collection_truncate');
@@ -5,7 +7,7 @@ t.drop();
 
 function truncate() {
     // Until SERVER-15274 is implemented, this is the only way to truncate a collection.
-    assert.commandWorked(t.runCommand('emptycapped')); // works on non-capped as well.
+    assert.commandWorked(t.runCommand('emptycapped'));  // works on non-capped as well.
 }
 
 function assertEmpty() {
@@ -27,14 +29,14 @@ function assertEmpty() {
 }
 
 // Single record case.
-t.insert({a:1});
+t.insert({a: 1});
 truncate();
 assertEmpty();
 
 // Multi-extent case.
 var initialStorageSize = t.stats().storageSize;
 while (t.stats().storageSize == initialStorageSize) {
-    t.insert({a:1});
+    t.insert({a: 1});
 }
 truncate();
 assertEmpty();

@@ -13,14 +13,18 @@ no)	wt_cv_enable_attach=no;;
 esac
 AC_MSG_RESULT($wt_cv_enable_attach)
 
+AH_TEMPLATE(HAVE_BUILTIN_EXTENSION_LZ4,
+	    [LZ4 support automatically loaded.])
 AH_TEMPLATE(HAVE_BUILTIN_EXTENSION_SNAPPY,
 	    [Snappy support automatically loaded.])
 AH_TEMPLATE(HAVE_BUILTIN_EXTENSION_ZLIB,
 	    [Zlib support automatically loaded.])
+AH_TEMPLATE(HAVE_BUILTIN_EXTENSION_ZSTD,
+	    [ZSTD support automatically loaded.])
 AC_MSG_CHECKING(if --with-builtins option specified)
 AC_ARG_WITH(builtins,
 	[AS_HELP_STRING([--with-builtins],
-	    [builtin extension names (snappy, zlib).])],
+	    [builtin extension names (lz4, snappy, zlib, zstd).])],
 	    [with_builtins=$withval],
 	    [with_builtins=])
 
@@ -28,35 +32,39 @@ AC_ARG_WITH(builtins,
 builtin_list=`echo "$with_builtins"|tr -s , ' '`
 for builtin_i in $builtin_list; do
 	case "$builtin_i" in
+	lz4)	AC_DEFINE(HAVE_BUILTIN_EXTENSION_LZ4)
+		wt_cv_with_builtin_extension_lz4=yes;;
 	snappy)	AC_DEFINE(HAVE_BUILTIN_EXTENSION_SNAPPY)
 		wt_cv_with_builtin_extension_snappy=yes;;
 	zlib)	AC_DEFINE(HAVE_BUILTIN_EXTENSION_ZLIB)
 		wt_cv_with_builtin_extension_zlib=yes;;
+	zstd)	AC_DEFINE(HAVE_BUILTIN_EXTENSION_ZSTD)
+		wt_cv_with_builtin_extension_zstd=yes;;
 	*)	AC_MSG_ERROR([Unknown builtin extension "$builtin_i"]);;
 	esac
 done
+AM_CONDITIONAL([HAVE_BUILTIN_EXTENSION_LZ4],
+    [test "$wt_cv_with_builtin_extension_lz4" = "yes"])
 AM_CONDITIONAL([HAVE_BUILTIN_EXTENSION_SNAPPY],
     [test "$wt_cv_with_builtin_extension_snappy" = "yes"])
 AM_CONDITIONAL([HAVE_BUILTIN_EXTENSION_ZLIB],
     [test "$wt_cv_with_builtin_extension_zlib" = "yes"])
+AM_CONDITIONAL([HAVE_BUILTIN_EXTENSION_ZSTD],
+    [test "$wt_cv_with_builtin_extension_zstd" = "yes"])
 AC_MSG_RESULT($with_builtins)
 
-AC_MSG_CHECKING(if --enable-bzip2 option specified)
-AC_ARG_ENABLE(bzip2,
-	[AS_HELP_STRING([--enable-bzip2],
-	    [Build the bzip2 compressor extension.])], r=$enableval, r=no)
+AH_TEMPLATE(
+    HAVE_CRC32_HARDWARE, [Define to 1 to configure CRC32 hardware support.])
+AC_MSG_CHECKING(if --enable-crc32-hardware option specified)
+AC_ARG_ENABLE(crc32-hardware,
+	AS_HELP_STRING([--enable-crc32-hardware],
+	    [Enable CRC32 hardware support.]), r=$enableval, r=yes)
 case "$r" in
-no)	wt_cv_enable_bzip2=no;;
-*)	wt_cv_enable_bzip2=yes;;
+no)	wt_cv_enable_crc32_hardware=no;;
+*)	AC_DEFINE(HAVE_CRC32_HARDWARE)
+	wt_cv_enable_crc32_hardware=yes;;
 esac
-AC_MSG_RESULT($wt_cv_enable_bzip2)
-if test "$wt_cv_enable_bzip2" = "yes"; then
-	AC_CHECK_HEADER(bzlib.h,,
-	    [AC_MSG_ERROR([--enable-bzip2 requires bzlib.h])])
-	AC_CHECK_LIB(bz2, BZ2_bzCompress,,
-	    [AC_MSG_ERROR([--enable-bzip2 requires bz2 library])])
-fi
-AM_CONDITIONAL([BZIP2], [test "$wt_cv_enable_bzip2" = "yes"])
+AC_MSG_RESULT($wt_cv_enable_crc32_hardware)
 
 AH_TEMPLATE(HAVE_DIAGNOSTIC, [Define to 1 for diagnostic tests.])
 AC_MSG_CHECKING(if --enable-diagnostic option specified)
@@ -159,14 +167,55 @@ no)	if test "$wt_cv_with_builtin_extension_snappy" = "yes"; then
 esac
 AC_MSG_RESULT($wt_cv_enable_snappy)
 if test "$wt_cv_enable_snappy" = "yes"; then
-	AC_LANG_PUSH([C++])
-	AC_CHECK_HEADER(snappy.h,,
+	AC_CHECK_HEADER(snappy-c.h,,
 	    [AC_MSG_ERROR([--enable-snappy requires snappy.h])])
-	AC_LANG_POP([C++])
 	AC_CHECK_LIB(snappy, snappy_compress,,
 	    [AC_MSG_ERROR([--enable-snappy requires snappy library])])
 fi
 AM_CONDITIONAL([SNAPPY], [test "$wt_cv_enable_snappy" = "yes"])
+
+AC_MSG_CHECKING(if --enable-lz4 option specified)
+AC_ARG_ENABLE(lz4,
+	[AS_HELP_STRING([--enable-lz4],
+	    [Build the lz4 compressor extension.])], r=$enableval, r=no)
+case "$r" in
+no)	if test "$wt_cv_with_builtin_extension_lz4" = "yes"; then
+		wt_cv_enable_lz4=yes
+	else
+		wt_cv_enable_lz4=no
+	fi
+	;;
+*)	if test "$wt_cv_with_builtin_extension_lz4" = "yes"; then
+		AC_MSG_ERROR(
+		   [Only one of --enable-lz4 --with-builtins=lz4 allowed])
+	fi
+	wt_cv_enable_lz4=yes;;
+esac
+AC_MSG_RESULT($wt_cv_enable_lz4)
+if test "$wt_cv_enable_lz4" = "yes"; then
+	AC_CHECK_HEADER(lz4.h,,
+	    [AC_MSG_ERROR([--enable-lz4 requires lz4.h])])
+	AC_CHECK_LIB(lz4, LZ4_compress_destSize,,
+	    [AC_MSG_ERROR([--enable-lz4 requires lz4 library with LZ4_compress_destSize support])])
+fi
+AM_CONDITIONAL([LZ4], [test "$wt_cv_enable_lz4" = "yes"])
+
+AC_MSG_CHECKING(if --enable-tcmalloc option specified)
+AC_ARG_ENABLE(tcmalloc,
+	[AS_HELP_STRING([--enable-tcmalloc],
+	    [Build WiredTiger with tcmalloc.])], r=$enableval, r=no)
+case "$r" in
+no)	wt_cv_enable_tcmalloc=no;;
+*)	wt_cv_enable_tcmalloc=yes;;
+esac
+AC_MSG_RESULT($wt_cv_enable_tcmalloc)
+if test "$wt_cv_enable_tcmalloc" = "yes"; then
+	AC_CHECK_HEADER(gperftools/tcmalloc.h,,
+	    [AC_MSG_ERROR([--enable-tcmalloc requires gperftools/tcmalloc.h])])
+	AC_CHECK_LIB(tcmalloc, tc_calloc,,
+	    [AC_MSG_ERROR([--enable-tcmalloc requires tcmalloc library])])
+fi
+AM_CONDITIONAL([TCMalloc], [test "$wt_cv_enable_tcmalloc" = "yes"])
 
 AH_TEMPLATE(SPINLOCK_TYPE, [Spinlock type from mutex.h.])
 AC_MSG_CHECKING(if --with-spinlock option specified)
@@ -181,23 +230,28 @@ pthread|pthreads)
 	AC_DEFINE(SPINLOCK_TYPE, SPINLOCK_PTHREAD_MUTEX);;
 pthread_adaptive|pthreads_adaptive)
 	AC_DEFINE(SPINLOCK_TYPE, SPINLOCK_PTHREAD_MUTEX_ADAPTIVE);;
-pthread_logging|pthreads_logging)
-	AC_DEFINE(SPINLOCK_TYPE, SPINLOCK_PTHREAD_MUTEX_LOGGING);;
 *)	AC_MSG_ERROR([Unknown spinlock type "$with_spinlock"]);;
 esac
 AC_MSG_RESULT($with_spinlock)
 
-AH_TEMPLATE(HAVE_VERBOSE, [Enable verbose message configuration.])
-AC_MSG_CHECKING(if --enable-verbose option specified)
-AC_ARG_ENABLE(verbose,
-	[AS_HELP_STRING([--enable-verbose],
-	    [Enable verbose message configuration.])], r=$enableval, r=no)
+AC_MSG_CHECKING(if --enable-strict option specified)
+AC_ARG_ENABLE(strict,
+	[AS_HELP_STRING([--enable-strict],
+	    [Enable strict compiler checking.])], r=$enableval, r=no)
 case "$r" in
-no)	wt_cv_enable_verbose=no;;
-*)	AC_DEFINE(HAVE_VERBOSE)
-	wt_cv_enable_verbose=yes;;
+no)	wt_cv_enable_strict=no;;
+*)	wt_cv_enable_strict=yes;;
 esac
-AC_MSG_RESULT($wt_cv_enable_verbose)
+AC_MSG_RESULT($wt_cv_enable_strict)
+
+AC_MSG_CHECKING(if --with-timestamp-size option specified)
+AC_ARG_WITH(timestamp-size,
+	[AS_HELP_STRING([--with-timestamp-size=NUM],
+	    [Size of transaction timestamps in bytes, default 8.])],
+	    [with_timestamp_size=$withval],
+	    [with_timestamp_size=8])
+AC_MSG_RESULT($with_timestamp_size)
+AC_DEFINE_UNQUOTED(WT_TIMESTAMP_SIZE, [$with_timestamp_size], [Size of a transaction timestamp in bytes])
 
 AC_MSG_CHECKING(if --enable-zlib option specified)
 AC_ARG_ENABLE(zlib,
@@ -224,5 +278,31 @@ if test "$wt_cv_enable_zlib" = "yes"; then
 	    [AC_MSG_ERROR([--enable-zlib requires zlib library])])
 fi
 AM_CONDITIONAL([ZLIB], [test "$wt_cv_enable_zlib" = "yes"])
+
+AC_MSG_CHECKING(if --enable-zstd option specified)
+AC_ARG_ENABLE(zstd,
+	[AS_HELP_STRING([--enable-zstd],
+	    [Build the zstd compressor extension.])], r=$enableval, r=no)
+case "$r" in
+no)	if test "$wt_cv_with_builtin_extension_zstd" = "yes"; then
+		wt_cv_enable_zstd=yes
+	else
+		wt_cv_enable_zstd=no
+	fi
+	;;
+*)	if test "$wt_cv_with_builtin_extension_zstd" = "yes"; then
+		AC_MSG_ERROR(
+		   [Only one of --enable-zstd --with-builtins=zstd allowed])
+	fi
+	wt_cv_enable_zstd=yes;;
+esac
+AC_MSG_RESULT($wt_cv_enable_zstd)
+if test "$wt_cv_enable_zstd" = "yes"; then
+	AC_CHECK_HEADER(zstd.h,,
+	    [AC_MSG_ERROR([--enable-zstd requires zstd.h])])
+	AC_CHECK_LIB(zstd, ZSTD_compress,,
+	    [AC_MSG_ERROR([--enable-zstd requires Zstd library])])
+fi
+AM_CONDITIONAL([ZSTD], [test "$wt_cv_enable_zstd" = "yes"])
 
 ])

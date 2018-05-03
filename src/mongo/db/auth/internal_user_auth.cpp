@@ -34,83 +34,41 @@
 
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-    namespace mmb = mongo::mutablebson;
+namespace mmb = mongo::mutablebson;
 
-    // not guarded by the authParams mutex never changed in
-    // multi-threaded operation
-    static bool authParamsSet = false;
+// not guarded by the authParams mutex never changed in
+// multi-threaded operation
+static bool authParamsSet = false;
 
-    // Store default authentication parameters for internal authentication to cluster members,
-    // guarded by the authParams mutex
-    static BSONObj authParams;
+// Store default authentication parameters for internal authentication to cluster members,
+// guarded by the authParams mutex
+static BSONObj authParams;
 
-    static boost::mutex authParamMutex;
+static stdx::mutex authParamMutex;
 
-    bool isInternalAuthSet() {
-       return authParamsSet;
+bool isInternalAuthSet() {
+    return authParamsSet;
+}
+
+void setInternalUserAuthParams(const BSONObj& authParamsIn) {
+    if (!isInternalAuthSet()) {
+        authParamsSet = true;
+    }
+    stdx::lock_guard<stdx::mutex> lk(authParamMutex);
+
+    authParams = authParamsIn.copy();
+}
+
+BSONObj getInternalUserAuthParams() {
+    if (!authParamsSet) {
+        return BSONObj();
     }
 
-    void setInternalUserAuthParams(const BSONObj& authParamsIn) {
-        if (!isInternalAuthSet()) {
-            authParamsSet = true;
-        }
-        boost::mutex::scoped_lock lk(authParamMutex);
+    stdx::lock_guard<stdx::mutex> lk(authParamMutex);
+    return authParams.copy();
+}
 
-        if (authParamsIn["mechanism"].String() != "SCRAM-SHA-1") {
-            authParams = authParamsIn.copy();
-            return;
-        }
-
-        // Create authParams for legacy MONGODB-CR authentication for 2.6/3.0 mixed
-        // mode if applicable.
-        mmb::Document fallback(authParamsIn);
-        fallback.root().findFirstChildNamed("mechanism").setValueString("MONGODB-CR");
-
-        mmb::Document doc(authParamsIn);
-        mmb::Element fallbackEl = doc.makeElementObject("fallbackParams");
-        fallbackEl.setValueObject(fallback.getObject());
-        doc.root().pushBack(fallbackEl);
-        authParams = doc.getObject().copy();
-    }
-
-    BSONObj getInternalUserAuthParamsWithFallback() {
-        if (!authParamsSet) {
-            return BSONObj();
-        }
-
-        boost::mutex::scoped_lock lk(authParamMutex);
-        return authParams.copy();
-    }
-
-    BSONObj getFallbackAuthParams(BSONObj params) {
-        if (params["fallbackParams"].type() != Object) {
-            return BSONObj();
-        }
-        return params["fallbackParams"].Obj();
-    }
-
-    bool authenticateInternalUser(DBClientWithCommands* conn) {
-        if (!isInternalAuthSet()) {
-            if (!serverGlobalParams.quiet) {
-                log() << "ERROR: No authentication parameters set for internal user";
-            }
-            return false;
-        }
-
-        try {
-            conn->auth(getInternalUserAuthParamsWithFallback());
-            return true;
-        } catch(const UserException& ex) {
-            if (!serverGlobalParams.quiet) {
-                log() << "can't authenticate to " << conn->toString()
-                      << " as internal user, error: "<< ex.what();
-            }
-            return false;
-        }
-    }
-} // namespace mongo
+}  // namespace mongo

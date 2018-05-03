@@ -31,142 +31,141 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/json.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace PdfileTests {
 
-    namespace Insert {
-        class Base {
-        public:
-            Base() : _scopedXact(&_txn, MODE_X),
-                     _lk(_txn.lockState()),
-                     _context(&_txn, ns()) {
+namespace Insert {
+class Base {
+public:
+    Base() : _lk(&_opCtx), _context(&_opCtx, ns()) {}
 
-            }
+    virtual ~Base() {
+        if (!collection())
+            return;
+        WriteUnitOfWork wunit(&_opCtx);
+        _context.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
+        wunit.commit();
+    }
 
-            virtual ~Base() {
-                if ( !collection() )
-                    return;
-                WriteUnitOfWork wunit(&_txn);
-                _context.db()->dropCollection( &_txn, ns() );
-                wunit.commit();
-            }
+protected:
+    const char* ns() {
+        return "unittests.pdfiletests.Insert";
+    }
+    Collection* collection() {
+        return _context.db()->getCollection(&_opCtx, ns());
+    }
 
-        protected:
-            const char *ns() {
-                return "unittests.pdfiletests.Insert";
-            }
-            Collection* collection() {
-                return _context.db()->getCollection( ns() );
-            }
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
+    Lock::GlobalWrite _lk;
+    OldClientContext _context;
+};
 
-            OperationContextImpl _txn;
-            ScopedTransaction _scopedXact;
-            Lock::GlobalWrite _lk;
-            Client::Context _context;
-        };
+class InsertNoId : public Base {
+public:
+    void run() {
+        WriteUnitOfWork wunit(&_opCtx);
+        BSONObj x = BSON("x" << 1);
+        ASSERT(x["_id"].type() == 0);
+        Collection* collection =
+            _context.db()->getOrCreateCollection(&_opCtx, NamespaceString(ns()));
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT(!collection->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
 
-        class InsertNoId : public Base {
-        public:
-            void run() {
-                WriteUnitOfWork wunit(&_txn);
-                BSONObj x = BSON( "x" << 1 );
-                ASSERT( x["_id"].type() == 0 );
-                Collection* collection = _context.db()->getOrCreateCollection( &_txn, ns() );
-                StatusWith<RecordId> dl = collection->insertDocument( &_txn, x, true );
-                ASSERT( !dl.isOK() );
+        StatusWith<BSONObj> fixed = fixDocumentForInsert(_opCtx.getServiceContext(), x);
+        ASSERT(fixed.isOK());
+        x = fixed.getValue();
+        ASSERT(x["_id"].type() == jstOID);
+        ASSERT(collection->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        wunit.commit();
+    }
+};
 
-                StatusWith<BSONObj> fixed = fixDocumentForInsert( x );
-                ASSERT( fixed.isOK() );
-                x = fixed.getValue();
-                ASSERT( x["_id"].type() == jstOID );
-                dl = collection->insertDocument( &_txn, x, true );
-                ASSERT( dl.isOK() );
-                wunit.commit();
-            }
-        };
+class UpdateDate : public Base {
+public:
+    void run() {
+        BSONObjBuilder b;
+        b.appendTimestamp("a");
+        b.append("_id", 1);
+        BSONObj o = b.done();
 
-        class UpdateDate : public Base {
-        public:
-            void run() {
-                BSONObjBuilder b;
-                b.appendTimestamp( "a" );
-                b.append( "_id", 1 );
-                BSONObj o = b.done();
+        BSONObj fixed = fixDocumentForInsert(_opCtx.getServiceContext(), o).getValue();
+        ASSERT_EQUALS(2, fixed.nFields());
+        ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
+        ASSERT(fixed.firstElement().number() == 1);
 
-                BSONObj fixed = fixDocumentForInsert( o ).getValue();
-                ASSERT_EQUALS( 2, fixed.nFields() );
-                ASSERT( fixed.firstElement().fieldNameStringData() == "_id" );
-                ASSERT( fixed.firstElement().number() == 1 );
+        BSONElement a = fixed["a"];
+        ASSERT(o["a"].type() == bsonTimestamp);
+        ASSERT(o["a"].timestampValue() == 0);
+        ASSERT(a.type() == bsonTimestamp);
+        ASSERT(a.timestampValue() > 0);
+    }
+};
 
-                BSONElement a = fixed["a"];
-                ASSERT( o["a"].type() == Timestamp );
-                ASSERT( o["a"].timestampValue() == 0 );
-                ASSERT( a.type() == Timestamp );
-                ASSERT( a.timestampValue() > 0 );
-            }
-        };
-
-        class UpdateDate2 : public Base {
-        public:
-            void run() {
-                BSONObj o;
-                {
-                    BSONObjBuilder b;
-                    b.appendTimestamp( "a" );
-                    b.appendTimestamp( "b" );
-                    b.append( "_id", 1 );
-                    o = b.obj();
-                }
-
-                BSONObj fixed = fixDocumentForInsert( o ).getValue();
-                ASSERT_EQUALS( 3, fixed.nFields() );
-                ASSERT( fixed.firstElement().fieldNameStringData() == "_id" );
-                ASSERT( fixed.firstElement().number() == 1 );
-
-                BSONElement a = fixed["a"];
-                ASSERT( o["a"].type() == Timestamp );
-                ASSERT( o["a"].timestampValue() == 0 );
-                ASSERT( a.type() == Timestamp );
-                ASSERT( a.timestampValue() > 0 );
-
-                BSONElement b = fixed["b"];
-                ASSERT( o["b"].type() == Timestamp );
-                ASSERT( o["b"].timestampValue() == 0 );
-                ASSERT( b.type() == Timestamp );
-                ASSERT( b.timestampValue() > 0 );
-            }
-        };
-
-        class ValidId : public Base {
-        public:
-            void run() {
-                ASSERT( fixDocumentForInsert( BSON( "_id" << 5 ) ).isOK() );
-                ASSERT( fixDocumentForInsert( BSON( "_id" << BSON( "x" << 5 ) ) ).isOK() );
-                ASSERT( !fixDocumentForInsert( BSON( "_id" << BSON( "$x" << 5 ) ) ).isOK() );
-                ASSERT( !fixDocumentForInsert( BSON( "_id" << BSON( "$oid" << 5 ) ) ).isOK() );
-            }
-        };
-    } // namespace Insert
-
-    class All : public Suite {
-    public:
-        All() : Suite( "pdfile" ) {}
-
-        void setupTests() {
-            add< Insert::InsertNoId >();
-            add< Insert::UpdateDate >();
-            add< Insert::UpdateDate2 >();
-            add< Insert::ValidId >();
+class UpdateDate2 : public Base {
+public:
+    void run() {
+        BSONObj o;
+        {
+            BSONObjBuilder b;
+            b.appendTimestamp("a");
+            b.appendTimestamp("b");
+            b.append("_id", 1);
+            o = b.obj();
         }
-    };
 
-    SuiteInstance<All> myall;
+        BSONObj fixed = fixDocumentForInsert(_opCtx.getServiceContext(), o).getValue();
+        ASSERT_EQUALS(3, fixed.nFields());
+        ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
+        ASSERT(fixed.firstElement().number() == 1);
 
-} // namespace PdfileTests
+        BSONElement a = fixed["a"];
+        ASSERT(o["a"].type() == bsonTimestamp);
+        ASSERT(o["a"].timestampValue() == 0);
+        ASSERT(a.type() == bsonTimestamp);
+        ASSERT(a.timestampValue() > 0);
 
+        BSONElement b = fixed["b"];
+        ASSERT(o["b"].type() == bsonTimestamp);
+        ASSERT(o["b"].timestampValue() == 0);
+        ASSERT(b.type() == bsonTimestamp);
+        ASSERT(b.timestampValue() > 0);
+    }
+};
+
+class ValidId : public Base {
+public:
+    void run() {
+        ASSERT(fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << 5)).isOK());
+        ASSERT(
+            fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << BSON("x" << 5))).isOK());
+        ASSERT(!fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << BSON("$x" << 5)))
+                    .isOK());
+        ASSERT(!fixDocumentForInsert(_opCtx.getServiceContext(), BSON("_id" << BSON("$oid" << 5)))
+                    .isOK());
+    }
+};
+}  // namespace Insert
+
+class All : public Suite {
+public:
+    All() : Suite("pdfile") {}
+
+    void setupTests() {
+        add<Insert::InsertNoId>();
+        add<Insert::UpdateDate>();
+        add<Insert::UpdateDate2>();
+        add<Insert::ValidId>();
+    }
+};
+
+SuiteInstance<All> myall;
+
+}  // namespace PdfileTests

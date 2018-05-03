@@ -26,56 +26,30 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/ops/update_lifecycle_impl.h"
 
-#include "mongo/db/client.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/field_ref.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/field_ref.h"
 
 namespace mongo {
-    namespace {
-        CollectionMetadataPtr getMetadata(const NamespaceString& nsString) {
-            if (shardingState.enabled()) {
-                return shardingState.getCollectionMetadata(nsString.ns());
-            }
 
-            return CollectionMetadataPtr();
-        }
-    }
+UpdateLifecycleImpl::UpdateLifecycleImpl(const NamespaceString& nsStr) : _nsString(nsStr) {}
 
-    UpdateLifecycleImpl::UpdateLifecycleImpl(bool ignoreVersion, const NamespaceString& nsStr)
-        : _nsString(nsStr)
-        , _shardVersion((!ignoreVersion && getMetadata(_nsString)) ?
-            getMetadata(_nsString)->getShardVersion() :
-            ChunkVersion::IGNORED()) {
-    }
+void UpdateLifecycleImpl::setCollection(Collection* collection) {
+    _collection = collection;
+}
 
-    void UpdateLifecycleImpl::setCollection(Collection* collection) {
-        _collection = collection;
-    }
+bool UpdateLifecycleImpl::canContinue() const {
+    // Collection needs to exist to continue
+    return _collection;
+}
 
-    bool UpdateLifecycleImpl::canContinue() const {
-        // Collection needs to exist to continue
-        return _collection;
-    }
+const UpdateIndexData* UpdateLifecycleImpl::getIndexKeys(OperationContext* opCtx) const {
+    if (_collection)
+        return &_collection->infoCache()->getIndexKeys(opCtx);
+    return NULL;
+}
 
-    const UpdateIndexData* UpdateLifecycleImpl::getIndexKeys(OperationContext* opCtx) const {
-        if (_collection)
-            return &_collection->infoCache()->indexKeys(opCtx);
-        return NULL;
-    }
-
-    const std::vector<FieldRef*>* UpdateLifecycleImpl::getImmutableFields() const {
-        CollectionMetadataPtr metadata = getMetadata(_nsString);
-        if (metadata) {
-            const std::vector<FieldRef*>& fields = metadata->getKeyPatternFields();
-            // Return shard-keys as immutable for the update system.
-            return &fields;
-        }
-        return NULL;
-    }
-
-} // namespace mongo
+}  // namespace mongo

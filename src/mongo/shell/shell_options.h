@@ -28,66 +28,70 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/rpc/protocol.h"
 
 namespace mongo {
 
-    namespace optionenvironment {
-        class OptionSection;
-        class Environment;
-    } // namespace optionenvironment
+namespace optionenvironment {
+class OptionSection;
+class Environment;
+}  // namespace optionenvironment
 
-    namespace moe = mongo::optionenvironment;
+namespace moe = mongo::optionenvironment;
 
-    struct ShellGlobalParams {
-        std::string url;
-        std::string dbhost;
-        std::string port;
-        std::vector<std::string> files;
+struct ShellGlobalParams {
+    std::string url;
+    std::string dbhost;
+    std::string port;
+    std::vector<std::string> files;
 
-        std::string username;
-        std::string password;
-        bool usingPassword;
-        std::string authenticationMechanism;
-        std::string authenticationDatabase;
-        std::string gssapiServiceName;
-        std::string gssapiHostName;
+    std::string username;
+    std::string password;
+    bool usingPassword;
+    std::string authenticationMechanism;
+    std::string authenticationDatabase;
+    std::string gssapiServiceName;
+    std::string gssapiHostName;
 
-        bool runShell;
-        bool nodb;
-        bool norc;
+    bool runShell;
+    bool nodb;
+    bool norc;
+    bool nojit = true;
+    bool javascriptProtection = true;
+    bool enableIPv6 = false;
 
-        std::string script;
+    std::string script;
 
-        bool autoKillOp;
-        bool useWriteCommandsDefault;
-        std::string writeMode;
+    bool autoKillOp = false;
+    bool useWriteCommandsDefault = true;
 
-        ShellGlobalParams() : autoKillOp(false),
-                              useWriteCommandsDefault(true),
-                              writeMode("commands") {
-        }
-    };
+    std::string writeMode = "commands";
+    std::string readMode = "compatibility";
+    bool shouldRetryWrites = false;
 
-    extern ShellGlobalParams shellGlobalParams;
+    boost::optional<rpc::ProtocolSet> rpcProtocols = boost::none;
 
-    Status addMongoShellOptions(moe::OptionSection* options);
+    int jsHeapLimitMB = 0;
+};
 
-    std::string getMongoShellHelp(StringData name, const moe::OptionSection& options);
+extern ShellGlobalParams shellGlobalParams;
 
-    /**
-     * Handle options that should come before validation, such as "help".
-     *
-     * Returns false if an option was found that implies we should prematurely exit with success.
-     */
-    bool handlePreValidationMongoShellOptions(const moe::Environment& params,
-                                                const std::vector<std::string>& args);
+Status addMongoShellOptions(moe::OptionSection* options);
 
-    Status storeMongoShellOptions(const moe::Environment& params,
-                                  const std::vector<std::string>& args);
+std::string getMongoShellHelp(StringData name, const moe::OptionSection& options);
 
-    Status validateMongoShellOptions(const moe::Environment& params);
+/**
+ * Handle options that should come before validation, such as "help".
+ *
+ * Returns false if an option was found that implies we should prematurely exit with success.
+ */
+bool handlePreValidationMongoShellOptions(const moe::Environment& params,
+                                          const std::vector<std::string>& args);
+
+Status storeMongoShellOptions(const moe::Environment& params, const std::vector<std::string>& args);
 }

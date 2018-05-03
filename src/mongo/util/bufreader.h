@@ -30,105 +30,107 @@
 
 #pragma once
 
-#include <boost/noncopyable.hpp>
+#include <utility>
 
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/data_type_terminated.h"
+#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/platform/strnlen.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-    /** helper to read and parse a block of memory
-        methods throw the eof exception if the operation would pass the end of the
-        buffer with which we are working.
-    */
-    class BufReader : boost::noncopyable {
-    public:
-        class eof : public std::exception {
-        public:
-            eof() { }
-            virtual const char * what() const throw() { return "BufReader eof"; }
-        };
+/** helper to read and parse a block of memory
+    methods throw the eof exception if the operation would pass the end of the
+    buffer with which we are working.
+*/
+class BufReader {
+    MONGO_DISALLOW_COPYING(BufReader);
 
-        BufReader(const void *p, unsigned len) : _start(p), _pos(p), _end(((char *)_pos)+len) { }
+public:
+    BufReader(const void* p, unsigned len)
+        : _start(reinterpret_cast<const char*>(p)), _pos(_start), _end(_start + len) {}
 
-        bool atEof() const { return _pos == _end; }
+    bool atEof() const {
+        return _pos == _end;
+    }
 
-        /** read in the object specified, and advance buffer pointer */
-        template <typename T>
-        void read(T &t) {
-            T* cur = (T*) _pos;
-            T *next = cur + 1;
-            if( _end < next ) throw eof();
-            t = *cur;
-            _pos = next;
-        }
+    /** read in the object specified, and advance buffer pointer */
+    template <typename T>
+    void read(T& t) {
+        ConstDataRangeCursor cdrc(_pos, _end);
+        uassertStatusOK(cdrc.readAndAdvance(&t));
+        _pos = cdrc.data();
+    }
 
-        /** read in and return an object of the specified type, and advance buffer pointer */
-        template <typename T>
-        T read() {
-            T out;
-            read(out);
-            return out;
-        }
+    /** read in and return an object of the specified type, and advance buffer pointer */
+    template <typename T>
+    T read() {
+        T out{};
+        read(out);
+        return out;
+    }
 
-        /** read in the object specified, but do not advance buffer pointer */
-        template <typename T>
-        void peek(T &t) const {
-            T* cur = (T*) _pos;
-            T *next = cur + 1;
-            if( _end < next ) throw eof();
-            t = *cur;
-        }
+    /** read in the object specified, but do not advance buffer pointer */
+    template <typename T>
+    void peek(T& t) const {
+        uassertStatusOK(ConstDataRange(_pos, _end).read(&t));
+    }
 
-        /** read in and return an object of the specified type, but do not advance buffer pointer */
-        template <typename T>
-        T peek() const {
-            T out;
-            peek(out);
-            return out;
-        }
+    /** read in and return an object of the specified type, but do not advance buffer pointer */
+    template <typename T>
+    T peek() const {
+        T out{};
+        peek(out);
+        return out;
+    }
 
-        /** return current offset into buffer */
-        unsigned offset() const { return (char*)_pos - (char*)_start; }
+    /** return current offset into buffer */
+    unsigned offset() const {
+        return _pos - _start;
+    }
 
-        /** return remaining bytes */
-        unsigned remaining() const { return (char*)_end -(char*)_pos; }
+    /** return remaining bytes */
+    unsigned remaining() const {
+        return _end - _pos;
+    }
 
-        /** back up by nbytes */
-        void rewind(unsigned nbytes) {
-            _pos = ((char *) _pos) - nbytes;
-            verify( _pos >= _start );
-        }
+    /** back up by nbytes */
+    void rewind(unsigned nbytes) {
+        _pos = _pos - nbytes;
+        invariant(_pos >= _start);
+    }
 
-        /** return current position pointer, and advance by len */
-        const void* skip(unsigned len) {
-            const char *nxt = ((char *) _pos) + len;
-            if( _end < nxt ) throw eof();
-            const void *p = _pos;
-            _pos = nxt;
-            return p;
-        }
+    /** return current position pointer, and advance by len */
+    const void* skip(unsigned len) {
+        ConstDataRangeCursor cdrc(_pos, _end);
+        uassertStatusOK(cdrc.advance(len));
+        return std::exchange(_pos, cdrc.data());
+    }
 
-        /// reads a NUL terminated string
-        StringData readCStr() {
-            const char* start = static_cast<const char*>(pos());
-            size_t len = strnlen(start, remaining()-1);
-            if (start[len] != '\0') throw eof(); // no NUL byte in remaining bytes
-            skip(len + 1/*NUL byte*/);
-            return StringData(start, len);
-        }
+    /// reads a NUL terminated string
+    StringData readCStr() {
+        auto range = read<Terminated<'\0', ConstDataRange>>().value;
 
-        void readStr(std::string& s) {
-            s = readCStr().toString();
-        }
+        return StringData(range.data(), range.length());
+    }
 
-        const void* pos() { return _pos; }
-        const void* start() { return _start; }
+    void readStr(std::string& s) {
+        s = readCStr().toString();
+    }
 
-    private:
-        const void *_start;
-        const void *_pos;
-        const void *_end;
-    };
+    const void* pos() {
+        return _pos;
+    }
+    const void* start() {
+        return _start;
+    }
 
+private:
+    const char* _start;
+    const char* _pos;
+    const char* _end;
+};
 }

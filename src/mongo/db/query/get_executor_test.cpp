@@ -32,8 +32,14 @@
 
 #include "mongo/db/query/get_executor.h"
 
+#include <boost/optional.hpp>
+#include <string>
+
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/query_settings.h"
+#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -41,104 +47,124 @@ using namespace mongo;
 
 namespace {
 
-    using std::auto_ptr;
+using std::unique_ptr;
 
-    static const char* ns = "somebogusns";
+static const NamespaceString nss("test.collection");
 
-    /**
-     * Utility functions to create a CanonicalQuery
-     */
-    CanonicalQuery* canonicalize(const char* queryStr, const char* sortStr,
-                                 const char* projStr) {
-        BSONObj queryObj = fromjson(queryStr);
-        BSONObj sortObj = fromjson(sortStr);
-        BSONObj projObj = fromjson(projStr);
-        CanonicalQuery* cq;
-        Status result = CanonicalQuery::canonicalize(ns, queryObj, sortObj,
-                                                     projObj,
-                                                     &cq);
-        ASSERT_OK(result);
-        return cq;
+/**
+ * Utility functions to create a CanonicalQuery
+ */
+unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
+                                        const char* sortStr,
+                                        const char* projStr) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson(queryStr));
+    qr->setSort(fromjson(sortStr));
+    qr->setProj(fromjson(projStr));
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+    ASSERT_OK(statusWithCQ.getStatus());
+    return std::move(statusWithCQ.getValue());
+}
+
+//
+// get_executor tests
+//
+
+//
+// filterAllowedIndexEntries
+//
+
+/**
+ * Test function to check filterAllowedIndexEntries.
+ *
+ * indexes: A vector of index entries to filter against.
+ * keyPatterns: A set of index key patterns to use in the filter.
+ * indexNames: A set of index names to use for the filter.
+ *
+ * expectedFilteredNames: The names of indexes that are expected to pass through the filter.
+ */
+void testAllowedIndices(std::vector<IndexEntry> indexes,
+                        BSONObjSet keyPatterns,
+                        stdx::unordered_set<std::string> indexNames,
+                        stdx::unordered_set<std::string> expectedFilteredNames) {
+    PlanCache planCache;
+    QuerySettings querySettings;
+
+    // getAllowedIndices should return false when query shape is not yet in query settings.
+    unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1}", "{}", "{}"));
+    PlanCacheKey key = planCache.computeKey(*cq);
+    ASSERT_FALSE(querySettings.getAllowedIndicesFilter(key));
+
+    querySettings.setAllowedIndices(*cq, key, keyPatterns, indexNames);
+    // Index entry vector should contain 1 entry after filtering.
+    boost::optional<AllowedIndicesFilter> hasFilter = querySettings.getAllowedIndicesFilter(key);
+    ASSERT_TRUE(hasFilter);
+    ASSERT_FALSE(key.empty());
+    auto& filter = *hasFilter;
+
+    // Apply filter in allowed indices.
+    filterAllowedIndexEntries(filter, &indexes);
+    size_t matchedIndexes = 0;
+    for (const auto& indexEntry : indexes) {
+        ASSERT_TRUE(expectedFilteredNames.find(indexEntry.name) != expectedFilteredNames.end());
+        matchedIndexes++;
     }
+    ASSERT_EQ(matchedIndexes, indexes.size());
+}
 
-    //
-    // get_executor tests
-    //
+// Use of index filters to select compound index over single key index.
+TEST(GetExecutorTest, GetAllowedIndices) {
+    testAllowedIndices(
+        {IndexEntry(fromjson("{a: 1}"), "a_1"),
+         IndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+         IndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+        SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{a: 1, b: 1}")}),
+        stdx::unordered_set<std::string>{},
+        {"a_1_b_1"});
+}
 
-    //
-    // filterAllowedIndexEntries
-    //
+// Setting index filter referring to non-existent indexes
+// will effectively disregard the index catalog and
+// result in the planner generating a collection scan.
+TEST(GetExecutorTest, GetAllowedIndicesNonExistentIndexKeyPatterns) {
+    testAllowedIndices(
+        {IndexEntry(fromjson("{a: 1}"), "a_1"),
+         IndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+         IndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+        SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{nosuchfield: 1}")}),
+        stdx::unordered_set<std::string>{},
+        stdx::unordered_set<std::string>{});
+}
 
-    /**
-     * Test function to check filterAllowedIndexEntries
-     */
-    void testAllowedIndices(const char* hintKeyPatterns[],
-                            const char* indexCatalogKeyPatterns[],
-                            const char* expectedFilteredKeyPatterns[]) {
-         QuerySettings querySettings;
-         AllowedIndices *allowedIndicesRaw;
+// This test case shows how to force query execution to use
+// an index that orders items in descending order.
+TEST(GetExecutorTest, GetAllowedIndicesDescendingOrder) {
+    testAllowedIndices(
+        {IndexEntry(fromjson("{a: 1}"), "a_1"), IndexEntry(fromjson("{a: -1}"), "a_-1")},
+        SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{a: -1}")}),
+        stdx::unordered_set<std::string>{},
+        {"a_-1"});
+}
 
-         // getAllowedIndices should return false when query shape is not yet in query settings.
-         auto_ptr<CanonicalQuery> cq(canonicalize("{a: 1}", "{}", "{}"));
-         ASSERT_FALSE(querySettings.getAllowedIndices(*cq, &allowedIndicesRaw));
+TEST(GetExecutorTest, GetAllowedIndicesMatchesByName) {
+    testAllowedIndices(
+        {IndexEntry(fromjson("{a: 1}"), "a_1"), IndexEntry(fromjson("{a: 1}"), "a_1:en")},
+        // BSONObjSet default constructor is explicit, so we cannot copy-list-initialize until
+        // C++14.
+        SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+        {"a_1"},
+        {"a_1"});
+}
 
-         // Add entry to query settings.
-         const PlanCacheKey& key = cq->getPlanCacheKey();
-         std::vector<BSONObj> indexKeyPatterns;
-         for (int i=0; hintKeyPatterns[i] != NULL; ++i) {
-             indexKeyPatterns.push_back(fromjson(hintKeyPatterns[i]));
-         }
-         querySettings.setAllowedIndices(*cq, indexKeyPatterns);
-
-         // Index entry vector should contain 1 entry after filtering.
-         ASSERT_TRUE(querySettings.getAllowedIndices(*cq, &allowedIndicesRaw));
-         ASSERT_FALSE(key.empty());
-         ASSERT(NULL != allowedIndicesRaw);
-         auto_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
-
-         // Indexes from index catalog.
-         std::vector<IndexEntry> indexEntries;
-         for (int i=0; indexCatalogKeyPatterns[i] != NULL; ++i) {
-             indexEntries.push_back(IndexEntry(fromjson(indexCatalogKeyPatterns[i])));
-         }
-
-         // Apply filter in allowed indices.
-         filterAllowedIndexEntries(*allowedIndices, &indexEntries);
-         size_t numExpected = 0;
-         while (expectedFilteredKeyPatterns[numExpected] != NULL) {
-             ASSERT_LESS_THAN(numExpected, indexEntries.size());
-             ASSERT_EQUALS(indexEntries[numExpected].keyPattern,
-                           fromjson(expectedFilteredKeyPatterns[numExpected]));
-             numExpected++;
-         }
-         ASSERT_EQUALS(indexEntries.size(), numExpected);
-     }
-
-    // Use of index filters to select compound index over single key index.
-    TEST(GetExecutorTest, GetAllowedIndices) {
-        const char* hintKeyPatterns[] = {"{a: 1, b: 1}", NULL};
-        const char* indexCatalogKeyPatterns[] = {"{a: 1}", "{a: 1, b: 1}", "{a: 1, c: 1}", NULL};
-        const char* expectedFilteredKeyPatterns[] = {"{a: 1, b: 1}", NULL};
-        testAllowedIndices(hintKeyPatterns, indexCatalogKeyPatterns,  expectedFilteredKeyPatterns);
-    }
-
-    // Setting index filter referring to non-existent indexes
-    // will effectively disregard the index catalog and
-    // result in the planner generating a collection scan.
-    TEST(GetExecutorTest, GetAllowedIndicesNonExistentIndexKeyPatterns) {
-        const char* hintKeyPatterns[] = {"{nosuchfield: 1}", NULL};
-        const char* indexCatalogKeyPatterns[] = {"{a: 1}", "{a: 1, b: 1}", "{a: 1, c: 1}", NULL};
-        const char* expectedFilteredKeyPatterns[] = {NULL};
-        testAllowedIndices(hintKeyPatterns, indexCatalogKeyPatterns,  expectedFilteredKeyPatterns);
-    }
-
-    // This test case shows how to force query execution to use
-    // an index that orders items in descending order.
-    TEST(GetExecutorTest, GetAllowedIndicesDescendingOrder) {
-        const char* hintKeyPatterns[] = {"{a: -1}", NULL};
-        const char* indexCatalogKeyPatterns[] = {"{a: 1}", "{a: -1}", NULL};
-        const char* expectedFilteredKeyPatterns[] = {"{a: -1}", NULL};
-        testAllowedIndices(hintKeyPatterns, indexCatalogKeyPatterns,  expectedFilteredKeyPatterns);
-    }
+TEST(GetExecutorTest, GetAllowedIndicesMatchesMultipleIndexesByKey) {
+    testAllowedIndices(
+        {IndexEntry(fromjson("{a: 1}"), "a_1"), IndexEntry(fromjson("{a: 1}"), "a_1:en")},
+        SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{a: 1}")}),
+        stdx::unordered_set<std::string>{},
+        {"a_1", "a_1:en"});
+}
 
 }  // namespace

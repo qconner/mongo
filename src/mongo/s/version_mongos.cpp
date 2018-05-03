@@ -37,30 +37,20 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/version.h"
-#include "mongo/util/version_reporting.h"
 
 namespace mongo {
 
-    void printShardingVersionInfo( bool out ) {
-        if ( out ) {
-            std::cout << "MongoS version " << versionString << " starting: pid=" <<
-                ProcessId::getCurrent() << " port=" << serverGlobalParams.port <<
-                ( sizeof(int*) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() <<
-                " (--help for usage)" << std::endl;
-            DEV std::cout << "_DEBUG build" << std::endl;
-            std::cout << "git version: " << gitVersion() << std::endl;
-            std::cout << openSSLVersion("OpenSSL version: ") << std::endl;
-            std::cout <<  "build sys info: " << sysInfo() << std::endl;
-        }
-        else {
-            log() << "MongoS version " << versionString << " starting: pid=" <<
-                ProcessId::getCurrent() << " port=" << serverGlobalParams.port <<
-                ( sizeof( int* ) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() <<
-                " (--help for usage)" << std::endl;
-            DEV log() << "_DEBUG build" << std::endl;
-            logProcessDetails();
-        }
+void printShardingVersionInfo(bool out) {
+    auto&& vii = VersionInfoInterface::instance();
+    if (out) {
+        setPlainConsoleLogger();
+        log() << mongosVersion(vii);
+        vii.logBuildInfo();
+    } else {
+        log() << mongosVersion(vii);
+        vii.logBuildInfo();
+        logProcessDetails();
     }
-} // namespace mongo
+}
+}  // namespace mongo

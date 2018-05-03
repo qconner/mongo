@@ -1,5 +1,13 @@
 // Test the planCacheListQueryShapes command, which returns a list of query shapes
 // for the queries currently cached in the collection.
+//
+// @tags: [
+//   # This test attempts to perform queries with plan cache filters set up. The former operation
+//   # may be routed to a secondary in the replica set, whereas the latter must be routed to the
+//   # primary.
+//   assumes_read_preference_unchanged,
+//   does_not_support_stepdowns,
+// ]
 
 var t = db.jstests_plan_cache_list_shapes;
 t.drop();
@@ -20,7 +28,8 @@ function getShapes(collection) {
 // and should return an empty array of query shapes.
 var missingCollection = db.jstests_query_cache_missing;
 missingCollection.drop();
-assert.eq(0, getShapes(missingCollection).length,
+assert.eq(0,
+          getShapes(missingCollection).length,
           'planCacheListQueryShapes should return empty array on non-existent collection');
 
 t.save({a: 1, b: 1});
@@ -33,15 +42,16 @@ t.ensureIndex({a: 1});
 t.ensureIndex({a: 1, b: 1});
 
 // Run a query.
-assert.eq(1, t.find({a: 1, b: 1}, {_id: 1, a: 1}).sort({a: -1}).itcount(),
-          'unexpected document count');
+assert.eq(
+    1, t.find({a: 1, b: 1}, {_id: 1, a: 1}).sort({a: -1}).itcount(), 'unexpected document count');
 
 // We now expect the two indices to be compared and a cache entry to exist.
 // Retrieve query shapes from the test collection
 // Number of shapes should match queries executed by multi-plan runner.
 var shapes = getShapes();
 assert.eq(1, shapes.length, 'unexpected number of shapes in planCacheListQueryShapes result');
-assert.eq({query: {a: 1, b: 1}, sort: {a: -1}, projection: {_id: 1, a: 1}}, shapes[0],
+assert.eq({query: {a: 1, b: 1}, sort: {a: -1}, projection: {_id: 1, a: 1}},
+          shapes[0],
           'unexpected query shape returned from planCacheListQueryShapes');
 
 // Running a different query shape should cause another entry to be cached.

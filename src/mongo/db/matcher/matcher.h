@@ -30,39 +30,54 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/match_details.h"
 
 
 namespace mongo {
 
+class CollatorInterface;
+
+/**
+ * Matcher is a simple wrapper around a BSONObj and the MatchExpression created from it.
+ */
+class Matcher {
+    MONGO_DISALLOW_COPYING(Matcher);
+
+public:
     /**
-     * Matcher is a simple wrapper around a BSONObj and the MatchExpression created from it.
+     * 'collator' must outlive the returned Matcher and any MatchExpression cloned from it.
      */
-    class Matcher {
-        MONGO_DISALLOW_COPYING(Matcher);
+    Matcher(const BSONObj& pattern,
+            const boost::intrusive_ptr<ExpressionContext>& expCtx,
+            const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
+            MatchExpressionParser::AllowedFeatureSet allowedFeatures =
+                MatchExpressionParser::kDefaultSpecialFeatures);
 
-    public:
-        explicit Matcher(const BSONObj& pattern, 
-                         const MatchExpressionParser::WhereCallback& whereCallback =
-                                    MatchExpressionParser::WhereCallback());
+    bool matches(const BSONObj& doc, MatchDetails* details = NULL) const;
 
-        bool matches(const BSONObj& doc, MatchDetails* details = NULL ) const;
-
-        const BSONObj* getQuery() const { return &_pattern; };
-
-        std::string toString() const { return _pattern.toString(); }
-
-    private:
-        BSONObj _pattern;
-
-        boost::scoped_ptr<MatchExpression> _expression;
+    const BSONObj* getQuery() const {
+        return &_pattern;
     };
+
+    std::string toString() const {
+        return _pattern.toString();
+    }
+
+    MatchExpression* getMatchExpression() {
+        return _expression.get();
+    }
+
+private:
+    BSONObj _pattern;
+
+    std::unique_ptr<MatchExpression> _expression;
+};
 
 }  // namespace mongo

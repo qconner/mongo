@@ -32,18 +32,13 @@
 
 #include <ostream>
 
-#include "mongo/bson/optime.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    std::ostream& operator<<(std::ostream &s, const OpTime &ot) {
-        s << ot.toString();
-        return s;
-    }
-
-    std::ostream& operator<<(std::ostream &s, const Date_t &t) {
-        s << t.toString();
-        return s;
-    }
+std::ostream& operator<<(std::ostream& s, const Timestamp& ot) {
+    s << ot.toString();
+    return s;
+}
 }

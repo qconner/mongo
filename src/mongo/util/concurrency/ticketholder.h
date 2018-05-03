@@ -30,92 +30,116 @@
 #include <semaphore.h>
 #endif
 
-#include <boost/thread/condition_variable.hpp>
-
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    class TicketHolder {
-        MONGO_DISALLOW_COPYING(TicketHolder);
-    public:
-        explicit TicketHolder(int num);
-        ~TicketHolder();
+class TicketHolder {
+    MONGO_DISALLOW_COPYING(TicketHolder);
 
-        bool tryAcquire();
+public:
+    explicit TicketHolder(int num);
+    ~TicketHolder();
 
-        void waitForTicket();
+    bool tryAcquire();
 
-        void release();
+    /**
+     * Attempts to acquire a ticket. Blocks until a ticket is acquired or the OperationContext
+     * 'opCtx' is killed, throwing an AssertionException.
+     * If 'opCtx' is not provided or equal to nullptr, the wait is not interruptible.
+     */
+    void waitForTicket(OperationContext* opCtx);
+    void waitForTicket() {
+        waitForTicket(nullptr);
+    }
 
-        Status resize(int newSize);
+    /**
+     * Attempts to acquire a ticket within a deadline, 'until'. Returns 'true' if a ticket is
+     * acquired and 'false' if the deadline is reached, but the operation is retryable. Throws an
+     * AssertionException if the OperationContext 'opCtx' is killed and no waits for tickets can
+     * proceed.
+     * If 'opCtx' is not provided or equal to nullptr, the wait is not interruptible.
+     */
+    bool waitForTicketUntil(OperationContext* opCtx, Date_t until);
+    bool waitForTicketUntil(Date_t until) {
+        return waitForTicketUntil(nullptr, until);
+    }
+    void release();
 
-        int available() const;
+    Status resize(int newSize);
 
-        int used() const;
+    int available() const;
 
-        int outof() const;
+    int used() const;
 
-    private:
+    int outof() const;
+
+private:
 #if defined(__linux__)
-        mutable sem_t _sem;
+    mutable sem_t _sem;
 
-        // You can read _outof without a lock, but have to hold _resizeMutex to change.
-        AtomicInt32 _outof;
-        boost::mutex _resizeMutex;
+    // You can read _outof without a lock, but have to hold _resizeMutex to change.
+    AtomicInt32 _outof;
+    stdx::mutex _resizeMutex;
 #else
-        bool _tryAcquire();
+    bool _tryAcquire();
 
-        AtomicInt32 _outof;
-        int _num;
-        mongo::mutex _mutex;
-        boost::condition_variable_any _newTicket;
+    AtomicInt32 _outof;
+    int _num;
+    stdx::mutex _mutex;
+    stdx::condition_variable _newTicket;
 #endif
-    };
+};
 
-    class ScopedTicket {
-    public:
+class ScopedTicket {
+public:
+    ScopedTicket(TicketHolder* holder) : _holder(holder) {
+        _holder->waitForTicket();
+    }
 
-        ScopedTicket(TicketHolder* holder) : _holder(holder) {
-            _holder->waitForTicket();
-        }
+    ~ScopedTicket() {
+        _holder->release();
+    }
 
-        ~ScopedTicket() {
+private:
+    TicketHolder* _holder;
+};
+
+class TicketHolderReleaser {
+    MONGO_DISALLOW_COPYING(TicketHolderReleaser);
+
+public:
+    TicketHolderReleaser() {
+        _holder = NULL;
+    }
+
+    explicit TicketHolderReleaser(TicketHolder* holder) {
+        _holder = holder;
+    }
+
+    ~TicketHolderReleaser() {
+        if (_holder) {
             _holder->release();
         }
+    }
 
-    private:
-        TicketHolder* _holder;
-    };
+    bool hasTicket() const {
+        return _holder != NULL;
+    }
 
-    class TicketHolderReleaser {
-        MONGO_DISALLOW_COPYING(TicketHolderReleaser);
-    public:
-        TicketHolderReleaser() {
-            _holder = NULL;
+    void reset(TicketHolder* holder = NULL) {
+        if (_holder) {
+            _holder->release();
         }
+        _holder = holder;
+    }
 
-        explicit TicketHolderReleaser(TicketHolder* holder) {
-            _holder = holder;
-        }
-
-        ~TicketHolderReleaser() {
-            if (_holder) {
-                _holder->release();
-            }
-        }
-
-        bool hasTicket() const { return _holder != NULL; }
-
-        void reset(TicketHolder* holder = NULL) {
-            if (_holder) {
-                _holder->release();
-            }
-            _holder = holder;
-        }
-
-    private:
-        TicketHolder * _holder;
-    };
-}
+private:
+    TicketHolder* _holder;
+};
+}  // namespace mongo

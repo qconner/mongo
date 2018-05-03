@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,15 +14,23 @@
  * of instructions.
  */
 
-#if SPINLOCK_TYPE == SPINLOCK_GCC
+/*
+ * __spin_init_internal --
+ *      Initialize the WT portion of a spinlock.
+ */
+static inline void
+__spin_init_internal(WT_SPINLOCK *t, const char *name)
+{
+	t->name = name;
+	t->stat_count_off = t->stat_app_usecs_off = t->stat_int_usecs_off = -1;
+	t->initialized = 1;
+}
 
-#define	WT_DECL_SPINLOCK_ID(i)
-#define	__wt_spin_trylock(session, lock, idp)				\
-	__wt_spin_trylock_func(session, lock)
+#if SPINLOCK_TYPE == SPINLOCK_GCC
 
 /* Default to spinning 1000 times before yielding. */
 #ifndef WT_SPIN_COUNT
-#define	WT_SPIN_COUNT 1000
+#define	WT_SPIN_COUNT WT_THOUSAND
 #endif
 
 /*
@@ -33,9 +41,9 @@ static inline int
 __wt_spin_init(WT_SESSION_IMPL *session, WT_SPINLOCK *t, const char *name)
 {
 	WT_UNUSED(session);
-	WT_UNUSED(name);
 
-	*(t) = 0;
+	t->lock = 0;
+	__spin_init_internal(t, name);
 	return (0);
 }
 
@@ -48,19 +56,19 @@ __wt_spin_destroy(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
 	WT_UNUSED(session);
 
-	*(t) = 0;
+	t->lock = 0;
 }
 
 /*
- * __wt_spin_trylock_func --
+ * __wt_spin_trylock --
  *      Try to lock a spinlock or fail immediately if it is busy.
  */
 static inline int
-__wt_spin_trylock_func(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
+__wt_spin_trylock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
 	WT_UNUSED(session);
 
-	return (__sync_lock_test_and_set(t, 1) == 0 ? 0 : EBUSY);
+	return (__sync_lock_test_and_set(&t->lock, 1) == 0 ? 0 : EBUSY);
 }
 
 /*
@@ -74,10 +82,10 @@ __wt_spin_lock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 
 	WT_UNUSED(session);
 
-	while (__sync_lock_test_and_set(t, 1)) {
-		for (i = 0; *t && i < WT_SPIN_COUNT; i++)
+	while (__sync_lock_test_and_set(&t->lock, 1)) {
+		for (i = 0; t->lock && i < WT_SPIN_COUNT; i++)
 			WT_PAUSE();
-		if (*t)
+		if (t->lock)
 			__wt_yield();
 	}
 }
@@ -91,12 +99,11 @@ __wt_spin_unlock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
 	WT_UNUSED(session);
 
-	__sync_lock_release(t);
+	__sync_lock_release(&t->lock);
 }
 
-#elif SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX ||\
-	SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_ADAPTIVE ||\
-	SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_LOGGING
+#elif SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX ||			\
+    SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_ADAPTIVE
 
 /*
  * __wt_spin_init --
@@ -106,21 +113,19 @@ static inline int
 __wt_spin_init(WT_SESSION_IMPL *session, WT_SPINLOCK *t, const char *name)
 {
 #if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_ADAPTIVE
+	WT_DECL_RET;
 	pthread_mutexattr_t attr;
 
 	WT_RET(pthread_mutexattr_init(&attr));
-	WT_RET(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP));
-	WT_RET(pthread_mutex_init(&t->lock, &attr));
+	ret = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+	if (ret == 0)
+		ret = pthread_mutex_init(&t->lock, &attr);
+	WT_TRET(pthread_mutexattr_destroy(&attr));
+	WT_RET(ret);
 #else
 	WT_RET(pthread_mutex_init(&t->lock, NULL));
 #endif
-
-	t->name = name;
-	t->initialized = 1;
-
-#if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_LOGGING
-	WT_RET(__wt_spin_lock_register_lock(session, t));
-#endif
+	__spin_init_internal(t, name);
 
 	WT_UNUSED(session);
 	return (0);
@@ -135,28 +140,21 @@ __wt_spin_destroy(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
 	WT_UNUSED(session);
 
-#if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_LOGGING
-	__wt_spin_lock_unregister_lock(session, t);
-#endif
 	if (t->initialized) {
 		(void)pthread_mutex_destroy(&t->lock);
 		t->initialized = 0;
 	}
 }
 
-#if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX ||\
-	SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_ADAPTIVE
-
-#define	WT_DECL_SPINLOCK_ID(i)
-#define	__wt_spin_trylock(session, lock, idp)				\
-	__wt_spin_trylock_func(session, lock)
+#if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX ||				\
+    SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_ADAPTIVE
 
 /*
- * __wt_spin_trylock_func --
+ * __wt_spin_trylock --
  *      Try to lock a spinlock or fail immediately if it is busy.
  */
 static inline int
-__wt_spin_trylock_func(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
+__wt_spin_trylock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
 	WT_UNUSED(session);
 
@@ -170,110 +168,11 @@ __wt_spin_trylock_func(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 static inline void
 __wt_spin_lock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
-	WT_UNUSED(session);
-
-	(void)pthread_mutex_lock(&t->lock);
-}
-#endif
-
-#if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_LOGGING
-
-/*
- * When logging statistics, we track which spinlocks block and why.
- */
-#define	WT_DECL_SPINLOCK_ID(i)						\
-	static int i = WT_SPINLOCK_REGISTER
-#define	WT_SPINLOCK_REGISTER		-1
-#define	WT_SPINLOCK_REGISTER_FAILED	-2
-#define	__wt_spin_trylock(session, lock, idp)				\
-	__wt_spin_trylock_func(session, lock, idp, __FILE__, __LINE__)
-#define	__wt_spin_lock(session, lock) do {				\
-	WT_DECL_SPINLOCK_ID(__id);					\
-	__wt_spin_lock_func(session, lock, &__id, __FILE__, __LINE__);	\
-} while (0)
-
-/*
- * __wt_spin_trylock_func --
- *      Try to lock a spinlock or fail immediately if it is busy.
- */
-static inline int
-__wt_spin_trylock_func(WT_SESSION_IMPL *session,
-    WT_SPINLOCK *t, int *idp, const char *file, int line)
-{
-	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
 
-	conn = S2C_SAFE(session);
-	/* If we're not maintaining statistics, it's simple. */
-	if (session == NULL || !FLD_ISSET(conn->stat_flags, WT_STAT_CONN_FAST))
-		return (pthread_mutex_trylock(&t->lock));
-
-	/*
-	 * If this caller hasn't yet registered, do so.  The caller's location
-	 * ID is a static offset into a per-connection structure, and that has
-	 * problems: first, if there are multiple connections, we'll need to
-	 * hold some kind of lock to avoid racing when setting that value, and
-	 * second, if/when there are multiple connections and/or a single
-	 * connection is closed and re-opened, the variable may be initialized
-	 * and the underlying connection information may not.  Check both.
-	 */
-	if (*idp == WT_SPINLOCK_REGISTER ||
-	    conn->spinlock_block[*idp].name == NULL)
-		WT_RET(__wt_spin_lock_register_caller(
-		    session, t->name, file, line, idp));
-
-	/*
-	 * Try to acquire the mutex: on failure, update blocking statistics, on
-	 * success, set our ID as the mutex holder.
-	 *
-	 * Note the race between acquiring the lock and setting our ID as the
-	 * holder, this can appear in the output as mutexes blocking in ways
-	 * that can't actually happen (although still an indicator of a mutex
-	 * that's busier than we'd like).
-	 */
-	if ((ret = pthread_mutex_trylock(&t->lock)) == 0)
-		t->id = *idp;
-	else
-		if (*idp >= 0) {
-			++conn->spinlock_block[*idp].total;
-			if (t->id >= 0)
-				++conn->spinlock_block[*idp].blocked[t->id];
-		}
-
-	/* Update the mutex counter and flush to minimize the windows. */
-	++t->counter;
-	WT_FULL_BARRIER();
-	return (ret);
+	if ((ret = pthread_mutex_lock(&t->lock)) != 0)
+		WT_PANIC_MSG(session, ret, "pthread_mutex_lock: %s", t->name);
 }
-
-/*
- * __wt_spin_lock_func --
- *      Spin until the lock is acquired.
- */
-static inline void
-__wt_spin_lock_func(WT_SESSION_IMPL *session,
-    WT_SPINLOCK *t, int *idp, const char *file, int line)
-{
-	/* If we're not maintaining statistics, it's simple. */
-	if (session == NULL ||
-	    !FLD_ISSET(conn->stat_flags, WT_STAT_CONN_FAST)) {
-		pthread_mutex_lock(&t->lock);
-		return;
-	}
-
-	/* Try to acquire the mutex. */
-	if (__wt_spin_trylock_func(session, t, idp, file, line) == 0)
-		return;
-
-	/*
-	 * On failure, wait on the mutex; once acquired, set our ID as the
-	 * holder and flush to minimize the windows.
-	 */
-	pthread_mutex_lock(&t->lock);
-	t->id = *idp;
-	WT_FULL_BARRIER();
-}
-
 #endif
 
 /*
@@ -283,19 +182,13 @@ __wt_spin_lock_func(WT_SESSION_IMPL *session,
 static inline void
 __wt_spin_unlock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
-	WT_UNUSED(session);
+	WT_DECL_RET;
 
-	(void)pthread_mutex_unlock(&t->lock);
+	if ((ret = pthread_mutex_unlock(&t->lock)) != 0)
+		WT_PANIC_MSG(session, ret, "pthread_mutex_unlock: %s", t->name);
 }
 
 #elif SPINLOCK_TYPE == SPINLOCK_MSVC
-
-#define	WT_DECL_SPINLOCK_ID(i)	
-#define	WT_SPINLOCK_REGISTER		-1
-#define	WT_SPINLOCK_REGISTER_FAILED	-2
-
-#define	__wt_spin_trylock(session, lock, idp)				\
-	__wt_spin_trylock_func(session, lock)
 
 /*
  * __wt_spin_init --
@@ -304,11 +197,17 @@ __wt_spin_unlock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 static inline int
 __wt_spin_init(WT_SESSION_IMPL *session, WT_SPINLOCK *t, const char *name)
 {
-	WT_UNUSED(session);
-	WT_UNUSED(name);
+	DWORD windows_error;
 
-	InitializeCriticalSectionAndSpinCount(&t->lock, 4000);
+	if (InitializeCriticalSectionAndSpinCount(&t->lock, 4000) == 0) {
+		windows_error = __wt_getlasterror();
+		__wt_errx(session,
+		    "%s: InitializeCriticalSectionAndSpinCount: %s",
+		    name, __wt_formatmessage(session, windows_error));
+		return (__wt_map_windows_error(windows_error));
+	}
 
+	__spin_init_internal(t, name);
 	return (0);
 }
 
@@ -321,15 +220,18 @@ __wt_spin_destroy(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
 	WT_UNUSED(session);
 
-	DeleteCriticalSection(&t->lock);
+	if (t->initialized) {
+		DeleteCriticalSection(&t->lock);
+		t->initialized = 0;
+	}
 }
 
 /*
- * __wt_spin_trylock_func --
+ * __wt_spin_trylock --
  *      Try to lock a spinlock or fail immediately if it is busy.
  */
 static inline int
-__wt_spin_trylock_func(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
+__wt_spin_trylock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 {
 	WT_UNUSED(session);
 
@@ -366,3 +268,65 @@ __wt_spin_unlock(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
 #error Unknown spinlock type
 
 #endif
+
+/*
+ * WT_SPIN_INIT_TRACKED --
+ *	Spinlock initialization, with tracking.
+ *
+ * Implemented as a macro so we can pass in a statistics field and convert
+ * it into a statistics structure array offset.
+ */
+#define	WT_SPIN_INIT_TRACKED(session, t, name) do {			\
+	WT_RET(__wt_spin_init(session, t, #name));			\
+	(t)->stat_count_off = (int16_t)WT_STATS_FIELD_TO_OFFSET(	\
+	    S2C(session)->stats, lock_##name##_count);			\
+	(t)->stat_app_usecs_off = (int16_t)WT_STATS_FIELD_TO_OFFSET(	\
+	    S2C(session)->stats, lock_##name##_wait_application);	\
+	(t)->stat_int_usecs_off = (int16_t)WT_STATS_FIELD_TO_OFFSET(	\
+	    S2C(session)->stats, lock_##name##_wait_internal);		\
+} while (0)
+
+/*
+ * __wt_spin_lock_track --
+ *	Spinlock acquisition, with tracking.
+ */
+static inline void
+__wt_spin_lock_track(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
+{
+	uint64_t time_start, time_stop;
+	int64_t **stats;
+
+	if (t->stat_count_off != -1 && WT_STAT_ENABLED(session)) {
+		time_start = __wt_clock(session);
+		__wt_spin_lock(session, t);
+		time_stop = __wt_clock(session);
+		stats = (int64_t **)S2C(session)->stats;
+		stats[session->stat_bucket][t->stat_count_off]++;
+		if (F_ISSET(session, WT_SESSION_INTERNAL))
+			stats[session->stat_bucket][t->stat_int_usecs_off] +=
+			    (int64_t)WT_CLOCKDIFF_US(time_stop, time_start);
+		else
+			stats[session->stat_bucket][t->stat_app_usecs_off] +=
+			    (int64_t)WT_CLOCKDIFF_US(time_stop, time_start);
+	} else
+		__wt_spin_lock(session, t);
+}
+
+/*
+ * __wt_spin_trylock_track --
+ *      Try to lock a spinlock or fail immediately if it is busy.
+ *      Track if successful.
+ */
+static inline int
+__wt_spin_trylock_track(WT_SESSION_IMPL *session, WT_SPINLOCK *t)
+{
+	int64_t **stats;
+
+	if (t->stat_count_off != -1 && WT_STAT_ENABLED(session)) {
+		WT_RET(__wt_spin_trylock(session, t));
+		stats = (int64_t **)S2C(session)->stats;
+		stats[session->stat_bucket][t->stat_count_off]++;
+		return (0);
+	}
+	return (__wt_spin_trylock(session, t));
+}

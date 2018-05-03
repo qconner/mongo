@@ -28,6 +28,7 @@
 
 #include "mongo/util/fail_point_registry.h"
 
+#include "mongo/util/fail_point_server_parameter.h"
 #include "mongo/util/map_util.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -35,31 +36,36 @@ using mongoutils::str::stream;
 
 namespace mongo {
 
-    using std::string;
+using std::string;
 
-    FailPointRegistry::FailPointRegistry(): _frozen(false) {
+FailPointRegistry::FailPointRegistry() : _frozen(false) {}
+
+Status FailPointRegistry::addFailPoint(const string& name, FailPoint* failPoint) {
+    if (_frozen) {
+        return Status(ErrorCodes::CannotMutateObject, "Registry is already frozen");
     }
 
-    Status FailPointRegistry::addFailPoint(const string& name,
-            FailPoint* failPoint) {
-        if (_frozen) {
-            return Status(ErrorCodes::CannotMutateObject, "Registry is already frozen");
-        }
-
-        if (_fpMap.count(name) > 0) {
-            return Status(ErrorCodes::DuplicateKey,
-                    stream() << "Fail point already registered: " << name);
-        }
-
-        _fpMap.insert(make_pair(name, failPoint));
-        return Status::OK();
+    if (_fpMap.count(name) > 0) {
+        return Status(ErrorCodes::DuplicateKey,
+                      stream() << "Fail point already registered: " << name);
     }
 
-    FailPoint* FailPointRegistry::getFailPoint(const string& name) const {
-        return mapFindWithDefault(_fpMap, name, static_cast<FailPoint*>(NULL));
-    }
+    _fpMap.insert(make_pair(name, failPoint));
+    return Status::OK();
+}
 
-    void FailPointRegistry::freeze() {
-        _frozen = true;
+FailPoint* FailPointRegistry::getFailPoint(const string& name) const {
+    return mapFindWithDefault(_fpMap, name, static_cast<FailPoint*>(nullptr));
+}
+
+void FailPointRegistry::freeze() {
+    _frozen = true;
+}
+
+void FailPointRegistry::registerAllFailPointsAsServerParameters() {
+    for (auto it = _fpMap.begin(); it != _fpMap.end(); ++it) {
+        // Intentionally leaked.
+        new FailPointServerParameter(it->first, it->second);
     }
+}
 }

@@ -32,38 +32,62 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/logger/component_message_log_domain.h"
 #include "mongo/logger/rotatable_file_writer.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 namespace logger {
 
+/**
+ * Container for managing log domains.
+ *
+ * Use this while setting up the logging system, before launching any threads.
+ */
+class LogManager {
+    MONGO_DISALLOW_COPYING(LogManager);
+
+public:
+    LogManager();
+    ~LogManager();
+
     /**
-     * Container for managing log domains.
-     *
-     * Use this while setting up the logging system, before launching any threads.
+     * Gets the global domain for this manager.  It has no name.
+     * Will attach a default console log appender.
      */
-    class LogManager {
-        MONGO_DISALLOW_COPYING(LogManager);
-    public:
-        LogManager();
-        ~LogManager();
+    ComponentMessageLogDomain* getGlobalDomain() {
+        return &_globalDomain;
+    }
 
-        /**
-         * Gets the global domain for this manager.  It has no name.
-         */
-        ComponentMessageLogDomain* getGlobalDomain() { return &_globalDomain; }
+    /**
+     * Get the log domain with the given name, creating if needed.
+     */
+    MessageLogDomain* getNamedDomain(const std::string& name);
 
-        /**
-         * Get the log domain with the given name, creating if needed.
-         */
-        MessageLogDomain* getNamedDomain(const std::string& name);
+    /**
+     * Detaches the default console log appender
+     *
+     * @note This function is not thread safe.
+     */
+    void detachDefaultConsoleAppender();
 
-    private:
-        typedef unordered_map<std::string, MessageLogDomain*> DomainsByNameMap;
+    /**
+     * Reattaches the default console log appender
+     *
+     * @note This function is not thread safe.
+     */
+    void reattachDefaultConsoleAppender();
 
-        DomainsByNameMap _domains;
-        ComponentMessageLogDomain _globalDomain;
-    };
+    /**
+     * Checks if the default console log appender is attached
+     */
+    bool isDefaultConsoleAppenderAttached() const;
+
+private:
+    typedef stdx::unordered_map<std::string, MessageLogDomain*> DomainsByNameMap;
+
+    DomainsByNameMap _domains;
+    ComponentMessageLogDomain _globalDomain;
+    ComponentMessageLogDomain::AppenderHandle _defaultAppender;
+};
 
 }  // namespace logger
 }  // namespace mongo

@@ -30,171 +30,321 @@
 
 #include "mongo/db/matcher/expression_tree.h"
 
-#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/bsonobjiterator.h"
+#include "mongo/db/matcher/expression_always_boolean.h"
 
 namespace mongo {
 
-    ListOfMatchExpression::~ListOfMatchExpression() {
-        for ( unsigned i = 0; i < _expressions.size(); i++ )
-            delete _expressions[i];
-        _expressions.clear();
+ListOfMatchExpression::~ListOfMatchExpression() {
+    for (unsigned i = 0; i < _expressions.size(); i++) {
+        delete _expressions[i];
     }
+    _expressions.clear();
+}
 
-    void ListOfMatchExpression::add( MatchExpression* e ) {
-        verify( e );
-        _expressions.push_back( e );
+void ListOfMatchExpression::add(MatchExpression* e) {
+    verify(e);
+    _expressions.push_back(e);
+}
+
+
+void ListOfMatchExpression::_debugList(StringBuilder& debug, int level) const {
+    for (unsigned i = 0; i < _expressions.size(); i++)
+        _expressions[i]->debugString(debug, level + 1);
+}
+
+void ListOfMatchExpression::_listToBSON(BSONArrayBuilder* out) const {
+    for (unsigned i = 0; i < _expressions.size(); i++) {
+        BSONObjBuilder childBob(out->subobjStart());
+        _expressions[i]->serialize(&childBob);
     }
+    out->doneFast();
+}
 
+MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() const {
+    return [](std::unique_ptr<MatchExpression> expression) -> std::unique_ptr<MatchExpression> {
+        auto& children = static_cast<ListOfMatchExpression&>(*expression)._expressions;
 
-    void ListOfMatchExpression::_debugList( StringBuilder& debug, int level ) const {
-        for ( unsigned i = 0; i < _expressions.size(); i++ )
-            _expressions[i]->debugString( debug, level + 1 );
-    }
+        // Recursively apply optimizations to child expressions.
+        for (auto& childExpression : children) {
+            // Since 'childExpression' is a reference to a member of the ListOfMatchExpression's
+            // child array, this assignment replaces the original child with the optimized child.
+            // We must set this child's entry in '_expressions' to null after assigning ownership to
+            // 'childExpressionPtr'. Otherwise, if the call to optimize() throws we will attempt to
+            // free twice.
+            std::unique_ptr<MatchExpression> childExpressionPtr(childExpression);
+            childExpression = nullptr;
 
-    void ListOfMatchExpression::_listToBSON(BSONArrayBuilder* out) const {
-        for ( unsigned i = 0; i < _expressions.size(); i++ ) {
-            BSONObjBuilder childBob(out->subobjStart());
-            _expressions[i]->toBSON(&childBob);
+            auto optimizedExpression = MatchExpression::optimize(std::move(childExpressionPtr));
+            childExpression = optimizedExpression.release();
         }
-        out->doneFast();
-    }
 
-    bool ListOfMatchExpression::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() )
-            return false;
+        // Associativity of AND and OR: an AND absorbs the children of any ANDs among its children
+        // (and likewise for any OR with OR children).
+        MatchType matchType = expression->matchType();
+        if (matchType == AND || matchType == OR) {
+            std::vector<MatchExpression*> absorbedExpressions;
+            for (MatchExpression*& childExpression : children) {
+                if (childExpression->matchType() == matchType) {
+                    // Move this child out of the children array.
+                    std::unique_ptr<ListOfMatchExpression> childExpressionPtr(
+                        static_cast<ListOfMatchExpression*>(childExpression));
+                    childExpression = nullptr;  // Null out this child's entry in _expressions, so
+                                                // that it will be deleted by the erase call below.
 
-        const ListOfMatchExpression* realOther = static_cast<const ListOfMatchExpression*>( other );
+                    // Move all of the grandchildren from the child expression to
+                    // absorbedExpressions.
+                    auto& grandChildren = childExpressionPtr->_expressions;
+                    absorbedExpressions.insert(
+                        absorbedExpressions.end(), grandChildren.begin(), grandChildren.end());
+                    grandChildren.clear();
 
-        if ( _expressions.size() != realOther->_expressions.size() )
-            return false;
+                    // Note that 'childExpressionPtr' will now be destroyed.
+                }
+            }
 
-        // TOOD: order doesn't matter
-        for ( unsigned i = 0; i < _expressions.size(); i++ )
-            if ( !_expressions[i]->equivalent( realOther->_expressions[i] ) )
-                return false;
+            // We replaced each destroyed child expression with nullptr. Now we remove those
+            // nullptrs from the array.
+            children.erase(std::remove(children.begin(), children.end(), nullptr), children.end());
 
-        return true;
-    }
+            // Append the absorbed children to the end of the array.
+            children.insert(children.end(), absorbedExpressions.begin(), absorbedExpressions.end());
+        }
 
-    // -----
+        // Remove all children of AND that are $alwaysTrue and all children of OR that are
+        // $alwaysFalse.
+        if (matchType == AND || matchType == OR) {
+            for (MatchExpression*& childExpression : children) {
+                if ((childExpression->isTriviallyTrue() && matchType == MatchExpression::AND) ||
+                    (childExpression->isTriviallyFalse() && matchType == MatchExpression::OR)) {
+                    std::unique_ptr<MatchExpression> childPtr(childExpression);
+                    childExpression = nullptr;
+                }
+            }
 
-    bool AndMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        for ( size_t i = 0; i < numChildren(); i++ ) {
-            if ( !getChild(i)->matches( doc, details ) ) {
-                if ( details )
-                    details->resetOutput();
-                return false;
+            // We replaced each destroyed child expression with nullptr. Now we remove those
+            // nullptrs from the vector.
+            children.erase(std::remove(children.begin(), children.end(), nullptr), children.end());
+        }
+
+        // Check if the above optimizations eliminated all children. An OR with no children is
+        // always false.
+        // TODO SERVER-34759 It is correct to replace this empty AND with an $alwaysTrue, but we
+        // need to make enhancements to the planner to make it understand an $alwaysTrue and an
+        // empty AND as the same thing. The planner can create inferior plans for $alwaysTrue which
+        // it would not produce for an AND with no children.
+        if (children.empty() && matchType == MatchExpression::OR) {
+            return stdx::make_unique<AlwaysFalseMatchExpression>();
+        }
+
+        if (children.size() == 1) {
+            if ((matchType == AND || matchType == OR || matchType == INTERNAL_SCHEMA_XOR)) {
+                // Simplify AND/OR/XOR with exactly one operand to an expression consisting of just
+                // that operand.
+                MatchExpression* simplifiedExpression = children.front();
+                children.clear();
+                return std::unique_ptr<MatchExpression>(simplifiedExpression);
+            } else if (matchType == NOR) {
+                // Simplify NOR of exactly one operand to NOT of that operand.
+                auto simplifiedExpression = stdx::make_unique<NotMatchExpression>(children.front());
+                children.clear();
+                return std::move(simplifiedExpression);
             }
         }
-        return true;
-    }
 
-    bool AndMatchExpression::matchesSingleElement( const BSONElement& e ) const {
-        for ( size_t i = 0; i < numChildren(); i++ ) {
-            if ( !getChild(i)->matchesSingleElement( e ) ) {
-                return false;
+        if (matchType == MatchExpression::AND || matchType == MatchExpression::OR) {
+            for (auto& childExpression : children) {
+                // An AND containing an expression that always evaluates to false can be
+                // optimized to a single $alwaysFalse expression.
+                if (childExpression->isTriviallyFalse() && matchType == MatchExpression::AND) {
+                    return stdx::make_unique<AlwaysFalseMatchExpression>();
+                }
+
+                // Likewise, an OR containing an expression that always evaluates to true can be
+                // optimized to a single $alwaysTrue expression.
+                if (childExpression->isTriviallyTrue() && matchType == MatchExpression::OR) {
+                    return stdx::make_unique<AlwaysTrueMatchExpression>();
+                }
             }
         }
-        return true;
-    }
 
+        return expression;
+    };
+}
 
-    void AndMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$and\n";
-        _debugList( debug, level );
-    }
-
-    void AndMatchExpression::toBSON(BSONObjBuilder* out) const {
-        BSONArrayBuilder arrBob(out->subarrayStart("$and"));
-        _listToBSON(&arrBob);
-    }
-
-    // -----
-
-    bool OrMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        for ( size_t i = 0; i < numChildren(); i++ ) {
-            if ( getChild(i)->matches( doc, NULL ) ) {
-                return true;
-            }
-        }
+bool ListOfMatchExpression::equivalent(const MatchExpression* other) const {
+    if (matchType() != other->matchType())
         return false;
-    }
 
-    bool OrMatchExpression::matchesSingleElement( const BSONElement& e ) const {
-        for ( size_t i = 0; i < numChildren(); i++ ) {
-            if ( getChild(i)->matchesSingleElement( e ) ) {
-                return true;
-            }
-        }
+    const ListOfMatchExpression* realOther = static_cast<const ListOfMatchExpression*>(other);
+
+    if (_expressions.size() != realOther->_expressions.size())
         return false;
-    }
 
-
-    void OrMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$or\n";
-        _debugList( debug, level );
-    }
-
-    void OrMatchExpression::toBSON(BSONObjBuilder* out) const {
-        BSONArrayBuilder arrBob(out->subarrayStart("$or"));
-        _listToBSON(&arrBob);
-    }
-
-    // ----
-
-    bool NorMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        for ( size_t i = 0; i < numChildren(); i++ ) {
-            if ( getChild(i)->matches( doc, NULL ) ) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool NorMatchExpression::matchesSingleElement( const BSONElement& e ) const {
-        for ( size_t i = 0; i < numChildren(); i++ ) {
-            if ( getChild(i)->matchesSingleElement( e ) ) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void NorMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$nor\n";
-        _debugList( debug, level );
-    }
-
-    void NorMatchExpression::toBSON(BSONObjBuilder* out) const {
-        BSONArrayBuilder arrBob(out->subarrayStart("$nor"));
-        _listToBSON(&arrBob);
-    }
-
-    // -------
-
-    void NotMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$not\n";
-        _exp->debugString( debug, level + 1 );
-    }
-
-    void NotMatchExpression::toBSON(BSONObjBuilder* out) const {
-        BSONObjBuilder childBob(out->subobjStart("$not"));
-        _exp->toBSON(&childBob);
-        childBob.doneFast();
-    }
-
-    bool NotMatchExpression::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() )
+    // TOOD: order doesn't matter
+    for (unsigned i = 0; i < _expressions.size(); i++)
+        if (!_expressions[i]->equivalent(realOther->_expressions[i]))
             return false;
 
-        return _exp->equivalent( other->getChild(0) );
+    return true;
+}
+
+// -----
+
+bool AndMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
+    for (size_t i = 0; i < numChildren(); i++) {
+        if (!getChild(i)->matches(doc, details)) {
+            if (details)
+                details->resetOutput();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AndMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
+    for (size_t i = 0; i < numChildren(); i++) {
+        if (!getChild(i)->matchesSingleElement(e, details)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+void AndMatchExpression::debugString(StringBuilder& debug, int level) const {
+    _debugAddSpace(debug, level);
+    debug << "$and\n";
+    _debugList(debug, level);
+}
+
+void AndMatchExpression::serialize(BSONObjBuilder* out) const {
+    if (!numChildren()) {
+        // It is possible for an AndMatchExpression to have no children, resulting in the serialized
+        // expression {$and: []}, which is not a valid query object.
+        return;
     }
 
+    BSONArrayBuilder arrBob(out->subarrayStart("$and"));
+    _listToBSON(&arrBob);
+    arrBob.doneFast();
+}
+
+bool AndMatchExpression::isTriviallyTrue() const {
+    return numChildren() == 0;
+}
+
+// -----
+
+bool OrMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
+    for (size_t i = 0; i < numChildren(); i++) {
+        if (getChild(i)->matches(doc, NULL)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool OrMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
+    for (size_t i = 0; i < numChildren(); i++) {
+        if (getChild(i)->matchesSingleElement(e, details)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+void OrMatchExpression::debugString(StringBuilder& debug, int level) const {
+    _debugAddSpace(debug, level);
+    debug << "$or\n";
+    _debugList(debug, level);
+}
+
+void OrMatchExpression::serialize(BSONObjBuilder* out) const {
+    if (!numChildren()) {
+        // It is possible for an OrMatchExpression to have no children, resulting in the serialized
+        // expression {$or: []}, which is not a valid query object. An empty $or is logically
+        // equivalent to {$alwaysFalse: 1}.
+        out->append(AlwaysFalseMatchExpression::kName, 1);
+        return;
+    }
+    BSONArrayBuilder arrBob(out->subarrayStart("$or"));
+    _listToBSON(&arrBob);
+}
+
+bool OrMatchExpression::isTriviallyFalse() const {
+    return numChildren() == 0;
+}
+
+// ----
+
+bool NorMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
+    for (size_t i = 0; i < numChildren(); i++) {
+        if (getChild(i)->matches(doc, NULL)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool NorMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
+    for (size_t i = 0; i < numChildren(); i++) {
+        if (getChild(i)->matchesSingleElement(e, details)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void NorMatchExpression::debugString(StringBuilder& debug, int level) const {
+    _debugAddSpace(debug, level);
+    debug << "$nor\n";
+    _debugList(debug, level);
+}
+
+void NorMatchExpression::serialize(BSONObjBuilder* out) const {
+    BSONArrayBuilder arrBob(out->subarrayStart("$nor"));
+    _listToBSON(&arrBob);
+}
+
+// -------
+
+void NotMatchExpression::debugString(StringBuilder& debug, int level) const {
+    _debugAddSpace(debug, level);
+    debug << "$not\n";
+    _exp->debugString(debug, level + 1);
+}
+
+void NotMatchExpression::serialize(BSONObjBuilder* out) const {
+    BSONObjBuilder childBob;
+    _exp->serialize(&childBob);
+
+    BSONObj tempObj = childBob.obj();
+
+    // We don't know what the inner object is, and thus whether serializing to $not will result in a
+    // parseable MatchExpression. As a fix, we change it to $nor, which is always parseable.
+    BSONArrayBuilder tBob(out->subarrayStart("$nor"));
+    tBob.append(tempObj);
+    tBob.doneFast();
+}
+
+bool NotMatchExpression::equivalent(const MatchExpression* other) const {
+    if (matchType() != other->matchType())
+        return false;
+
+    return _exp->equivalent(other->getChild(0));
+}
+
+
+MatchExpression::ExpressionOptimizerFunc NotMatchExpression::getOptimizer() const {
+    return [](std::unique_ptr<MatchExpression> expression) {
+        auto& notExpression = static_cast<NotMatchExpression&>(*expression);
+        notExpression._exp = MatchExpression::optimize(std::move(notExpression._exp));
+
+        return expression;
+    };
+}
 }

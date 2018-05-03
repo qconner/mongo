@@ -28,75 +28,74 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/storage/kv/kv_database_catalog_entry.h"
+#include "mongo/db/storage/kv/kv_database_catalog_entry_mock.h"
 
-#include "mongo/base/init.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/global_environment_noop.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
+#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
+namespace mongo {
 namespace {
 
-    using namespace mongo;
+TEST(KVDatabaseCatalogEntryTest, CreateCollectionValidNamespace) {
+    KVStorageEngine storageEngine(
+        new DevNullKVEngine(), KVStorageEngineOptions{}, kvDatabaseCatalogEntryMockFactory);
+    storageEngine.finishInit();
+    KVDatabaseCatalogEntryMock dbEntry("mydb", &storageEngine);
+    OperationContextNoop ctx;
+    ASSERT_OK(dbEntry.createCollection(&ctx, "mydb.mycoll", CollectionOptions(), true));
+    std::list<std::string> collectionNamespaces;
+    dbEntry.getCollectionNamespaces(&collectionNamespaces);
+    ASSERT_FALSE(collectionNamespaces.empty());
+}
 
-    MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-        setGlobalEnvironment(new GlobalEnvironmentNoop());
-        return Status::OK();
-    }
+TEST(KVDatabaseCatalogEntryTest, CreateCollectionEmptyNamespace) {
+    KVStorageEngine storageEngine(
+        new DevNullKVEngine(), KVStorageEngineOptions{}, kvDatabaseCatalogEntryMockFactory);
+    storageEngine.finishInit();
+    KVDatabaseCatalogEntryMock dbEntry("mydb", &storageEngine);
+    OperationContextNoop ctx;
+    ASSERT_NOT_OK(dbEntry.createCollection(&ctx, "", CollectionOptions(), true));
+    std::list<std::string> collectionNamespaces;
+    dbEntry.getCollectionNamespaces(&collectionNamespaces);
+    ASSERT_TRUE(collectionNamespaces.empty());
+}
 
-    TEST(KVDatabaseCatalogEntryTest, CreateCollectionValidNamespace) {
-        KVStorageEngine storageEngine(new DevNullKVEngine());
-        storageEngine.finishInit();
-        KVDatabaseCatalogEntry dbEntry("mydb", &storageEngine);
-        OperationContextNoop ctx;
-        ASSERT_OK(dbEntry.createCollection(&ctx, "mydb.mycoll", CollectionOptions(), true));
-        std::list<std::string> collectionNamespaces;
-        dbEntry.getCollectionNamespaces(&collectionNamespaces);
-        ASSERT_FALSE(collectionNamespaces.empty());
-    }
-
-    TEST(KVDatabaseCatalogEntryTest, CreateCollectionEmptyNamespace) {
-        KVStorageEngine storageEngine(new DevNullKVEngine());
-        storageEngine.finishInit();
-        KVDatabaseCatalogEntry dbEntry("mydb", &storageEngine);
-        OperationContextNoop ctx;
-        ASSERT_NOT_OK(dbEntry.createCollection(&ctx, "", CollectionOptions(), true));
-        std::list<std::string> collectionNamespaces;
-        dbEntry.getCollectionNamespaces(&collectionNamespaces);
-        ASSERT_TRUE(collectionNamespaces.empty());
-    }
-
-    /**
-     * Derived class of devnull KV engine where createRecordStore is overridden to fail
-     * on an empty namespace (provided by the test).
-     */
-    class InvalidRecordStoreKVEngine : public DevNullKVEngine {
-    public:
-        virtual Status createRecordStore( OperationContext* opCtx,
-                                          StringData ns,
-                                          StringData ident,
-                                          const CollectionOptions& options ) {
-            if (ns == "fail.me") {
-                return Status(ErrorCodes::BadValue, "failed to create record store");
-            }
-            return DevNullKVEngine::createRecordStore(opCtx, ns, ident, options);
+/**
+ * Derived class of devnull KV engine where createRecordStore is overridden to fail
+ * on an empty namespace (provided by the test).
+ */
+class InvalidRecordStoreKVEngine : public DevNullKVEngine {
+public:
+    virtual Status createRecordStore(OperationContext* opCtx,
+                                     StringData ns,
+                                     StringData ident,
+                                     const CollectionOptions& options) {
+        if (ns == "fail.me") {
+            return Status(ErrorCodes::BadValue, "failed to create record store");
         }
-    };
-
-    // After createCollection fails, collection namespaces should remain empty.
-    TEST(KVDatabaseCatalogEntryTest, CreateCollectionInvalidRecordStore) {
-        KVStorageEngine storageEngine(new InvalidRecordStoreKVEngine());
-        storageEngine.finishInit();
-        KVDatabaseCatalogEntry dbEntry("fail", &storageEngine);
-        OperationContextNoop ctx;
-        ASSERT_NOT_OK(dbEntry.createCollection(&ctx, "fail.me", CollectionOptions(), true));
-        std::list<std::string> collectionNamespaces;
-        dbEntry.getCollectionNamespaces(&collectionNamespaces);
-        ASSERT_TRUE(collectionNamespaces.empty());
+        return DevNullKVEngine::createRecordStore(opCtx, ns, ident, options);
     }
+};
+
+// After createCollection fails, collection namespaces should remain empty.
+TEST(KVDatabaseCatalogEntryTest, CreateCollectionInvalidRecordStore) {
+    KVStorageEngine storageEngine(new InvalidRecordStoreKVEngine(),
+                                  KVStorageEngineOptions{},
+                                  kvDatabaseCatalogEntryMockFactory);
+    storageEngine.finishInit();
+    KVDatabaseCatalogEntryMock dbEntry("fail", &storageEngine);
+    OperationContextNoop ctx;
+    ASSERT_NOT_OK(dbEntry.createCollection(&ctx, "fail.me", CollectionOptions(), true));
+    std::list<std::string> collectionNamespaces;
+    dbEntry.getCollectionNamespaces(&collectionNamespaces);
+    ASSERT_TRUE(collectionNamespaces.empty());
+}
 
 }  // namespace
+}  // namespace mongo

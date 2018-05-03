@@ -30,24 +30,30 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/fts/fts_spec.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    class FTSAccessMethod : public BtreeBasedAccessMethod {
-    public:
-        FTSAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree );
-        virtual ~FTSAccessMethod() { }
+class FTSAccessMethod : public IndexAccessMethod {
+public:
+    FTSAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
-        const fts::FTSSpec& getSpec() const { return _ftsSpec; }
+    const fts::FTSSpec& getSpec() const {
+        return _ftsSpec;
+    }
 
-    private:
-        // Implemented:
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
+private:
+    /**
+     * Fills 'keys' with the keys that should be generated for 'obj' on this index.
+     *
+     * This function ignores the 'multikeyPaths' pointer because text indexes don't support tracking
+     * path-level multikey information.
+     */
+    void doGetKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const final;
 
-        fts::FTSSpec _ftsSpec;
-    };
+    fts::FTSSpec _ftsSpec;
+};
 
-} // namespace mongo
+}  // namespace mongo

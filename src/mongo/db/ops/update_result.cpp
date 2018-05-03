@@ -1,7 +1,5 @@
-//@file update_result.cpp
-
 /**
- *    Copyright (C) 2008-2014 MongoDB Inc.
+ *    Copyright (C) 2017 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,33 +26,39 @@
  *    it in the license file.
  */
 
+
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/update_result.h"
 
+#include "mongo/db/lasterror.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    UpdateResult::UpdateResult(bool existing_,
-                               bool modifiers_,
-                               unsigned long long numDocsModified_,
-                               unsigned long long numMatched_,
-                               const BSONObj& upsertedObject_,
-                               const BSONObj& newObj_)
-        : existing(existing_),
-          modifiers(modifiers_),
-          numDocsModified(numDocsModified_),
-          numMatched(numMatched_),
-          newObj(newObj_) {
-
-        BSONElement id = upsertedObject_["_id"];
-        if ( ! existing && numMatched == 1 && !id.eoo() ) {
-            upserted = id.wrap(kUpsertedFieldName);
-        }
-        LOG(4) << "UpdateResult -- " << toString();
+UpdateResult::UpdateResult(bool existing_,
+                           bool modifiers_,
+                           unsigned long long numDocsModified_,
+                           unsigned long long numMatched_,
+                           const BSONObj& upsertedObject_)
+    : existing(existing_),
+      modifiers(modifiers_),
+      numDocsModified(numDocsModified_),
+      numMatched(numMatched_) {
+    BSONElement id = upsertedObject_["_id"];
+    if (!existing && numMatched == 0 && !id.eoo()) {
+        upserted = id.wrap(kUpsertedFieldName);
     }
+    LOG(4) << "UpdateResult -- " << redact(toString());
+}
+
+std::string UpdateResult::toString() const {
+    return str::stream() << " upserted: " << upserted << " modifiers: " << modifiers
+                         << " existing: " << existing << " numDocsModified: " << numDocsModified
+                         << " numMatched: " << numMatched;
+}
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2016 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -31,52 +31,68 @@
 #include <vector>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/optime.h"
 
 namespace mongo {
 
-    class Status;
+class Status;
 
 namespace repl {
 
-    /**
-     * Arguments to the handshake command.
-     */
-    class UpdatePositionArgs {
-    public:
-        struct UpdateInfo {
-            UpdateInfo(const OID& anRid, const OpTime& aTs, long long aCfgver, long long aMemberId);
+/**
+ * Arguments to the update position command.
+ */
+class UpdatePositionArgs {
+public:
+    static const char kCommandFieldName[];
+    static const char kUpdateArrayFieldName[];
+    static const char kAppliedOpTimeFieldName[];
+    static const char kDurableOpTimeFieldName[];
+    static const char kMemberIdFieldName[];
+    static const char kConfigVersionFieldName[];
 
-            OID rid;
-            OpTime ts;
-            long long cfgver;
-            long long memberId;
-        };
+    struct UpdateInfo {
+        UpdateInfo(const OpTime& applied,
+                   const OpTime& durable,
+                   long long aCfgver,
+                   long long aMemberId);
 
-        typedef std::vector<UpdateInfo>::const_iterator UpdateIterator;
-
-        /**
-         * Initializes this UpdatePositionArgs from the contents of "argsObj".
-         */
-        Status initialize(const BSONObj& argsObj);
-
-        /**
-         * Gets a begin iterator over the UpdateInfos stored in this UpdatePositionArgs.
-         */
-        UpdateIterator updatesBegin() const { return _updates.begin(); }
-
-        /**
-         * Gets an end iterator over the UpdateInfos stored in this UpdatePositionArgs.
-         */
-        UpdateIterator updatesEnd() const { return _updates.end(); }
-
-        /**
-         * Returns a BSONified version of the object.
-         * _updates is only included if it is not empty.
-         */
-        BSONObj toBSON() const;
-    private:
-        std::vector<UpdateInfo> _updates;
+        OpTime appliedOpTime;
+        OpTime durableOpTime;
+        long long cfgver;
+        long long memberId;
     };
 
-} // namespace repl
-} // namespace mongo
+    typedef std::vector<UpdateInfo>::const_iterator UpdateIterator;
+
+    /**
+     * Initializes this UpdatePositionArgs from the contents of "argsObj".
+     */
+    Status initialize(const BSONObj& argsObj);
+
+    /**
+     * Gets a begin iterator over the UpdateInfos stored in this UpdatePositionArgs.
+     */
+    UpdateIterator updatesBegin() const {
+        return _updates.begin();
+    }
+
+    /**
+     * Gets an end iterator over the UpdateInfos stored in this UpdatePositionArgs.
+     */
+    UpdateIterator updatesEnd() const {
+        return _updates.end();
+    }
+
+    /**
+     * Returns a BSONified version of the object.
+     * _updates is only included if it is not empty.
+     */
+    BSONObj toBSON() const;
+
+private:
+    std::vector<UpdateInfo> _updates;
+};
+
+}  // namespace repl
+}  // namespace mongo

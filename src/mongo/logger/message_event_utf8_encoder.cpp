@@ -34,78 +34,134 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
 namespace logger {
 
-    static MessageEventDetailsEncoder::DateFormatter _dateFormatter = outputDateAsISOStringLocal;
+const int LogContext::kDefaultMaxLogSizeKB;
 
-    void MessageEventDetailsEncoder::setDateFormatter(DateFormatter dateFormatter) {
-        _dateFormatter = dateFormatter;
+LogContext::LogContext()
+    : _dateFormatter{outputDateAsISOStringLocal}, _maxLogSizeSource{nullptr} {};
+
+LogContext& MessageEventDetailsEncoder::getGlobalLogContext() {
+    static LogContext context;
+    return context;
+}
+
+void MessageEventDetailsEncoder::setMaxLogSizeKBSource(const AtomicWord<int>& source) {
+    invariant(getGlobalLogContext()._maxLogSizeSource == nullptr);
+    getGlobalLogContext()._maxLogSizeSource = &source;
+}
+
+int MessageEventDetailsEncoder::getMaxLogSizeKB() {
+    auto* source = getGlobalLogContext()._maxLogSizeSource;
+
+    // If not initialized, use the default
+    if (source == nullptr)
+        return LogContext::kDefaultMaxLogSizeKB;
+
+    // If initialized, use the reference
+    // TODO: This seems like a CST seq'd load we don't need. `loadRelaxed()`?
+    return source->load();
+}
+
+void MessageEventDetailsEncoder::setDateFormatter(DateFormatter dateFormatter) {
+    getGlobalLogContext()._dateFormatter = dateFormatter;
+}
+
+DateFormatter MessageEventDetailsEncoder::getDateFormatter() {
+    return getGlobalLogContext()._dateFormatter;
+}
+
+namespace {
+#ifdef _WIN32
+constexpr auto kEOL = "\r\n"_sd;
+#else
+constexpr auto kEOL = "\n"_sd;
+#endif
+}  // namespace
+
+MessageEventDetailsEncoder::~MessageEventDetailsEncoder() {}
+std::ostream& MessageEventDetailsEncoder::encode(const MessageEventEphemeral& event,
+                                                 std::ostream& os) {
+    const auto maxLogSizeKB = getMaxLogSizeKB();
+
+    const size_t maxLogSize = maxLogSizeKB * 1024;
+
+    getDateFormatter()(os, event.getDate());
+    os << ' ';
+
+    os << event.getSeverity().toChar();
+    os << ' ';
+
+    LogComponent component = event.getComponent();
+    os << component;
+    os << ' ';
+
+    StringData contextName = event.getContextName();
+    if (!contextName.empty()) {
+        os << '[' << contextName << "] ";
     }
 
-    MessageEventDetailsEncoder::DateFormatter MessageEventDetailsEncoder::getDateFormatter() {
-        return _dateFormatter;
-    }
+    StringData msg = event.getMessage();
 
-    MessageEventDetailsEncoder::~MessageEventDetailsEncoder() {}
-    std::ostream& MessageEventDetailsEncoder::encode(const MessageEventEphemeral& event,
-                                                     std::ostream &os) {
+#ifdef _WIN32
+    // We need to translate embedded Unix style line endings into Windows style endings.
+    std::string tempstr;
+    size_t embeddedNewLine = msg.find('\n');
 
-        static const size_t maxLogLine = 10 * 1024;
+    if (embeddedNewLine != std::string::npos) {
+        tempstr = msg.toString().replace(embeddedNewLine, 1, "\r\n");
 
-        _dateFormatter(os, event.getDate());
-        os << ' ';
+        embeddedNewLine = tempstr.find('\n', embeddedNewLine + 2);
+        while (embeddedNewLine != std::string::npos) {
+            tempstr = tempstr.replace(embeddedNewLine, 1, "\r\n");
 
-        os << event.getSeverity().toChar();
-        os << ' ';
-
-        LogComponent component = event.getComponent();
-        os << component;
-        os << ' ';
-
-        StringData contextName = event.getContextName();
-        if (!contextName.empty()) {
-            os << '[' << contextName << "] ";
+            embeddedNewLine = tempstr.find('\n', embeddedNewLine + 2);
         }
 
-        StringData msg = event.getMessage();
-        if (msg.size() > maxLogLine) {
-            os << "warning: log line attempted (" << msg.size() / 1024 << "k) over max size (" <<
-                maxLogLine / 1024 << "k), printing beginning and end ... ";
-            os << msg.substr(0, maxLogLine / 3);
-            os << " .......... ";
-            os << msg.substr(msg.size() - (maxLogLine / 3));
-        }
-        else {
-            os << msg;
-        }
-        if (!msg.endsWith(StringData("\n", StringData::LiteralTag())))
-            os << '\n';
-        return os;
+        msg = tempstr;
+    }
+#endif
+
+    if (event.isTruncatable() && msg.size() > maxLogSize) {
+        os << "warning: log line attempted (" << msg.size() / 1024 << "kB) over max size ("
+           << maxLogSizeKB << "kB), printing beginning and end ... ";
+        os << msg.substr(0, maxLogSize / 3);
+        os << " .......... ";
+        os << msg.substr(msg.size() - (maxLogSize / 3));
+    } else {
+        os << msg;
     }
 
-    MessageEventWithContextEncoder::~MessageEventWithContextEncoder() {}
-    std::ostream& MessageEventWithContextEncoder::encode(const MessageEventEphemeral& event,
-                                                         std::ostream& os) {
-        StringData contextName = event.getContextName();
-        if (!contextName.empty()) {
-            os << '[' << contextName << "] ";
-        }
-        StringData message = event.getMessage();
-        os << message;
-        if (!message.endsWith("\n"))
-            os << '\n';
-        return os;
-    }
+    if (!msg.endsWith(kEOL))
+        os << kEOL;
 
-    MessageEventUnadornedEncoder::~MessageEventUnadornedEncoder() {}
-    std::ostream& MessageEventUnadornedEncoder::encode(const MessageEventEphemeral& event,
-                                                       std::ostream& os) {
-        StringData message = event.getMessage();
-        os << message;
-        if (!message.endsWith("\n"))
-            os << '\n';
-        return os;
+    return os;
+}
+
+MessageEventWithContextEncoder::~MessageEventWithContextEncoder() {}
+std::ostream& MessageEventWithContextEncoder::encode(const MessageEventEphemeral& event,
+                                                     std::ostream& os) {
+    StringData contextName = event.getContextName();
+    if (!contextName.empty()) {
+        os << '[' << contextName << "] ";
     }
+    StringData message = event.getMessage();
+    os << message;
+    if (!message.endsWith("\n"))
+        os << '\n';
+    return os;
+}
+
+MessageEventUnadornedEncoder::~MessageEventUnadornedEncoder() {}
+std::ostream& MessageEventUnadornedEncoder::encode(const MessageEventEphemeral& event,
+                                                   std::ostream& os) {
+    StringData message = event.getMessage();
+    os << message;
+    if (!message.endsWith("\n"))
+        os << '\n';
+    return os;
+}
 
 }  // namespace logger
 }  // namespace mongo

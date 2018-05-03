@@ -30,34 +30,43 @@
 
 #pragma once
 
-#include "mongo/db/fts/fts_query.h"
-#include "mongo/db/matcher/expression.h"
-#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/fts/fts_query_impl.h"
+#include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
-    class TextMatchExpression : public LeafMatchExpression {
-    public:
-        TextMatchExpression() : LeafMatchExpression( TEXT ) {}
-        virtual ~TextMatchExpression() {}
+class NamespaceString;
+class OperationContext;
 
-        Status init( const std::string& query, const std::string& language );
+class TextMatchExpression : public TextMatchExpressionBase {
+public:
+    explicit TextMatchExpression(fts::FTSQueryImpl ftsQuery);
+    TextMatchExpression(OperationContext* opCtx, const NamespaceString& nss, TextParams params);
 
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
+    const fts::FTSQuery& getFTSQuery() const final {
+        return _ftsQuery;
+    }
 
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
+    bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
+        // Text match expressions force the selection of the text index and always generate EXACT
+        // index bounds (which causes the MatchExpression node to be trimmed), so we don't currently
+        // implement any explicit text matching logic here. SERVER-17648 tracks the work to
+        // implement a real text matcher.
+        //
+        // TODO: simply returning 'true' here isn't quite correct. First, we should be overriding
+        // matches() instead of matchesSingleElement(), because the latter is only ever called if
+        // the matched document has an element with path "_fts". Second, there are scenarios where
+        // we will use the untrimmed expression tree for matching (for example, when deciding
+        // whether or not to retry an operation that throws WriteConflictException); in those cases,
+        // we won't be able to correctly determine whether or not the object matches the expression.
+        return true;
+    }
 
-        virtual void toBSON(BSONObjBuilder* out) const;
+    std::unique_ptr<MatchExpression> shallowClone() const final;
 
-        virtual bool equivalent( const MatchExpression* other ) const;
+private:
+    fts::FTSQueryImpl _ftsQuery;
+};
 
-        virtual LeafMatchExpression* shallowClone() const;
-
-        const std::string& getQuery() const { return _query; }
-        const std::string& getLanguage() const { return _language; }
-    private:
-        std::string _query;
-        std::string _language;
-    };
-
-} // namespace mongo
+}  // namespace mongo

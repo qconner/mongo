@@ -39,132 +39,168 @@
 
 namespace mongo {
 
-    using std::endl;
+using std::endl;
 
-    OpCounters::OpCounters() {}
+OpCounters::OpCounters() {}
 
-    void OpCounters::incInsertInWriteLock(int n) {
-        RARELY _checkWrap();
-        _insert.fetchAndAdd(n);
-    }
+void OpCounters::gotInserts(int n) {
+    RARELY _checkWrap();
+    _insert.fetchAndAdd(n);
+}
 
-    void OpCounters::gotInsert() {
-        RARELY _checkWrap();
-        _insert.fetchAndAdd(1);
-    }
+void OpCounters::gotInsert() {
+    RARELY _checkWrap();
+    _insert.fetchAndAdd(1);
+}
 
-    void OpCounters::gotQuery() {
-        RARELY _checkWrap();
-        _query.fetchAndAdd(1);
-    }
+void OpCounters::gotQuery() {
+    RARELY _checkWrap();
+    _query.fetchAndAdd(1);
+}
 
-    void OpCounters::gotUpdate() {
-        RARELY _checkWrap();
-        _update.fetchAndAdd(1);
-    }
+void OpCounters::gotUpdate() {
+    RARELY _checkWrap();
+    _update.fetchAndAdd(1);
+}
 
-    void OpCounters::gotDelete() {
-        RARELY _checkWrap();
-        _delete.fetchAndAdd(1);
-    }
+void OpCounters::gotDelete() {
+    RARELY _checkWrap();
+    _delete.fetchAndAdd(1);
+}
 
-    void OpCounters::gotGetMore() {
-        RARELY _checkWrap();
-        _getmore.fetchAndAdd(1);
-    }
+void OpCounters::gotGetMore() {
+    RARELY _checkWrap();
+    _getmore.fetchAndAdd(1);
+}
 
-    void OpCounters::gotCommand() {
-        RARELY _checkWrap();
-        _command.fetchAndAdd(1);
-    }
+void OpCounters::gotCommand() {
+    RARELY _checkWrap();
+    _command.fetchAndAdd(1);
+}
 
-    void OpCounters::gotOp( int op , bool isCommand ) {
-        switch ( op ) {
-        case dbInsert: /*gotInsert();*/ break; // need to handle multi-insert
+void OpCounters::gotOp(int op, bool isCommand) {
+    switch (op) {
+        case dbInsert: /*gotInsert();*/
+            break;     // need to handle multi-insert
         case dbQuery:
-            if ( isCommand )
+            if (isCommand)
                 gotCommand();
             else
                 gotQuery();
             break;
 
-        case dbUpdate: gotUpdate(); break;
-        case dbDelete: gotDelete(); break;
-        case dbGetMore: gotGetMore(); break;
+        case dbUpdate:
+            gotUpdate();
+            break;
+        case dbDelete:
+            gotDelete();
+            break;
+        case dbGetMore:
+            gotGetMore();
+            break;
         case dbKillCursors:
         case opReply:
-        case dbMsg:
             break;
-        default: log() << "OpCounters::gotOp unknown op: " << op << endl;
-        }
+        default:
+            log() << "OpCounters::gotOp unknown op: " << op << endl;
     }
+}
 
-    void OpCounters::_checkWrap() {
-        const unsigned MAX = 1 << 30;
-        
-        bool wrap =
-            _insert.loadRelaxed() > MAX ||
-            _query.loadRelaxed() > MAX ||
-            _update.loadRelaxed() > MAX ||
-            _delete.loadRelaxed() > MAX ||
-            _getmore.loadRelaxed() > MAX ||
-            _command.loadRelaxed() > MAX;
-        
-        if ( wrap ) {
-            _insert.store(0);
-            _query.store(0);
-            _update.store(0);
-            _delete.store(0);
-            _getmore.store(0);
-            _command.store(0);
-        }
+void OpCounters::_checkWrap() {
+    const unsigned MAX = 1 << 30;
+
+    bool wrap = _insert.loadRelaxed() > MAX || _query.loadRelaxed() > MAX ||
+        _update.loadRelaxed() > MAX || _delete.loadRelaxed() > MAX ||
+        _getmore.loadRelaxed() > MAX || _command.loadRelaxed() > MAX;
+
+    if (wrap) {
+        _insert.store(0);
+        _query.store(0);
+        _update.store(0);
+        _delete.store(0);
+        _getmore.store(0);
+        _command.store(0);
     }
+}
 
-    BSONObj OpCounters::getObj() const {
-        BSONObjBuilder b;
-        b.append( "insert" , _insert.loadRelaxed() );
-        b.append( "query" , _query.loadRelaxed() );
-        b.append( "update" , _update.loadRelaxed() );
-        b.append( "delete" , _delete.loadRelaxed() );
-        b.append( "getmore" , _getmore.loadRelaxed() );
-        b.append( "command" , _command.loadRelaxed() );
-        return b.obj();
+BSONObj OpCounters::getObj() const {
+    BSONObjBuilder b;
+    b.append("insert", _insert.loadRelaxed());
+    b.append("query", _query.loadRelaxed());
+    b.append("update", _update.loadRelaxed());
+    b.append("delete", _delete.loadRelaxed());
+    b.append("getmore", _getmore.loadRelaxed());
+    b.append("command", _command.loadRelaxed());
+    return b.obj();
+}
+
+void NetworkCounter::hitPhysicalIn(long long bytes) {
+    static const int64_t MAX = 1ULL << 60;
+
+    // don't care about the race as its just a counter
+    const bool overflow = _physicalBytesIn.loadRelaxed() > MAX;
+
+    if (overflow) {
+        _physicalBytesIn.store(bytes);
+    } else {
+        _physicalBytesIn.fetchAndAdd(bytes);
     }
+}
 
-    void NetworkCounter::hit( long long bytesIn , long long bytesOut ) {
-        const long long MAX = 1ULL << 60;
+void NetworkCounter::hitPhysicalOut(long long bytes) {
+    static const int64_t MAX = 1ULL << 60;
 
-        // don't care about the race as its just a counter
-        bool overflow = _bytesIn > MAX || _bytesOut > MAX;
+    // don't care about the race as its just a counter
+    const bool overflow = _physicalBytesOut.loadRelaxed() > MAX;
 
-        if ( overflow ) {
-            _lock.lock();
-            _overflows++;
-            _bytesIn = bytesIn;
-            _bytesOut = bytesOut;
-            _requests = 1;
-            _lock.unlock();
-        }
-        else {
-            _lock.lock();
-            _bytesIn += bytesIn;
-            _bytesOut += bytesOut;
-            _requests++;
-            _lock.unlock();
-        }
+    if (overflow) {
+        _physicalBytesOut.store(bytes);
+    } else {
+        _physicalBytesOut.fetchAndAdd(bytes);
     }
+}
 
-    void NetworkCounter::append( BSONObjBuilder& b ) {
-        _lock.lock();
-        b.appendNumber( "bytesIn" , _bytesIn );
-        b.appendNumber( "bytesOut" , _bytesOut );
-        b.appendNumber( "numRequests" , _requests );
-        _lock.unlock();
+void NetworkCounter::hitLogicalIn(long long bytes) {
+    static const int64_t MAX = 1ULL << 60;
+
+    // don't care about the race as its just a counter
+    const bool overflow = _together.logicalBytesIn.loadRelaxed() > MAX;
+
+    if (overflow) {
+        _together.logicalBytesIn.store(bytes);
+        // The requests field only gets incremented here (and not in hitPhysical) because the
+        // hitLogical and hitPhysical are each called for each operation. Incrementing it in both
+        // functions would double-count the number of operations.
+        _together.requests.store(1);
+    } else {
+        _together.logicalBytesIn.fetchAndAdd(bytes);
+        _together.requests.fetchAndAdd(1);
     }
+}
+
+void NetworkCounter::hitLogicalOut(long long bytes) {
+    static const int64_t MAX = 1ULL << 60;
+
+    // don't care about the race as its just a counter
+    const bool overflow = _logicalBytesOut.loadRelaxed() > MAX;
+
+    if (overflow) {
+        _logicalBytesOut.store(bytes);
+    } else {
+        _logicalBytesOut.fetchAndAdd(bytes);
+    }
+}
+
+void NetworkCounter::append(BSONObjBuilder& b) {
+    b.append("bytesIn", static_cast<long long>(_together.logicalBytesIn.loadRelaxed()));
+    b.append("bytesOut", static_cast<long long>(_logicalBytesOut.loadRelaxed()));
+    b.append("physicalBytesIn", static_cast<long long>(_physicalBytesIn.loadRelaxed()));
+    b.append("physicalBytesOut", static_cast<long long>(_physicalBytesOut.loadRelaxed()));
+    b.append("numRequests", static_cast<long long>(_together.requests.loadRelaxed()));
+}
 
 
-    OpCounters globalOpCounters;
-    OpCounters replOpCounters;
-    NetworkCounter networkCounter;
-
+OpCounters globalOpCounters;
+OpCounters replOpCounters;
+NetworkCounter networkCounter;
 }

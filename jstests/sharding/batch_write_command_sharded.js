@@ -4,269 +4,238 @@
 // *only* mongos-specific tests.
 //
 
-// Only reason for using localhost name is to make the test consistent with naming host so it
-// will be easier to check for the host name inside error objects.
-var options = { separateConfig : true, sync : true, configOptions: { useHostName: false }};
-var st = new ShardingTest({shards: 2, mongos: 1, other: options});
-st.stopBalancer();
+// Checking UUID consistency involves talking to the config server primary, but there is no config
+// server primary by the end of this test.
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-var mongos = st.s0;
-var admin = mongos.getDB( "admin" );
-var config = mongos.getDB( "config" );
-var shards = config.shards.find().toArray();
-var configConnStr = st._configDB;
+(function() {
+    "use strict";
 
-jsTest.log("Starting sharding batch write tests...");
+    var st = new ShardingTest({shards: 2, mongos: 1});
 
-var request;
-var result;
+    var mongos = st.s0;
+    var admin = mongos.getDB("admin");
+    var config = mongos.getDB("config");
+    var configConnStr = st._configDB;
 
-// NOTE: ALL TESTS BELOW SHOULD BE SELF-CONTAINED, FOR EASIER DEBUGGING
+    jsTest.log("Starting sharding batch write tests...");
 
-//
-//
-// Mongos _id autogeneration tests for sharded collections
+    var request;
+    var result;
 
-var coll = mongos.getCollection("foo.bar");
-assert.commandWorked(admin.runCommand({ enableSharding : coll.getDB().toString() }));
-assert.commandWorked(admin.runCommand({ shardCollection : coll.toString(),
-                                        key : { _id : 1 } }));
+    // NOTE: ALL TESTS BELOW SHOULD BE SELF-CONTAINED, FOR EASIER DEBUGGING
 
-//
-// Basic insert no _id
-coll.remove({});
-printjson( request = {insert : coll.getName(),
-                      documents: [{ a : 1 }] } );
-printjson( result = coll.runCommand(request) );
-assert(result.ok);
-assert.eq(1, result.n);
-assert.eq(1, coll.count());
+    //
+    //
+    // Mongos _id autogeneration tests for sharded collections
 
-//
-// Multi insert some _ids
-coll.remove({});
-printjson( request = {insert : coll.getName(),
-                   documents: [{ _id : 0, a : 1 }, { a : 2 }] } );
-printjson( result = coll.runCommand(request) );
-assert(result.ok);
-assert.eq(2, result.n);
-assert.eq(2, coll.count());
-assert.eq(1, coll.count({ _id : 0 }));
+    var coll = mongos.getCollection("foo.bar");
+    assert.commandWorked(admin.runCommand({enableSharding: coll.getDB().toString()}));
+    st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
+    assert.commandWorked(admin.runCommand({shardCollection: coll.toString(), key: {_id: 1}}));
 
-//
-// Ensure generating many _ids don't push us over limits
-var maxDocSize = (16 * 1024 * 1024) / 1000;
-var baseDocSize = Object.bsonsize({ a : 1, data : "" });
-var dataSize = maxDocSize - baseDocSize;
+    //
+    // Basic insert no _id
+    coll.remove({});
+    printjson(request = {insert: coll.getName(), documents: [{a: 1}]});
+    printjson(result = coll.runCommand(request));
+    assert(result.ok);
+    assert.eq(1, result.n);
+    assert.eq(1, coll.count());
 
-var data = "";
-for (var i = 0; i < dataSize; i++)
-    data += "x";
+    //
+    // Multi insert some _ids
+    coll.remove({});
+    printjson(request = {insert: coll.getName(), documents: [{_id: 0, a: 1}, {a: 2}]});
+    printjson(result = coll.runCommand(request));
+    assert(result.ok);
+    assert.eq(2, result.n);
+    assert.eq(2, coll.count());
+    assert.eq(1, coll.count({_id: 0}));
 
-var documents = [];
-for (var i = 0; i < 1000; i++) documents.push({ a : i, data : data });
+    //
+    // Ensure generating many _ids don't push us over limits
+    var maxDocSize = (16 * 1024 * 1024) / 1000;
+    var baseDocSize = Object.bsonsize({a: 1, data: ""});
+    var dataSize = maxDocSize - baseDocSize;
 
-assert.commandWorked(coll.getMongo().getDB("admin").runCommand({ setParameter : 1, logLevel : 4 }));
-coll.remove({});
-request = { insert : coll.getName(),
-            documents: documents };
-printjson( result = coll.runCommand(request) );
-assert(result.ok);
-assert.eq(1000, result.n);
-assert.eq(1000, coll.count());
+    var data = "";
+    for (var i = 0; i < dataSize; i++)
+        data += "x";
 
-//
-//
-// Config server upserts (against admin db, for example) require _id test
-var adminColl = admin.getCollection(coll.getName());
+    var documents = [];
+    for (var i = 0; i < 1000; i++)
+        documents.push({a: i, data: data});
 
-//
-// Without _id
-adminColl.remove({});
-printjson( request = {update : adminColl.getName(),
-                      updates : [{ q : { a : 1 }, u : { a : 1 }, upsert : true }]});
-printjson( result = adminColl.runCommand(request) );
-assert(!result.ok);
+    assert.commandWorked(coll.getMongo().getDB("admin").runCommand({setParameter: 1, logLevel: 4}));
+    coll.remove({});
+    request = {insert: coll.getName(), documents: documents};
+    printjson(result = coll.runCommand(request));
+    assert(result.ok);
+    assert.eq(1000, result.n);
+    assert.eq(1000, coll.count());
 
-//
-// With _id
-adminColl.remove({});
-printjson( request = {update : adminColl.getName(),
-                      updates : [{ q : { _id : 1, a : 1 }, u : { a : 1 }, upsert : true }]});
-printjson( result = adminColl.runCommand(request) );
-assert(result.ok);
-assert.eq(1, result.n);
-assert.eq(1, adminColl.count());
+    //
+    //
+    // Config server upserts (against admin db, for example) require _id test
+    var adminColl = admin.getCollection(coll.getName());
 
-//
-//
-// Stale config progress tests
-// Set up a new collection across two shards, then revert the chunks to an earlier state to put
-// mongos and mongod permanently out of sync.
+    //
+    // Without _id
+    adminColl.remove({});
+    printjson(
+        request = {update: adminColl.getName(), updates: [{q: {a: 1}, u: {a: 1}, upsert: true}]});
+    var result = adminColl.runCommand(request);
+    assert.commandWorked(result);
+    assert.eq(1, result.n);
+    assert.eq(1, adminColl.count());
 
-// START SETUP
-var brokenColl = mongos.getCollection( "broken.coll" );
-assert.commandWorked(admin.runCommand({ enableSharding : brokenColl.getDB().toString() }));
-printjson(admin.runCommand({ movePrimary : brokenColl.getDB().toString(), to : shards[0]._id }));
-assert.commandWorked(admin.runCommand({ shardCollection : brokenColl.toString(),
-                                        key : { _id : 1 } }));
-assert.commandWorked(admin.runCommand({ split : brokenColl.toString(),
-                                        middle : { _id : 0 } }));
+    //
+    // With _id
+    adminColl.remove({});
+    printjson(request = {
+        update: adminColl.getName(),
+        updates: [{q: {_id: 1, a: 1}, u: {a: 1}, upsert: true}]
+    });
+    assert.commandWorked(adminColl.runCommand(request));
+    assert.eq(1, result.n);
+    assert.eq(1, adminColl.count());
 
-var oldChunks = config.chunks.find().toArray();
+    //
+    //
+    // Stale config progress tests
+    // Set up a new collection across two shards, then revert the chunks to an earlier state to put
+    // mongos and mongod permanently out of sync.
 
-// Start a new mongos and bring it up-to-date with the chunks so far
+    // START SETUP
+    var brokenColl = mongos.getCollection("broken.coll");
+    assert.commandWorked(admin.runCommand({enableSharding: brokenColl.getDB().toString()}));
+    st.ensurePrimaryShard(brokenColl.getDB().toString(), st.shard0.shardName);
+    assert.commandWorked(admin.runCommand({shardCollection: brokenColl.toString(), key: {_id: 1}}));
+    assert.commandWorked(admin.runCommand({split: brokenColl.toString(), middle: {_id: 0}}));
 
-var staleMongos = MongoRunner.runMongos({ configdb : configConnStr });
-brokenColl = staleMongos.getCollection(brokenColl.toString());
-assert.writeOK(brokenColl.insert({ hello : "world" }));
+    var oldChunks = config.chunks.find().toArray();
 
-// Modify the chunks to make shards at a higher version
+    // Start a new mongos and bring it up-to-date with the chunks so far
 
-assert.commandWorked(admin.runCommand({ moveChunk : brokenColl.toString(),
-                                        find : { _id : 0 },
-                                        to : shards[1]._id }));
+    var staleMongos = MongoRunner.runMongos({configdb: configConnStr});
+    brokenColl = staleMongos.getCollection(brokenColl.toString());
+    assert.writeOK(brokenColl.insert({hello: "world"}));
 
-// Rewrite the old chunks back to the config server
+    // Modify the chunks to make shards at a higher version
 
-assert.writeOK(config.chunks.remove({}));
-for ( var i = 0; i < oldChunks.length; i++ )
-    assert.writeOK(config.chunks.insert(oldChunks[i]));
+    assert.commandWorked(admin.runCommand(
+        {moveChunk: brokenColl.toString(), find: {_id: 0}, to: st.shard1.shardName}));
 
-// Stale mongos can no longer bring itself up-to-date!
-// END SETUP
+    // Rewrite the old chunks back to the config server
 
-//
-// Config server insert, repeatedly stale
-printjson( request = {insert : brokenColl.getName(),
-                      documents: [{_id:-1}]} );
-printjson( result = brokenColl.runCommand(request) );
-assert(result.ok);
-assert.eq(0, result.n);
-assert.eq(1, result.writeErrors.length);
-assert.eq(0, result.writeErrors[0].index);
-assert.eq(result.writeErrors[0].code, 82); // No Progress Made
+    assert.writeOK(config.chunks.remove({}));
+    for (var i = 0; i < oldChunks.length; i++) {
+        assert.writeOK(config.chunks.insert(oldChunks[i]));
+    }
 
-//
-// Config server insert to other shard, repeatedly stale
-printjson( request = {insert : brokenColl.getName(),
-                   documents: [{_id:1}]} );
-printjson( result = brokenColl.runCommand(request) );
-assert(result.ok);
-assert.eq(0, result.n);
-assert.eq(1, result.writeErrors.length);
-assert.eq(0, result.writeErrors[0].index);
-assert.eq(result.writeErrors[0].code, 82); // No Progress Made
+    // Ensure that the inserts have propagated to all secondary nodes
+    st.configRS.awaitReplication();
 
-//
-//
-// Tests against config server
-var configColl = config.getCollection( "batch_write_protocol_sharded" );
+    // Stale mongos can no longer bring itself up-to-date!
+    // END SETUP
 
-//
-// Basic config server insert
-configColl.remove({});
-printjson( request = {insert : configColl.getName(),
-                      documents: [{a:1}]} );
-printjson( result = configColl.runCommand(request) );
-assert(result.ok);
-assert.eq(1, result.n);
-assert.eq(1, st.config0.getCollection(configColl + "").count());
-assert.eq(1, st.config1.getCollection(configColl + "").count());
-assert.eq(1, st.config2.getCollection(configColl + "").count());
+    //
+    // Config server insert, repeatedly stale
+    printjson(request = {insert: brokenColl.getName(), documents: [{_id: -1}]});
+    printjson(result = brokenColl.runCommand(request));
+    assert(result.ok);
+    assert.eq(0, result.n);
+    assert.eq(1, result.writeErrors.length);
+    assert.eq(0, result.writeErrors[0].index);
+    assert.eq(result.writeErrors[0].code, 82);  // No Progress Made
 
-//
-// Basic config server update
-configColl.remove({});
-configColl.insert({a:1});
-printjson( request = {update : configColl.getName(),
-                      updates: [{q: {a:1}, u: {$set: {b:2}}}]} );
-printjson( result = configColl.runCommand(request) );
-assert(result.ok);
-assert.eq(1, result.n);
-assert.eq(1, st.config0.getCollection(configColl + "").count({b:2}));
-assert.eq(1, st.config1.getCollection(configColl + "").count({b:2}));
-assert.eq(1, st.config2.getCollection(configColl + "").count({b:2}));
+    //
+    // Config server insert to other shard, repeatedly stale
+    printjson(request = {insert: brokenColl.getName(), documents: [{_id: 1}]});
+    printjson(result = brokenColl.runCommand(request));
+    assert(result.ok);
+    assert.eq(0, result.n);
+    assert.eq(1, result.writeErrors.length);
+    assert.eq(0, result.writeErrors[0].index);
+    assert.eq(result.writeErrors[0].code, 82);  // No Progress Made
 
-//
-// Basic config server delete
-configColl.remove({});
-configColl.insert({a:1});
-printjson( request = {'delete' : configColl.getName(),
-                      deletes: [{q: {a:1}, limit: 0}]} );
-printjson( result = configColl.runCommand(request) );
-assert(result.ok);
-assert.eq(1, result.n);
-assert.eq(0, st.config0.getCollection(configColl + "").count());
-assert.eq(0, st.config1.getCollection(configColl + "").count());
-assert.eq(0, st.config2.getCollection(configColl + "").count());
+    //
+    //
+    // Tests against config server
+    var configColl = config.getCollection("batch_write_protocol_sharded");
 
-MongoRunner.stopMongod(st.config1.port, 15);
+    //
+    // Basic config server insert
+    configColl.remove({});
+    printjson(request = {insert: configColl.getName(), documents: [{a: 1}]});
+    var result = configColl.runCommand(request);
+    assert.commandWorked(result);
+    assert.eq(1, result.n);
 
-// Config server insert with 2nd config down.
-configColl.remove({});
-printjson( request = {insert : configColl.getName(),
-                      documents: [{a:1}]} );
-printjson( result = configColl.runCommand(request) );
-assert(!result.ok);
-assert(result.errmsg != null);
+    st.configRS.awaitReplication();
+    assert.eq(1, st.config0.getCollection(configColl + "").count());
+    assert.eq(1, st.config1.getCollection(configColl + "").count());
+    assert.eq(1, st.config2.getCollection(configColl + "").count());
 
-//
-// Config server update with 2nd config down.
-configColl.remove({});
-configColl.insert({a:1});
-printjson( request = {update : configColl.getName(),
-                      updates: [{q: {a:1}, u: {$set: {b:2}}}]} );
-printjson( result = configColl.runCommand(request) );
-assert(!result.ok);
-assert(result.errmsg != null);
+    //
+    // Basic config server update
+    configColl.remove({});
+    configColl.insert({a: 1});
+    printjson(request = {update: configColl.getName(), updates: [{q: {a: 1}, u: {$set: {b: 2}}}]});
+    printjson(result = configColl.runCommand(request));
+    assert(result.ok);
+    assert.eq(1, result.n);
 
-//
-// Config server delete with 2nd config down.
-configColl.remove({});
-configColl.insert({a:1});
-printjson( request = {delete : configColl.getName(),
-                      deletes: [{q: {a:1}, limit: 0}]} );
-printjson( result = configColl.runCommand(request) );
-assert(!result.ok);
-assert(result.errmsg != null);
+    st.configRS.awaitReplication();
+    assert.eq(1, st.config0.getCollection(configColl + "").count({b: 2}));
+    assert.eq(1, st.config1.getCollection(configColl + "").count({b: 2}));
+    assert.eq(1, st.config2.getCollection(configColl + "").count({b: 2}));
 
-//
-// Config server insert with 2nd config down while bypassing fsync check.
-configColl.remove({});
-printjson( request = { insert: configColl.getName(),
-                       documents: [{ a: 1 }],
-                       // { w: 0 } has special meaning for config servers
-                       writeConcern: { w: 0 }} );
-printjson( result = configColl.runCommand(request) );
-assert(!result.ok);
-assert(result.errmsg != null);
+    //
+    // Basic config server delete
+    configColl.remove({});
+    configColl.insert({a: 1});
+    printjson(request = {'delete': configColl.getName(), deletes: [{q: {a: 1}, limit: 0}]});
+    printjson(result = configColl.runCommand(request));
+    assert(result.ok);
+    assert.eq(1, result.n);
 
-//
-// Config server update with 2nd config down while bypassing fsync check.
-configColl.remove({});
-configColl.insert({a:1});
-printjson( request = { update: configColl.getName(),
-                       updates: [{ q: { a: 1 }, u: { $set: { b:2 }}}],
-                       // { w: 0 } has special meaning for config servers
-                       writeConcern: { w: 0 }} );
-printjson( result = configColl.runCommand(request) );
-assert(!result.ok);
-assert(result.errmsg != null);
+    st.configRS.awaitReplication();
+    assert.eq(0, st.config0.getCollection(configColl + "").count());
+    assert.eq(0, st.config1.getCollection(configColl + "").count());
+    assert.eq(0, st.config2.getCollection(configColl + "").count());
 
-//
-// Config server update with 2nd config down while bypassing fsync check.
-configColl.remove({});
-configColl.insert({a:1});
-printjson( request = { delete: configColl.getName(),
-                       deletes: [{ q: { a: 1 }, limit: 0 }],
-                       // { w: 0 } has special meaning for config servers
-                       writeConcern: { w: 0 }} );
-printjson( result = configColl.runCommand(request) );
-assert(!result.ok);
-assert(result.errmsg != null);
+    MongoRunner.stopMongod(st.config1);
+    MongoRunner.stopMongod(st.config2);
+    st.configRS.awaitNoPrimary();
 
-jsTest.log("DONE!");
+    // Config server insert with no config PRIMARY
+    configColl.remove({});
+    printjson(request = {insert: configColl.getName(), documents: [{a: 1}]});
+    printjson(result = configColl.runCommand(request));
+    assert(!result.ok);
+    assert(result.errmsg != null);
 
-MongoRunner.stopMongos( staleMongos );
-st.stop();
+    // Config server insert with no config PRIMARY
+    configColl.remove({});
+    configColl.insert({a: 1});
+    printjson(request = {update: configColl.getName(), updates: [{q: {a: 1}, u: {$set: {b: 2}}}]});
+    printjson(result = configColl.runCommand(request));
+    assert(!result.ok);
+    assert(result.errmsg != null);
+
+    // Config server insert with no config PRIMARY
+    configColl.remove({});
+    configColl.insert({a: 1});
+    printjson(request = {delete: configColl.getName(), deletes: [{q: {a: 1}, limit: 0}]});
+    printjson(result = configColl.runCommand(request));
+    assert(!result.ok);
+    assert(result.errmsg != null);
+
+    jsTest.log("DONE!");
+
+    MongoRunner.stopMongos(staleMongos);
+    st.stop();
+
+}());

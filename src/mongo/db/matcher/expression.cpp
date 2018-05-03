@@ -30,52 +30,60 @@
 
 #include "mongo/db/matcher/expression.h"
 
-#include "mongo/bson/bsonobjiterator.h"
-#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
-    using std::string;
+using std::string;
 
-    MatchExpression::MatchExpression( MatchType type )
-        : _matchType( type ) { }
+MatchExpression::MatchExpression(MatchType type) : _matchType(type) {}
 
-    string MatchExpression::toString() const {
-        StringBuilder buf;
-        debugString( buf, 0 );
-        return buf.str();
-    }
-
-    void MatchExpression::_debugAddSpace( StringBuilder& debug, int level ) const {
-        for ( int i = 0; i < level; i++ )
-            debug << "    ";
-    }
-
-    bool MatchExpression::matchesBSON( const BSONObj& doc, MatchDetails* details ) const {
-        BSONMatchableDocument mydoc( doc );
-        return matches( &mydoc, details );
-    }
-
-
-    void AtomicMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$atomic\n";
-    }
-
-    void AtomicMatchExpression::toBSON(BSONObjBuilder* out) const {
-        out->append("$isolated", 1);
-    }
-
-    void FalseMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$false\n";
-    }
-
-    void FalseMatchExpression::toBSON(BSONObjBuilder* out) const {
-        out->append("$false", 1);
-    }
-
+string MatchExpression::toString() const {
+    StringBuilder buf;
+    debugString(buf, 0);
+    return buf.str();
 }
 
+void MatchExpression::_debugAddSpace(StringBuilder& debug, int level) const {
+    for (int i = 0; i < level; i++)
+        debug << "    ";
+}
 
+bool MatchExpression::matchesBSON(const BSONObj& doc, MatchDetails* details) const {
+    BSONMatchableDocument mydoc(doc);
+    return matches(&mydoc, details);
+}
+
+bool MatchExpression::matchesBSONElement(BSONElement elem, MatchDetails* details) const {
+    BSONElementViewMatchableDocument matchableDoc(elem);
+    return matches(&matchableDoc, details);
+}
+
+void MatchExpression::setCollator(const CollatorInterface* collator) {
+    for (size_t i = 0; i < numChildren(); ++i) {
+        getChild(i)->setCollator(collator);
+    }
+
+    _doSetCollator(collator);
+}
+
+void MatchExpression::addDependencies(DepsTracker* deps) const {
+    for (size_t i = 0; i < numChildren(); ++i) {
+
+        // Don't recurse through MatchExpression nodes which require an entire array or entire
+        // subobject for matching.
+        const auto type = matchType();
+        switch (type) {
+            case MatchExpression::ELEM_MATCH_VALUE:
+            case MatchExpression::ELEM_MATCH_OBJECT:
+            case MatchExpression::INTERNAL_SCHEMA_OBJECT_MATCH:
+                continue;
+            default:
+                getChild(i)->addDependencies(deps);
+        }
+    }
+
+    _doAddDependencies(deps);
+}
+}

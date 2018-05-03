@@ -34,16 +34,23 @@
 
 #pragma once
 
+
+// Microsoft seems opposed to implementing this:
+// https://connect.microsoft.com/VisualStudio/feedback/details/804542
+#define MONGO_COMPILER_COLD_FUNCTION
+
 #define MONGO_COMPILER_NORETURN __declspec(noreturn)
 
 #define MONGO_COMPILER_VARIABLE_UNUSED
 
-#define MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT) __declspec( align( ALIGNMENT ) )
+#define MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT) __declspec(align(ALIGNMENT))
 
-#define MONGO_COMPILER_ALIGN_VARIABLE(ALIGNMENT) __declspec( align( ALIGNMENT ) )
+#define MONGO_COMPILER_ALIGN_VARIABLE(ALIGNMENT) __declspec(align(ALIGNMENT))
 
 #define MONGO_COMPILER_API_EXPORT __declspec(dllexport)
 #define MONGO_COMPILER_API_IMPORT __declspec(dllimport)
+
+#define MONGO_WARN_UNUSED_RESULT_CLASS
 
 #ifdef _M_IX86
 // 32-bit x86 supports multiple of calling conventions.  We build supporting the cdecl convention
@@ -56,3 +63,7 @@
 
 #define MONGO_likely(x) bool(x)
 #define MONGO_unlikely(x) bool(x)
+
+#define MONGO_COMPILER_ALWAYS_INLINE __forceinline
+
+#define MONGO_COMPILER_UNREACHABLE __assume(false)

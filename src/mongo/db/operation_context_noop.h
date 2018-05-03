@@ -27,90 +27,38 @@
  */
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <boost/optional.hpp>
 
-#include "mongo/db/operation_context.h"
-#include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker_noop.h"
-#include "mongo/db/curop.h"
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/progress_meter.h"
 
 namespace mongo {
 
-    class OperationContextNoop : public OperationContext {
-    public:
-        OperationContextNoop(RecoveryUnit* ru)
-            : _recoveryUnit(ru),
-              _locker(new LockerNoop()) {
+class Client;
 
-        }
+class OperationContextNoop : public OperationContext {
+public:
+    /**
+     * These constructors are for use in legacy tests that do not need operation contexts that are
+     * properly connected to clients.
+     */
+    OperationContextNoop() : OperationContextNoop(nullptr, 0) {}
+    OperationContextNoop(RecoveryUnit* ru) : OperationContextNoop(nullptr, 0) {
+        setRecoveryUnit(ru, WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    }
 
-        OperationContextNoop()
-            : _recoveryUnit(new RecoveryUnitNoop()),
-              _locker(new LockerNoop()) {
-
-        }
-
-        virtual ~OperationContextNoop() { }
-
-        virtual Client* getClient() const {
-            invariant(false);
-            return NULL;
-        }
-
-        virtual CurOp* getCurOp() const {
-            invariant(false);
-            return NULL;
-        }
-
-        virtual RecoveryUnit* recoveryUnit() const {
-            return _recoveryUnit.get();
-        }
-
-        virtual RecoveryUnit* releaseRecoveryUnit() {
-            return _recoveryUnit.release();
-        }
-
-        virtual void setRecoveryUnit(RecoveryUnit* unit) {
-            _recoveryUnit.reset(unit);
-        }
-
-        virtual Locker* lockState() const {
-            return _locker.get();
-        }
-
-        virtual ProgressMeter* setMessage(const char * msg,
-                                          const std::string &name,
-                                          unsigned long long progressMeterTotal,
-                                          int secondsBetween) {
-            return &_pm;
-        }
-
-        virtual void checkForInterrupt() const { }
-        virtual Status checkForInterruptNoAssert() const {
-            return Status::OK();
-        }
-
-        virtual bool isPrimaryFor( StringData ns ) {
-            return true;
-        }
-
-        virtual bool isGod() const {
-            return false;
-        }
-
-        virtual std::string getNS() const {
-            return std::string();
-        };
-
-        virtual unsigned int getOpID() const {
-            return 0;
-        }
-
-    private:
-        std::auto_ptr<RecoveryUnit> _recoveryUnit;
-        boost::scoped_ptr<Locker> _locker;
-        ProgressMeter _pm;
-    };
+    /**
+     * This constructor is for use by ServiceContexts, and should not be called directly.
+     */
+    OperationContextNoop(Client* client, unsigned int opId) : OperationContext(client, opId) {
+        setRecoveryUnit(new RecoveryUnitNoop(),
+                        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        setLockState(stdx::make_unique<LockerNoop>());
+    }
+};
 
 }  // namespace mongo

@@ -28,45 +28,40 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/optional.hpp>
+#include <iostream>
 #include <vector>
 
-#include "mongo/util/processinfo.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/processinfo.h"
 
 using mongo::ProcessInfo;
+using boost::optional;
 
 namespace mongo_test {
-    TEST(ProcessInfo, SysInfoIsInitialized) {
-        ProcessInfo processInfo;
-        if (processInfo.supported()) {
-            ASSERT_FALSE(processInfo.getOsType().empty());
-        }
+TEST(ProcessInfo, SysInfoIsInitialized) {
+    ProcessInfo processInfo;
+    if (processInfo.supported()) {
+        ASSERT_FALSE(processInfo.getOsType().empty());
     }
+}
 
-    TEST(ProcessInfo, NonZeroPageSize) {
-        if (ProcessInfo::blockCheckSupported()) {
-            ASSERT_GREATER_THAN(ProcessInfo::getPageSize(), 0u);
-        }
+TEST(ProcessInfo, NonZeroPageSize) {
+    if (ProcessInfo::blockCheckSupported()) {
+        ASSERT_GREATER_THAN(ProcessInfo::getPageSize(), 0u);
     }
+}
 
-    const size_t PAGES = 10;
+TEST(ProcessInfo, GetNumAvailableCores) {
+#if defined(__APPLE__) || defined(__linux__) || (defined(__sun) && defined(__SVR4)) || \
+    defined(_WIN32)
+    unsigned long numAvailCores = ProcessInfo::getNumAvailableCores();
+    ASSERT_GREATER_THAN(numAvailCores, 0u);
+    ASSERT_LESS_THAN_OR_EQUALS(numAvailCores, ProcessInfo::getNumCores());
+#endif
+}
 
-    TEST(ProcessInfo, BlockInMemoryDoesNotThrowIfSupported) {
-        if (ProcessInfo::blockCheckSupported()) {
-            static char ptr[4096 * PAGES] = "This needs data to not be in .bss";
-            ProcessInfo::blockInMemory(ptr + ProcessInfo::getPageSize() * 2);
-        }
-    }
-
-    TEST(ProcessInfo, PagesInMemoryIsSensible) {
-        if (ProcessInfo::blockCheckSupported()) {
-            static char ptr[4096 * PAGES] = "This needs data to not be in .bss";
-            ptr[(ProcessInfo::getPageSize() * 0) + 1] = 'a';
-            ptr[(ProcessInfo::getPageSize() * 8) + 1] = 'a';
-            std::vector<char> result;
-            ASSERT_TRUE(ProcessInfo::pagesInMemory(const_cast<char*>(ptr), PAGES, &result));
-            ASSERT_TRUE(result[0]);
-            ASSERT_TRUE(result[8]);
-        }
-    }
+TEST(ProcessInfo, GetNumCoresReturnsNonZeroNumberOfProcessors) {
+    ASSERT_GREATER_THAN(ProcessInfo::getNumCores(), 0u);
+}
 }

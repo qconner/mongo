@@ -34,13 +34,35 @@
 
 #pragma once
 
+
+#ifdef __clang__
+// Our minimum clang version (3.4) doesn't support the "cold" attribute. We could try to use it with
+// clang versions that support the attribute, but since Apple uses weird version numbers on clang
+// and the main goal with the attribute is to improve our production builds with gcc, it didn't seem
+// worth it.
+#define MONGO_COMPILER_COLD_FUNCTION
 #define MONGO_COMPILER_NORETURN __attribute__((__noreturn__))
+// MONGO_WARN_UNUSED_RESULT is only supported in the semantics we want for classes in Clang, not in
+// GCC < 7.
+#define MONGO_WARN_UNUSED_RESULT_CLASS [[gnu::warn_unused_result]]
+#else
+#define MONGO_COMPILER_COLD_FUNCTION __attribute__((__cold__))
+#define MONGO_COMPILER_NORETURN __attribute__((__noreturn__, __cold__))
+
+// GCC 7 added support for [[nodiscard]] with the semantics we want.
+#if defined(__has_cpp_attribute) && __has_cpp_attribute(nodiscard)
+#define MONGO_WARN_UNUSED_RESULT_CLASS [[nodiscard]]
+#else
+#define MONGO_WARN_UNUSED_RESULT_CLASS
+#endif
+
+#endif
 
 #define MONGO_COMPILER_VARIABLE_UNUSED __attribute__((__unused__))
 
-#define MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT) __attribute__(( __aligned__(ALIGNMENT) ))
+#define MONGO_COMPILER_ALIGN_TYPE(ALIGNMENT) __attribute__((__aligned__(ALIGNMENT)))
 
-#define MONGO_COMPILER_ALIGN_VARIABLE(ALIGNMENT) __attribute__(( __aligned__(ALIGNMENT) ))
+#define MONGO_COMPILER_ALIGN_VARIABLE(ALIGNMENT) __attribute__((__aligned__(ALIGNMENT)))
 
 // NOTE(schwerin): These visibility and calling-convention macro definitions assume we're not using
 // GCC/CLANG to target native Windows. If/when we decide to do such targeting, we'll need to change
@@ -58,9 +80,13 @@
 // #endif
 // #else ... fall through to the definitions below.
 
-#define MONGO_COMPILER_API_EXPORT __attribute__(( __visibility__("default") ))
+#define MONGO_COMPILER_API_EXPORT __attribute__((__visibility__("default")))
 #define MONGO_COMPILER_API_IMPORT
 #define MONGO_COMPILER_API_CALLING_CONVENTION
 
 #define MONGO_likely(x) static_cast<bool>(__builtin_expect(static_cast<bool>(x), 1))
 #define MONGO_unlikely(x) static_cast<bool>(__builtin_expect(static_cast<bool>(x), 0))
+
+#define MONGO_COMPILER_ALWAYS_INLINE [[gnu::always_inline]]
+
+#define MONGO_COMPILER_UNREACHABLE __builtin_unreachable()

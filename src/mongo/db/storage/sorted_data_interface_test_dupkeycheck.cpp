@@ -30,141 +30,141 @@
 
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
-    using boost::scoped_ptr;
+// Insert a key and verify that dupKeyCheck() returns a non-OK status for
+// the same key. When dupKeyCheck() is called with the exact (key, RecordId)
+// pair that was inserted, it should still return an OK status.
+TEST(SortedDataInterface, DupKeyCheckAfterInsert) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
 
-    // Insert a key and verify that dupKeyCheck() returns a non-OK status for
-    // the same key. When dupKeyCheck() is called with the exact (key, RecordId)
-    // pair that was inserted, it should still return an OK status.
-    TEST( SortedDataInterface, DupKeyCheckAfterInsert ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
 
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, false ) );
-                uow.commit();
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->dupKeyCheck( opCtx.get(), key1, loc1 ) );
-                ASSERT_NOT_OK( sorted->dupKeyCheck( opCtx.get(), key1, RecordId::min() ) );
-                uow.commit();
-            }
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, false));
+            uow.commit();
         }
     }
 
-    // Verify that dupKeyCheck() returns an OK status for a key that does
-    // not exist in the index.
-    TEST( SortedDataInterface, DupKeyCheckEmpty ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
 
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->dupKeyCheck(opCtx.get(), key1, loc1));
+            ASSERT_NOT_OK(sorted->dupKeyCheck(opCtx.get(), key1, RecordId::min()));
+            uow.commit();
         }
+    }
+}
 
+// Verify that dupKeyCheck() returns an OK status for a key that does
+// not exist in the index.
+TEST(SortedDataInterface, DupKeyCheckEmpty) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->dupKeyCheck( opCtx.get(), key1, loc1 ) );
-                uow.commit();
-            }
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->dupKeyCheck(opCtx.get(), key1, loc1));
+            uow.commit();
+        }
+    }
+}
+
+// Insert a key and verify that dupKeyCheck() acknowledges the duplicate key, even
+// when the insert key is located at a RecordId that comes after the one specified.
+TEST(SortedDataInterface, DupKeyCheckWhenDiskLocBefore) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
+            uow.commit();
         }
     }
 
-    // Insert a key and verify that dupKeyCheck() acknowledges the duplicate key, even
-    // when the insert key is located at a RecordId that comes after the one specified.
-    TEST( SortedDataInterface, DupKeyCheckWhenDiskLocBefore ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
 
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_NOT_OK(sorted->dupKeyCheck(opCtx.get(), key1, RecordId::min()));
+            uow.commit();
         }
+    }
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                uow.commit();
-            }
-        }
+// Insert a key and verify that dupKeyCheck() acknowledges the duplicate key, even
+// when the insert key is located at a RecordId that comes before the one specified.
+TEST(SortedDataInterface, DupKeyCheckWhenDiskLocAfter) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
 
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_NOT_OK( sorted->dupKeyCheck( opCtx.get(), key1, RecordId::min() ) );
-                uow.commit();
-            }
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
+            uow.commit();
         }
     }
 
-    // Insert a key and verify that dupKeyCheck() acknowledges the duplicate key, even
-    // when the insert key is located at a RecordId that comes before the one specified.
-    TEST( SortedDataInterface, DupKeyCheckWhenDiskLocAfter ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                uow.commit();
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_NOT_OK( sorted->dupKeyCheck( opCtx.get(), key1, RecordId::max() ) );
-                uow.commit();
-            }
-        }
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
     }
 
-} // namespace mongo
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_NOT_OK(sorted->dupKeyCheck(opCtx.get(), key1, RecordId::max()));
+            uow.commit();
+        }
+    }
+}
+
+}  // namespace
+}  // namespace mongo

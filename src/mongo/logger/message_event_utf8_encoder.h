@@ -36,50 +36,85 @@
 namespace mongo {
 namespace logger {
 
+typedef void (*DateFormatter)(std::ostream&, Date_t);
+
+/**
+ * This is the logging context for the MessageEventDetailsEncoder below.  It actively controls how
+ * the output is encoded. As of now, there can be only one.
+ */
+struct LogContext {
+    static constexpr int kDefaultMaxLogSizeKB = 10;
+
+    LogContext();
+
+    DateFormatter _dateFormatter;
+    const AtomicWord<int>* _maxLogSizeSource;
+};
+
+/**
+ * Encoder that writes log messages of the style that MongoDB writes to console and files.
+ */
+class MessageEventDetailsEncoder : public Encoder<MessageEventEphemeral> {
+public:
     /**
-     * Encoder that writes log messages of the style that MongoDB writes to console and files.
+     * Sets the date formatter function for all instances of MessageEventDetailsEncoder.
+     *
+     * Only and always safe to call during single-threaded execution, as in during start-up
+     * intiailization.
      */
-    class MessageEventDetailsEncoder : public Encoder<MessageEventEphemeral> {
-    public:
-        typedef void (*DateFormatter)(std::ostream&, Date_t);
-
-        /**
-         * Sets the date formatter function for all instances of MessageEventDetailsEncoder.
-         *
-         * Only and always safe to call during single-threaded execution, as in during start-up
-         * intiailization.
-         */
-        static void setDateFormatter(DateFormatter dateFormatter);
-
-        /**
-         * Gets the date formatter function in use by instances of MessageEventDetailsEncoder.
-         *
-         * Always safe to call.
-         */
-        static DateFormatter getDateFormatter();
-
-        virtual ~MessageEventDetailsEncoder();
-        virtual std::ostream& encode(const MessageEventEphemeral& event, std::ostream& os);
-    };
-
-    /**
-     * Encoder that generates log messages suitable for syslog.
-     */
-    class MessageEventWithContextEncoder : public Encoder<MessageEventEphemeral> {
-    public:
-        virtual ~MessageEventWithContextEncoder();
-        virtual std::ostream& encode(const MessageEventEphemeral& event, std::ostream& os);
-    };
-
+    static void setDateFormatter(DateFormatter dateFormatter);
 
     /**
-     * Encoder that generates log messages containing only the raw text of the message.
+     * Gets the date formatter function in use by instances of MessageEventDetailsEncoder.
+     *
+     * Always safe to call.
      */
-    class MessageEventUnadornedEncoder : public Encoder<MessageEventEphemeral> {
-    public:
-        virtual ~MessageEventUnadornedEncoder();
-        virtual std::ostream& encode(const MessageEventEphemeral& event, std::ostream& os);
-    };
+    static DateFormatter getDateFormatter();
+
+    /**
+     * Sets a static wrapper to track an atomic variable reference
+     *
+     * Only safe to call once during single-threaded execution, as in during start-up
+     * initialization.
+     */
+    static void setMaxLogSizeKBSource(const AtomicWord<int>& source);
+
+    /**
+     * Loads a max log size from the reference set above. If no reference has been set, it returns
+     * the default. Note that this has to be an atomic operation, cache values when possible.
+     *
+     * Always safe to call.
+     */
+    static int getMaxLogSizeKB();
+
+    virtual ~MessageEventDetailsEncoder();
+    virtual std::ostream& encode(const MessageEventEphemeral& event, std::ostream& os);
+
+private:
+    /**
+     * Grab the singleton LogContext
+     */
+    static LogContext& getGlobalLogContext();
+};
+
+/**
+ * Encoder that generates log messages suitable for syslog.
+ */
+class MessageEventWithContextEncoder : public Encoder<MessageEventEphemeral> {
+public:
+    virtual ~MessageEventWithContextEncoder();
+    virtual std::ostream& encode(const MessageEventEphemeral& event, std::ostream& os);
+};
+
+
+/**
+ * Encoder that generates log messages containing only the raw text of the message.
+ */
+class MessageEventUnadornedEncoder : public Encoder<MessageEventEphemeral> {
+public:
+    virtual ~MessageEventUnadornedEncoder();
+    virtual std::ostream& encode(const MessageEventEphemeral& event, std::ostream& os);
+};
 
 }  // namespace logger
 }  // namespace mongo

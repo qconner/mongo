@@ -1,12 +1,11 @@
 // Test copyDatabase command inside a sharded cluster with and without auth.  Tests with auth are
 // currently disabled due to SERVER-13080.
+// @tags: [requires_sharding, requires_replication]
 
 var baseName = "jstests_clone_copyauth_between_shards";
 
 function copydbWithinShardedCluster(useReplSets, passCredentials, useAuth) {
-    var clusterConfig = {shards : 1,
-                         mongos : 1,
-                         config : 1 };
+    var clusterConfig = {shards: 1, mongos: 1, config: 1};
 
     if (useAuth) {
         clusterConfig.auth = "";
@@ -25,7 +24,9 @@ function copydbWithinShardedCluster(useReplSets, passCredentials, useAuth) {
 
     if (useAuth) {
         mongos.getDB("admin").createUser({user: "super", pwd: "super", roles: ["root"]});
-        assert.throws(function() { mongos.getDB("test1")["test1"].findOne(); });
+        assert.throws(function() {
+            mongos.getDB("test1")["test1"].findOne();
+        });
         mongos.getDB("admin").auth("super", "super");
     }
 
@@ -36,9 +37,9 @@ function copydbWithinShardedCluster(useReplSets, passCredentials, useAuth) {
 
     // The copyDatabase command acts differently depending on whether we pass username and password
     if (passCredentials) {
-        var result = mongos.getDB('admin').copyDatabase('test1', 'test2', undefined, "super", "super");
-    }
-    else {
+        var result =
+            mongos.getDB('admin').copyDatabase('test1', 'test2', undefined, "super", "super");
+    } else {
         var result = mongos.getDB('admin').copyDatabase('test1', 'test2');
     }
     printjson(result);
@@ -49,10 +50,10 @@ function copydbWithinShardedCluster(useReplSets, passCredentials, useAuth) {
 }
 
 // SERVER-13080
-//copydbWithinShardedCluster(true, true, true);
-//copydbWithinShardedCluster(false, true, true);
-//copydbWithinShardedCluster(true, false, true);
-//copydbWithinShardedCluster(false, false, true);
+// copydbWithinShardedCluster(true, true, true);
+// copydbWithinShardedCluster(false, true, true);
+// copydbWithinShardedCluster(true, false, true);
+// copydbWithinShardedCluster(false, false, true);
 copydbWithinShardedCluster(true, false, false);
 copydbWithinShardedCluster(false, false, false);
 

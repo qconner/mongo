@@ -29,114 +29,122 @@
 #include "mongo/db/storage/mmap_v1/record_access_tracker.h"
 
 #include "mongo/db/storage/mmap_v1/record.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 
 using namespace mongo;
 
 namespace {
 
-    const void* pointerOf(int data) {
-        return reinterpret_cast<const void*>(data);
-    }
+const std::unique_ptr<ClockSource> clock = stdx::make_unique<ClockSourceMock>();
 
-    TEST(RecordAccessTrackerTest, TouchRecordTwice) {
-        RecordAccessTracker tracker;
-        tracker.disableSystemBlockInMemCheck();
+const void* pointerOf(int data) {
+#pragma warning(push)
+// C4312: 'reinterpret_cast': conversion from 'int' to 'const void *' of greater size
+#pragma warning(disable : 4312)
+    return reinterpret_cast<const void*>(data);
+#pragma warning(pop)
+}
 
-        const void* record = pointerOf(0x10003);
+TEST(RecordAccessTrackerTest, TouchRecordTwice) {
+    RecordAccessTracker tracker(clock.get());
+    tracker.disableSystemBlockInMemCheck();
 
-        ASSERT_FALSE(tracker.checkAccessedAndMark(record));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(record));
-    }
+    const void* record = pointerOf(0x10003);
 
-    TEST(RecordAccessTrackerTest, TouchPageTwice) {
-        RecordAccessTracker tracker;
-        tracker.disableSystemBlockInMemCheck();
+    ASSERT_FALSE(tracker.checkAccessedAndMark(record));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(record));
+}
 
-        const void* firstRecord = pointerOf(0x10003);
-        const void* secondRecord = pointerOf(0x10004);
+TEST(RecordAccessTrackerTest, TouchPageTwice) {
+    RecordAccessTracker tracker(clock.get());
+    tracker.disableSystemBlockInMemCheck();
 
-        ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecord));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecord));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(firstRecord));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecord));
-    }
+    const void* firstRecord = pointerOf(0x10003);
+    const void* secondRecord = pointerOf(0x10004);
 
-    TEST(RecordAccessTrackerTest, TouchTwoPagesTwice) {
-        RecordAccessTracker tracker;
-        tracker.disableSystemBlockInMemCheck();
+    ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecord));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecord));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(firstRecord));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecord));
+}
 
-        const void* firstRecordFirstPage = pointerOf(0x11000);
-        const void* secondRecordFirstPage = pointerOf(0x11100);
+TEST(RecordAccessTrackerTest, TouchTwoPagesTwice) {
+    RecordAccessTracker tracker(clock.get());
+    tracker.disableSystemBlockInMemCheck();
 
-        const void* firstRecordSecondPage = pointerOf(0x12000);
-        const void* secondRecordSecondPage = pointerOf(0x12100);
+    const void* firstRecordFirstPage = pointerOf(0x11000);
+    const void* secondRecordFirstPage = pointerOf(0x11100);
 
-        ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordFirstPage));
-        ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordSecondPage));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordFirstPage));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordSecondPage));
-    }
+    const void* firstRecordSecondPage = pointerOf(0x12000);
+    const void* secondRecordSecondPage = pointerOf(0x12100);
 
-    // Tests RecordAccessTracker::reset().
-    TEST(RecordAccessTrackerTest, TouchTwoPagesTwiceWithReset) {
-        RecordAccessTracker tracker;
-        tracker.disableSystemBlockInMemCheck();
+    ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordFirstPage));
+    ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordSecondPage));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordFirstPage));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordSecondPage));
+}
 
-        const void* firstRecordFirstPage = pointerOf(0x11000);
-        const void* secondRecordFirstPage = pointerOf(0x11100);
+// Tests RecordAccessTracker::reset().
+TEST(RecordAccessTrackerTest, TouchTwoPagesTwiceWithReset) {
+    RecordAccessTracker tracker(clock.get());
+    tracker.disableSystemBlockInMemCheck();
 
-        const void* firstRecordSecondPage = pointerOf(0x12000);
-        const void* secondRecordSecondPage = pointerOf(0x12100);
+    const void* firstRecordFirstPage = pointerOf(0x11000);
+    const void* secondRecordFirstPage = pointerOf(0x11100);
 
-        ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordFirstPage));
-        ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordSecondPage));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordFirstPage));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordSecondPage));
+    const void* firstRecordSecondPage = pointerOf(0x12000);
+    const void* secondRecordSecondPage = pointerOf(0x12100);
 
-        // Now reset and make sure things look as though we have a fresh RecordAccessTracker.
-        tracker.reset();
-        ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordFirstPage));
-        ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordSecondPage));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordFirstPage));
-        ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordSecondPage));
-    }
+    ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordFirstPage));
+    ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordSecondPage));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordFirstPage));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordSecondPage));
 
-    // Tests RecordAccessTracker::markAccessed().
-    TEST(RecordAccessTrackerTest, AccessTest) {
-        RecordAccessTracker tracker;
-        tracker.disableSystemBlockInMemCheck();
+    // Now reset and make sure things look as though we have a fresh RecordAccessTracker.
+    tracker.reset();
+    ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordFirstPage));
+    ASSERT_FALSE(tracker.checkAccessedAndMark(firstRecordSecondPage));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordFirstPage));
+    ASSERT_TRUE(tracker.checkAccessedAndMark(secondRecordSecondPage));
+}
 
-        // Mark the first page in superpage 3 as accessed.
-        const void* record = pointerOf(0x30000);
-        tracker.markAccessed(record);
+// Tests RecordAccessTracker::markAccessed().
+TEST(RecordAccessTrackerTest, AccessTest) {
+    RecordAccessTracker tracker(clock.get());
+    tracker.disableSystemBlockInMemCheck();
 
-        // Test that all remaining addresses in the page give true when asked whether they are
-        // recently accessed.
-        for (int i = 0x30001; i < 0x31000; i++) {
-            const void* touchedPageRecord = pointerOf(i);
-            ASSERT_TRUE(tracker.checkAccessedAndMark(touchedPageRecord));
-        }
-    }
+    // Mark the first page in superpage 3 as accessed.
+    const void* record = pointerOf(0x30000);
+    tracker.markAccessed(record);
 
-    // Touch pages in 128 separate superpages, and make sure that they all are reported as
+    // Test that all remaining addresses in the page give true when asked whether they are
     // recently accessed.
-    TEST(RecordAccessTrackerTest, Access128Superpages) {
-        RecordAccessTracker tracker;
-        tracker.disableSystemBlockInMemCheck();
-
-        // Touch the pages.
-        for (int i = 0x00000; i < 0x800000; i += 0x10000) {
-            const void* touchedPageRecord = pointerOf(i);
-            tracker.markAccessed(touchedPageRecord);
-        }
-
-        // Ensure we know that the pages have all been touched.
-        for (int i = 0x00000; i < 0x800000; i += 0x10000) {
-            // It should be fine if there is an offset of, say, 0xA, into the page.
-            const void* touchedPageRecord = pointerOf(i + 0xA);
-            ASSERT_TRUE(tracker.checkAccessedAndMark(touchedPageRecord));
-        }
+    for (int i = 0x30001; i < 0x31000; i++) {
+        const void* touchedPageRecord = pointerOf(i);
+        ASSERT_TRUE(tracker.checkAccessedAndMark(touchedPageRecord));
     }
+}
+
+// Touch pages in 128 separate superpages, and make sure that they all are reported as
+// recently accessed.
+TEST(RecordAccessTrackerTest, Access128Superpages) {
+    RecordAccessTracker tracker(clock.get());
+    tracker.disableSystemBlockInMemCheck();
+
+    // Touch the pages.
+    for (int i = 0x00000; i < 0x800000; i += 0x10000) {
+        const void* touchedPageRecord = pointerOf(i);
+        tracker.markAccessed(touchedPageRecord);
+    }
+
+    // Ensure we know that the pages have all been touched.
+    for (int i = 0x00000; i < 0x800000; i += 0x10000) {
+        // It should be fine if there is an offset of, say, 0xA, into the page.
+        const void* touchedPageRecord = pointerOf(i + 0xA);
+        ASSERT_TRUE(tracker.checkAccessedAndMark(touchedPageRecord));
+    }
+}
 
 }  // namespace

@@ -34,8 +34,10 @@
 #include "mongo/base/init.h"
 #include "mongo/util/processinfo.h"
 
-#include <iostream>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
 #include <fstream>
+#include <iostream>
 
 #include "mongo/util/log.h"
 
@@ -43,47 +45,51 @@ using namespace std;
 
 namespace mongo {
 
-    class PidFileWiper {
-    public:
-        ~PidFileWiper() {
-            if (path.empty()) {
-                return;
+class PidFileWiper {
+public:
+    ~PidFileWiper() {
+        if (path.empty()) {
+            return;
+        }
+
+        ofstream out(path.c_str(), ios_base::out);
+        out.close();
+    }
+
+    bool write(const boost::filesystem::path& p) {
+        path = p;
+        ofstream out(path.c_str(), ios_base::out);
+        out << ProcessId::getCurrent() << endl;
+        if (!out.good()) {
+            auto errAndStr = errnoAndDescription();
+            if (errAndStr.first == 0) {
+                log() << "ERROR: Cannot write pid file to " << path.string()
+                      << ": Unable to determine OS error";
+            } else {
+                log() << "ERROR: Cannot write pid file to " << path.string() << ": "
+                      << errAndStr.second;
             }
-
-            ofstream out( path.c_str() , ios_base::out );
-            out.close();
+        } else {
+            boost::system::error_code ec;
+            boost::filesystem::permissions(
+                path,
+                boost::filesystem::owner_read | boost::filesystem::owner_write |
+                    boost::filesystem::group_read | boost::filesystem::others_read,
+                ec);
+            if (ec) {
+                log() << "Could not set permissions on pid file " << path.string() << ": "
+                      << ec.message();
+                return false;
+            }
         }
-
-        bool write( const string& p ) {
-            path = p;
-            ofstream out( path.c_str() , ios_base::out );
-            out << ProcessId::getCurrent() << endl;
-            return out.good();
-        }
-
-        string path;
-    } pidFileWiper;
-
-    bool writePidFile( const string& path ) {
-        bool e = pidFileWiper.write( path );
-        if (!e) {
-            log() << "ERROR: Cannot write pid file to " << path
-                  << ": "<< strerror(errno);
-        }
-        return e;
+        return out.good();
     }
 
-    ProcessInfo::SystemInfo* ProcessInfo::systemInfo = NULL;
+private:
+    boost::filesystem::path path;
+} pidFileWiper;
 
-    void ProcessInfo::initializeSystemInfo() {
-        if (systemInfo == NULL) {
-            systemInfo = new SystemInfo();
-        }
-    }
-
-    MONGO_INITIALIZER(SystemInfo)(InitializerContext* context) {
-        ProcessInfo::initializeSystemInfo();
-        return Status::OK();
-    }
-
+bool writePidFile(const string& path) {
+    return pidFileWiper.write(path);
 }
+}  // namespace mongo

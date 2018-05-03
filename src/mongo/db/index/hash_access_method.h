@@ -32,35 +32,44 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/hasher.h"  // For HashSeed.
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index/btree_based_access_method.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
+class CollatorInterface;
+
+/**
+ * This is the access method for "hashed" indices.
+ */
+class HashAccessMethod : public IndexAccessMethod {
+public:
+    HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+
+private:
     /**
-     * This is the access method for "hashed" indices.
+     * Fills 'keys' with the keys that should be generated for 'obj' on this index.
+     *
+     * This function ignores the 'multikeyPaths' pointer because hashed indexes don't support
+     * tracking path-level multikey information.
      */
-    class HashAccessMethod : public BtreeBasedAccessMethod {
-    public:
-        using BtreeBasedAccessMethod::_descriptor;
+    void doGetKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const final;
 
-        HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
-        virtual ~HashAccessMethod() { }
+    // Only one of our fields is hashed.  This is the field name for it.
+    std::string _hashedField;
 
-    private:
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
+    // _seed defaults to zero.
+    HashSeed _seed;
 
-        // Only one of our fields is hashed.  This is the field name for it.
-        std::string _hashedField;
+    // _hashVersion defaults to zero.
+    int _hashVersion;
 
-        // _seed defaults to zero.
-        HashSeed _seed;
+    BSONObj _missingKey;
 
-        // _hashVersion defaults to zero.
-        int _hashVersion;
-
-        BSONObj _missingKey;
-    };
+    // Null if this index orders strings according to the simple binary compare. If non-null,
+    // represents the collator used to generate index keys for indexed strings.
+    const CollatorInterface* _collator;
+};
 
 }  // namespace mongo

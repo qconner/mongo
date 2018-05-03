@@ -30,35 +30,36 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/index/2d_common.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    class IndexCatalogEntry;
-    class IndexCursor;
-    class IndexDescriptor;
-    struct TwoDIndexingParams;
+class IndexCatalogEntry;
+class IndexDescriptor;
+struct TwoDIndexingParams;
 
-    class TwoDAccessMethod : public BtreeBasedAccessMethod {
-    public:
-        using BtreeBasedAccessMethod::_descriptor;
+class TwoDAccessMethod : public IndexAccessMethod {
+public:
+    TwoDAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
-        TwoDAccessMethod(IndexCatalogEntry* btreeState,
-                         SortedDataInterface* btree);
-        virtual ~TwoDAccessMethod() { }
+private:
+    const IndexDescriptor* getDescriptor() {
+        return _descriptor;
+    }
+    TwoDIndexingParams& getParams() {
+        return _params;
+    }
 
-    private:
+    /**
+     * Fills 'keys' with the keys that should be generated for 'obj' on this index.
+     *
+     * This function ignores the 'multikeyPaths' pointer because 2d indexes don't support tracking
+     * path-level multikey information.
+     */
+    void doGetKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const final;
 
-        const IndexDescriptor* getDescriptor() { return _descriptor; }
-        TwoDIndexingParams& getParams() { return _params; }
-
-        // This really gets the 'locs' from the provided obj.
-        void getKeys(const BSONObj& obj, std::vector<BSONObj>& locs) const;
-
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
-
-        TwoDIndexingParams _params;
-    };
+    TwoDIndexingParams _params;
+};
 
 }  // namespace mongo

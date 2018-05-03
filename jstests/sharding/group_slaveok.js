@@ -1,65 +1,73 @@
-// Tests group using slaveOk
+/**
+ * Tests group using slaveOk.
+ */
 
-var st = new ShardingTest( testName = "groupSlaveOk",
-                           numShards = 1,
-                           verboseLevel = 0,
-                           numMongos = 1,
-                           { rs : true, 
-                             rs0 : { nodes : 2 }
-                           })
+// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-var rst = st._rs[0].test
+(function() {
+    'use strict';
 
-// Insert data into replica set
-var conn = new Mongo( st.s.host )
-conn.setLogLevel( 3 )
+    load("jstests/replsets/rslib.js");
 
-var coll = conn.getCollection( "test.groupSlaveOk" )
-coll.drop()
+    var st = new ShardingTest({shards: 1, mongos: 1, other: {rs: true, rs0: {nodes: 2}}});
+    var rst = st.rs0;
 
-var bulk = coll.initializeUnorderedBulkOp();
-for( var i = 0; i < 300; i++ ){
-    bulk.insert( { i : i % 10 } );
-}
-assert.writeOK( bulk.execute() );
+    // Insert data into replica set
+    var conn = new Mongo(st.s.host);
 
-st.printShardingStatus()
+    var coll = conn.getCollection("test.groupSlaveOk");
+    coll.drop();
 
-// Wait for client to update itself and replication to finish
-rst.awaitReplication()
+    var bulk = coll.initializeUnorderedBulkOp();
+    for (var i = 0; i < 300; i++) {
+        bulk.insert({i: i % 10});
+    }
+    assert.writeOK(bulk.execute());
 
-var primary = rst.getPrimary()
-var sec = rst.getSecondary()
+    // Wait for client to update itself and replication to finish
+    rst.awaitReplication();
 
-// Data now inserted... stop the master, since only two in set, other will still be secondary
-rst.stop(rst.getMaster());
-printjson( rst.status() )
+    var primary = rst.getPrimary();
+    var sec = rst.getSecondary();
 
-// Wait for the mongos to recognize the slave
-ReplSetTest.awaitRSClientHosts( conn, sec, { ok : true, secondary : true } )
+    // Data now inserted... stop the master, since only two in set, other will still be secondary
+    rst.stop(rst.getPrimary());
+    printjson(rst.status());
 
-// Need to check slaveOk=true first, since slaveOk=false will destroy conn in pool when
-// master is down
-conn.setSlaveOk()
+    // Wait for the mongos to recognize the slave
+    awaitRSClientHosts(conn, sec, {ok: true, secondary: true});
 
-// Should not throw exception, since slaveOk'd
-assert.eq( 10, coll.group({ key : { i : true } , 
-                            reduce : function( obj, ctx ){ ctx.count += 1 } ,
-                            initial : { count : 0 } }).length )
+    // Need to check slaveOk=true first, since slaveOk=false will destroy conn in pool when
+    // master is down
+    conn.setSlaveOk();
 
-try {
-   
-    conn.setSlaveOk( false ) 
-    var res = coll.group({ key : { i : true } , 
-                           reduce : function( obj, ctx ){ ctx.count += 1 } ,
-                           initial : { count : 0 } });
+    // Should not throw exception, since slaveOk'd
+    assert.eq(10,
+              coll.group({
+                      key: {i: true},
+                      reduce: function(obj, ctx) {
+                          ctx.count += 1;
+                      },
+                      initial: {count: 0}
+                  })
+                  .length);
 
-    print( "Should not reach here! Group result: " + tojson(res) );
-    assert( false );
-}
-catch( e ){
-    print( "Non-slaveOk'd connection failed." + tojson(e) )
-}
+    try {
+        conn.setSlaveOk(false);
+        var res = coll.group({
+            key: {i: true},
+            reduce: function(obj, ctx) {
+                ctx.count += 1;
+            },
+            initial: {count: 0}
+        });
 
-// Finish
-st.stop()
+        print("Should not reach here! Group result: " + tojson(res));
+        assert(false);
+    } catch (e) {
+        print("Non-slaveOk'd connection failed." + tojson(e));
+    }
+
+    st.stop();
+})();

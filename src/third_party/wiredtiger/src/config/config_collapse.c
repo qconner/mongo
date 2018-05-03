@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -38,14 +38,16 @@ __wt_config_collapse(
 	WT_DECL_ITEM(tmp);
 	WT_DECL_RET;
 
+	*config_ret = NULL;
+
 	WT_RET(__wt_scr_alloc(session, 0, &tmp));
 
-	WT_ERR(__wt_config_init(session, &cparser, cfg[0]));
+	__wt_config_init(session, &cparser, cfg[0]);
 	while ((ret = __wt_config_next(&cparser, &k, &v)) == 0) {
 		if (k.type != WT_CONFIG_ITEM_STRING &&
 		    k.type != WT_CONFIG_ITEM_ID)
 			WT_ERR_MSG(session, EINVAL,
-			    "Invalid configuration key found: '%s'\n", k.str);
+			    "Invalid configuration key found: '%s'", k.str);
 		WT_ERR(__wt_config_get(session, cfg, &k, &v));
 		/* Include the quotes around string keys/values. */
 		if (k.type == WT_CONFIG_ITEM_STRING) {
@@ -59,6 +61,8 @@ __wt_config_collapse(
 		WT_ERR(__wt_buf_catfmt(session, tmp, "%.*s=%.*s,",
 		    (int)k.len, k.str, (int)v.len, v.str));
 	}
+
+	/* We loop until error, and the expected error is WT_NOTFOUND. */
 	if (ret != WT_NOTFOUND)
 		goto err;
 
@@ -90,8 +94,9 @@ err:	__wt_scr_free(session, &tmp);
  * the qsort stable.
  */
 typedef struct {
-	char  *k, *v;				/* key, value */
+	char *k, *v;				/* key, value */
 	size_t gen;				/* generation */
+	bool strip;				/* remove the value */
 } WT_CONFIG_MERGE_ENTRY;
 
 /*
@@ -110,7 +115,7 @@ typedef struct {
  */
 static int
 __config_merge_scan(WT_SESSION_IMPL *session,
-    const char *key, const char *value, WT_CONFIG_MERGE *cp)
+    const char *key, const char *value, bool strip, WT_CONFIG_MERGE *cp)
 {
 	WT_CONFIG cparser;
 	WT_CONFIG_ITEM k, v;
@@ -122,12 +127,12 @@ __config_merge_scan(WT_SESSION_IMPL *session,
 	WT_ERR(__wt_scr_alloc(session, 0, &kb));
 	WT_ERR(__wt_scr_alloc(session, 0, &vb));
 
-	WT_ERR(__wt_config_init(session, &cparser, value));
+	__wt_config_init(session, &cparser, value);
 	while ((ret = __wt_config_next(&cparser, &k, &v)) == 0) {
 		if (k.type != WT_CONFIG_ITEM_STRING &&
 		    k.type != WT_CONFIG_ITEM_ID)
 			WT_ERR_MSG(session, EINVAL,
-			    "Invalid configuration key found: '%s'\n", k.str);
+			    "Invalid configuration key found: '%s'", k.str);
 
 		/* Include the quotes around string keys/values. */
 		if (k.type == WT_CONFIG_ITEM_STRING) {
@@ -180,7 +185,7 @@ __config_merge_scan(WT_SESSION_IMPL *session,
 		if (v.type == WT_CONFIG_ITEM_STRUCT &&
 		    strchr(vb->data, '=') != NULL) {
 			WT_ERR(__config_merge_scan(
-			    session, kb->data, vb->data, cp));
+			    session, kb->data, vb->data, strip, cp));
 			continue;
 		}
 
@@ -193,6 +198,7 @@ __config_merge_scan(WT_SESSION_IMPL *session,
 		WT_ERR(__wt_strndup(session,
 		    vb->data, vb->size, &cp->entries[cp->entries_next].v));
 		cp->entries[cp->entries_next].gen = cp->entries_next;
+		cp->entries[cp->entries_next].strip = strip;
 		++cp->entries_next;
 	}
 	WT_ERR_NOTFOUND_OK(ret);
@@ -222,8 +228,8 @@ __config_merge_format_next(WT_SESSION_IMPL *session, const char *prefix,
     size_t plen, size_t *enp, WT_CONFIG_MERGE *cp, WT_ITEM *build)
 {
 	WT_CONFIG_MERGE_ENTRY *ep;
-	size_t len1, len2, next;
-	char *p;
+	size_t len1, len2, next, saved_len;
+	const char *p;
 
 	for (; *enp < cp->entries_next; ++*enp) {
 		ep = &cp->entries[*enp];
@@ -267,6 +273,9 @@ __config_merge_format_next(WT_SESSION_IMPL *session, const char *prefix,
 		 * new level.
 		 */
 		if ((p = strchr(ep->k + plen, SEPC)) != NULL) {
+			/* Save the start location of the new level. */
+			saved_len = build->size;
+
 			next = WT_PTRDIFF(p, ep->k);
 			WT_RET(__wt_buf_catfmt(session,
 			    build, "%.*s=(", (int)(next - plen), ep->k + plen));
@@ -274,8 +283,21 @@ __config_merge_format_next(WT_SESSION_IMPL *session, const char *prefix,
 			    session, ep->k, next + 1, enp, cp, build));
 			__strip_comma(build);
 			WT_RET(__wt_buf_catfmt(session, build, "),"));
+
+			/*
+			 * It's possible the level contained nothing, check and
+			 * discard empty levels.
+			 */
+			p = build->data;
+			if (p[build->size - 3] == '(')
+				build->size = saved_len;
+
 			continue;
 		}
+
+		/* Discard flagged entries. */
+		if (ep->strip)
+			continue;
 
 		/* Append the entry to the buffer. */
 		WT_RET(__wt_buf_catfmt(
@@ -314,7 +336,7 @@ err:	__wt_scr_free(session, &build);
  * __config_merge_cmp --
  *	Qsort function: sort the config merge array.
  */
-static int
+static int WT_CDECL
 __config_merge_cmp(const void *a, const void *b)
 {
 	WT_CONFIG_MERGE_ENTRY *ae, *be;
@@ -330,23 +352,27 @@ __config_merge_cmp(const void *a, const void *b)
 
 /*
  * __wt_config_merge --
- *	Merge a set of configuration strings into newly allocated memory.
+ *	Merge a set of configuration strings into newly allocated memory,
+ * optionally discarding configuration items.
  *
  * This function takes a NULL-terminated list of configuration strings (where
  * the values are in order from least to most preferred), and merges them into
  * newly allocated memory.  The algorithm is to walk the configuration strings
  * and build a table of each key/value pair. The pairs are sorted based on the
  * name and the configuration string in which they were found, and a final
- * configuration string is built from the result.
+ * configuration string is built from the result. Additionally, a configuration
+ * string can be specified and those configuration values are removed from the
+ * final string.
  *
  * Note:
- *	Nested structures are parsed and merge. For example, if configuration
+ *	Nested structures are parsed and merged. For example, if configuration
  *	strings "key=(k1=v1,k2=v2)" and "key=(k1=v2)" appear, the result will
  *	be "key=(k1=v2,k2=v2)" because the nested values are merged.
  */
 int
-__wt_config_merge(
-    WT_SESSION_IMPL *session, const char **cfg, const char **config_ret)
+__wt_config_merge(WT_SESSION_IMPL *session,
+    const char **cfg, const char *cfg_strip, const char **config_ret)
+    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	WT_CONFIG_MERGE merge;
 	WT_DECL_RET;
@@ -358,9 +384,16 @@ __wt_config_merge(
 	WT_RET(__wt_realloc_def(
 	    session, &merge.entries_allocated, 100, &merge.entries));
 
-	/* Scan the configuration strings, entering them into the array. */
+	/*
+	 * Scan the configuration strings, entering them into the array. The
+	 * list of configuration values to be removed must be scanned last
+	 * so their generation numbers are the highest.
+	 */
 	for (; *cfg != NULL; ++cfg)
-		WT_ERR(__config_merge_scan(session, NULL, *cfg, &merge));
+		WT_ERR(__config_merge_scan(session, NULL, *cfg, false, &merge));
+	if (cfg_strip != NULL)
+		WT_ERR(__config_merge_scan(
+		    session, NULL, cfg_strip, true, &merge));
 
 	/*
 	 * Sort the array by key and, in the case of identical keys, by

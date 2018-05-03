@@ -31,13 +31,29 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/init.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 
+#include <memory>
+
 namespace mongo {
+namespace {
 
-    // static
-    bool WiredTigerKVEngine::initRsOplogBackgroundThread(StringData ns) {
-        return false;
-    }
+bool initRsOplogBackgroundThread(StringData ns) {
+    return NamespaceString::oplog(ns);
+}
 
+MONGO_INITIALIZER(SetInitRsOplogBackgroundThreadCallback)(InitializerContext* context) {
+    WiredTigerKVEngine::setInitRsOplogBackgroundThreadCallback(initRsOplogBackgroundThread);
+    return Status::OK();
+}
+
+ServiceContextRegistrar serviceContextCreator([]() {
+    return std::make_unique<ServiceContextNoop>();
+});
+}  // namespace
 }  // namespace mongo

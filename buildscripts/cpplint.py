@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # Copyright (c) 2009 Google Inc. All rights reserved.
 #
@@ -190,6 +190,7 @@ _ERROR_CATEGORIES = [
   'build/printf_format',
   'build/storage_class',
   'legal/copyright',
+  'mongo/polyfill',
   'readability/alt_tokens',
   'readability/braces',
   'readability/casting',
@@ -1610,6 +1611,70 @@ def ReverseCloseExpression(clean_lines, linenum, pos):
   # Did not find start of expression before beginning of file, give up
   return (line, 0, -1)
 
+def make_polyfill_regex():
+  polyfill_required_names = [
+    '_',
+    'adopt_lock',
+    'async',
+    'chrono',
+    'condition_variable',
+    'condition_variable_any',
+    'cv_status',
+    'defer_lock',
+    'future',
+    'future_status',
+    'launch',
+    'lock_guard',
+    'mutex',
+    'notify_all_at_thread_exit',
+    'packaged_task',
+    'promise',
+    'recursive_mutex',
+    'shared_lock,',
+    'shared_mutex',
+    'shared_timed_mutex',
+    'this_thread(?!::at_thread_exit)',
+    'thread',
+    'timed_mutex',
+    'try_to_lock',
+    'unique_lock',
+    'unordered_map',
+    'unordered_multimap',
+    'unordered_multiset',
+    'unordered_set',
+  ]
+
+  qualified_names = ['boost::' + name + "\\b" for name in polyfill_required_names]
+  qualified_names.extend('std::' + name  + "\\b" for name in polyfill_required_names)
+  qualified_names_regex = '|'.join(qualified_names)
+  return re.compile(qualified_names_regex)
+_RE_PATTERN_MONGO_POLYFILL=make_polyfill_regex()
+
+def CheckForMongoPolyfill(filename, clean_lines, linenum, error):
+  line = clean_lines.elided[linenum]
+  if re.search(_RE_PATTERN_MONGO_POLYFILL, line):
+    error(filename, linenum, 'mongodb/polyfill', 5,
+          'Illegal use of banned name from std::/boost::, use mongo::stdx:: variant instead')
+
+def CheckForMongoAtomic(filename, clean_lines, linenum, error):
+  line = clean_lines.elided[linenum]
+  if re.search('std::atomic', line):
+    error(filename, linenum, 'mongodb/stdatomic', 5,
+          'Illegal use of prohibited std::atomic<T>, use AtomicWord<T> or other types '
+          'from "mongo/platform/atomic_word.h"')
+
+def CheckForMongoVolatile(filename, clean_lines, linenum, error):
+  line = clean_lines.elided[linenum]
+  if re.search('[^_]volatile', line) and not "__asm__" in line:
+    error(filename, linenum, 'mongodb/volatile', 5,
+          'Illegal use of the volatile storage keyword, use AtomicWord instead '
+          'from "mongo/platform/atomic_word.h"')
+
+def CheckForNonMongoAssert(filename, clean_lines, linenum, error):
+  line = clean_lines.elided[linenum]
+  if re.search(r'\bassert\s*\(', line):
+    error(filename, linenum, 'mongodb/assert', 5,
+          'Illegal use of the bare assert function, use a function from assert_utils.h instead.')
 
 def CheckForCopyright(filename, lines, error):
   """Logs an error if no Copyright message appears at the top of the file."""
@@ -5752,6 +5817,10 @@ def ProcessLine(filename, file_extension, clean_lines, line,
   nesting_state.Update(filename, clean_lines, line, error)
   CheckForNamespaceIndentation(filename, nesting_state, clean_lines, line,
                                error)
+  CheckForMongoPolyfill(filename, clean_lines, line, error)
+  CheckForMongoAtomic(filename, clean_lines, line, error)
+  CheckForMongoVolatile(filename, clean_lines, line, error)
+  CheckForNonMongoAssert(filename, clean_lines, line, error)
   if nesting_state.InAsmBlock(): return
   CheckForFunctionLengths(filename, clean_lines, line, function_state, error)
   CheckForMultilineCommentsAndStrings(filename, clean_lines, line, error)

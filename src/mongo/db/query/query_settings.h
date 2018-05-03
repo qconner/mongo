@@ -28,118 +28,128 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
-#include <vector>
-#include <boost/thread/mutex.hpp>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_entry.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/db/query/plan_cache.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
-    /**
-     * Holds allowed indices.
-     */
-    class AllowedIndices {
-    private:
-        MONGO_DISALLOW_COPYING(AllowedIndices);
-    public:
-        AllowedIndices(const std::vector<BSONObj>& indexKeyPatterns);
-        ~AllowedIndices();
+/**
+ * Filter indicating whether an index entry is in the set of allowed indices.
+ */
+class AllowedIndicesFilter {
+private:
+    MONGO_DISALLOW_COPYING(AllowedIndicesFilter);
 
-        // These are the index key patterns that
-        // we will use to override the indexes retrieved from
-        // the index catalog.
-        std::vector<BSONObj> indexKeyPatterns;
-    };
+public:
+    AllowedIndicesFilter(const BSONObjSet& indexKeyPatterns,
+                         const stdx::unordered_set<std::string>& indexNames);
+    AllowedIndicesFilter(AllowedIndicesFilter&& other) = default;
+
+    AllowedIndicesFilter& operator=(AllowedIndicesFilter&& other) = default;
 
     /**
-     * Value type for query settings.
-     * Holds:
-     *     query shape (query, sort, projection)
-     *     vector of index specs
+     * Returns true if entry is allowed by the filter either because it has a matching key pattern
+     * or index name, and returns false otherwise.
      */
-    class AllowedIndexEntry {
-    private:
-        MONGO_DISALLOW_COPYING(AllowedIndexEntry);
-    public:
-        AllowedIndexEntry(const BSONObj& query, const BSONObj& sort,
-                          const BSONObj& projection,
-                          const std::vector<BSONObj>& indexKeyPatterns);
-        ~AllowedIndexEntry();
-        AllowedIndexEntry* clone() const;
+    bool allows(const IndexEntry& entry) const {
+        return indexKeyPatterns.find(entry.keyPattern) != indexKeyPatterns.end() ||
+            indexNames.find(entry.name) != indexNames.end();
+    }
 
-        // _query, _sort and _projection collectively
-        // represent the query shape that we are storing hint overrides for.
-        BSONObj query;
-        BSONObj sort;
-        BSONObj projection;
+    // These are the index key patterns and names that
+    // we will use to override the indexes retrieved from
+    // the index catalog.
+    BSONObjSet indexKeyPatterns;
+    stdx::unordered_set<std::string> indexNames;
+};
 
-        // These are the index key patterns that
-        // we will use to override the indexes retrieved from
-        // the index catalog.
-        std::vector<BSONObj> indexKeyPatterns;
-    };
+/**
+ * Value type for query settings.
+ * Holds:
+ *     query shape (query, sort, projection, collation)
+ *     unordered_set of index specs
+ */
+class AllowedIndexEntry {
+public:
+    AllowedIndexEntry(const BSONObj& query,
+                      const BSONObj& sort,
+                      const BSONObj& projection,
+                      const BSONObj& collation,
+                      const BSONObjSet& indexKeyPatterns,
+                      const stdx::unordered_set<std::string>& indexNames);
+
+    // query, sort, projection, and collation collectively represent the query shape that we are
+    // storing hint overrides for.
+    BSONObj query;
+    BSONObj sort;
+    BSONObj projection;
+    BSONObj collation;
+
+    // These are the index key patterns and names that
+    // we will use to override the indexes retrieved from
+    // the index catalog.
+    BSONObjSet indexKeyPatterns;
+    stdx::unordered_set<std::string> indexNames;
+};
+
+/**
+ * Holds the index filters in a collection.
+ */
+class QuerySettings {
+private:
+    MONGO_DISALLOW_COPYING(QuerySettings);
+
+public:
+    QuerySettings() = default;
 
     /**
-     * Holds the index filters in a collection.
+     * Returns AllowedIndicesFilter for the query if it is set in the query settings, or
+     * boost::none if it isn't.
      */
-    class QuerySettings {
-    private:
-        MONGO_DISALLOW_COPYING(QuerySettings);
-    public:
-        QuerySettings();
+    boost::optional<AllowedIndicesFilter> getAllowedIndicesFilter(const PlanCacheKey& query) const;
 
-        ~QuerySettings();
+    /**
+     * Returns copies of all overrides for the collection.
+     */
+    std::vector<AllowedIndexEntry> getAllAllowedIndices() const;
 
-        /**
-         * Returns true and fills out allowedIndicesOut if a hint is set in the query settings
-         * for the query.
-         * Returns false and sets allowedIndicesOut to NULL otherwise.
-         * Caller owns AllowedIndices.
-         */
-        bool getAllowedIndices(const CanonicalQuery& query,
-                               AllowedIndices** allowedIndicesOut) const;
+    /**
+     * Adds or replaces entry in query settings.
+     * If existing entry is found for the same key, replaces it.
+     */
+    void setAllowedIndices(const CanonicalQuery& canonicalQuery,
+                           const PlanCacheKey& key,
+                           const BSONObjSet& indexKeyPatterns,
+                           const stdx::unordered_set<std::string>& indexNames);
 
-        /**
-         * Returns copies all overrides for the collection..
-         * Caller owns overrides in vector.
-         */
-        std::vector<AllowedIndexEntry*> getAllAllowedIndices() const;
+    /**
+     * Removes single entry from query settings. No effect if query shape is not found.
+     */
+    void removeAllowedIndices(const PlanCacheKey& canonicalQuery);
 
-        /**
-         * Adds or replaces entry in query settings.
-         * If existing entry is found for the same key,
-         * frees resources for existing entry before replacing.
-         */
-        void setAllowedIndices(const CanonicalQuery& canonicalQuery,
-                               const std::vector<BSONObj>& indexes);
+    /**
+     * Clears all allowed indices from query settings.
+     */
+    void clearAllowedIndices();
 
-        /**
-         * Removes single entry from query settings. No effect if query shape is not found.
-         */
-        void removeAllowedIndices(const CanonicalQuery& canonicalQuery);
+private:
+    // Allowed index entries owned here.
+    using AllowedIndexEntryMap = stdx::unordered_map<PlanCacheKey, AllowedIndexEntry>;
+    AllowedIndexEntryMap _allowedIndexEntryMap;
 
-        /**
-         * Clears all allowed indices from query settings.
-         */
-        void clearAllowedIndices();
-
-    private:
-        /**
-         * Clears entries without acquiring mutex.
-         */
-        void _clear();
-
-        typedef unordered_map<PlanCacheKey, AllowedIndexEntry*> AllowedIndexEntryMap;
-        AllowedIndexEntryMap _allowedIndexEntryMap;
-
-        /**
-         * Protects data in query settings.
-         */
-        mutable boost::mutex _mutex;
-    };
+    /**
+     * Protects data in query settings.
+     */
+    mutable stdx::mutex _mutex;
+};
 
 }  // namespace mongo

@@ -28,77 +28,85 @@
 
 #pragma once
 
-#include <boost/optional/optional.hpp>
 #include <boost/intrusive_ptr.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/weak_ptr.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/record_id.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
+/**
+ * Stage for pulling results out from an aggregation pipeline.
+ */
+class PipelineProxyStage final : public PlanStage {
+public:
+    PipelineProxyStage(OperationContext* opCtx,
+                       std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
+                       WorkingSet* ws);
+
+    PlanStage::StageState doWork(WorkingSetID* out) final;
+
+    bool isEOF() final;
+
+    //
+    // Manage our OperationContext.
+    //
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+
+    // Returns empty PlanStageStats object
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    // Not used.
+    SpecificStats* getSpecificStats() const final {
+        MONGO_UNREACHABLE;
+    }
+
+    void doInvalidate(OperationContext* opCtx, const RecordId& rid, InvalidationType type) final {
+        // A PlanExecutor with a PipelineProxyStage should be registered with the global cursor
+        // manager, so should not receive invalidations.
+        MONGO_UNREACHABLE;
+    }
+
     /**
-     * Stage for pulling results out from an aggregation pipeline.
+     * Pass through the last oplog timestamp from the proxied pipeline.
      */
-    class PipelineProxyStage : public PlanStage {
-    public:
-        PipelineProxyStage(boost::intrusive_ptr<Pipeline> pipeline,
-                           const boost::shared_ptr<PlanExecutor>& child,
-                           WorkingSet* ws);
+    Timestamp getLatestOplogTimestamp() const;
 
-        virtual PlanStage::StageState work(WorkingSetID* out);
+    std::string getPlanSummaryStr() const;
+    void getPlanSummaryStats(PlanSummaryStats* statsOut) const;
 
-        virtual bool isEOF();
+    StageType stageType() const final {
+        return STAGE_PIPELINE_PROXY;
+    }
 
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    /**
+     * Writes the pipelineProxyStage's operators to a std::vector<Value>, providing the level of
+     * detail specified by 'verbosity'.
+     */
+    std::vector<Value> writeExplainOps(ExplainOptions::Verbosity verbosity) const;
 
-        //
-        // Manage our OperationContext. We intentionally don't propagate to the child
-        // Runner as that is handled by DocumentSourceCursor as it needs to.
-        //
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
+    static const char* kStageType;
 
-        /**
-         * Make obj the next object returned by getNext().
-         */
-        void pushBack(const BSONObj& obj);
+protected:
+    void doDispose() final;
 
-        /**
-         * Return a shared pointer to the PlanExecutor that feeds the pipeline. The returned
-         * pointer may be NULL.
-         */
-        boost::shared_ptr<PlanExecutor> getChildExecutor();
+private:
+    boost::optional<BSONObj> getNextBson();
 
-        //
-        // These should not be used.
-        //
+    // Things in the _stash should be returned before pulling items from _pipeline.
+    std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
+    std::vector<BSONObj> _stash;
+    const bool _includeMetaData;
 
-        virtual PlanStageStats* getStats() { return NULL; }
-        virtual CommonStats* getCommonStats() { return NULL; }
-        virtual SpecificStats* getSpecificStats() { return NULL; }
+    // Not owned by us.
+    WorkingSet* _ws;
+};
 
-        // Not used.
-        virtual std::vector<PlanStage*> getChildren() const;
-
-        // Not used.
-        virtual StageType stageType() const { return STAGE_PIPELINE_PROXY; }
-
-    private:
-        boost::optional<BSONObj> getNextBson();
-
-        // Things in the _stash sould be returned before pulling items from _pipeline.
-        const boost::intrusive_ptr<Pipeline> _pipeline;
-        std::vector<BSONObj> _stash;
-        const bool _includeMetaData;
-        boost::weak_ptr<PlanExecutor> _childExec;
-
-        // Not owned by us.
-        WorkingSet* _ws;
-    };
-
-} // namespace mongo
+}  // namespace mongo

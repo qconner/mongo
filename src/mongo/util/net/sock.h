@@ -33,293 +33,242 @@
 
 #ifndef _WIN32
 
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <errno.h>
 
-#ifdef __openbsd__
-# include <sys/uio.h>
+#ifdef __OpenBSD__
+#include <sys/uio.h>
 #endif
 
-#endif // not _WIN32
+#endif  // not _WIN32
 
-#include <boost/scoped_ptr.hpp>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/config.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/platform/compiler.h"
-#include "mongo/platform/cstdint.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/net/sockaddr.h"
 
 namespace mongo {
 
-#ifdef MONGO_SSL
-    class SSLManagerInterface;
-    class SSLConnection;
+#ifdef MONGO_CONFIG_SSL
+class SSLManagerInterface;
+class SSLConnectionInterface;
 #endif
+struct SSLPeerInfo;
 
-    extern const int portSendFlags;
-    extern const int portRecvFlags;
+extern const int portSendFlags;
+extern const int portRecvFlags;
 
-    const int SOCK_FAMILY_UNKNOWN_ERROR=13078;
+void setSocketKeepAliveParams(int sock,
+                              unsigned int maxKeepIdleSecs = 300,
+                              unsigned int maxKeepIntvlSecs = 300);
+void disableNagle(int sock);
 
-    void disableNagle(int sock);
+#if !defined(_WIN32)
 
-#if defined(_WIN32)
+inline void closesocket(int s) {
+    close(s);
+}
+const int INVALID_SOCKET = -1;
+typedef int SOCKET;
 
-    typedef short sa_family_t;
-    typedef int socklen_t;
+#endif  // _WIN32
 
-    // This won't actually be used on windows
-    struct sockaddr_un {
-        short sun_family;
-        char sun_path[108]; // length from unix header
-    };
+std::string makeUnixSockPath(int port);
 
-#else // _WIN32
+// If an ip address is passed in, just return that.  If a hostname is passed
+// in, look up its ip and return that.  Returns "" on failure.
+std::string hostbyname(const char* hostname);
 
-    inline void closesocket(int s) { close(s); }
-    const int INVALID_SOCKET = -1;
-    typedef int SOCKET;
+void enableIPv6(bool state = true);
+bool IPv6Enabled();
+void setSockTimeouts(int sock, double secs);
 
-#endif // _WIN32
+/** this is not cache and does a syscall */
+std::string getHostName();
 
-    std::string makeUnixSockPath(int port);
+/** this is cached, so if changes during the process lifetime
+ * will be stale */
+std::string getHostNameCached();
 
-    // If an ip address is passed in, just return that.  If a hostname is passed
-    // in, look up its ip and return that.  Returns "" on failure.
-    std::string hostbyname(const char *hostname);
+/** Returns getHostNameCached():<port>. */
+std::string getHostNameCachedAndPort();
 
-    void enableIPv6(bool state=true);
-    bool IPv6Enabled();
-    void setSockTimeouts(int sock, double secs);
+/** Returns getHostNameCached(), or getHostNameCached():<port> if running on a non-default port. */
+std::string prettyHostName();
+
+/**
+ * thin wrapped around file descriptor and system calls
+ * todo: ssl
+ */
+class Socket {
+    MONGO_DISALLOW_COPYING(Socket);
+
+public:
+    static const int errorPollIntervalSecs;
+
+    Socket(int sock, const SockAddr& farEnd);
+
+    /** In some cases the timeout will actually be 2x this value - eg we do a partial send,
+        then the timeout fires, then we try to send again, then the timeout fires again with
+        no data sent, then we detect that the other side is down.
+
+        Generally you don't want a timeout, you should be very prepared for errors if you set one.
+    */
+    Socket(double so_timeout = 0, logger::LogSeverity logLevel = logger::LogSeverity::Log());
+
+    ~Socket();
+
+    /** The correct way to initialize and connect to a socket is as follows: (1) construct the
+     *  SockAddr, (2) check whether the SockAddr isValid(), (3) if the SockAddr is valid, a
+     *  Socket may then try to connect to that SockAddr. It is critical to check the return
+     *  value of connect as a false return indicates that there was an error, and the Socket
+     *  failed to connect to the given SockAddr. This failure may be due to ConnectBG returning
+     *  an error, or due to a timeout on connection, or due to the system socket deciding the
+     *  socket is invalid.
+     */
+    bool connect(SockAddr& farEnd);
+
+    void close();
+    void send(const char* data, int len, const char* context);
+    void send(const std::vector<std::pair<char*, int>>& data, const char* context);
+
+    // recv len or throw SocketException
+    void recv(char* data, int len);
+    int unsafe_recv(char* buf, int max);
+
+    logger::LogSeverity getLogLevel() const {
+        return _logLevel;
+    }
+    void setLogLevel(logger::LogSeverity ll) {
+        _logLevel = ll;
+    }
+
+    SockAddr remoteAddr() const {
+        return _remote;
+    }
+    std::string remoteString() const {
+        return _remote.toString();
+    }
+    unsigned remotePort() const {
+        return _remote.getPort();
+    }
+
+    SockAddr localAddr() const {
+        return _local;
+    }
+
+    void clearCounters() {
+        _bytesIn = 0;
+        _bytesOut = 0;
+    }
+    long long getBytesIn() const {
+        return _bytesIn;
+    }
+    long long getBytesOut() const {
+        return _bytesOut;
+    }
+    int rawFD() const {
+        return _fd;
+    }
 
     /**
-     * wrapped around os representation of network address
+     * This sets the Sock's socket descriptor to be invalid and returns the old descriptor. This
+     * only gets called in listen.cpp in Listener::_accepted(). This gets called on the listener
+     * thread immediately after the thread creates the Sock, so it doesn't need to be thread-safe.
      */
-    struct SockAddr {
-        SockAddr();
-        explicit SockAddr(int sourcePort); /* listener side */
-        SockAddr(const char *ip, int port); /* EndPoint (remote) side, or if you want to specify which interface locally */
+    int stealSD() {
+        int tmp = _fd;
+        _fd = -1;
+        return tmp;
+    }
 
-        template <typename T> T& as() { return *(T*)(&sa); }
-        template <typename T> const T& as() const { return *(const T*)(&sa); }
-        
-        std::string toString(bool includePort=true) const;
+    void setTimeout(double secs);
+    bool isStillConnected();
 
-        bool isValid() const { return _isValid; }
+    void setHandshakeReceived() {
+        _awaitingHandshake = false;
+    }
 
-        /** 
-         * @return one of AF_INET, AF_INET6, or AF_UNIX
-         */
-        sa_family_t getType() const;
+    bool isAwaitingHandshake() {
+        return _awaitingHandshake;
+    }
 
-        unsigned getPort() const;
+#ifdef MONGO_CONFIG_SSL
+    /** secures inline
+     *  ssl - Pointer to the global SSLManager.
+     *  remoteHost - The hostname of the remote server.
+     */
+    bool secure(SSLManagerInterface* ssl, const std::string& remoteHost);
 
-        std::string getAddr() const;
-
-        bool isLocalHost() const;
-
-        bool operator==(const SockAddr& r) const;
-
-        bool operator!=(const SockAddr& r) const;
-
-        bool operator<(const SockAddr& r) const;
-
-        const sockaddr* raw() const {return (sockaddr*)&sa;}
-        sockaddr* raw() {return (sockaddr*)&sa;}
-
-        socklen_t addressSize;
-    private:
-        struct sockaddr_storage sa;
-        bool _isValid;
-    };
-
-    extern SockAddr unknownAddress; // ( "0.0.0.0", 0 )
-
-    /** this is not cache and does a syscall */
-    std::string getHostName();
-    
-    /** this is cached, so if changes during the process lifetime
-     * will be stale */
-    std::string getHostNameCached();
-
-    std::string prettyHostName();
+    void secureAccepted(SSLManagerInterface* ssl);
+#endif
 
     /**
-     * thrown by Socket and SockAddr
+     * This function calls SSL_accept() if SSL-encrypted sockets
+     * are desired. SSL_accept() waits until the remote host calls
+     * SSL_connect(). The return value is the subject name of any
+     * client certificate provided during the handshake.
+     *
+     * @firstBytes is the first bytes received on the socket used
+     * to detect the connection SSL, @len is the number of bytes
+     *
+     * This function may throw SocketException.
      */
-    class SocketException : public DBException {
-    public:
-        const enum Type { CLOSED , RECV_ERROR , SEND_ERROR, RECV_TIMEOUT, SEND_TIMEOUT, FAILED_STATE, CONNECT_ERROR } _type;
-        
-        SocketException( Type t , const std::string& server , int code = 9001 , const std::string& extra="" ) 
-            : DBException( std::string("socket exception [")  + _getStringType( t ) + "] for " + server, code ),
-              _type(t),
-              _server(server),
-              _extra(extra)
-        {}
-
-        virtual ~SocketException() throw() {}
-
-        bool shouldPrint() const { return _type != CLOSED; }
-        virtual std::string toString() const;
-        virtual const std::string* server() const { return &_server; }
-    private:
-
-        // TODO: Allow exceptions better control over their messages
-        static std::string _getStringType( Type t ){
-            switch (t) {
-                case CLOSED:        return "CLOSED";
-                case RECV_ERROR:    return "RECV_ERROR";
-                case SEND_ERROR:    return "SEND_ERROR";
-                case RECV_TIMEOUT:  return "RECV_TIMEOUT";
-                case SEND_TIMEOUT:  return "SEND_TIMEOUT";
-                case FAILED_STATE:  return "FAILED_STATE";
-                case CONNECT_ERROR: return "CONNECT_ERROR";
-                default:            return "UNKNOWN"; // should never happen
-            }
-        }
-
-        std::string _server;
-        std::string _extra;
-    };
-
+    SSLPeerInfo doSSLHandshake(const char* firstBytes = NULL, int len = 0);
 
     /**
-     * thin wrapped around file descriptor and system calls
-     * todo: ssl
+     * @return the time when the socket was opened.
      */
-    class Socket {
-        MONGO_DISALLOW_COPYING(Socket);
-    public:
+    uint64_t getSockCreationMicroSec() const {
+        return _fdCreationMicroSec;
+    }
 
-        static const int errorPollIntervalSecs;
+    void handleRecvError(int ret, int len);
+    void handleSendError(int ret, const char* context);
 
-        Socket(int sock, const SockAddr& farEnd);
+    std::string getSNIServerName() const;
 
-        /** In some cases the timeout will actually be 2x this value - eg we do a partial send,
-            then the timeout fires, then we try to send again, then the timeout fires again with
-            no data sent, then we detect that the other side is down.
+private:
+    void _init();
 
-            Generally you don't want a timeout, you should be very prepared for errors if you set one.
-        */
-        Socket(double so_timeout = 0, logger::LogSeverity logLevel = logger::LogSeverity::Log() );
+    /** sends dumbly, just each buffer at a time */
+    void _send(const std::vector<std::pair<char*, int>>& data, const char* context);
 
-        ~Socket();
+    /** raw send, same semantics as ::send with an additional context parameter */
+    int _send(const char* data, int len, const char* context);
 
-        /** The correct way to initialize and connect to a socket is as follows: (1) construct the
-         *  SockAddr, (2) check whether the SockAddr isValid(), (3) if the SockAddr is valid, a
-         *  Socket may then try to connect to that SockAddr. It is critical to check the return
-         *  value of connect as a false return indicates that there was an error, and the Socket
-         *  failed to connect to the given SockAddr. This failure may be due to ConnectBG returning
-         *  an error, or due to a timeout on connection, or due to the system socket deciding the
-         *  socket is invalid.
-         */
-        bool connect(SockAddr& farEnd);
+    /** raw recv, same semantics as ::recv */
+    int _recv(char* buf, int max);
 
-        void close();
-        void send( const char * data , int len, const char *context );
-        void send( const std::vector< std::pair< char *, int > > &data, const char *context );
+    SOCKET _fd;
+    uint64_t _fdCreationMicroSec;
+    SockAddr _local;
+    SockAddr _remote;
+    double _timeout;
 
-        // recv len or throw SocketException
-        void recv( char * data , int len );
-        int unsafe_recv( char *buf, int max );
-        
-        logger::LogSeverity getLogLevel() const { return _logLevel; }
-        void setLogLevel( logger::LogSeverity ll ) { _logLevel = ll; }
+    long long _bytesIn;
+    long long _bytesOut;
+    time_t _lastValidityCheckAtSecs;
 
-        SockAddr remoteAddr() const { return _remote; }
-        std::string remoteString() const { return _remote.toString(); }
-        unsigned remotePort() const { return _remote.getPort(); }
-
-        SockAddr localAddr() const { return _local; }
-
-        void clearCounters() { _bytesIn = 0; _bytesOut = 0; }
-        long long getBytesIn() const { return _bytesIn; }
-        long long getBytesOut() const { return _bytesOut; }
-        int rawFD() const { return _fd; }
-
-        void setTimeout( double secs );
-        bool isStillConnected();
-
-        void setHandshakeReceived() {
-            _awaitingHandshake = false;
-        }
-
-        bool isAwaitingHandshake() {
-            return _awaitingHandshake;
-        }
-
-#ifdef MONGO_SSL
-        /** secures inline 
-         *  ssl - Pointer to the global SSLManager.
-         *  remoteHost - The hostname of the remote server.
-         */
-        bool secure( SSLManagerInterface* ssl, const std::string& remoteHost);
-
-        void secureAccepted( SSLManagerInterface* ssl );
+#ifdef MONGO_CONFIG_SSL
+    std::unique_ptr<SSLConnectionInterface> _sslConnection;
+    SSLManagerInterface* _sslManager;
 #endif
-        
-        /**
-         * This function calls SSL_accept() if SSL-encrypted sockets
-         * are desired. SSL_accept() waits until the remote host calls
-         * SSL_connect(). The return value is the subject name of any
-         * client certificate provided during the handshake.
-         *
-         * @firstBytes is the first bytes received on the socket used
-         * to detect the connection SSL, @len is the number of bytes
-         *
-         * This function may throw SocketException.
-         */
-        std::string doSSLHandshake(const char* firstBytes = NULL, int len = 0);
-        
-        /**
-         * @return the time when the socket was opened.
-         */
-        uint64_t getSockCreationMicroSec() const {
-            return _fdCreationMicroSec;
-        }
+    logger::LogSeverity _logLevel;  // passed to log() when logging errors
 
-        void handleRecvError(int ret, int len);
-        MONGO_COMPILER_NORETURN void handleSendError(int ret, const char* context);
-
-    private:
-        void _init();
-
-        /** sends dumbly, just each buffer at a time */
-        void _send( const std::vector< std::pair< char *, int > > &data, const char *context );
-
-        /** raw send, same semantics as ::send with an additional context parameter */
-        int _send( const char * data , int len , const char * context );
-
-        /** raw recv, same semantics as ::recv */
-        int _recv( char * buf , int max );
-
-        int _fd;
-        uint64_t _fdCreationMicroSec;
-        SockAddr _local;
-        SockAddr _remote;
-        double _timeout;
-
-        long long _bytesIn;
-        long long _bytesOut;
-        time_t _lastValidityCheckAtSecs;
-
-#ifdef MONGO_SSL
-        boost::scoped_ptr<SSLConnection> _sslConnection;
-        SSLManagerInterface* _sslManager;
-#endif
-        logger::LogSeverity _logLevel; // passed to log() when logging errors
- 
-        /** true until the first packet has been received or an outgoing connect has been made */
-        bool _awaitingHandshake;
-
-    };
+    /** true until the first packet has been received or an outgoing connect has been made */
+    bool _awaitingHandshake;
+};
 
 
-} // namespace mongo
+}  // namespace mongo

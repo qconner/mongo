@@ -1,146 +1,61 @@
 //
-// Tests launching multi-version ShardingTest clusters
+// Tests launching multi-version ShardingTest clusters.
+//
+// We cannot test with the shards being replica sets. If the 'replSetInitiate' command goes to a
+// 3.6 node, then the node will initiate in fCV 3.6 and refuse to talk to the 3.4 node. If the
+// 'replSetInitiate' command goes to a 3.4 node, then the node will not write it's fCV document
+// at initiation and the 3.6 node will refuse to initial sync from it. For 3.8, we will be able
+// to send 'replSetInitiate' to the 3.6 node and it will write the document at initiate in fCV
+// 3.6 (since this changed between 3.4 and 3.6), and the 3.8 node will initial sync from it.
+// TODO(SERVER-33180) update this test to use replica set shards.
 //
 
 load('./jstests/multiVersion/libs/verify_versions.js');
 
 (function() {
-"use strict";
-// Check our latest versions
-var versionsToCheck = [ "last-stable",
-                        "latest" ];
-                       
-jsTest.log( "Testing legacy versions..." );
+    "use strict";
+    // Check our latest versions
+    var versionsToCheck = ["last-stable", "latest"];
+    var versionsToCheckConfig = ["latest"];
+    var versionsToCheckMongos = ["last-stable"];
 
-for( var i = 0; i < versionsToCheck.length; i++ ){
+    jsTest.log("Testing mixed versions...");
 
-    var version = versionsToCheck[ i ];
-    
-    // Set up a cluster
-    
-    var st = new ShardingTest({ shards : 2, 
-                                mongos : 2,
-                                other : { 
-                                    separateConfig : true,
-                                    mongosOptions : { binVersion : version },
-                                    configOptions : { binVersion : version },
-                                    shardOptions : { binVersion : version }
-                                } });
-    
-    var shards = [ st.shard0, st.shard1 ];
-    var mongoses = [ st.s0, st.s1 ];
-    var configs = [ st.config0 ];
-    
-    // Make sure the started versions are actually the correct versions
-    for( var j = 0; j < shards.length; j++ ) assert.binVersion( shards[j], version );
-    for( j = 0; j < mongoses.length; j++ ) assert.binVersion( mongoses[j], version );
-    for( j = 0; j < configs.length; j++ ) assert.binVersion( configs[j], version );
-    
+    // Set up a multi-version cluster
+    var st = new ShardingTest({
+        shards: 2,
+        mongos: 2,
+        other: {
+            mongosOptions: {binVersion: versionsToCheckMongos},
+            configOptions: {binVersion: versionsToCheckConfig},
+            shardOptions: {binVersion: versionsToCheck},
+            enableBalancer: true,
+            shardAsReplicaSet: false
+        }
+    });
+
+    var shards = [st.shard0, st.shard1];
+    var mongoses = [st.s0, st.s1];
+    var configs = [st.config0, st.config1, st.config2];
+
+    // Make sure we have hosts of all the different versions
+    var versionsFound = [];
+    for (var j = 0; j < shards.length; j++)
+        versionsFound.push(shards[j].getBinVersion());
+
+    assert.allBinVersions(versionsToCheck, versionsFound);
+
+    versionsFound = [];
+    for (var j = 0; j < mongoses.length; j++)
+        versionsFound.push(mongoses[j].getBinVersion());
+
+    assert.allBinVersions(versionsToCheckMongos, versionsFound);
+
+    versionsFound = [];
+    for (var j = 0; j < configs.length; j++)
+        versionsFound.push(configs[j].getBinVersion());
+
+    assert.allBinVersions(versionsToCheckConfig, versionsFound);
+
     st.stop();
-}
-
-jsTest.log( "Testing mixed versions..." );
-        
-// Set up a multi-version cluster
-
-st = new ShardingTest({ shards : 2,
-                            mongos : 2,
-                            other : {
-                                
-                                // Three config servers
-                                separateConfig : true,
-                                sync : true,
-                                
-                                mongosOptions : { binVersion : versionsToCheck },
-                                configOptions : { binVersion : versionsToCheck },
-                                shardOptions : { binVersion : versionsToCheck }
-                                
-                            } });
-    
-shards = [ st.shard0, st.shard1 ];
-mongoses = [ st.s0, st.s1 ];
-configs = [ st.config0, st.config1, st.config2 ];
-
-// Make sure we have hosts of all the different versions
-var versionsFound = [];
-for ( j = 0; j < shards.length; j++ ) 
-    versionsFound.push( shards[j].getBinVersion() );
-
-assert.allBinVersions( versionsToCheck, versionsFound );
-
-versionsFound = [];
-for ( j = 0; j < mongoses.length; j++ ) 
-    versionsFound.push( mongoses[j].getBinVersion() );
-
-assert.allBinVersions( versionsToCheck, versionsFound );
-    
-versionsFound = [];
-for ( j = 0; j < configs.length; j++ ) 
-    versionsFound.push( configs[j].getBinVersion() );
-    
-assert.allBinVersions( versionsToCheck, versionsFound );
-    
-st.stop();
-
-
-jsTest.log( "Testing mixed versions with replica sets..." );
-        
-// Set up a multi-version cluster w/ replica sets
-
-st = new ShardingTest({ shards : 2,
-                            mongos : 2,
-                            other : {
-                                
-                                // Three config servers
-                                separateConfig : true,
-                                sync : true,
-                                
-                                // Replica set shards
-                                rs : true,
-                                
-                                mongosOptions : { binVersion : versionsToCheck },
-                                configOptions : { binVersion : versionsToCheck },
-                                rsOptions : { binVersion : versionsToCheck }
-                                
-                            } });
-    
-var nodesA = st.rs0.nodes;
-var nodesB = st.rs1.nodes;
-mongoses = [ st.s0, st.s1 ];
-configs = [ st.config0, st.config1, st.config2 ];
-
-var getVersion = function( mongo ){
-    var result = mongo.getDB( "admin" ).runCommand({ serverStatus : 1 });
-    return result.version;
-};
-
-// Make sure we have hosts of all the different versions
-versionsFound = [];
-for ( j = 0; j < nodesA.length; j++ ) 
-    versionsFound.push( nodesA[j].getBinVersion() );
-
-assert.allBinVersions( versionsToCheck, versionsFound );
-
-versionsFound = [];
-for ( j = 0; j < nodesB.length; j++ ) 
-    versionsFound.push( nodesB[j].getBinVersion() );
-
-assert.allBinVersions( versionsToCheck, versionsFound );
-
-versionsFound = [];
-for ( j = 0; j < mongoses.length; j++ )
-    versionsFound.push( mongoses[j].getBinVersion() );
-
-assert.allBinVersions( versionsToCheck, versionsFound );
-
-versionsFound = [];
-for ( j = 0; j < configs.length; j++ )
-    versionsFound.push( configs[j].getBinVersion() );
-
-assert.allBinVersions( versionsToCheck, versionsFound );
-
-jsTest.log("DONE!");
-   
-st.stop();
-}); // TODO: SERVER-17348 enable again after v3.0 is released.
-
+})();

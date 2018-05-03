@@ -30,81 +30,93 @@
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
+#include <memory>
 
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
 
 namespace mongo {
 
-    class DevNullKVEngine : public KVEngine {
-    public:
-        virtual ~DevNullKVEngine(){}
+class JournalListener;
 
-        virtual RecoveryUnit* newRecoveryUnit() {
-            return new RecoveryUnitNoop();
-        }
+class DevNullKVEngine : public KVEngine {
+public:
+    virtual ~DevNullKVEngine() {}
 
-        virtual Status createRecordStore( OperationContext* opCtx,
-                                          StringData ns,
-                                          StringData ident,
-                                          const CollectionOptions& options ) {
-            return Status::OK();
-        }
+    virtual RecoveryUnit* newRecoveryUnit() {
+        return new RecoveryUnitNoop();
+    }
 
-        virtual RecordStore* getRecordStore( OperationContext* opCtx,
-                                             StringData ns,
+    virtual Status createRecordStore(OperationContext* opCtx,
+                                     StringData ns,
+                                     StringData ident,
+                                     const CollectionOptions& options) {
+        return Status::OK();
+    }
+
+    virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
+                                                        StringData ns,
+                                                        StringData ident,
+                                                        const CollectionOptions& options);
+
+    virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
-                                             const CollectionOptions& options );
+                                             const IndexDescriptor* desc) {
+        return Status::OK();
+    }
 
-        virtual Status createSortedDataInterface( OperationContext* opCtx,
-                                                  StringData ident,
-                                                  const IndexDescriptor* desc ) {
-            return Status::OK();
-        }
+    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
+                                                        StringData ident,
+                                                        const IndexDescriptor* desc);
 
-        virtual SortedDataInterface* getSortedDataInterface( OperationContext* opCtx,
-                                                             StringData ident,
-                                                             const IndexDescriptor* desc );
+    virtual Status dropIdent(OperationContext* opCtx, StringData ident) {
+        return Status::OK();
+    }
 
-        virtual Status dropIdent( OperationContext* opCtx,
-                                  StringData ident ) {
-            return Status::OK();
-        }
+    virtual bool supportsDocLocking() const {
+        return true;
+    }
 
-        virtual bool supportsDocLocking() const {
-            return true;
-        }
+    virtual bool supportsDirectoryPerDB() const {
+        return false;
+    }
 
-        virtual bool supportsDirectoryPerDB() const {
-            return false;
-        }
+    /**
+     * devnull does no journaling, so don't report the engine as durable.
+     */
+    virtual bool isDurable() const {
+        return false;
+    }
 
-        virtual bool isDurable() const {
-            return true;
-        }
+    virtual bool isEphemeral() const {
+        return true;
+    }
 
-        virtual int64_t getIdentSize( OperationContext* opCtx,
-                                      StringData ident ) {
-            return 1;
-        }
+    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
+        return 1;
+    }
 
-        virtual Status repairIdent( OperationContext* opCtx,
-                                    StringData ident ) {
-            return Status::OK();
-        }
+    virtual Status repairIdent(OperationContext* opCtx, StringData ident) {
+        return Status::OK();
+    }
 
-        virtual bool hasIdent(OperationContext* opCtx, StringData ident) const {
-            return true;
-        }
+    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const {
+        return true;
+    }
 
-        std::vector<std::string> getAllIdents( OperationContext* opCtx ) const {
-            return std::vector<std::string>();
-        }
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const {
+        return std::vector<std::string>();
+    }
 
-        virtual void cleanShutdown() {};
+    virtual void cleanShutdown(){};
 
-    private:
-        boost::shared_ptr<void> _catalogInfo;
-    };
+    void setJournalListener(JournalListener* jl) final {}
+
+    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const override {
+        return Timestamp();
+    }
+
+private:
+    std::shared_ptr<void> _catalogInfo;
+};
 }

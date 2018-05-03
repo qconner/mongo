@@ -33,49 +33,110 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
 
-    class DeleteRequest {
-        MONGO_DISALLOW_COPYING(DeleteRequest);
-    public:
-        explicit DeleteRequest(const NamespaceString& nsString) :
-            _nsString(nsString),
-            _multi(false),
-            _logop(false),
-            _god(false),
-            _fromMigrate(false),
-            _isExplain(false),
-            _yieldPolicy(PlanExecutor::YIELD_MANUAL) {}
+class DeleteRequest {
+    MONGO_DISALLOW_COPYING(DeleteRequest);
 
-        void setQuery(const BSONObj& query) { _query = query; }
-        void setMulti(bool multi = true) { _multi = multi; }
-        void setUpdateOpLog(bool logop = true) { _logop = logop; }
-        void setGod(bool god = true) { _god = god; }
-        void setFromMigrate(bool fromMigrate = true) { _fromMigrate = fromMigrate; }
-        void setExplain(bool isExplain = true) { _isExplain = isExplain; }
-        void setYieldPolicy(PlanExecutor::YieldPolicy yieldPolicy) { _yieldPolicy = yieldPolicy; }
+public:
+    explicit DeleteRequest(const NamespaceString& nsString)
+        : _nsString(nsString),
+          _multi(false),
+          _god(false),
+          _fromMigrate(false),
+          _isExplain(false),
+          _returnDeleted(false),
+          _yieldPolicy(PlanExecutor::NO_YIELD) {}
 
-        const NamespaceString& getNamespaceString() const { return _nsString; }
-        const BSONObj& getQuery() const { return _query; }
-        bool isMulti() const { return _multi; }
-        bool shouldCallLogOp() const { return _logop; }
-        bool isGod() const { return _god; }
-        bool isFromMigrate() const { return _fromMigrate; }
-        bool isExplain() const { return _isExplain; }
-        PlanExecutor::YieldPolicy getYieldPolicy() const { return _yieldPolicy; }
+    void setQuery(const BSONObj& query) {
+        _query = query;
+    }
+    void setProj(const BSONObj& proj) {
+        _proj = proj;
+    }
+    void setSort(const BSONObj& sort) {
+        _sort = sort;
+    }
+    void setCollation(const BSONObj& collation) {
+        _collation = collation;
+    }
+    void setMulti(bool multi = true) {
+        _multi = multi;
+    }
+    void setGod(bool god = true) {
+        _god = god;
+    }
+    void setFromMigrate(bool fromMigrate = true) {
+        _fromMigrate = fromMigrate;
+    }
+    void setExplain(bool isExplain = true) {
+        _isExplain = isExplain;
+    }
+    void setReturnDeleted(bool returnDeleted = true) {
+        _returnDeleted = returnDeleted;
+    }
+    void setYieldPolicy(PlanExecutor::YieldPolicy yieldPolicy) {
+        _yieldPolicy = yieldPolicy;
+    }
 
-        std::string toString() const;
+    const NamespaceString& getNamespaceString() const {
+        return _nsString;
+    }
+    const BSONObj& getQuery() const {
+        return _query;
+    }
+    const BSONObj& getProj() const {
+        return _proj;
+    }
+    const BSONObj& getSort() const {
+        return _sort;
+    }
+    const BSONObj& getCollation() const {
+        return _collation;
+    }
+    bool isMulti() const {
+        return _multi;
+    }
+    bool isGod() const {
+        return _god;
+    }
+    bool isFromMigrate() const {
+        return _fromMigrate;
+    }
+    bool isExplain() const {
+        return _isExplain;
+    }
+    bool shouldReturnDeleted() const {
+        return _returnDeleted;
+    }
+    PlanExecutor::YieldPolicy getYieldPolicy() const {
+        return _yieldPolicy;
+    }
 
-    private:
-        const NamespaceString& _nsString;
-        BSONObj _query;
-        bool _multi;
-        bool _logop;
-        bool _god;
-        bool _fromMigrate;
-        bool _isExplain;
-        PlanExecutor::YieldPolicy _yieldPolicy;
-    };
+    void setStmtId(StmtId stmtId) {
+        _stmtId = std::move(stmtId);
+    }
+
+    StmtId getStmtId() const {
+        return _stmtId;
+    }
+
+private:
+    const NamespaceString& _nsString;
+    BSONObj _query;
+    BSONObj _proj;
+    BSONObj _sort;
+    BSONObj _collation;
+    // The statement id of this request.
+    StmtId _stmtId = kUninitializedStmtId;
+    bool _multi;
+    bool _god;
+    bool _fromMigrate;
+    bool _isExplain;
+    bool _returnDeleted;
+    PlanExecutor::YieldPolicy _yieldPolicy;
+};
 
 }  // namespace mongo

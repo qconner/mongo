@@ -1,5 +1,3 @@
-// btree_interface_test.cpp
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -29,46 +27,55 @@
  */
 
 #include "mongo/db/storage/mmap_v1/btree/btree_interface.h"
+
+#include "mongo/base/init.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/storage/mmap_v1/btree/btree_test_help.h"
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
-    using std::auto_ptr;
+using std::unique_ptr;
 
-    class MyHarnessHelper : public HarnessHelper {
-    public:
-        MyHarnessHelper()
-            : _recordStore("a.b"),
-              _order(Ordering::make(BSONObj())) {
-        }
+class MyHarnessHelper final : public SortedDataInterfaceHarnessHelper {
+public:
+    MyHarnessHelper() : _recordStore("a.b"), _order(Ordering::make(BSONObj())) {}
 
-        virtual SortedDataInterface* newSortedDataInterface(bool unique) {
-            auto_ptr<SortedDataInterface> sorted(getMMAPV1Interface(&_headManager,
-                                                                    &_recordStore,
-                                                                    &_cursorRegistry,
-                                                                    _order,
-                                                                    "a_1",
-                                                                    1));
-            OperationContextNoop op;
-            massertStatusOK(sorted->initAsEmpty(&op));
-            return sorted.release();
-        }
-
-        virtual RecoveryUnit* newRecoveryUnit() {
-            return new HeapRecordStoreBtreeRecoveryUnit();
-        }
-
-    private:
-        TestHeadManager _headManager;
-        HeapRecordStoreBtree _recordStore;
-        SavedCursorRegistry _cursorRegistry;
-        Ordering _order;
-    };
-
-    HarnessHelper* newHarnessHelper() {
-        return new MyHarnessHelper();
+    std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique) final {
+        std::unique_ptr<SortedDataInterface> sorted(
+            getMMAPV1Interface(&_headManager,
+                               &_recordStore,
+                               &_cursorRegistry,
+                               _order,
+                               "a_1",  // indexName
+                               IndexDescriptor::IndexVersion::kV1,
+                               unique));
+        OperationContextNoop op;
+        massertStatusOK(sorted->initAsEmpty(&op));
+        return sorted;
     }
 
+    std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
+        return stdx::make_unique<HeapRecordStoreBtreeRecoveryUnit>();
+    }
+
+private:
+    TestHeadManager _headManager;
+    HeapRecordStoreBtree _recordStore;
+    SavedCursorRegistry _cursorRegistry;
+    Ordering _order;
+};
+
+std::unique_ptr<HarnessHelper> makeHarnessHelper() {
+    return stdx::make_unique<MyHarnessHelper>();
 }
+
+MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
+    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+    return Status::OK();
+}
+}  // namespace
+}  // namespace mongo

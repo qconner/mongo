@@ -1,5 +1,3 @@
-// sorted_data_interface_test_harness.h
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -30,55 +28,110 @@
 
 #pragma once
 
+#include <initializer_list>
+#include <memory>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/test_harness_helper.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/unowned_ptr.h"
 
 namespace mongo {
 
-    const BSONObj key0 = BSON( "" << 0 );
-    const BSONObj key1 = BSON( "" << 1 );
-    const BSONObj key2 = BSON( "" << 2 );
-    const BSONObj key3 = BSON( "" << 3 );
-    const BSONObj key4 = BSON( "" << 4 );
-    const BSONObj key5 = BSON( "" << 5 );
-    const BSONObj key6 = BSON( "" << 6 );
+const BSONObj key0 = BSON("" << 0);
+const BSONObj key1 = BSON("" << 1);
+const BSONObj key2 = BSON("" << 2);
+const BSONObj key3 = BSON("" << 3);
+const BSONObj key4 = BSON("" << 4);
+const BSONObj key5 = BSON("" << 5);
+const BSONObj key6 = BSON("" << 6);
 
-    const BSONObj compoundKey1a = BSON( "" << 1 << "" << "a" );
-    const BSONObj compoundKey1b = BSON( "" << 1 << "" << "b" );
-    const BSONObj compoundKey1c = BSON( "" << 1 << "" << "c" );
-    const BSONObj compoundKey1d = BSON( "" << 1 << "" << "d" );
-    const BSONObj compoundKey2a = BSON( "" << 2 << "" << "a" );
-    const BSONObj compoundKey2b = BSON( "" << 2 << "" << "b" );
-    const BSONObj compoundKey2c = BSON( "" << 2 << "" << "c" );
-    const BSONObj compoundKey3a = BSON( "" << 3 << "" << "a" );
-    const BSONObj compoundKey3b = BSON( "" << 3 << "" << "b" );
-    const BSONObj compoundKey3c = BSON( "" << 3 << "" << "c" );
+const BSONObj compoundKey1a = BSON("" << 1 << ""
+                                      << "a");
+const BSONObj compoundKey1b = BSON("" << 1 << ""
+                                      << "b");
+const BSONObj compoundKey1c = BSON("" << 1 << ""
+                                      << "c");
+const BSONObj compoundKey1d = BSON("" << 1 << ""
+                                      << "d");
+const BSONObj compoundKey2a = BSON("" << 2 << ""
+                                      << "a");
+const BSONObj compoundKey2b = BSON("" << 2 << ""
+                                      << "b");
+const BSONObj compoundKey2c = BSON("" << 2 << ""
+                                      << "c");
+const BSONObj compoundKey3a = BSON("" << 3 << ""
+                                      << "a");
+const BSONObj compoundKey3b = BSON("" << 3 << ""
+                                      << "b");
+const BSONObj compoundKey3c = BSON("" << 3 << ""
+                                      << "c");
 
-    const RecordId loc1( 10, 42 );
-    const RecordId loc2( 10, 44 );
-    const RecordId loc3( 10, 46 );
-    const RecordId loc4( 10, 48 );
-    const RecordId loc5( 10, 50 );
-    const RecordId loc6( 10, 52 );
-    const RecordId loc7( 10, 54 );
-    const RecordId loc8( 10, 56 );
+const RecordId loc1(0, 42);
+const RecordId loc2(0, 44);
+const RecordId loc3(0, 46);
+const RecordId loc4(0, 48);
+const RecordId loc5(0, 50);
+const RecordId loc6(0, 52);
+const RecordId loc7(0, 54);
+const RecordId loc8(0, 56);
 
-    class RecoveryUnit;
-    class SortedDataInterface;
+class RecoveryUnit;
 
-    class HarnessHelper {
-    public:
-        HarnessHelper(){}
-        virtual ~HarnessHelper(){}
+class SortedDataInterfaceHarnessHelper : public virtual HarnessHelper {
+public:
+    virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique) = 0;
 
-        virtual SortedDataInterface* newSortedDataInterface( bool unique ) = 0;
-        virtual RecoveryUnit* newRecoveryUnit() = 0;
+    /**
+     * Creates a new SDI with some initial data.
+     *
+     * For clarity to readers, toInsert must be sorted.
+     */
+    std::unique_ptr<SortedDataInterface> newSortedDataInterface(
+        bool unique, std::initializer_list<IndexKeyEntry> toInsert);
+};
 
-        virtual OperationContext* newOperationContext() {
-            return new OperationContextNoop( newRecoveryUnit() );
-        }
-    };
+/**
+ * Inserts all entries in toInsert into index.
+ * ASSERT_OKs the inserts.
+ * Always uses dupsAllowed=true.
+ *
+ * Should be used for declaring and changing conditions, not for testing inserts.
+ */
+void insertToIndex(unowned_ptr<OperationContext> opCtx,
+                   unowned_ptr<SortedDataInterface> index,
+                   std::initializer_list<IndexKeyEntry> toInsert);
 
-    HarnessHelper* newHarnessHelper();
+inline void insertToIndex(unowned_ptr<HarnessHelper> harness,
+                          unowned_ptr<SortedDataInterface> index,
+                          std::initializer_list<IndexKeyEntry> toInsert) {
+    auto client = harness->serviceContext()->makeClient("insertToIndex");
+    insertToIndex(harness->newOperationContext(client.get()), index, toInsert);
 }
+
+/**
+ * Removes all entries in toRemove from index.
+ * Always uses dupsAllowed=true.
+ *
+ * Should be used for declaring and changing conditions, not for testing removes.
+ */
+void removeFromIndex(unowned_ptr<OperationContext> opCtx,
+                     unowned_ptr<SortedDataInterface> index,
+                     std::initializer_list<IndexKeyEntry> toRemove);
+
+inline void removeFromIndex(unowned_ptr<HarnessHelper> harness,
+                            unowned_ptr<SortedDataInterface> index,
+                            std::initializer_list<IndexKeyEntry> toRemove) {
+    auto client = harness->serviceContext()->makeClient("removeFromIndex");
+    removeFromIndex(harness->newOperationContext(client.get()), index, toRemove);
+}
+
+inline std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper() {
+    return dynamic_ptr_cast<SortedDataInterfaceHarnessHelper>(newHarnessHelper());
+}
+}  // namespace mongo

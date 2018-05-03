@@ -36,18 +36,19 @@
 
 namespace mongo {
 
-    class Database;
-    class OperationContext;
+class Database;
+class OperationContext;
 
-    // If justOne is true, deletedId is set to the id of the deleted object.
-    long long deleteObjects(OperationContext* txn,
-                            Database* db,
-                            StringData ns,
-                            BSONObj pattern,
-                            PlanExecutor::YieldPolicy policy,
-                            bool justOne,
-                            bool logop = false,
-                            bool god = false,
-                            bool fromMigrate = false);
-
+/**
+ * Deletes objects from 'collection' that match the query predicate given by 'pattern'. If 'justOne'
+ * is true, deletes only the first matching object. The PlanExecutor used to do the deletion will
+ * not yield. If 'god' is true, deletes are allowed on system namespaces.
+ */
+long long deleteObjects(OperationContext* opCtx,
+                        Collection* collection,
+                        const NamespaceString& ns,
+                        BSONObj pattern,
+                        bool justOne,
+                        bool god = false,
+                        bool fromMigrate = false);
 }

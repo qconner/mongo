@@ -29,123 +29,131 @@
 #pragma once
 
 #include "mongo/base/status.h"
-#include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
+#include "mongo/executor/task_executor.h"
 
 namespace mongo {
 namespace repl {
 
-    class ReplicaSetConfig;
+class ReplSetConfig;
+
+/**
+ * Quorum checking state machine.
+ *
+ * Usage: Construct a QuorumChecker, pass in a pointer to the configuration for which you're
+ * checking quorum, and the integer index of the member config representing the "executing"
+ * node.  Use ScatterGatherRunner or otherwise execute a scatter-gather procedure as described
+ * in the class comment for the ScatterGatherAlgorithm class.  After
+ * hasReceivedSufficientResponses() returns true, you may call getFinalStatus() to get the
+ * result of the quorum check.
+ */
+class QuorumChecker : public ScatterGatherAlgorithm {
+    MONGO_DISALLOW_COPYING(QuorumChecker);
+
+public:
+    /**
+     * Constructs a QuorumChecker that is used to confirm that sufficient nodes are up to accept
+     * "rsConfig".  "myIndex" is the index of the local node, which is assumed to be up.
+     *
+     * "rsConfig" must stay in scope until QuorumChecker's destructor completes.
+     */
+    QuorumChecker(const ReplSetConfig* rsConfig, int myIndex, long long term);
+    virtual ~QuorumChecker();
+
+    virtual std::vector<executor::RemoteCommandRequest> getRequests() const;
+    virtual void processResponse(const executor::RemoteCommandRequest& request,
+                                 const executor::RemoteCommandResponse& response);
+
+    virtual bool hasReceivedSufficientResponses() const;
+
+    Status getFinalStatus() const {
+        return _finalStatus;
+    }
+
+private:
+    /**
+     * Callback that executes after _haveReceivedSufficientReplies() becomes true.
+     *
+     * Computes the quorum result based on responses received so far, stores it into
+     * _finalStatus, and enables QuorumChecker::run() to return.
+     */
+    void _onQuorumCheckComplete();
 
     /**
-     * Quorum checking state machine.
-     *
-     * Usage: Construct a QuorumChecker, pass in a pointer to the configuration for which you're
-     * checking quorum, and the integer index of the member config representing the "executing"
-     * node.  Use ScatterGatherRunner or otherwise execute a scatter-gather procedure as described
-     * in the class comment for the ScatterGatherAlgorithm class.  After
-     * hasReceivedSufficientResponses() returns true, you may call getFinalStatus() to get the
-     * result of the quorum check.
+     * Updates the QuorumChecker state based on the data from a single heartbeat response.
      */
-    class QuorumChecker : public ScatterGatherAlgorithm {
-        MONGO_DISALLOW_COPYING(QuorumChecker);
-    public:
-        /**
-         * Constructs a QuorumChecker that is used to confirm that sufficient nodes are up to accept
-         * "rsConfig".  "myIndex" is the index of the local node, which is assumed to be up.
-         *
-         * "rsConfig" must stay in scope until QuorumChecker's destructor completes.
-         */
-        QuorumChecker(const ReplicaSetConfig* rsConfig, int myIndex);
-        virtual ~QuorumChecker();
+    void _tabulateHeartbeatResponse(const executor::RemoteCommandRequest& request,
+                                    const executor::RemoteCommandResponse& response);
 
-        virtual std::vector<ReplicationExecutor::RemoteCommandRequest> getRequests() const;
-        virtual void processResponse(
-                const ReplicationExecutor::RemoteCommandRequest& request,
-                const ResponseStatus& response);
+    // Pointer to the replica set configuration for which we're checking quorum.
+    const ReplSetConfig* const _rsConfig;
 
-        virtual bool hasReceivedSufficientResponses() const;
+    // Index of the local node's member configuration in _rsConfig.
+    const int _myIndex;
 
-        Status getFinalStatus() const { return _finalStatus; }
+    // The term of this node.
+    const long long _term;
 
-    private:
-        /**
-         * Callback that executes after _haveReceivedSufficientReplies() becomes true.
-         *
-         * Computes the quorum result based on responses received so far, stores it into
-         * _finalStatus, and enables QuorumChecker::run() to return.
-         */
-        void _onQuorumCheckComplete();
+    // List of voting nodes that have responded affirmatively.
+    std::vector<HostAndPort> _voters;
 
-        /**
-         * Updates the QuorumChecker state based on the data from a single heartbeat response.
-         */
-        void _tabulateHeartbeatResponse(
-                const ReplicationExecutor::RemoteCommandRequest& request,
-                const ResponseStatus& response);
+    // List of nodes with bad responses and the bad response status they returned.
+    std::vector<std::pair<HostAndPort, Status>> _badResponses;
 
-        // Pointer to the replica set configuration for which we're checking quorum.
-        const ReplicaSetConfig* const _rsConfig;
+    // Total number of responses and timeouts processed.
+    int _numResponses;
 
-        // Index of the local node's member configuration in _rsConfig.
-        const int _myIndex;
+    // Number of electable nodes that have responded affirmatively.
+    int _numElectable;
 
-        // List of voting nodes that have responded affirmatively.
-        std::vector<HostAndPort> _voters;
+    // Set to a non-OK status if a response from a remote node indicates
+    // that the quorum check should definitely fail, such as because of
+    // a replica set name mismatch.
+    Status _vetoStatus;
 
-        // List of nodes with bad responses and the bad response status they returned.
-        std::vector<std::pair<HostAndPort, Status> > _badResponses;
+    // Final status of the quorum check, returned by run().
+    Status _finalStatus;
+};
 
-        // Total number of responses and timeouts processed.
-        int _numResponses;
+/**
+ * Performs a quorum call to determine if a sufficient number of nodes are up
+ * to initiate a replica set with configuration "rsConfig".
+ *
+ * "myIndex" is the index of this node's member configuration in "rsConfig".
+ * "executor" is the event loop in which to schedule network/aysnchronous processing.
+ * "term" is the term of this node.
+ *
+ * For purposes of initiate, a quorum is only met if all of the following conditions
+ * are met:
+ * - All nodes respond.
+ * - No nodes other than the node running the quorum check have data.
+ * - No nodes are already joined to a replica set.
+ * - No node reports a replica set name other than the one in "rsConfig".
+ */
+Status checkQuorumForInitiate(executor::TaskExecutor* executor,
+                              const ReplSetConfig& rsConfig,
+                              const int myIndex,
+                              long long term);
 
-        // Number of electable nodes that have responded affirmatively.
-        int _numElectable;
-
-        // Set to a non-OK status if a response from a remote node indicates
-        // that the quorum check should definitely fail, such as because of
-        // a replica set name mismatch.
-        Status _vetoStatus;
-
-        // Final status of the quorum check, returned by run().
-        Status _finalStatus;
-    };
-
-    /**
-     * Performs a quorum call to determine if a sufficient number of nodes are up
-     * to initiate a replica set with configuration "rsConfig".
-     *
-     * "myIndex" is the index of this node's member configuration in "rsConfig".
-     * "executor" is the event loop in which to schedule network/aysnchronous processing.
-     *
-     * For purposes of initiate, a quorum is only met if all of the following conditions
-     * are met:
-     * - All nodes respond.
-     * - No nodes other than the node running the quorum check have data.
-     * - No nodes are already joined to a replica set.
-     * - No node reports a replica set name other than the one in "rsConfig".
-     */
-    Status checkQuorumForInitiate(ReplicationExecutor* executor,
-                                  const ReplicaSetConfig& rsConfig,
-                                  const int myIndex);
-
-    /**
-     * Performs a quorum call to determine if a sufficient number of nodes are up
-     * to replace the current replica set configuration with "rsConfig".
-     *
-     * "myIndex" is the index of this node's member configuration in "rsConfig".
-     * "executor" is the event loop in which to schedule network/aysnchronous processing.
-     *
-     * For purposes of reconfig, a quorum is only met if all of the following conditions
-     * are met:
-     * - A majority of voting nodes respond.
-     * - At least one electable node responds.
-     * - No responding node reports a replica set name other than the one in "rsConfig".
-     * - All responding nodes report a config version less than the one in "rsConfig".
-     */
-    Status checkQuorumForReconfig(ReplicationExecutor* executor,
-                                  const ReplicaSetConfig& rsConfig,
-                                  const int myIndex);
+/**
+ * Performs a quorum call to determine if a sufficient number of nodes are up
+ * to replace the current replica set configuration with "rsConfig".
+ *
+ * "myIndex" is the index of this node's member configuration in "rsConfig".
+ * "executor" is the event loop in which to schedule network/aysnchronous processing.
+ * "term" is the term of this node.
+ *
+ * For purposes of reconfig, a quorum is only met if all of the following conditions
+ * are met:
+ * - A majority of voting nodes respond.
+ * - At least one electable node responds.
+ * - No responding node reports a replica set name other than the one in "rsConfig".
+ * - All responding nodes report a config version less than the one in "rsConfig".
+ */
+Status checkQuorumForReconfig(executor::TaskExecutor* executor,
+                              const ReplSetConfig& rsConfig,
+                              const int myIndex,
+                              long long term);
 
 }  // namespace repl
 }  // namespace mongo

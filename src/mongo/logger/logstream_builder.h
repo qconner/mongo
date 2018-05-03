@@ -27,139 +27,218 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 #include <sstream>
 #include <string>
 
-#include "mongo/client/export_macros.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/logger/labeled_level.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/logger/message_log_domain.h"
+#include "mongo/stdx/chrono.h"
 #include "mongo/util/exit_code.h"
 
 namespace mongo {
 namespace logger {
 
-    class Tee;
+class Tee;
+
+/**
+ * Stream-ish object used to build and append log messages.
+ */
+class LogstreamBuilder {
+public:
+    static LogSeverity severityCast(int ll) {
+        return LogSeverity::cast(ll);
+    }
+    static LogSeverity severityCast(LogSeverity ls) {
+        return ls;
+    }
+    static LabeledLevel severityCast(const LabeledLevel& labeled) {
+        return labeled;
+    }
 
     /**
-     * Stream-ish object used to build and append log messages.
+     * Construct a LogstreamBuilder that writes to "domain" on destruction.
+     *
+     * "contextName" is a short name of the thread or other context.
+     * "severity" is the logging severity of the message.
      */
-    class MONGO_CLIENT_API LogstreamBuilder {
-    public:
-        static LogSeverity severityCast(int ll) { return LogSeverity::cast(ll); }
-        static LogSeverity severityCast(LogSeverity ls) { return ls; }
-        static LabeledLevel severityCast(const LabeledLevel &labeled) { return labeled; }
+    LogstreamBuilder(MessageLogDomain* domain, StringData contextName, LogSeverity severity);
 
-        /**
-         * Construct a LogstreamBuilder that writes to "domain" on destruction.
-         *
-         * "contextName" is a short name of the thread or other context.
-         * "severity" is the logging severity of the message.
-         */
-        LogstreamBuilder(MessageLogDomain* domain,
-                         const std::string& contextName,
-                         LogSeverity severity);
+    /**
+     * Construct a LogstreamBuilder that writes to "domain" on destruction.
+     *
+     * "contextName" is a short name of the thread or other context.
+     * "severity" is the logging severity of the message.
+     * "component" is the primary log component of the message.
+     *
+     * By default, this class will create one ostream per thread, and it
+     * will cache that object in a threadlocal and reuse it for subsequent
+     * logs messages. Set "shouldCache" to false to create a new ostream
+     * for each instance of this class rather than cacheing.
+     */
+    LogstreamBuilder(MessageLogDomain* domain,
+                     StringData contextName,
+                     LogSeverity severity,
+                     LogComponent component,
+                     bool shouldCache = true);
 
-        /**
-         * Construct a LogstreamBuilder that writes to "domain" on destruction.
-         *
-         * "contextName" is a short name of the thread or other context.
-         * "severity" is the logging severity of the message.
-         * "component" is the primary log component of the message.
-         */
-        LogstreamBuilder(MessageLogDomain* domain,
-                         const std::string& contextName,
-                         LogSeverity severity,
-                         LogComponent component);
+    /**
+     * Deprecated.
+     */
+    LogstreamBuilder(MessageLogDomain* domain, StringData contextName, LabeledLevel labeledLevel);
 
-        /**
-         * Deprecated.
-         */
-        LogstreamBuilder(MessageLogDomain* domain,
-                         const std::string& contextName,
-                         LabeledLevel labeledLevel);
+    LogstreamBuilder(LogstreamBuilder&& other) = default;
+    LogstreamBuilder& operator=(LogstreamBuilder&& other) = default;
 
-        /**
-         * Copies a LogstreamBuilder.  LogstreamBuilder instances are copyable only until the first
-         * call to stream() or operator<<.
-         *
-         * TODO(schwerin): After C++11 transition, replace with a move-constructor, and make
-         * LogstreamBuilder movable.
-         */
-        LogstreamBuilder(const LogstreamBuilder& other);
-
-        /**
-         * Destroys a LogstreamBuilder().  If anything was written to it via stream() or operator<<,
-         * constructs a MessageLogDomain::Event and appends it to the associated domain.
-         */
-        ~LogstreamBuilder();
+    /**
+     * Destroys a LogstreamBuilder().  If anything was written to it via stream() or operator<<,
+     * constructs a MessageLogDomain::Event and appends it to the associated domain.
+     */
+    ~LogstreamBuilder();
 
 
-        /**
-         * Sets an optional prefix for the message.
-         */
-        LogstreamBuilder& setBaseMessage(const std::string& baseMessage) {
-            _baseMessage = baseMessage;
-            return *this;
-        }
+    /**
+     * Sets an optional prefix for the message.
+     */
+    LogstreamBuilder& setBaseMessage(const std::string& baseMessage) {
+        _baseMessage = baseMessage;
+        return *this;
+    }
 
-        std::ostream& stream() { makeStream(); return *_os; }
+    LogstreamBuilder& setIsTruncatable(bool isTruncatable) {
+        _isTruncatable = isTruncatable;
+        return *this;
+    }
 
-        LogstreamBuilder& operator<<(const char *x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(const std::string& x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(StringData x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(char *x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(char x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(int x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(ExitCode x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(long x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(unsigned long x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(unsigned x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(unsigned short x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(double x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(void *x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(const void *x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(long long x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(unsigned long long x) { stream() << x; return *this; }
-        LogstreamBuilder& operator<<(bool x) { stream() << x; return *this; }
+    std::ostream& stream() {
+        if (!_os)
+            makeStream();
+        return *_os;
+    }
 
-        template <typename T>
-        LogstreamBuilder& operator<<(const T& x) {
-            stream() << x.toString();
-            return *this;
-        }
+    LogstreamBuilder& operator<<(const char* x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(const std::string& x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(StringData x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(char* x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(char x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(int x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(ExitCode x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(long x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(unsigned long x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(unsigned x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(unsigned short x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(double x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(void* x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(const void* x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(long long x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(unsigned long long x) {
+        stream() << x;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(bool x) {
+        stream() << x;
+        return *this;
+    }
 
-        LogstreamBuilder& operator<< (std::ostream& ( *manip )(std::ostream&)) {
-            stream() << manip;
-            return *this;
-        }
-        LogstreamBuilder& operator<< (std::ios_base& (*manip)(std::ios_base&)) {
-            stream() << manip;
-            return *this;
-        }
+    template <typename Period>
+    LogstreamBuilder& operator<<(const Duration<Period>& d) {
+        stream() << d;
+        return *this;
+    }
 
-        /**
-         * In addition to appending the message to _domain, write it to the given tee.  May only
-         * be called once per instance of LogstreamBuilder.
-         */
-        void operator<<(Tee* tee);
+    LogstreamBuilder& operator<<(BSONType t) {
+        stream() << typeName(t);
+        return *this;
+    }
 
-    private:
-        LogstreamBuilder& operator=(const LogstreamBuilder& other);
+    LogstreamBuilder& operator<<(ErrorCodes::Error ec) {
+        stream() << ErrorCodes::errorString(ec);
+        return *this;
+    }
 
-        void makeStream();
+    template <typename T>
+    LogstreamBuilder& operator<<(const T& x) {
+        stream() << x.toString();
+        return *this;
+    }
 
-        MessageLogDomain* _domain;
-        std::string _contextName;
-        LogSeverity _severity;
-        LogComponent _component;
-        std::string _baseMessage;
-        std::ostringstream* _os;
-        Tee* _tee;
+    LogstreamBuilder& operator<<(std::ostream& (*manip)(std::ostream&)) {
+        stream() << manip;
+        return *this;
+    }
+    LogstreamBuilder& operator<<(std::ios_base& (*manip)(std::ios_base&)) {
+        stream() << manip;
+        return *this;
+    }
 
-    };
+    /**
+     * In addition to appending the message to _domain, write it to the given tee.  May only
+     * be called once per instance of LogstreamBuilder.
+     */
+    void operator<<(Tee* tee);
+
+private:
+    void makeStream();
+
+    MessageLogDomain* _domain;
+    std::string _contextName;
+    LogSeverity _severity;
+    LogComponent _component;
+    std::string _baseMessage;
+    std::unique_ptr<std::ostringstream> _os;
+    Tee* _tee;
+    bool _isTruncatable = true;
+    bool _shouldCache;
+};
 
 
 }  // namespace logger

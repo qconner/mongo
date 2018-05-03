@@ -29,115 +29,261 @@
 #pragma once
 
 #include <deque>
+#include <memory>
 
-#include "mongo/db/storage/mmap_v1/dur.h"
-#include "mongo/db/repl/sync.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/repl/multiapplier.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_buffer.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 
-    class OperationContext;
+class Database;
+class OperationContext;
+struct MultikeyPathInfo;
 
 namespace repl {
-    class BackgroundSyncInterface;
-    class ReplicationCoordinator;
+class ReplicationCoordinator;
+class OpTime;
+
+/**
+ * Used for oplog application on a replica set secondary.
+ * Primarily used to apply batches of operations fetched from a sync source during steady state
+ * replication and initial sync.
+ *
+ * When used for steady state replication, runs a thread that reads batches of operations from
+ * an oplog buffer (through the BackgroundSync interface) and applies the batch of operations.
+ */
+class SyncTail {
+public:
+    using MultiSyncApplyFunc =
+        stdx::function<Status(OperationContext* opCtx,
+                              MultiApplier::OperationPtrs* ops,
+                              SyncTail* st,
+                              WorkerMultikeyPathInfo* workerMultikeyPathInfo)>;
 
     /**
-     * "Normal" replica set syncing
+     *
+     * Constructs a SyncTail.
+     * During steady state replication, oplogApplication() obtains batches of operations to apply
+     * from 'observer'. It is not required to provide 'observer' at construction if we do not plan
+     * on using oplogApplication(). During the oplog application phase, the batch of operations is
+     * distributed across writer threads in 'writerPool'. Each writer thread applies its own vector
+     * of operations using 'func'. The writer thread pool is not owned by us.
      */
-    class SyncTail : public Sync {
-        typedef void (*MultiSyncApplyFunc)(const std::vector<BSONObj>& ops, SyncTail* st);
+    SyncTail(OplogApplier::Observer* observer,
+             ReplicationConsistencyMarkers* consistencyMarkers,
+             StorageInterface* storageInterface,
+             MultiSyncApplyFunc func,
+             ThreadPool* writerPool);
+    virtual ~SyncTail();
+
+    /**
+     * Creates thread pool for writer tasks.
+     */
+    static std::unique_ptr<ThreadPool> makeWriterPool();
+    static std::unique_ptr<ThreadPool> makeWriterPool(int threadCount);
+
+    /**
+     * Applies the operation that is in param o.
+     * Functions for applying operations/commands and increment server status counters may
+     * be overridden for testing.
+     */
+    static Status syncApply(OperationContext* opCtx,
+                            const BSONObj& o,
+                            OplogApplication::Mode oplogApplicationMode);
+
+    /**
+     * Runs oplog application in a loop until shutdown() is called.
+     * Retrieves operations from the OplogBuffer in batches that will be applied in parallel using
+     * multiApply().
+     */
+    void oplogApplication(OplogBuffer* oplogBuffer, ReplicationCoordinator* replCoord);
+
+    /**
+     * Shuts down oplogApplication() processing.
+     */
+    void shutdown();
+
+    /**
+     * Returns true if we are shutting down.
+     */
+    bool inShutdown() const;
+
+
+    class OpQueue {
     public:
-        SyncTail(BackgroundSyncInterface *q, MultiSyncApplyFunc func);
-        virtual ~SyncTail();
-        virtual bool syncApply(OperationContext* txn,
-                               const BSONObj &o,
-                               bool convertUpdateToUpsert = false);
+        OpQueue() : _bytes(0) {
+            _batch.reserve(replBatchLimitOperations.load());
+        }
+
+        size_t getBytes() const {
+            return _bytes;
+        }
+        size_t getCount() const {
+            return _batch.size();
+        }
+        bool empty() const {
+            return _batch.empty();
+        }
+        const OplogEntry& front() const {
+            invariant(!_batch.empty());
+            return _batch.front();
+        }
+        const OplogEntry& back() const {
+            invariant(!_batch.empty());
+            return _batch.back();
+        }
+        const std::vector<OplogEntry>& getBatch() const {
+            return _batch;
+        }
+
+        void emplace_back(BSONObj obj) {
+            invariant(!_mustShutdown);
+            _bytes += obj.objsize();
+            _batch.emplace_back(std::move(obj));
+        }
+        void pop_back() {
+            _bytes -= back().getRawObjSizeBytes();
+            _batch.pop_back();
+        }
 
         /**
-         * Runs _applyOplogUntil(stopOpTime)
-         */
-        virtual void oplogApplication(OperationContext* txn, const OpTime& stopOpTime);
-
-        void oplogApplication();
-        bool peek(BSONObj* obj);
-
-        class OpQueue {
-        public:
-            OpQueue() : _size(0) {}
-            size_t getSize() { return _size; }
-            std::deque<BSONObj>& getDeque() { return _deque; }
-            void push_back(BSONObj& op) {
-                _deque.push_back(op);
-                _size += op.objsize();
-            }
-            bool empty() {
-                return _deque.empty();
-            }
-
-            BSONObj back() {
-                verify(!_deque.empty());
-                return _deque.back();
-            }
-
-        private:
-            std::deque<BSONObj> _deque;
-            size_t _size;
-        };
-
-        // returns true if we should continue waiting for BSONObjs, false if we should
-        // stop waiting and apply the queue we have.  Only returns false if !ops.empty().
-        bool tryPopAndWaitForMore(OperationContext* txn,
-                                  OpQueue* ops,
-                                  ReplicationCoordinator* replCoord);
-
-    protected:
-        // Cap the batches using the limit on journal commits.
-        // This works out to be 100 MB (64 bit) or 50 MB (32 bit)
-        static const unsigned int replBatchLimitBytes = dur::UncommittedBytesLimit;
-        static const int replBatchLimitSeconds = 1;
-        static const unsigned int replBatchLimitOperations = 5000;
-
-        // Prefetch and write a deque of operations, using the supplied function.
-        // Initial Sync and Sync Tail each use a different function.
-        // Returns the last OpTime applied.
-        OpTime multiApply(OperationContext* txn, std::deque<BSONObj>& ops);
-
-        /**
-         * Applies oplog entries until reaching "endOpTime".
+         * A batch with this set indicates that the upstream stages of the pipeline are shutdown and
+         * no more batches will be coming.
          *
-         * NOTE:Will not transition or check states
+         * This can only happen with empty batches.
+         *
+         * TODO replace the empty object used to signal draining with this.
          */
-        void _applyOplogUntil(OperationContext* txn, const OpTime& endOpTime);
+        bool mustShutdown() const {
+            return _mustShutdown;
+        }
+        void setMustShutdownFlag() {
+            invariant(empty());
+            _mustShutdown = true;
+        }
+
+        /**
+         * Leaves this object in an unspecified state. Only assignment and destruction are valid.
+         */
+        std::vector<OplogEntry> releaseBatch() {
+            return std::move(_batch);
+        }
 
     private:
-        BackgroundSyncInterface* _networkQueue;
-
-        // Function to use during applyOps
-        MultiSyncApplyFunc _applyFunc;
-
-        // Doles out all the work to the reader pool threads and waits for them to complete
-        void prefetchOps(const std::deque<BSONObj>& ops);
-        // Used by the thread pool readers to prefetch an op
-        static void prefetchOp(const BSONObj& op);
-
-        // Doles out all the work to the writer pool threads and waits for them to complete
-        void applyOps(const std::vector< std::vector<BSONObj> >& writerVectors);
-
-        void fillWriterVectors(const std::deque<BSONObj>& ops, 
-                               std::vector< std::vector<BSONObj> >* writerVectors);
-        void handleSlaveDelay(const BSONObj& op);
-
-        // persistent pool of worker threads for writing ops to the databases
-        threadpool::ThreadPool _writerPool;
-        // persistent pool of worker threads for prefetching
-        threadpool::ThreadPool _prefetcherPool;
-
+        std::vector<OplogEntry> _batch;
+        size_t _bytes;
+        bool _mustShutdown = false;
     };
 
-    // These free functions are used by the thread pool workers to write ops to the db.
-    void multiSyncApply(const std::vector<BSONObj>& ops, SyncTail* st);
-    void multiInitialSyncApply(const std::vector<BSONObj>& ops, SyncTail* st);
+    struct BatchLimits {
+        size_t bytes = replBatchLimitBytes;
+        size_t ops = replBatchLimitOperations.load();
 
-} // namespace repl
-} // namespace mongo
+        // If provided, the batch will not include any operations with timestamps after this point.
+        // This is intended for implementing slaveDelay, so it should be some number of seconds
+        // before now.
+        boost::optional<Date_t> slaveDelayLatestTimestamp = {};
+    };
+
+    /**
+     * Attempts to pop an OplogEntry off the BGSync queue and add it to ops.
+     *
+     * Returns true if the (possibly empty) batch in ops should be ended and a new one started.
+     * If ops is empty on entry and nothing can be added yet, will wait up to a second before
+     * returning true.
+     */
+    bool tryPopAndWaitForMore(OperationContext* opCtx,
+                              OplogBuffer* oplogBuffer,
+                              OpQueue* ops,
+                              const BatchLimits& limits);
+
+    /**
+     * Fetch a single document referenced in the operation from the sync source.
+     */
+    virtual BSONObj getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry);
+
+    /**
+     * If an update fails, fetches the missing document and inserts it into the local collection.
+     *
+     * Returns true if the document was fetched and inserted successfully.
+     */
+    virtual bool fetchAndInsertMissingDocument(OperationContext* opCtx,
+                                               const OplogEntry& oplogEntry);
+
+    void setHostname(const std::string& hostname);
+
+    static AtomicInt32 replBatchLimitOperations;
+
+    /**
+     * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then
+     * using a set of threads to apply the operations.
+     *
+     * If the batch application is successful, returns the optime of the last op applied, which
+     * should be the last op in the batch.
+     * Returns ErrorCodes::CannotApplyOplogWhilePrimary if the node has become primary.
+     *
+     * To provide crash resilience, this function will advance the persistent value of 'minValid'
+     * to at least the last optime of the batch. If 'minValid' is already greater than or equal
+     * to the last optime of this batch, it will not be updated.
+     */
+    StatusWith<OpTime> multiApply(OperationContext* opCtx, MultiApplier::Operations ops);
+
+protected:
+    static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
+    static const int replBatchLimitSeconds = 1;
+
+private:
+    /**
+     * Pops the operation at the front of the OplogBuffer.
+     * Updates stats on BackgroundSync.
+     */
+    void _consume(OperationContext* opCtx, OplogBuffer* oplogBuffer);
+
+    class OpQueueBatcher;
+
+    std::string _hostname;
+
+    OplogApplier::Observer* const _observer;
+    ReplicationConsistencyMarkers* const _consistencyMarkers;
+    StorageInterface* const _storageInterface;
+
+    // Function to use during applyOps
+    MultiSyncApplyFunc _applyFunc;
+
+    // Pool of worker threads for writing ops to the databases.
+    // Not owned by us.
+    ThreadPool* const _writerPool;
+
+    // Protects member data of SyncTail.
+    mutable stdx::mutex _mutex;
+
+    // Set to true if shutdown() has been called.
+    bool _inShutdown = false;
+};
+
+// These free functions are used by the thread pool workers to write ops to the db.
+// They consume the passed in OperationPtrs and callers should not make any assumptions about the
+// state of the container after calling. However, these functions cannot modify the pointed-to
+// operations because the OperationPtrs container contains const pointers.
+Status multiSyncApply(OperationContext* opCtx,
+                      MultiApplier::OperationPtrs* ops,
+                      SyncTail* st,
+                      WorkerMultikeyPathInfo* workerMultikeyPathInfo);
+
+Status multiInitialSyncApply(OperationContext* opCtx,
+                             MultiApplier::OperationPtrs* ops,
+                             SyncTail* st,
+                             WorkerMultikeyPathInfo* workerMultikeyPathInfo);
+
+}  // namespace repl
+}  // namespace mongo

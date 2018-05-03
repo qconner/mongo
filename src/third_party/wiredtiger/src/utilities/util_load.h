@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -16,13 +16,15 @@ typedef struct {
 } CONFIG_LIST;
 
 int	 config_exec(WT_SESSION *, char **);
-int	 config_list_add(CONFIG_LIST *, char *);
+int	 config_list_add(WT_SESSION *, CONFIG_LIST *, char *);
 void	 config_list_free(CONFIG_LIST *);
-int	 config_reorder(char **);
+int	 config_reorder(WT_SESSION *, char **);
 int	 config_update(WT_SESSION *, char **);
 
 /* Flags for util_load_json */
-#define	LOAD_JSON_APPEND	0x0001	/* append (ignore record number keys) */
-#define	LOAD_JSON_NO_OVERWRITE	0x0002	/* don't overwrite existing data */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	LOAD_JSON_APPEND	0x1u	/* append (ignore record number keys) */
+#define	LOAD_JSON_NO_OVERWRITE	0x2u	/* don't overwrite existing data */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 int	 util_load_json(WT_SESSION *, const char *, uint32_t);

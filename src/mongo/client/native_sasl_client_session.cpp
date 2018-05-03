@@ -32,64 +32,67 @@
 #include "mongo/base/init.h"
 #include "mongo/client/sasl_client_conversation.h"
 #include "mongo/client/sasl_plain_client_conversation.h"
-#include "mongo/client/sasl_scramsha1_client_conversation.h"
+#include "mongo/client/sasl_scram_client_conversation.h"
+#include "mongo/client/scram_client_cache.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 namespace {
 
-    SaslClientSession* createNativeSaslClientSession(const std::string mech) {
-        return new NativeSaslClientSession();
+SaslClientSession* createNativeSaslClientSession(const std::string mech) {
+    return new NativeSaslClientSession();
+}
+
+MONGO_INITIALIZER(NativeSaslClientContext)(InitializerContext* context) {
+    SaslClientSession::create = createNativeSaslClientSession;
+    return Status::OK();
+}
+
+// Global cache for SCRAM-SHA-1/256 credentials
+auto* scramsha1ClientCache = new SCRAMClientCache<SHA1Block>;
+auto* scramsha256ClientCache = new SCRAMClientCache<SHA256Block>;
+
+}  // namespace
+
+NativeSaslClientSession::NativeSaslClientSession()
+    : SaslClientSession(), _step(0), _done(false), _saslConversation(nullptr) {}
+
+NativeSaslClientSession::~NativeSaslClientSession() {}
+
+Status NativeSaslClientSession::initialize() {
+    if (_saslConversation)
+        return Status(ErrorCodes::AlreadyInitialized,
+                      "Cannot reinitialize NativeSaslClientSession.");
+
+    std::string mechanism = getParameter(parameterMechanism).toString();
+    if (mechanism == "PLAIN") {
+        _saslConversation.reset(new SaslPLAINClientConversation(this));
+    } else if (mechanism == "SCRAM-SHA-1") {
+        _saslConversation.reset(
+            new SaslSCRAMClientConversationImpl<SHA1Block>(this, scramsha1ClientCache));
+    } else if (mechanism == "SCRAM-SHA-256") {
+        _saslConversation.reset(
+            new SaslSCRAMClientConversationImpl<SHA256Block>(this, scramsha256ClientCache));
+    } else {
+        return Status(ErrorCodes::BadValue,
+                      mongoutils::str::stream() << "SASL mechanism " << mechanism
+                                                << " is not supported");
     }
 
-    MONGO_INITIALIZER(NativeSaslClientContext)(InitializerContext* context) {
-        SaslClientSession::create = createNativeSaslClientSession;
-        return Status::OK();
+    return Status::OK();
+}
+
+Status NativeSaslClientSession::step(StringData inputData, std::string* outputData) {
+    if (!_saslConversation) {
+        return Status(ErrorCodes::BadValue,
+                      mongoutils::str::stream()
+                          << "The client authentication session has not been properly initialized");
     }
 
-} // namespace
-
-    NativeSaslClientSession::NativeSaslClientSession() :
-            SaslClientSession(),
-            _step(0),
-            _done(false),
-            _saslConversation(NULL) {
+    StatusWith<bool> status = _saslConversation->step(inputData, outputData);
+    if (status.isOK()) {
+        _done = status.getValue();
     }
-
-    NativeSaslClientSession::~NativeSaslClientSession() {}
-
-    Status NativeSaslClientSession::initialize() {
-        if (_saslConversation)
-            return Status(ErrorCodes::AlreadyInitialized,
-                "Cannot reinitialize NativeSaslClientSession.");
-
-        std::string mechanism = getParameter(parameterMechanism).toString();
-        if (mechanism == "PLAIN") {
-            _saslConversation.reset(new SaslPLAINClientConversation(this));
-        }
-        else if (mechanism == "SCRAM-SHA-1") {
-            _saslConversation.reset(new SaslSCRAMSHA1ClientConversation(this));
-        }
-        else {
-            return Status(ErrorCodes::BadValue,
-                mongoutils::str::stream() << "SASL mechanism " << mechanism <<
-                                             " is not supported");
-        }
-
-        return Status::OK();
-    }
-
-    Status NativeSaslClientSession::step(StringData inputData, std::string* outputData) {
-        if (!_saslConversation) {
-            return Status(ErrorCodes::BadValue,
-                mongoutils::str::stream() <<
-                "The client authentication session has not been properly initialized");
-        }
-
-        StatusWith<bool> status = _saslConversation->step(inputData, outputData);
-        if (status.isOK()) {
-            _done = status.getValue();
-        }
-        return status.getStatus();
-    }
+    return status.getStatus();
+}
 }  // namespace

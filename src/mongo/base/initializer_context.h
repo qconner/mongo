@@ -27,35 +27,39 @@
 
 #pragma once
 
+#include "mongo/base/disallow_copying.h"
+#include "mongo/db/service_context_fwd.h"
+
 #include <map>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-
 namespace mongo {
+/**
+ * Context of an initialization process.  Passed as a parameter to initialization functions.
+ *
+ * See mongo/base/initializer.h and mongo/base/initializer_dependency_graph.h for more details.
+ */
+class InitializerContext {
+    MONGO_DISALLOW_COPYING(InitializerContext);
 
-    /**
-     * Context of an initialization process.  Passed as a parameter to initialization functions.
-     *
-     * See mongo/base/initializer.h and mongo/base/initializer_dependency_graph.h for more details.
-     */
-    class InitializerContext {
-        MONGO_DISALLOW_COPYING(InitializerContext);
+public:
+    typedef std::vector<std::string> ArgumentVector;
+    typedef std::map<std::string, std::string> EnvironmentMap;
 
-    public:
-        typedef std::vector<std::string> ArgumentVector;
-        typedef std::map<std::string, std::string> EnvironmentMap;
+    InitializerContext(const ArgumentVector& args, const EnvironmentMap& env)
+        : _args(args), _env(env) {}
 
-        InitializerContext(const ArgumentVector& args,
-                           const EnvironmentMap& env);
+    const ArgumentVector& args() const {
+        return _args;
+    }
+    const EnvironmentMap& env() const {
+        return _env;
+    }
 
-        const ArgumentVector& args() const { return _args; }
-        const EnvironmentMap& env() const { return _env; }
-
-    private:
-        ArgumentVector _args;
-        EnvironmentMap _env;
-    };
+private:
+    ArgumentVector _args;
+    EnvironmentMap _env;
+};
 
 }  // namespace mongo

@@ -33,86 +33,117 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/mmap_v1/diskloc.h"
 
 namespace mongo {
 
-    class NamespaceDetails;
+class NamespaceDetails;
 
-    class MMAPV1DatabaseCatalogEntry;;
-    class RecordStore;
-    class OperationContext;
+class MMAPV1DatabaseCatalogEntry;
+;
+class RecordStore;
+class OperationContext;
 
-    class NamespaceDetailsCollectionCatalogEntry : public CollectionCatalogEntry {
-    public:
-        NamespaceDetailsCollectionCatalogEntry( StringData ns,
-                                                NamespaceDetails* details,
-                                                RecordStore* namespacesRecordStore,
-                                                RecordStore* indexRecordStore,
-                                                MMAPV1DatabaseCatalogEntry* db );
+class NamespaceDetailsCollectionCatalogEntry : public CollectionCatalogEntry {
+public:
+    NamespaceDetailsCollectionCatalogEntry(StringData ns,
+                                           NamespaceDetails* details,
+                                           RecordStore* namespacesRecordStore,
+                                           RecordId namespacesRecordId,
+                                           RecordStore* indexRecordStore,
+                                           MMAPV1DatabaseCatalogEntry* db);
 
-        virtual ~NamespaceDetailsCollectionCatalogEntry(){}
+    ~NamespaceDetailsCollectionCatalogEntry() {}
 
-        virtual CollectionOptions getCollectionOptions(OperationContext* txn) const;
+    CollectionOptions getCollectionOptions(OperationContext* opCtx) const final;
 
-        virtual int getTotalIndexCount(OperationContext* txn) const;
+    int getTotalIndexCount(OperationContext* opCtx) const final;
 
-        virtual int getCompletedIndexCount(OperationContext* txn) const;
+    int getCompletedIndexCount(OperationContext* opCtx) const final;
 
-        virtual int getMaxAllowedIndexes() const;
+    int getMaxAllowedIndexes() const final;
 
-        virtual void getAllIndexes( OperationContext* txn,
-                                    std::vector<std::string>* names ) const;
+    void getAllIndexes(OperationContext* opCtx, std::vector<std::string>* names) const final;
 
-        virtual BSONObj getIndexSpec( OperationContext* txn,
-                                      StringData idxName ) const;
+    void getReadyIndexes(OperationContext* opCtx, std::vector<std::string>* names) const final;
 
-        virtual bool isIndexMultikey(OperationContext* txn,
-                                     StringData indexName) const;
-        virtual bool isIndexMultikey(int idxNo) const;
+    BSONObj getIndexSpec(OperationContext* opCtx, StringData idxName) const final;
 
-        virtual bool setIndexIsMultikey(OperationContext* txn,
-                                        int idxNo,
-                                        bool multikey = true);
-        virtual bool setIndexIsMultikey(OperationContext* txn,
-                                        StringData indexName,
-                                        bool multikey = true);
+    bool isIndexMultikey(OperationContext* opCtx,
+                         StringData indexName,
+                         MultikeyPaths* multikeyPaths) const final;
+    bool isIndexMultikey(int idxNo) const;
 
-        virtual RecordId getIndexHead( OperationContext* txn,
-                                       StringData indexName ) const;
+    bool setIndexIsMultikey(OperationContext* opCtx, int idxNo, bool multikey = true);
+    bool setIndexIsMultikey(OperationContext* opCtx,
+                            StringData indexName,
+                            const MultikeyPaths& multikeyPaths) final;
 
-        virtual void setIndexHead( OperationContext* txn,
-                                   StringData indexName,
-                                   const RecordId& newHead );
+    RecordId getIndexHead(OperationContext* opCtx, StringData indexName) const final;
 
-        virtual bool isIndexReady( OperationContext* txn,
-                                   StringData indexName ) const;
+    void setIndexHead(OperationContext* opCtx, StringData indexName, const RecordId& newHead) final;
 
-        virtual Status removeIndex( OperationContext* txn,
-                                    StringData indexName );
+    bool isIndexReady(OperationContext* opCtx, StringData indexName) const final;
 
-        virtual Status prepareForIndexBuild( OperationContext* txn,
-                                             const IndexDescriptor* spec );
+    KVPrefix getIndexPrefix(OperationContext* opCtx, StringData indexName) const final;
 
-        virtual void indexBuildSuccess( OperationContext* txn,
-                                        StringData indexName );
+    Status removeIndex(OperationContext* opCtx, StringData indexName) final;
 
-        virtual void updateTTLSetting( OperationContext* txn,
-                                       StringData idxName,
-                                       long long newExpireSeconds );
+    Status prepareForIndexBuild(OperationContext* opCtx,
+                                const IndexDescriptor* spec,
+                                bool isBackgroundSecondaryBuild) final;
 
-        virtual void updateFlags(OperationContext* txn, int newValue);
+    void indexBuildSuccess(OperationContext* opCtx, StringData indexName) final;
 
-        // not part of interface, but available to my storage engine
+    void updateTTLSetting(OperationContext* opCtx,
+                          StringData idxName,
+                          long long newExpireSeconds) final;
 
-        int _findIndexNumber( OperationContext* txn, StringData indexName) const;
+    void updateFlags(OperationContext* opCtx, int newValue) final;
 
-    private:
-        NamespaceDetails* _details;
-        RecordStore* _namespacesRecordStore;
-        RecordStore* _indexRecordStore;
-        MMAPV1DatabaseCatalogEntry* _db;
+    void addUUID(OperationContext* opCtx, CollectionUUID uuid, Collection* coll) final;
 
-        friend class MMAPV1DatabaseCatalogEntry;
-    };
+    bool isEqualToMetadataUUID(OperationContext* opCtx, OptionalCollectionUUID uuid);
+
+    void updateValidator(OperationContext* opCtx,
+                         const BSONObj& validator,
+                         StringData validationLevel,
+                         StringData validationAction) final;
+
+    void setIsTemp(OperationContext* opCtx, bool isTemp) final;
+
+    void updateCappedSize(OperationContext* opCtx, long long size) final;
+
+    // not part of interface, but available to my storage engine
+
+    int _findIndexNumber(OperationContext* opCtx, StringData indexName) const;
+
+    RecordId getNamespacesRecordId() {
+        return _namespacesRecordId;
+    }
+
+    /**
+     * 'opCtx' is only allowed to be null when called from the constructor.
+     */
+    void setNamespacesRecordId(OperationContext* opCtx, RecordId newId);
+
+private:
+    NamespaceDetails* _details;
+    RecordStore* _namespacesRecordStore;
+
+    // Where this entry lives in the _namespacesRecordStore.
+    RecordId _namespacesRecordId;
+
+    RecordStore* _indexRecordStore;
+    MMAPV1DatabaseCatalogEntry* _db;
+
+    /**
+     * Updates the entry for this namespace in '_namespacesRecordStore', updating
+     * '_namespacesRecordId' if necessary.
+     */
+    void _updateSystemNamespaces(OperationContext* opCtx, const BSONObj& update);
+
+    friend class MMAPV1DatabaseCatalogEntry;
+};
 }

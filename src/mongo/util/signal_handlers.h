@@ -32,31 +32,33 @@
 
 namespace mongo {
 
-    /**
-     * Sets up handlers for signals and other events like terminate and new_handler.
-     *
-     * This must be called very early in main, before runGlobalInitializers().
-     *
-     * installControlCHandler - true means the program would like to setup its on Control-C handler
-     *                        - used by command line tools
-     */
-    void setupSignalHandlers(bool installControlCHandler);
+enum class LogFileStatus {
+    kNeedToRotateLogFile,
+    kNoLogFileToRotate,
+};
 
-    /**
-     * Starts the thread to handle asynchronous signals.
-     *
-     * This must be the first thread started from the main thread. Call this immediately after
-     * initializeServerGlobalState().
-     */
-    void startSignalProcessingThread();
+/**
+ * Sets up handlers for signals and other events like terminate and new_handler.
+ *
+ * This must be called very early in main, before runGlobalInitializers().
+ */
+void setupSignalHandlers();
 
-    /*
-     * Uninstall the Control-C handler
-     *
-     * Windows Only
-     * Used by nt services to remove the Control-C handler after the system knows it is running
-     * as a service, and not as a console program.
-     */
-    void removeControlCHandler();
+/**
+ * Starts the thread to handle asynchronous signals.
+ *
+ * This must be the first thread started from the main thread. Call this immediately after
+ * initializeServerGlobalState().
+ */
+void startSignalProcessingThread(LogFileStatus rotate = LogFileStatus::kNeedToRotateLogFile);
 
-} // namespace mongo
+/*
+ * Uninstall the Control-C handler
+ *
+ * Windows Only
+ * Used by nt services to remove the Control-C handler after the system knows it is running
+ * as a service, and not as a console program.
+ */
+void removeControlCHandler();
+
+}  // namespace mongo

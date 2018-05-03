@@ -35,53 +35,53 @@ namespace mongo {
 namespace logger {
 
 namespace {
-    const char unknownSeverityString[] = "UNKNOWN";
-    const char severeSeverityString[] = "SEVERE";
-    const char errorSeverityString[] = "ERROR";
-    const char warningSeverityString[] = "warning";
-    const char infoSeverityString[] = "info";
-    const char debugSeverityString[] = "debug";
+constexpr auto unknownSeverityString = "UNKNOWN"_sd;
+constexpr auto severeSeverityString = "SEVERE"_sd;
+constexpr auto errorSeverityString = "ERROR"_sd;
+constexpr auto warningSeverityString = "warning"_sd;
+constexpr auto infoSeverityString = "info"_sd;
+constexpr auto debugSeverityString = "debug"_sd;
 }  // namespace
 
-    StringData LogSeverity::toStringData() const {
-        if (_severity > 0)
-            return StringData(debugSeverityString, StringData::LiteralTag());
-        if (*this == LogSeverity::Severe())
-            return StringData(severeSeverityString, StringData::LiteralTag());
-        if (*this == LogSeverity::Error())
-            return StringData(errorSeverityString, StringData::LiteralTag());
-        if (*this == LogSeverity::Warning())
-            return StringData(warningSeverityString, StringData::LiteralTag());
-        if (*this == LogSeverity::Info())
-            return StringData(infoSeverityString, StringData::LiteralTag());
-        if (*this == LogSeverity::Log())
-            return StringData(infoSeverityString, StringData::LiteralTag());
-        return StringData(unknownSeverityString, StringData::LiteralTag());
-    }
+StringData LogSeverity::toStringData() const {
+    if (_severity > 0)
+        return debugSeverityString;
+    if (*this == LogSeverity::Severe())
+        return severeSeverityString;
+    if (*this == LogSeverity::Error())
+        return errorSeverityString;
+    if (*this == LogSeverity::Warning())
+        return warningSeverityString;
+    if (*this == LogSeverity::Info())
+        return infoSeverityString;
+    if (*this == LogSeverity::Log())
+        return infoSeverityString;
+    return unknownSeverityString;
+}
 
-    char LogSeverity::toChar() const {
-        if (_severity > 0)
-            return 'D';
-        // 'S' might be confused with "Success"
-        // Return 'F' to imply Fatal instead.
-        if (*this == LogSeverity::Severe())
-            return 'F';
-        if (*this == LogSeverity::Error())
-            return 'E';
-        if (*this == LogSeverity::Warning())
-            return 'W';
-        if (*this == LogSeverity::Info())
-            return 'I';
-        if (*this == LogSeverity::Log())
-            return 'I';
-        // Should not reach here - returning 'U' for Unknown severity
-        // to be consistent with toStringData().
-        return 'U';
-    }
+char LogSeverity::toChar() const {
+    if (_severity > 0)
+        return 'D';
+    // 'S' might be confused with "Success"
+    // Return 'F' to imply Fatal instead.
+    if (*this == LogSeverity::Severe())
+        return 'F';
+    if (*this == LogSeverity::Error())
+        return 'E';
+    if (*this == LogSeverity::Warning())
+        return 'W';
+    if (*this == LogSeverity::Info())
+        return 'I';
+    if (*this == LogSeverity::Log())
+        return 'I';
+    // Should not reach here - returning 'U' for Unknown severity
+    // to be consistent with toStringData().
+    return 'U';
+}
 
-    std::ostream& operator<<(std::ostream& os, LogSeverity severity) {
-        return os << severity.toStringData();
-    }
+std::ostream& operator<<(std::ostream& os, LogSeverity severity) {
+    return os << severity.toStringData();
+}
 
 }  // namespace logger
 }  // namespace mongo

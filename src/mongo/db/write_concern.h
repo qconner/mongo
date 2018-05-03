@@ -28,59 +28,78 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
-    class OperationContext;
+class OperationContext;
+template <typename T>
+class StatusWith;
 
-    /**
-     * Verifies that a WriteConcern is valid for this particular host.
-     */
-    Status validateWriteConcern( const WriteConcernOptions& writeConcern );
+namespace repl {
+class OpTime;
+}
 
-    struct WriteConcernResult {
-        WriteConcernResult() {
-            reset();
-        }
+/**
+ * Returns true if 'cmdObj' has a 'writeConcern' field.
+ */
+bool commandSpecifiesWriteConcern(const BSONObj& cmdObj);
 
-        void reset() {
-            syncMillis = -1;
-            fsyncFiles = -1;
-            wTimedOut = false;
-            wTime = -1;
-            err = "";
-        }
+/**
+ * Attempts to extract a writeConcern from cmdObj.
+ * Verifies that the writeConcern is of type Object (BSON type) and
+ * that the resulting writeConcern is valid for this particular host.
+ */
+StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx, const BSONObj& cmdObj);
 
-        void appendTo( const WriteConcernOptions& writeConcern, BSONObjBuilder* result ) const;
+/**
+ * Verifies that a WriteConcern is valid for this particular host.
+ */
+Status validateWriteConcern(OperationContext* opCtx, const WriteConcernOptions& writeConcern);
 
-        int syncMillis;
-        int fsyncFiles;
+struct WriteConcernResult {
+    WriteConcernResult() {
+        reset();
+    }
 
-        bool wTimedOut;
-        int wTime;
-        std::vector<HostAndPort> writtenTo;
+    void reset() {
+        syncMillis = -1;
+        fsyncFiles = -1;
+        wTimedOut = false;
+        wTime = -1;
+        err = "";
+    }
 
-        std::string err; // this is the old err field, should deprecate
-    };
+    void appendTo(const WriteConcernOptions& writeConcern, BSONObjBuilder* result) const;
 
-    /**
-     * Blocks until the database is sure the specified user write concern has been fulfilled, or
-     * returns an error status if the write concern fails.  Does no validation of the input write
-     * concern, it is an error to pass this function an invalid write concern for the host.
-     *
-     * Takes a user write concern as well as the replication opTime the write concern applies to -
-     * if this opTime.isNull() no replication-related write concern options will be enforced.
-     *
-     * Returns result of the write concern if successful.
-     * Returns NotMaster if the host steps down while waiting for replication
-     * Returns UnknownReplWriteConcern if the wMode specified was not enforceable
-     */
-    Status waitForWriteConcern( OperationContext* txn,
-                                const WriteConcernOptions& writeConcern,
-                                const OpTime& replOpTime,
-                                WriteConcernResult* result );
+    int syncMillis;
+    int fsyncFiles;
+
+    bool wTimedOut;
+    int wTime;
+    std::vector<HostAndPort> writtenTo;
+
+    std::string err;  // this is the old err field, should deprecate
+};
+
+/**
+ * Blocks until the database is sure the specified user write concern has been fulfilled, or
+ * returns an error status if the write concern fails.  Does no validation of the input write
+ * concern, it is an error to pass this function an invalid write concern for the host.
+ *
+ * Takes a user write concern as well as the replication opTime the write concern applies to -
+ * if this opTime.isNull() no replication-related write concern options will be enforced.
+ *
+ * Returns result of the write concern if successful.
+ * Returns NotMaster if the host steps down while waiting for replication
+ * Returns UnknownReplWriteConcern if the wMode specified was not enforceable
+ */
+Status waitForWriteConcern(OperationContext* opCtx,
+                           const repl::OpTime& replOpTime,
+                           const WriteConcernOptions& writeConcern,
+                           WriteConcernResult* result);
 
 
-} // namespace mongo
+}  // namespace mongo

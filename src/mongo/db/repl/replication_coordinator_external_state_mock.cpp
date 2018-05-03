@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
@@ -34,121 +36,240 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/repl/operation_context_repl_mock.h"
+#include "mongo/db/repl/oplog_buffer_blocking_queue.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/sequence_util.h"
 
 namespace mongo {
 namespace repl {
 
-    ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock()
-        : _localRsConfigDocument(ErrorCodes::NoMatchingDocument, "No local config document"),
-          _lastOpTime(ErrorCodes::NoMatchingDocument, "No last oplog entry"),
-         _canAcquireGlobalSharedLock(true),
-         _storeLocalConfigDocumentStatus(Status::OK()),
-         _storeLocalConfigDocumentShouldHang(false),
-         _connectionsClosed(false) {
+ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock()
+    : _localRsConfigDocument(ErrorCodes::NoMatchingDocument, "No local config document"),
+      _localRsLastVoteDocument(ErrorCodes::NoMatchingDocument, "No local lastVote document"),
+      _lastOpTime(ErrorCodes::NoMatchingDocument, "No last oplog entry"),
+      _canAcquireGlobalSharedLock(true),
+      _storeLocalConfigDocumentStatus(Status::OK()),
+      _storeLocalLastVoteDocumentStatus(Status::OK()),
+      _storeLocalLastVoteDocumentShouldHang(false),
+      _connectionsClosed(false),
+      _threadsStarted(false) {}
+
+ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
+
+void ReplicationCoordinatorExternalStateMock::startThreads(const ReplSettings& settings) {
+    _threadsStarted = true;
+}
+
+bool ReplicationCoordinatorExternalStateMock::isInitialSyncFlagSet(OperationContext*) {
+    return false;
+}
+
+void ReplicationCoordinatorExternalStateMock::startSteadyStateReplication(OperationContext*,
+                                                                          ReplicationCoordinator*) {
+}
+
+void ReplicationCoordinatorExternalStateMock::stopDataReplication(OperationContext*) {}
+
+Status ReplicationCoordinatorExternalStateMock::runRepairOnLocalDB(OperationContext* opCtx) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* opCtx,
+                                                                         const BSONObj& config) {
+    return storeLocalConfigDocument(opCtx, config);
+}
+
+void ReplicationCoordinatorExternalStateMock::waitForAllEarlierOplogWritesToBeVisible(
+    OperationContext* opCtx) {}
+
+void ReplicationCoordinatorExternalStateMock::shutdown(OperationContext*) {}
+
+executor::TaskExecutor* ReplicationCoordinatorExternalStateMock::getTaskExecutor() const {
+    return nullptr;
+}
+
+ThreadPool* ReplicationCoordinatorExternalStateMock::getDbWorkThreadPool() const {
+    return nullptr;
+}
+
+void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
+
+bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
+                                                     ServiceContext* const service) {
+    return sequenceContains(_selfHosts, host);
+}
+
+void ReplicationCoordinatorExternalStateMock::addSelf(const HostAndPort& host) {
+    _selfHosts.push_back(host);
+}
+
+HostAndPort ReplicationCoordinatorExternalStateMock::getClientHostAndPort(
+    const OperationContext* opCtx) {
+    return _clientHostAndPort;
+}
+
+void ReplicationCoordinatorExternalStateMock::setClientHostAndPort(
+    const HostAndPort& clientHostAndPort) {
+    _clientHostAndPort = clientHostAndPort;
+}
+
+StatusWith<BSONObj> ReplicationCoordinatorExternalStateMock::loadLocalConfigDocument(
+    OperationContext* opCtx) {
+    return _localRsConfigDocument;
+}
+
+Status ReplicationCoordinatorExternalStateMock::storeLocalConfigDocument(OperationContext* opCtx,
+                                                                         const BSONObj& config) {
+    if (_storeLocalConfigDocumentStatus.isOK()) {
+        setLocalConfigDocument(StatusWith<BSONObj>(config));
+        return Status::OK();
     }
+    return _storeLocalConfigDocumentStatus;
+}
 
-    ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
+void ReplicationCoordinatorExternalStateMock::setLocalConfigDocument(
+    const StatusWith<BSONObj>& localConfigDocument) {
+    _localRsConfigDocument = localConfigDocument;
+}
 
-    void ReplicationCoordinatorExternalStateMock::startThreads() {}
-    void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
-    void ReplicationCoordinatorExternalStateMock::initiateOplog(OperationContext* txn) {}
-    void ReplicationCoordinatorExternalStateMock::shutdown() {}
-    void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
+StatusWith<LastVote> ReplicationCoordinatorExternalStateMock::loadLocalLastVoteDocument(
+    OperationContext* opCtx) {
+    return _localRsLastVoteDocument;
+}
 
-    OID ReplicationCoordinatorExternalStateMock::ensureMe(OperationContext*) {
-        return OID::gen();
-    }
-
-    bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host) {
-        return sequenceContains(_selfHosts, host);
-    }
-
-    void ReplicationCoordinatorExternalStateMock::addSelf(const HostAndPort& host) {
-        _selfHosts.push_back(host);
-    }
-
-    HostAndPort ReplicationCoordinatorExternalStateMock::getClientHostAndPort(
-            const OperationContext* txn) {
-        return _clientHostAndPort;
-    }
-
-    void ReplicationCoordinatorExternalStateMock::setClientHostAndPort(
-            const HostAndPort& clientHostAndPort) {
-        _clientHostAndPort = clientHostAndPort;
-    }
-
-    StatusWith<BSONObj> ReplicationCoordinatorExternalStateMock::loadLocalConfigDocument(
-            OperationContext* txn) {
-        return _localRsConfigDocument;
-    }
-
-    Status ReplicationCoordinatorExternalStateMock::storeLocalConfigDocument(
-            OperationContext* txn,
-            const BSONObj& config) {
-        {
-            boost::unique_lock<boost::mutex> lock(_shouldHangMutex);
-            while (_storeLocalConfigDocumentShouldHang) {
-                _shouldHangCondVar.wait(lock);
-            }
+Status ReplicationCoordinatorExternalStateMock::storeLocalLastVoteDocument(
+    OperationContext* opCtx, const LastVote& lastVote) {
+    {
+        stdx::unique_lock<stdx::mutex> lock(_shouldHangLastVoteMutex);
+        while (_storeLocalLastVoteDocumentShouldHang) {
+            _shouldHangLastVoteCondVar.wait(lock);
         }
-        if (_storeLocalConfigDocumentStatus.isOK()) {
-            setLocalConfigDocument(StatusWith<BSONObj>(config));
-            return Status::OK();
-        }
-        return _storeLocalConfigDocumentStatus;
     }
-
-    void ReplicationCoordinatorExternalStateMock::setLocalConfigDocument(
-            const StatusWith<BSONObj>& localConfigDocument) {
-
-        _localRsConfigDocument = localConfigDocument;
+    if (_storeLocalLastVoteDocumentStatus.isOK()) {
+        setLocalLastVoteDocument(StatusWith<LastVote>(lastVote));
+        return Status::OK();
     }
+    return _storeLocalLastVoteDocumentStatus;
+}
 
-    void ReplicationCoordinatorExternalStateMock::setGlobalOpTime(const OpTime& newTime) {
+void ReplicationCoordinatorExternalStateMock::setLocalLastVoteDocument(
+    const StatusWith<LastVote>& localLastVoteDocument) {
+    _localRsLastVoteDocument = localLastVoteDocument;
+}
+
+void ReplicationCoordinatorExternalStateMock::setGlobalTimestamp(ServiceContext* service,
+                                                                 const Timestamp& newTime) {}
+
+StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(
+    OperationContext* opCtx) {
+    return _lastOpTime;
+}
+
+void ReplicationCoordinatorExternalStateMock::setLastOpTime(const StatusWith<OpTime>& lastApplied) {
+    _lastOpTime = lastApplied;
+}
+
+void ReplicationCoordinatorExternalStateMock::setStoreLocalConfigDocumentStatus(Status status) {
+    _storeLocalConfigDocumentStatus = status;
+}
+
+bool ReplicationCoordinatorExternalStateMock::threadsStarted() const {
+    return _threadsStarted;
+}
+
+void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentStatus(Status status) {
+    _storeLocalLastVoteDocumentStatus = status;
+}
+
+void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentToHang(bool hang) {
+    stdx::unique_lock<stdx::mutex> lock(_shouldHangLastVoteMutex);
+    _storeLocalLastVoteDocumentShouldHang = hang;
+    if (!hang) {
+        _shouldHangLastVoteCondVar.notify_all();
     }
+}
 
-    StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(
-        OperationContext* txn) {
-        return _lastOpTime;
-    }
+void ReplicationCoordinatorExternalStateMock::setFirstOpTimeOfMyTerm(const OpTime& opTime) {
+    _firstOpTimeOfMyTerm = opTime;
+}
 
-    void ReplicationCoordinatorExternalStateMock::setLastOpTime(
-        const StatusWith<OpTime>& lastApplied) {
-        _lastOpTime = lastApplied;
-    }
+void ReplicationCoordinatorExternalStateMock::closeConnections() {
+    _connectionsClosed = true;
+}
 
-    void ReplicationCoordinatorExternalStateMock::setStoreLocalConfigDocumentStatus(Status status) {
-        _storeLocalConfigDocumentStatus = status;
-    }
+void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationContext* opCtx) {}
 
-    void ReplicationCoordinatorExternalStateMock::setStoreLocalConfigDocumentToHang(bool hang) {
-        boost::unique_lock<boost::mutex> lock(_shouldHangMutex);
-        _storeLocalConfigDocumentShouldHang = hang;
-        if (!hang) {
-            _shouldHangCondVar.notify_all();
-        }
-    }
+void ReplicationCoordinatorExternalStateMock::killAllTransactionCursors(OperationContext* opCtx) {}
 
-    void ReplicationCoordinatorExternalStateMock::closeConnections() {
-        _connectionsClosed = true;
-    }
+void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
 
-    void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationContext* txn) {}
+void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 
-    void ReplicationCoordinatorExternalStateMock::clearShardingState() {}
+void ReplicationCoordinatorExternalStateMock::stopProducer() {}
 
-    void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
+void ReplicationCoordinatorExternalStateMock::startProducerIfStopped() {}
 
-    OperationContext* ReplicationCoordinatorExternalStateMock::createOperationContext(
-            const std::string& threadName) {
-        return new OperationContextReplMock;
-    }
+void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 
-    void ReplicationCoordinatorExternalStateMock::dropAllTempCollections(OperationContext* txn) {}
+void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(
+    const OpTime& newCommitPoint) {}
 
-} // namespace repl
-} // namespace mongo
+void ReplicationCoordinatorExternalStateMock::updateLocalSnapshot(const OpTime& optime) {}
+
+bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
+    return _areSnapshotsEnabled;
+}
+
+void ReplicationCoordinatorExternalStateMock::setAreSnapshotsEnabled(bool val) {
+    _areSnapshotsEnabled = val;
+}
+
+void ReplicationCoordinatorExternalStateMock::notifyOplogMetadataWaiters(
+    const OpTime& committedOpTime) {}
+
+boost::optional<OpTime> ReplicationCoordinatorExternalStateMock::getEarliestDropPendingOpTime()
+    const {
+    return {};
+}
+
+double ReplicationCoordinatorExternalStateMock::getElectionTimeoutOffsetLimitFraction() const {
+    return 0.15;
+}
+
+bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageEngine(
+    OperationContext* opCtx) const {
+    return _isReadCommittedSupported;
+}
+
+bool ReplicationCoordinatorExternalStateMock::isReadConcernSnapshotSupportedByStorageEngine(
+    OperationContext* opCtx) const {
+    return true;
+}
+
+std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherMaxFetcherRestarts() const {
+    return 0;
+}
+
+void ReplicationCoordinatorExternalStateMock::setIsReadCommittedEnabled(bool val) {
+    _isReadCommittedSupported = val;
+}
+
+void ReplicationCoordinatorExternalStateMock::onDrainComplete(OperationContext* opCtx) {}
+
+OpTime ReplicationCoordinatorExternalStateMock::onTransitionToPrimary(OperationContext* opCtx,
+                                                                      bool isV1ElectionProtocol) {
+    _lastOpTime = _firstOpTimeOfMyTerm;
+    _firstOpTimeOfMyTerm = OpTime();
+    return fassert(40297, _lastOpTime);
+}
+
+void ReplicationCoordinatorExternalStateMock::startNoopWriter(OpTime opTime) {}
+
+void ReplicationCoordinatorExternalStateMock::stopNoopWriter() {}
+
+void ReplicationCoordinatorExternalStateMock::setupNoopWriter(Seconds waitTime) {}
+
+}  // namespace repl
+}  // namespace mongo

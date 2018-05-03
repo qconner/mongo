@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -30,23 +30,15 @@ util_rename(WT_SESSION *session, int argc, char *argv[])
 	/* The remaining arguments are the object uri and new name. */
 	if (argc != 2)
 		return (usage());
-	if ((uri = util_name(*argv, "table")) == NULL)
+	if ((uri = util_uri(session, *argv, "table")) == NULL)
 		return (1);
 	newuri = argv[1];
 
-	if ((ret = session->rename(session, uri, newuri, NULL)) != 0) {
-		fprintf(stderr, "%s: rename %s to %s: %s\n",
-		    progname, uri, newuri, wiredtiger_strerror(ret));
-		goto err;
-	}
+	if ((ret = session->rename(session, uri, newuri, NULL)) != 0)
+		(void)util_err(
+		    session, ret, "session.rename: %s, %s", uri, newuri);
 
-	if (0) {
-err:		ret = 1;
-	}
-
-	if (uri != NULL)
-		free(uri);
-
+	free(uri);
 	return (ret);
 }
 

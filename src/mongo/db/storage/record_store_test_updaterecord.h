@@ -38,51 +38,32 @@
 namespace mongo {
 namespace {
 
-    class UpdateNotifierSpy : public UpdateNotifier {
-    public:
-        UpdateNotifierSpy( OperationContext* txn, const RecordId &loc,
-                               const char *buf, size_t size )
-                : _txn( txn ),
-                  _loc( loc ),
-                  _data( buf, size ),
-                  nMoveCalls( 0 ),
-                  nInPlaceCalls( 0 ) {
-        }
+class UpdateNotifierSpy : public UpdateNotifier {
+public:
+    UpdateNotifierSpy(OperationContext* opCtx, const RecordId& loc, const char* buf, size_t size)
+        : _opCtx(opCtx), _loc(loc), _data(buf, size), nInPlaceCalls(0) {}
 
-        ~UpdateNotifierSpy() { }
+    ~UpdateNotifierSpy() {}
 
-        Status recordStoreGoingToMove( OperationContext *txn,
-                                       const RecordId &oldLocation,
-                                       const char *oldBuffer,
-                                       size_t oldSize ) {
-            nMoveCalls++;
-            ASSERT_EQUALS( _txn, txn );
-            ASSERT_EQUALS( _loc, oldLocation );
-            ASSERT_EQUALS( _data, oldBuffer );
-            return Status::OK();
-        }
+    Status recordStoreGoingToUpdateInPlace(OperationContext* opCtx, const RecordId& loc) {
+        nInPlaceCalls++;
+        ASSERT_EQUALS(_opCtx, opCtx);
+        ASSERT_EQUALS(_loc, loc);
+        return Status::OK();
+    }
 
-        Status recordStoreGoingToUpdateInPlace( OperationContext* txn,
-                                                const RecordId& loc ) {
-            nInPlaceCalls++;
-            ASSERT_EQUALS( _txn, txn );
-            ASSERT_EQUALS( _loc, loc );
-            return Status::OK();
-        }
+    int numInPlaceCallbacks() const {
+        return nInPlaceCalls;
+    }
 
-        int numMoveCallbacks() const { return nMoveCalls; }
+private:
+    OperationContext* _opCtx;
+    RecordId _loc;
+    std::string _data;
 
-        int numInPlaceCallbacks() const { return nInPlaceCalls; }
+    // To verify the number of callbacks to the notifier.
+    int nInPlaceCalls;
+};
 
-    private:
-        OperationContext *_txn;
-        RecordId _loc;
-        std::string _data;
-
-        // To verify the number of callbacks to the notifier.
-        int nMoveCalls;
-        int nInPlaceCalls;
-    };
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

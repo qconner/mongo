@@ -28,167 +28,221 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_out.h"
+
+#include "mongo/db/ops/write_ops.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/destructor_guard.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using std::vector;
+using boost::intrusive_ptr;
+using std::vector;
 
-    const char DocumentSourceOut::outName[] = "$out";
+DocumentSourceOut::~DocumentSourceOut() {
+    DESTRUCTOR_GUARD(
+        // Make sure we drop the temp collection if anything goes wrong. Errors are ignored
+        // here because nothing can be done about them. Additionally, if this fails and the
+        // collection is left behind, it will be cleaned up next time the server is started.
+        if (_tempNs.size()) {
+            pExpCtx->mongoProcessInterface->directClient()->dropCollection(_tempNs.ns());
+        });
+}
 
-    DocumentSourceOut::~DocumentSourceOut() {
-        DESTRUCTOR_GUARD(
-            // Make sure we drop the temp collection if anything goes wrong. Errors are ignored
-            // here because nothing can be done about them. Additionally, if this fails and the
-            // collection is left behind, it will be cleaned up next time the server is started.
-            if (_mongod && _tempNs.size())
-                _mongod->directClient()->dropCollection(_tempNs.ns());
-        )
+std::unique_ptr<LiteParsedDocumentSourceForeignCollections> DocumentSourceOut::liteParse(
+    const AggregationRequest& request, const BSONElement& spec) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "$out stage requires a string argument, but found "
+                          << typeName(spec.type()),
+            spec.type() == BSONType::String);
+
+    NamespaceString targetNss(request.getNamespaceString().db(), spec.valueStringData());
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid $out target namespace, " << targetNss.ns(),
+            targetNss.isValid());
+
+    ActionSet actions{ActionType::remove, ActionType::insert};
+    if (request.shouldBypassDocumentValidation()) {
+        actions.addAction(ActionType::bypassDocumentValidation);
     }
 
-    const char *DocumentSourceOut::getSourceName() const {
-        return outName;
-    }
+    PrivilegeVector privileges{Privilege(ResourcePattern::forExactNamespace(targetNss), actions)};
 
-    static AtomicUInt32 aggOutCounter;
-    void DocumentSourceOut::prepTempCollection() {
-        verify(_mongod);
-        verify(_tempNs.size() == 0);
+    return stdx::make_unique<LiteParsedDocumentSourceForeignCollections>(std::move(targetNss),
+                                                                         std::move(privileges));
+}
 
-        DBClientBase* conn = _mongod->directClient();
+REGISTER_DOCUMENT_SOURCE(out, DocumentSourceOut::liteParse, DocumentSourceOut::createFromBson);
 
-        // Fail early by checking before we do any work.
-        uassert(17017, str::stream() << "namespace '" << _outputNs.ns()
-                                     << "' is sharded so it can't be used for $out'",
-                !_mongod->isSharded(_outputNs));
+const char* DocumentSourceOut::getSourceName() const {
+    return "$out";
+}
 
-        // cannot $out to capped collection
-        uassert(17152, str::stream() << "namespace '" << _outputNs.ns()
-                                     << "' is capped so it can't be used for $out",
-                !_mongod->isCapped(_outputNs));
+static AtomicUInt32 aggOutCounter;
 
-        _tempNs = NamespaceString(StringData(str::stream() << _outputNs.db()
-                                             << ".tmp.agg_out."
-                                             << aggOutCounter.addAndFetch(1)
-                                             ));
+void DocumentSourceOut::initialize() {
+    DBClientBase* conn = pExpCtx->mongoProcessInterface->directClient();
 
-        {
-            BSONObj info;
-            bool ok =conn->runCommand(_outputNs.db().toString(),
-                                      BSON("create" << _tempNs.coll() << "temp" << true),
-                                      info);
-            uassert(16994, str::stream() << "failed to create temporary $out collection '"
-                                         << _tempNs.ns() << "': " << info.toString(),
-                    ok);
-        }
+    // Save the original collection options and index specs so we can check they didn't change
+    // during computation.
+    _originalOutOptions = pExpCtx->mongoProcessInterface->getCollectionOptions(_outputNs);
+    _originalIndexes = conn->getIndexSpecs(_outputNs.ns());
 
-        // copy indexes on _outputNs to _tempNs
-        const std::list<BSONObj> indexes = conn->getIndexSpecs(_outputNs);
-        for (std::list<BSONObj>::const_iterator it = indexes.begin(); it != indexes.end(); ++it) {
-            MutableDocument index((Document(*it)));
-            index.remove("_id"); // indexes shouldn't have _ids but some existing ones do
-            index["ns"] = Value(_tempNs.ns());
+    // Check if it's sharded or capped to make sure we have a chance of succeeding before we do all
+    // the work. If the collection becomes capped during processing, the collection options will
+    // have changed, and the $out will fail. If it becomes sharded during processing, the final
+    // rename will fail.
+    uassert(17017,
+            str::stream() << "namespace '" << _outputNs.ns()
+                          << "' is sharded so it can't be used for $out'",
+            !pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _outputNs));
+    uassert(17152,
+            str::stream() << "namespace '" << _outputNs.ns()
+                          << "' is capped so it can't be used for $out",
+            _originalOutOptions["capped"].eoo());
 
-            BSONObj indexBson = index.freeze().toBson();
-            conn->insert(_tempNs.getSystemIndexesCollection(), indexBson);
-            BSONObj err = conn->getLastErrorDetailed();
-            uassert(16995, str::stream() << "copying index for $out failed."
-                                         << " index: " << indexBson
-                                         << " error: " <<  err,
-                    DBClientWithCommands::getLastErrorString(err).empty());
-        }
-    }
+    // We will write all results into a temporary collection, then rename the temporary collection
+    // to be the target collection once we are done.
+    _tempNs = NamespaceString(str::stream() << _outputNs.db() << ".tmp.agg_out."
+                                            << aggOutCounter.addAndFetch(1));
 
-    void DocumentSourceOut::spill(DBClientBase* conn, const vector<BSONObj>& toInsert) {
-        conn->insert(_tempNs.ns(), toInsert);
-        BSONObj err = conn->getLastErrorDetailed();
-        uassert(16996, str::stream() << "insert for $out failed: " << err,
-                DBClientWithCommands::getLastErrorString(err).empty());
-    }
+    // Create output collection, copying options from existing collection if any.
+    {
+        BSONObjBuilder cmd;
+        cmd << "create" << _tempNs.coll();
+        cmd << "temp" << true;
+        cmd.appendElementsUnique(_originalOutOptions);
 
-    boost::optional<Document> DocumentSourceOut::getNext() {
-        pExpCtx->checkForInterrupt();
-
-        // make sure we only write out once
-        if (_done)
-            return boost::none;
-        _done = true;
-
-        verify(_mongod);
-        DBClientBase* conn = _mongod->directClient();
-
-        prepTempCollection();
-        verify(_tempNs.size() != 0);
-
-        vector<BSONObj> bufferedObjects;
-        int bufferedBytes = 0;
-        while (boost::optional<Document> next = pSource->getNext()) {
-            BSONObj toInsert = next->toBson();
-            bufferedBytes += toInsert.objsize();
-            if (!bufferedObjects.empty() && bufferedBytes > BSONObjMaxUserSize) {
-                spill(conn, bufferedObjects);
-                bufferedObjects.clear();
-                bufferedBytes = toInsert.objsize();
-            }
-            bufferedObjects.push_back(toInsert);
-        }
-
-        if (!bufferedObjects.empty())
-            spill(conn, bufferedObjects);
-
-        // Checking again to make sure we didn't become sharded while running.
-        uassert(17018, str::stream() << "namespace '" << _outputNs.ns()
-                                     << "' became sharded so it can't be used for $out'",
-                !_mongod->isSharded(_outputNs));
-
-        BSONObj rename = BSON("renameCollection" << _tempNs.ns()
-                           << "to" << _outputNs.ns()
-                           << "dropTarget" << true
-                           );
         BSONObj info;
-        bool ok = conn->runCommand("admin", rename, info);
-        uassert(16997,  str::stream() << "renameCollection for $out failed: " << info,
+        bool ok = conn->runCommand(_outputNs.db().toString(), cmd.done(), info);
+        uassert(16994,
+                str::stream() << "failed to create temporary $out collection '" << _tempNs.ns()
+                              << "': "
+                              << info.toString(),
                 ok);
-
-        // We don't need to drop the temp collection in our destructor if the rename succeeded.
-        _tempNs = NamespaceString("");
-
-        // This "DocumentSource" doesn't produce output documents. This can change in the future
-        // if we support using $out in "tee" mode.
-        return boost::none;
     }
 
-    DocumentSourceOut::DocumentSourceOut(const NamespaceString& outputNs,
-                                         const intrusive_ptr<ExpressionContext>& pExpCtx)
-        : DocumentSource(pExpCtx)
-        , _done(false)
-        , _tempNs("") // filled in by prepTempCollection
-        , _outputNs(outputNs)
-    {}
+    // copy indexes to _tempNs
+    for (std::list<BSONObj>::const_iterator it = _originalIndexes.begin();
+         it != _originalIndexes.end();
+         ++it) {
+        MutableDocument index((Document(*it)));
+        index.remove("_id");  // indexes shouldn't have _ids but some existing ones do
+        index["ns"] = Value(_tempNs.ns());
 
-    intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        uassert(16990, str::stream() << "$out only supports a string argument, not "
-                                     << typeName(elem.type()),
-                elem.type() == String);
-        
-        NamespaceString outputNs(pExpCtx->ns.db().toString() + '.' + elem.str());
-        uassert(17385, "Can't $out to special collection: " + elem.str(),
-                !outputNs.isSpecial());
-        return new DocumentSourceOut(outputNs, pExpCtx);
+        BSONObj indexBson = index.freeze().toBson();
+        conn->insert(_tempNs.getSystemIndexesCollection(), indexBson);
+        BSONObj err = conn->getLastErrorDetailed();
+        uassert(16995,
+                str::stream() << "copying index for $out failed."
+                              << " index: "
+                              << indexBson
+                              << " error: "
+                              << err,
+                DBClientBase::getLastErrorString(err).empty());
+    }
+    _initialized = true;
+}
+
+void DocumentSourceOut::spill(const vector<BSONObj>& toInsert) {
+    BSONObj err = pExpCtx->mongoProcessInterface->insert(pExpCtx, _tempNs, toInsert);
+    uassert(16996,
+            str::stream() << "insert for $out failed: " << err,
+            DBClientBase::getLastErrorString(err).empty());
+}
+
+DocumentSource::GetNextResult DocumentSourceOut::getNext() {
+    pExpCtx->checkForInterrupt();
+
+    if (_done) {
+        return GetNextResult::makeEOF();
     }
 
-    Value DocumentSourceOut::serialize(bool explain) const {
-        massert(17000, "$out shouldn't have different db than input",
-                _outputNs.db() == pExpCtx->ns.db());
-
-        return Value(DOC(getSourceName() << _outputNs.coll()));
+    if (!_initialized) {
+        initialize();
     }
 
-    DocumentSource::GetDepsReturn DocumentSourceOut::getDependencies(DepsTracker* deps) const {
-        deps->needWholeDocument = true;
-        return EXHAUSTIVE_ALL;
+    // Insert all documents into temp collection, batching to perform vectored inserts.
+    vector<BSONObj> bufferedObjects;
+    int bufferedBytes = 0;
+
+    auto nextInput = pSource->getNext();
+    for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
+        BSONObj toInsert = nextInput.releaseDocument().toBson();
+
+        bufferedBytes += toInsert.objsize();
+        if (!bufferedObjects.empty() && (bufferedBytes > BSONObjMaxUserSize ||
+                                         bufferedObjects.size() >= write_ops::kMaxWriteBatchSize)) {
+            spill(bufferedObjects);
+            bufferedObjects.clear();
+            bufferedBytes = toInsert.objsize();
+        }
+        bufferedObjects.push_back(toInsert);
     }
+    if (!bufferedObjects.empty())
+        spill(bufferedObjects);
+
+    switch (nextInput.getStatus()) {
+        case GetNextResult::ReturnStatus::kAdvanced: {
+            MONGO_UNREACHABLE;  // We consumed all advances above.
+        }
+        case GetNextResult::ReturnStatus::kPauseExecution: {
+            return nextInput;  // Propagate the pause.
+        }
+        case GetNextResult::ReturnStatus::kEOF: {
+
+            auto renameCommandObj =
+                BSON("renameCollection" << _tempNs.ns() << "to" << _outputNs.ns() << "dropTarget"
+                                        << true);
+
+            auto status = pExpCtx->mongoProcessInterface->renameIfOptionsAndIndexesHaveNotChanged(
+                pExpCtx->opCtx, renameCommandObj, _outputNs, _originalOutOptions, _originalIndexes);
+            uassert(16997, str::stream() << "$out failed: " << status.reason(), status.isOK());
+
+            // We don't need to drop the temp collection in our destructor if the rename succeeded.
+            _tempNs = {};
+            _done = true;
+
+            // $out doesn't currently produce any outputs.
+            return nextInput;
+        }
+    }
+    MONGO_UNREACHABLE;
+}
+
+DocumentSourceOut::DocumentSourceOut(const NamespaceString& outputNs,
+                                     const intrusive_ptr<ExpressionContext>& pExpCtx)
+    : DocumentSource(pExpCtx),
+      _done(false),
+      _tempNs(""),  // Filled in during getNext().
+      _outputNs(outputNs) {}
+
+intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
+    uassert(16990,
+            str::stream() << "$out only supports a string argument, not " << typeName(elem.type()),
+            elem.type() == String);
+
+    auto readConcernLevel = pExpCtx->opCtx->recoveryUnit()->getReadConcernLevel();
+    uassert(ErrorCodes::InvalidOptions,
+            "$out can not be used with either a 'majority' or 'snapshot' read concern level",
+            readConcernLevel != repl::ReadConcernLevel::kMajorityReadConcern &&
+                readConcernLevel != repl::ReadConcernLevel::kSnapshotReadConcern);
+
+    NamespaceString outputNs(pExpCtx->ns.db().toString() + '.' + elem.str());
+    uassert(17385, "Can't $out to special collection: " + elem.str(), !outputNs.isSpecial());
+    return new DocumentSourceOut(outputNs, pExpCtx);
+}
+
+Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+    massert(
+        17000, "$out shouldn't have different db than input", _outputNs.db() == pExpCtx->ns.db());
+
+    return Value(DOC(getSourceName() << _outputNs.coll()));
+}
+
+DocumentSource::GetDepsReturn DocumentSourceOut::getDependencies(DepsTracker* deps) const {
+    deps->needWholeDocument = true;
+    return EXHAUSTIVE_ALL;
+}
 }

@@ -1,3 +1,11 @@
+// @tags: [
+//   # This test attempts to remove documents using the stageDebug command, which doesn't support
+//   # specifying a writeConcern.
+//   assumes_write_concern_unchanged,
+//   does_not_support_stepdowns,
+//   requires_fastcount,
+// ]
+
 // Test basic delete stage functionality.
 var coll = db.stages_delete;
 var collScanStage = {cscan: {args: {direction: 1}, filter: {deleteMe: true}}};
@@ -8,7 +16,9 @@ coll.drop();
 assert.writeOK(coll.insert({deleteMe: true}));
 assert.writeOK(coll.insert({deleteMe: true}));
 assert.writeOK(coll.insert({deleteMe: false}));
-deleteStage = {delete: {args: {node: collScanStage, isMulti: true, shouldCallLogOp: true}}};
+deleteStage = {
+    delete: {args: {node: collScanStage, isMulti: true}}
+};
 assert.eq(coll.count(), 3);
 assert.commandWorked(db.runCommand({stageDebug: {collection: coll.getName(), plan: deleteStage}}));
 assert.eq(coll.count(), 1);
@@ -19,7 +29,9 @@ coll.drop();
 assert.writeOK(coll.insert({deleteMe: true}));
 assert.writeOK(coll.insert({deleteMe: true}));
 assert.writeOK(coll.insert({deleteMe: false}));
-deleteStage = {delete: {args: {node: collScanStage, isMulti: false, shouldCallLogOp: true}}};
+deleteStage = {
+    delete: {args: {node: collScanStage, isMulti: false}}
+};
 assert.eq(coll.count(), 3);
 assert.commandWorked(db.runCommand({stageDebug: {collection: coll.getName(), plan: deleteStage}}));
 assert.eq(coll.count(), 2);
